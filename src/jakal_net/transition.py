@@ -20,6 +20,7 @@ from jakal_net.core import (
     validate_route_block_logits,
     validate_route_logits,
 )
+from jakal_net.kernels import transition_dense_kernel, transition_topk_kernel
 
 
 def _masked_softmax(logits: Tensor, mask: Tensor, dim: int) -> Tensor:
@@ -155,6 +156,18 @@ class Transition(nn.Module):
     def compute_delta(self, src_layer: Layer, dst_layer: Layer) -> LayerDelta:
         if self.implementation == "reference":
             return self._compute_delta_reference(src_layer, dst_layer)
+        if self.implementation == "kernel":
+            projected_val, projected_state, sender_strength = self._project_inputs(
+                src_layer, dst_layer
+            )
+            return transition_dense_kernel(
+                route_fn=self.route_fn,
+                sender_strength=sender_strength,
+                src_val=src_layer.val,
+                projected_state=projected_state,
+                projected_val=projected_val,
+                dst_nodes=dst_layer.num_nodes,
+            )
         return self._compute_delta_streaming(src_layer, dst_layer)
 
     def forward(self, src_layer: Layer, dst_layer: Layer) -> Layer:
@@ -248,7 +261,11 @@ class SparseTransition(Transition):
                 .to(dtype=state_acc_dtype)
                 .unsqueeze(-1)
             )
-            delta_state.scatter_add_(dim=-1, index=topk_indices, src=state_contrib)
+            flat_indices = topk_indices.reshape(*topk_indices.shape[:-2], -1)
+            flat_state_contrib = state_contrib.reshape(*state_contrib.shape[:-2], -1)
+            delta_state.scatter_add_(
+                dim=-1, index=flat_indices, src=flat_state_contrib
+            )
 
             val_contrib = (
                 weighted_routes.to(dtype=val_acc_dtype).unsqueeze(-1)
@@ -256,10 +273,33 @@ class SparseTransition(Transition):
                 .to(dtype=val_acc_dtype)
                 .unsqueeze(-2)
             )
-            scatter_index = topk_indices.unsqueeze(-1).expand(*topk_indices.shape, dst_layer.dim)
-            delta_val.scatter_add_(dim=-2, index=scatter_index, src=val_contrib)
+            flat_val_contrib = val_contrib.reshape(
+                *val_contrib.shape[:-3], -1, dst_layer.dim
+            )
+            scatter_index = flat_indices.unsqueeze(-1).expand(
+                *flat_indices.shape, dst_layer.dim
+            )
+            delta_val.scatter_add_(dim=-2, index=scatter_index, src=flat_val_contrib)
 
         return LayerDelta(
             delta_state=delta_state.to(projected_state.dtype),
             delta_val=delta_val.to(projected_val.dtype),
         )
+
+    def compute_delta(self, src_layer: Layer, dst_layer: Layer) -> LayerDelta:
+        if self.implementation == "reference":
+            return self._compute_delta_reference(src_layer, dst_layer)
+        if self.implementation == "kernel":
+            projected_val, projected_state, sender_strength = self._project_inputs(
+                src_layer, dst_layer
+            )
+            return transition_topk_kernel(
+                route_fn=self.route_fn,
+                sender_strength=sender_strength,
+                src_val=src_layer.val,
+                projected_state=projected_state,
+                projected_val=projected_val,
+                dst_nodes=dst_layer.num_nodes,
+                topk=self.topk,
+            )
+        return self._compute_delta_streaming(src_layer, dst_layer)

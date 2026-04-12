@@ -20,6 +20,12 @@ from jakal_net.core import (
     validate_projected_state,
     validate_projected_val,
 )
+from jakal_net.kernels import (
+    propagation_dense_kernel,
+    propagation_topk_kernel,
+    propagation_window_kernel,
+    supports_pairwise_kernel,
+)
 
 
 def _causal_window_mask(
@@ -186,6 +192,17 @@ class Propagation(nn.Module):
     def compute_delta(self, layer: Layer) -> LayerDelta:
         if self.implementation == "reference":
             return self._compute_delta_reference(layer)
+        if self.implementation == "kernel":
+            if supports_pairwise_kernel(self.pairwise_fn):
+                projected_state, projected_val = self._project_inputs(layer)
+                return propagation_dense_kernel(
+                    pairwise_fn=self.pairwise_fn,
+                    edge_compress_fn=self.edge_compress_fn,
+                    layer_val=layer.val,
+                    projected_state=projected_state,
+                    projected_val=projected_val,
+                )
+            return self._compute_delta_streaming(layer)
         return self._compute_delta_streaming(layer)
 
     def forward(self, layer: Layer) -> LayerDelta | Layer:
@@ -411,3 +428,29 @@ class SparsePropagation(Propagation):
         if self.sparse_type == "window":
             return self._compute_window_delta_streaming(layer)
         return self._compute_topk_delta_streaming(layer)
+
+    def compute_delta(self, layer: Layer) -> LayerDelta:
+        if self.implementation == "reference":
+            return self._compute_delta_reference(layer)
+        if self.implementation == "kernel":
+            if supports_pairwise_kernel(self.pairwise_fn):
+                projected_state, projected_val = self._project_inputs(layer)
+                if self.sparse_type == "window":
+                    return propagation_window_kernel(
+                        pairwise_fn=self.pairwise_fn,
+                        edge_compress_fn=self.edge_compress_fn,
+                        layer_val=layer.val,
+                        projected_state=projected_state,
+                        projected_val=projected_val,
+                        window=self.window or 0,
+                    )
+                return propagation_topk_kernel(
+                    pairwise_fn=self.pairwise_fn,
+                    edge_compress_fn=self.edge_compress_fn,
+                    layer_val=layer.val,
+                    projected_state=projected_state,
+                    projected_val=projected_val,
+                    topk=self.topk or layer.num_nodes,
+                )
+            return self._compute_delta_streaming(layer)
+        return self._compute_delta_streaming(layer)

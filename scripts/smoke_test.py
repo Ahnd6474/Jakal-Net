@@ -40,6 +40,17 @@ def main() -> None:
     assert sparse_delta.delta_state.shape == same_level.state.shape
     assert sparse_delta.delta_val.shape == same_level.val.shape
 
+    kernel_propagation = Propagation(
+        pairwise_fn=DiagonalBilinearPairwise(dim=8),
+        state_proj_fn=ScalarAffine(),
+        implementation="kernel",
+    )
+    kernel_propagation.pairwise_fn.load_state_dict(propagation.pairwise_fn.state_dict())
+    kernel_propagation.state_proj_fn.load_state_dict(propagation.state_proj_fn.state_dict())
+    kernel_delta = kernel_propagation(same_level)
+    assert kernel_delta.delta_state.shape == same_level.state.shape
+    assert kernel_delta.delta_val.shape == same_level.val.shape
+
     src = Layer.zeros(dim=8, num_nodes=16, batch_shape=(2,))
     src = src.with_tensors(
         state=torch.randn_like(src.state),
@@ -59,6 +70,16 @@ def main() -> None:
     dst_after_sparse = sparse_transition(src, dst)
     assert dst_after_sparse.state.shape == dst.state.shape
     assert dst_after_sparse.val.shape == dst.val.shape
+
+    kernel_transition = SparseTransition(
+        route_fn=LinearRoute(src_dim=8, dst_nodes=6),
+        topk=2,
+        implementation="kernel",
+    )
+    kernel_transition.route_fn.load_state_dict(sparse_transition.route_fn.state_dict())
+    dst_after_kernel = kernel_transition(src, dst)
+    assert dst_after_kernel.state.shape == dst.state.shape
+    assert dst_after_kernel.val.shape == dst.val.shape
 
     print("smoke test passed")
 

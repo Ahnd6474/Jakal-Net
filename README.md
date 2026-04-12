@@ -190,6 +190,14 @@ Behavior:
 
 Important detail: propagation does not apply an activation to `layer.state` before transport.
 
+Implementation notes:
+
+- `implementation="reference"` materializes the full pairwise relation for debugging and regression checks.
+- `implementation="kernel"` uses vectorized fast paths for supported scorer types such as `DiagonalBilinearPairwise` and `BilinearPairwise`.
+- `implementation="streaming"` processes target and source blocks incrementally to avoid storing the full edge matrix.
+- `target_block_size` and `source_block_size` control the block shape in streaming mode.
+- `accumulator_dtype` lets you keep accumulation in a wider dtype such as `torch.float32`.
+
 If you set `return_delta=False`, the module applies the update to the input layer and returns a `Layer`. With `residual=True`, it adds the delta. With `residual=False`, it replaces the stored tensors.
 
 ### `SparsePropagation`
@@ -217,6 +225,11 @@ Supported sparse modes:
 - `sparse_type="topk"` keeps the highest-scoring source nodes per target
 
 The return behavior matches `Propagation`.
+
+- In `implementation="kernel"`, the `window` path uses an unfold-based fused fast path for supported pairwise scorers.
+- In `implementation="streaming"`, the `window` path only evaluates the necessary neighborhood.
+- In `implementation="kernel"`, the `topk` path uses a specialized vectorized score-and-top-k path for supported pairwise scorers.
+- In `implementation="streaming"`, the `topk` path keeps a running top-k set per target block.
 
 ### `Transition`
 
@@ -248,6 +261,10 @@ Notes:
 - `merge_mode="add"` accumulates into the existing destination tensors
 - `merge_mode="replace"` overwrites them with the transported result
 - `val_proj_fn` must return `[..., src_nodes, dst_dim]`
+- `implementation="kernel"` uses a dense vectorized transport path and currently works best with lightweight route functions such as `LinearRoute`
+- `implementation="streaming"` processes source blocks incrementally so the full routing matrix is never stored
+- `src_block_size` controls how many source nodes are routed per block in streaming mode
+- `accumulator_dtype` controls the internal accumulation dtype
 
 ### `SparseTransition`
 
@@ -270,6 +287,8 @@ That gives you:
 - dense routing semantics on the kept destinations
 - fixed `topk` sparsity for larger cross-layer moves
 - the same update behavior as `Transition`
+- a vectorized `implementation="kernel"` path for dense-logit top-k routing
+- scatter-based destination accumulation in streaming mode instead of a materialized dense routing matrix
 
 ### Helper modules
 
@@ -364,6 +383,21 @@ If you want to inspect the reference implementation directly, start here:
 
 The tests are small, but they are a good map of the intended behavior.
 
+For timing and memory checks, run:
+
+```powershell
+$env:PYTHONPATH = "src"
+.\.venv\Scripts\python.exe scripts\benchmark_operators.py --warmup 1 --iterations 5
+```
+
+That script compares `reference`, `kernel`, and `streaming` implementations for:
+
+- dense propagation
+- window sparse propagation
+- top-k sparse propagation
+- dense transition
+- top-k sparse transition
+
 ## License
 
 MIT-style usage terms do not apply here. This repository is distributed under Apache 2.0. See [LICENSE](./LICENSE) for the full text.
@@ -384,9 +418,9 @@ Expected output:
 
 ```text
 smoke test passed
-......
+..............
 ----------------------------------------------------------------------
-Ran 6 tests in 0.010s
+Ran 14 tests in 0.128s
 
 OK
 ```

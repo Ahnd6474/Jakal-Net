@@ -8,7 +8,7 @@ from torch import Tensor
 
 MergeMode = Literal["add", "replace"]
 SparsePropagationType = Literal["window", "topk"]
-ImplementationMode = Literal["reference", "streaming"]
+ImplementationMode = Literal["reference", "streaming", "kernel"]
 
 
 @dataclass(slots=True)
@@ -121,7 +121,7 @@ def validate_merge_mode(merge_mode: MergeMode) -> None:
 
 
 def validate_implementation(implementation: ImplementationMode) -> None:
-    if implementation not in {"reference", "streaming"}:
+    if implementation not in {"reference", "streaming", "kernel"}:
         raise ValueError(f"Unsupported implementation: {implementation!r}.")
 
 
