@@ -45,6 +45,16 @@ python -m pip install -r requirements.txt
 
 `requirements.txt` currently installs the CPU build of PyTorch. If you want a CUDA build, install the matching `torch` wheel first and then install the rest of the dependencies around it.
 
+For DirectML on Windows, use a separate environment:
+
+```powershell
+py -m venv .venv-dml
+.\.venv-dml\Scripts\Activate.ps1
+python -m pip install torch-directml numpy
+```
+
+This repository now accepts `--device directml` in the smoke test and benchmark scripts.
+
 This project is not packaged as an installable wheel yet, so examples and scripts expect:
 
 ```powershell
@@ -71,7 +81,15 @@ $env:PYTHONPATH = "src"
 You should see:
 
 ```text
+using device: cpu
 smoke test passed
+```
+
+To try the Intel GPU through DirectML:
+
+```powershell
+$env:PYTHONPATH = "src"
+.\.venv-dml\Scripts\python.exe scripts\smoke_test.py --device directml
 ```
 
 Here is the smallest useful Python example:
@@ -198,6 +216,8 @@ Implementation notes:
 - `target_block_size` and `source_block_size` control the block shape in streaming mode.
 - `accumulator_dtype` lets you keep accumulation in a wider dtype such as `torch.float32`.
 
+On DirectML, supported scorer combinations automatically fall back to the kernel path when the generic streaming path is not a good fit.
+
 If you set `return_delta=False`, the module applies the update to the input layer and returns a `Layer`. With `residual=True`, it adds the delta. With `residual=False`, it replaces the stored tensors.
 
 ### `SparsePropagation`
@@ -265,6 +285,8 @@ Notes:
 - `implementation="streaming"` processes source blocks incrementally so the full routing matrix is never stored
 - `src_block_size` controls how many source nodes are routed per block in streaming mode
 - `accumulator_dtype` controls the internal accumulation dtype
+
+On DirectML, `SparseTransition` uses a compatibility fallback that avoids unsupported scatter patterns.
 
 ### `SparseTransition`
 
@@ -397,6 +419,13 @@ That script compares `reference`, `kernel`, and `streaming` implementations for:
 - top-k sparse propagation
 - dense transition
 - top-k sparse transition
+
+You can run the same benchmark on DirectML like this:
+
+```powershell
+$env:PYTHONPATH = "src"
+.\.venv-dml\Scripts\python.exe scripts\benchmark_operators.py --device directml --warmup 1 --iterations 5
+```
 
 ## License
 

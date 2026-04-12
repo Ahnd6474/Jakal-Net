@@ -190,6 +190,19 @@ class Propagation(nn.Module):
         )
 
     def compute_delta(self, layer: Layer) -> LayerDelta:
+        if (
+            layer.val.device.type == "privateuseone"
+            and self.implementation != "reference"
+            and supports_pairwise_kernel(self.pairwise_fn)
+        ):
+            projected_state, projected_val = self._project_inputs(layer)
+            return propagation_dense_kernel(
+                pairwise_fn=self.pairwise_fn,
+                edge_compress_fn=self.edge_compress_fn,
+                layer_val=layer.val,
+                projected_state=projected_state,
+                projected_val=projected_val,
+            )
         if self.implementation == "reference":
             return self._compute_delta_reference(layer)
         if self.implementation == "kernel":
@@ -430,6 +443,38 @@ class SparsePropagation(Propagation):
         return self._compute_topk_delta_streaming(layer)
 
     def compute_delta(self, layer: Layer) -> LayerDelta:
+        if layer.val.device.type == "privateuseone" and supports_pairwise_kernel(
+            self.pairwise_fn
+        ):
+            projected_state, projected_val = self._project_inputs(layer)
+            if self.sparse_type == "window":
+                if self.implementation != "reference":
+                    return propagation_window_kernel(
+                        pairwise_fn=self.pairwise_fn,
+                        edge_compress_fn=self.edge_compress_fn,
+                        layer_val=layer.val,
+                        projected_state=projected_state,
+                        projected_val=projected_val,
+                        window=self.window or 0,
+                    )
+            elif self.sparse_type == "topk":
+                if self.implementation != "reference":
+                    return propagation_topk_kernel(
+                        pairwise_fn=self.pairwise_fn,
+                        edge_compress_fn=self.edge_compress_fn,
+                        layer_val=layer.val,
+                        projected_state=projected_state,
+                        projected_val=projected_val,
+                        topk=self.topk or layer.num_nodes,
+                    )
+                return propagation_topk_kernel(
+                    pairwise_fn=self.pairwise_fn,
+                    edge_compress_fn=self.edge_compress_fn,
+                    layer_val=layer.val,
+                    projected_state=projected_state,
+                    projected_val=projected_val,
+                    topk=self.topk or layer.num_nodes,
+                )
         if self.implementation == "reference":
             return self._compute_delta_reference(layer)
         if self.implementation == "kernel":
