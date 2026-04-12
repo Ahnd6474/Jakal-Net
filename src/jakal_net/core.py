@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Literal
+from typing import Callable, Iterator, Literal
 
 import torch
 from torch import Tensor
 
 MergeMode = Literal["add", "replace"]
 SparsePropagationType = Literal["window", "topk"]
+ImplementationMode = Literal["reference", "streaming"]
 
 
 @dataclass(slots=True)
@@ -119,6 +120,11 @@ def validate_merge_mode(merge_mode: MergeMode) -> None:
         raise ValueError(f"Unsupported merge_mode: {merge_mode!r}.")
 
 
+def validate_implementation(implementation: ImplementationMode) -> None:
+    if implementation not in {"reference", "streaming"}:
+        raise ValueError(f"Unsupported implementation: {implementation!r}.")
+
+
 def apply_optional_layer_fn(
     layer: Layer, layer_fn: Callable[[Layer], Layer] | None
 ) -> Layer:
@@ -147,7 +153,22 @@ def validate_projected_val(projected_val: Tensor, reference: Layer) -> None:
 
 
 def validate_pairwise_scores(scores: Tensor, layer: Layer) -> None:
-    expected_shape = (*layer.state.shape, layer.num_nodes)
+    validate_pairwise_block_scores(
+        scores=scores,
+        batch_shape=layer.batch_shape,
+        target_nodes=layer.num_nodes,
+        source_nodes=layer.num_nodes,
+    )
+
+
+def validate_pairwise_block_scores(
+    scores: Tensor,
+    *,
+    batch_shape: torch.Size | tuple[int, ...],
+    target_nodes: int,
+    source_nodes: int,
+) -> None:
+    expected_shape = (*batch_shape, target_nodes, source_nodes)
     if tuple(scores.shape) != expected_shape:
         raise ValueError(
             "pairwise_fn must return scores shaped like [..., num_nodes, num_nodes], "
@@ -156,9 +177,50 @@ def validate_pairwise_scores(scores: Tensor, layer: Layer) -> None:
 
 
 def validate_route_logits(logits: Tensor, src_layer: Layer, dst_layer: Layer) -> None:
-    expected_shape = (*src_layer.state.shape, dst_layer.num_nodes)
+    validate_route_block_logits(
+        logits=logits,
+        batch_shape=src_layer.batch_shape,
+        source_nodes=src_layer.num_nodes,
+        dst_nodes=dst_layer.num_nodes,
+    )
+
+
+def validate_route_block_logits(
+    logits: Tensor,
+    *,
+    batch_shape: torch.Size | tuple[int, ...],
+    source_nodes: int,
+    dst_nodes: int,
+) -> None:
+    expected_shape = (*batch_shape, source_nodes, dst_nodes)
     if tuple(logits.shape) != expected_shape:
         raise ValueError(
             "route_fn must return logits shaped like [..., src_nodes, dst_nodes], "
             f"expected {expected_shape}, got {tuple(logits.shape)}."
         )
+
+
+def resolve_block_size(block_size: int | None, total_size: int, *, name: str) -> int:
+    if total_size <= 0:
+        raise ValueError("total_size must be positive.")
+    if block_size is None:
+        return total_size
+    if block_size <= 0:
+        raise ValueError(f"{name} must be positive when provided.")
+    return min(block_size, total_size)
+
+
+def iter_blocks(total_size: int, block_size: int | None, *, name: str) -> Iterator[tuple[int, int]]:
+    resolved = resolve_block_size(block_size, total_size, name=name)
+    for start in range(0, total_size, resolved):
+        yield start, min(start + resolved, total_size)
+
+
+def resolve_accumulator_dtype(
+    tensor_dtype: torch.dtype, accumulator_dtype: torch.dtype | None
+) -> torch.dtype:
+    if accumulator_dtype is not None:
+        return accumulator_dtype
+    if tensor_dtype in {torch.float16, torch.bfloat16}:
+        return torch.float32
+    return tensor_dtype
