@@ -15,9 +15,11 @@ from torch import nn
 
 from jakal_net import (
     DiagonalBilinearPairwise,
+    describe_device,
     Layer,
     LinearRoute,
     Propagation,
+    resolve_device,
     ScalarAffine,
     SparsePropagation,
     SparseTransition,
@@ -111,6 +113,13 @@ class BenchmarkResult:
     max_abs_error: float
 
 
+@dataclass
+class BenchmarkFailure:
+    name: str
+    implementation: str
+    error: str
+
+
 def _maybe_synchronize(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -192,6 +201,10 @@ def _format_result(result: BenchmarkResult) -> str:
     )
 
 
+def _format_failure(failure: BenchmarkFailure) -> str:
+    return f"{failure.name:28} {failure.implementation:11} ERROR      {failure.error}"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="cpu")
@@ -201,8 +214,9 @@ def main() -> None:
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
-    device = torch.device(args.device)
+    device = resolve_device(args.device)
     dtype = torch.float32
+    print(f"using device: {describe_device(args.device)}")
 
     batch_shape = (4,)
     batch_factor = _batch_product(batch_shape)
@@ -385,15 +399,53 @@ def main() -> None:
     print("-" * 100)
 
     for name, implementations, logical_edges in benchmarks:
-        reference_name, reference_fn = implementations[0]
-        reference_output = reference_fn()
+        outputs: dict[str, object] = {}
+        failures: list[BenchmarkFailure] = []
+        baseline_name: str | None = None
 
         for implementation_name, fn in implementations:
-            output = fn()
-            error = 0.0 if implementation_name == reference_name else _max_abs_error(reference_output, output)
-            avg_ms, peak_mem = _measure(
-                fn, device=device, warmup=args.warmup, iterations=args.iterations
+            try:
+                outputs[implementation_name] = fn()
+                if baseline_name is None:
+                    baseline_name = implementation_name
+            except Exception as exc:  # noqa: BLE001
+                failures.append(
+                    BenchmarkFailure(
+                        name=name,
+                        implementation=implementation_name,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                )
+
+        if baseline_name is None:
+            for failure in failures:
+                print(_format_failure(failure))
+            continue
+
+        reference_output = outputs[baseline_name]
+        for implementation_name, fn in implementations:
+            if implementation_name not in outputs:
+                continue
+            output = outputs[implementation_name]
+            error = (
+                0.0
+                if implementation_name == baseline_name
+                else _max_abs_error(reference_output, output)
             )
+            try:
+                avg_ms, peak_mem = _measure(
+                    fn, device=device, warmup=args.warmup, iterations=args.iterations
+                )
+            except Exception as exc:  # noqa: BLE001
+                failures.append(
+                    BenchmarkFailure(
+                        name=name,
+                        implementation=implementation_name,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                )
+                continue
+
             result = BenchmarkResult(
                 name=name,
                 implementation=implementation_name,
@@ -403,6 +455,9 @@ def main() -> None:
                 max_abs_error=error,
             )
             print(_format_result(result))
+
+        for failure in failures:
+            print(_format_failure(failure))
 
 
 if __name__ == "__main__":

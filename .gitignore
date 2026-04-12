@@ -12,3 +12,6 @@ data/coco/
 
 .DS_Store
 Thumbs.db
+.venv-dml
+.tmp
+.tmp-dml

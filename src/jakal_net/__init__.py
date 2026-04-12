@@ -1,4 +1,5 @@
 from jakal_net.core import Layer, LayerDelta
+from jakal_net.devices import describe_device, resolve_device
 from jakal_net.modules import (
     BilinearPairwise,
     DiagonalBilinearPairwise,
@@ -12,6 +13,7 @@ from jakal_net.transition import SparseTransition, Transition
 
 __all__ = [
     "BilinearPairwise",
+    "describe_device",
     "DiagonalBilinearPairwise",
     "HadamardMLPPairwise",
     "Layer",
@@ -19,6 +21,7 @@ __all__ = [
     "LinearRoute",
     "MLPRoute",
     "Propagation",
+    "resolve_device",
     "ScalarAffine",
     "SparsePropagation",
     "SparseTransition",

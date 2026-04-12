@@ -225,6 +225,30 @@ class SparseTransition(Transition):
         delta_val = torch.einsum("...jk,...jd->...kd", weighted_routes, projected_val)
         return LayerDelta(delta_state=delta_state, delta_val=delta_val)
 
+    def _compute_delta_directml_fallback(
+        self, src_layer: Layer, dst_layer: Layer
+    ) -> LayerDelta:
+        logits = self.compute_route_logits(src_layer, dst_layer)
+        k = min(self.topk, dst_layer.num_nodes)
+        if k == dst_layer.num_nodes:
+            routes = torch.softmax(logits, dim=-1)
+        else:
+            topk_indices = logits.topk(k=k, dim=-1).indices
+            dst_index = torch.arange(
+                dst_layer.num_nodes, device=logits.device, dtype=topk_indices.dtype
+            )
+            dst_index = dst_index.view((1,) * topk_indices.ndim + (dst_layer.num_nodes,))
+            mask = (topk_indices.unsqueeze(-1) == dst_index).any(dim=-2)
+            routes = _masked_softmax(logits, mask, dim=-1)
+
+        projected_val, projected_state, sender_strength = self._project_inputs(
+            src_layer, dst_layer
+        )
+        weighted_routes = routes * sender_strength.unsqueeze(-1)
+        delta_state = torch.einsum("...jk,...j->...k", weighted_routes, projected_state)
+        delta_val = torch.einsum("...jk,...jd->...kd", weighted_routes, projected_val)
+        return LayerDelta(delta_state=delta_state, delta_val=delta_val)
+
     def _compute_delta_streaming(self, src_layer: Layer, dst_layer: Layer) -> LayerDelta:
         projected_val, projected_state, sender_strength = self._project_inputs(
             src_layer, dst_layer
@@ -287,6 +311,8 @@ class SparseTransition(Transition):
         )
 
     def compute_delta(self, src_layer: Layer, dst_layer: Layer) -> LayerDelta:
+        if src_layer.val.device.type == "privateuseone":
+            return self._compute_delta_directml_fallback(src_layer, dst_layer)
         if self.implementation == "reference":
             return self._compute_delta_reference(src_layer, dst_layer)
         if self.implementation == "kernel":
