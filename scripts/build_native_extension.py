@@ -41,6 +41,12 @@ def main() -> None:
     if use_cuda:
         sources.append(str(cuda_source))
 
+    extra_cflags = ["/std:c++17"] if os.name == "nt" else ["-std=c++17"]
+    if use_cuda:
+        extra_cflags.append("/DWITH_CUDA") if os.name == "nt" else extra_cflags.append(
+            "-DWITH_CUDA"
+        )
+
     module = load(
         name=args.module_name,
         sources=sources,
@@ -48,7 +54,7 @@ def main() -> None:
         verbose=args.verbose,
         with_cuda=use_cuda,
         extra_include_paths=[str(native_dir)],
-        extra_cflags=["/std:c++17"] if os.name == "nt" else ["-std=c++17"],
+        extra_cflags=extra_cflags,
         extra_cuda_cflags=["-std=c++17"] if use_cuda else None,
     )
 

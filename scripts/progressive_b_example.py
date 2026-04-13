@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Callable, Sequence
 
 import torch
 from torch import Tensor, nn
@@ -18,6 +18,7 @@ from jakal_net import (
     SparseTransition,
     Transition,
 )
+from jakal_net.kernel_common import apply_slot_mask_to_state, apply_slot_mask_to_val
 
 
 def _scale_delta(delta: LayerDelta, scale: float) -> LayerDelta:
@@ -39,6 +40,13 @@ def _stabilize_layer(layer: Layer, val_norm: nn.LayerNorm) -> Layer:
     return layer.with_tensors(
         state=torch.tanh(layer.state),
         val=val_norm(layer.val),
+    )
+
+
+def _apply_layer_slot_mask(layer: Layer, slot_mask: Tensor) -> Layer:
+    return layer.with_tensors(
+        state=apply_slot_mask_to_state(layer.state, slot_mask),
+        val=apply_slot_mask_to_val(layer.val, slot_mask),
     )
 
 
@@ -273,6 +281,14 @@ class ProgressiveBJointBlock(nn.Module):
         adapted = self._make_layer_like(s_layer, self.compressed_nodes)
         return self.compressed_adapter(compressed_b, adapted)
 
+    def forward_sequence_only(self, s_layer: Layer) -> Layer:
+        s_layer = _apply_scaled_delta(
+            s_layer,
+            self.s_propagation.compute_delta(s_layer),
+            self.s_delta_scale,
+        )
+        return _stabilize_layer(s_layer, self.s_val_norm)
+
     def forward(self, s_layer: Layer, compressed_b: Layer | None = None) -> tuple[Layer, Layer]:
         s_layer = _apply_scaled_delta(
             s_layer,
@@ -414,7 +430,12 @@ class ProgressiveBExampleLM(nn.Module):
         self.readout_norm = nn.LayerNorm(dim)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
 
-    def initialize_sequence_layer(self, token_ids: Tensor) -> Layer:
+    def initialize_sequence_layer(
+        self,
+        token_ids: Tensor,
+        *,
+        slot_mask: Tensor | None = None,
+    ) -> Layer:
         token_val = self.token_embedding(token_ids)
         position_val = self.position_embedding.unsqueeze(0)
         combined = token_val + position_val
@@ -425,7 +446,10 @@ class ProgressiveBExampleLM(nn.Module):
             state=state,
             val=combined,
         )
-        return _stabilize_layer(layer, self.sequence_val_norm)
+        layer = _stabilize_layer(layer, self.sequence_val_norm)
+        if slot_mask is not None:
+            layer = _apply_layer_slot_mask(layer, slot_mask)
+        return layer
 
     def read_prediction_slot(self, s_layer: Layer) -> Tensor:
         index = self.prediction_slot_index
@@ -433,9 +457,125 @@ class ProgressiveBExampleLM(nn.Module):
             index = s_layer.num_nodes + index
         return s_layer.val[..., index, :]
 
-    def forward(
+    def read_prediction_slots(self, s_layer: Layer, indices: Tensor) -> Tensor:
+        if tuple(indices.shape) != tuple(s_layer.batch_shape):
+            raise ValueError(
+                "indices must match s_layer batch shape, "
+                f"expected {tuple(s_layer.batch_shape)}, got {tuple(indices.shape)}."
+            )
+        flat_val = s_layer.val.reshape(-1, s_layer.num_nodes, self.dim)
+        flat_indices = indices.reshape(-1)
+        batch_index = torch.arange(flat_val.shape[0], device=flat_val.device)
+        gathered = flat_val[batch_index, flat_indices]
+        return gathered.reshape(*indices.shape, self.dim)
+
+    def _apply_sequence_mask(self, s_layer: Layer, slot_mask: Tensor) -> Layer:
+        return _apply_layer_slot_mask(s_layer, slot_mask)
+
+    def forward_full_sequence_causal(
+        self, token_ids: Tensor, *, return_layers: bool = False
+    ) -> Tensor | tuple[Tensor, Layer, None]:
+        if token_ids.shape[-1] != self.seq_nodes:
+            raise ValueError(
+                "full-sequence causal expects token_ids.shape[-1] to equal seq_nodes, "
+                f"got {token_ids.shape[-1]} and {self.seq_nodes}."
+            )
+
+        # This path keeps strict causality by using the causal S operators only.
+        s_layer = self.initialize_sequence_layer(token_ids)
+        for op in self.s_warmup:
+            s_layer = _apply_scaled_delta(s_layer, op.compute_delta(s_layer), 0.25)
+            s_layer = _stabilize_layer(s_layer, self.sequence_val_norm)
+        for block in self.joint_blocks:
+            s_layer = block.forward_sequence_only(s_layer)
+        for op in self.s_refine:
+            s_layer = _apply_scaled_delta(s_layer, op.compute_delta(s_layer), 0.25)
+            s_layer = _stabilize_layer(s_layer, self.sequence_val_norm)
+
+        logits = self.lm_head(self.readout_norm(s_layer.val))
+        if return_layers:
+            return logits, s_layer, None
+        return logits
+
+    def forward_teacher_forcing(
         self, token_ids: Tensor, *, return_layers: bool = False
     ) -> Tensor | tuple[Tensor, Layer, Layer | None]:
+        if token_ids.shape[-1] != self.seq_nodes:
+            raise ValueError(
+                "teacher forcing expects token_ids.shape[-1] to equal seq_nodes, "
+                f"got {token_ids.shape[-1]} and {self.seq_nodes}."
+            )
+
+        base_layer = self.initialize_sequence_layer(token_ids)
+        batch_shape = tuple(base_layer.batch_shape)
+        flat_batch = math.prod(batch_shape) if batch_shape else 1
+        device = token_ids.device
+
+        visible_upto = torch.arange(self.seq_nodes, device=device)
+        base_mask = visible_upto.view(self.seq_nodes, 1) >= torch.arange(
+            self.seq_nodes, device=device
+        ).view(1, self.seq_nodes)
+        slot_mask = base_mask.unsqueeze(0).expand(flat_batch, -1, -1)
+        prediction_indices = visible_upto.view(1, self.seq_nodes).expand(flat_batch, -1)
+
+        expanded_state = (
+            base_layer.state.reshape(flat_batch, self.seq_nodes)
+            .unsqueeze(1)
+            .expand(flat_batch, self.seq_nodes, self.seq_nodes)
+            .reshape(flat_batch * self.seq_nodes, self.seq_nodes)
+        )
+        expanded_val = (
+            base_layer.val.reshape(flat_batch, self.seq_nodes, self.dim)
+            .unsqueeze(1)
+            .expand(flat_batch, self.seq_nodes, self.seq_nodes, self.dim)
+            .reshape(flat_batch * self.seq_nodes, self.seq_nodes, self.dim)
+        )
+        slot_mask_flat = slot_mask.reshape(flat_batch * self.seq_nodes, self.seq_nodes)
+        prediction_indices_flat = prediction_indices.reshape(flat_batch * self.seq_nodes)
+
+        s_layer = Layer(
+            dim=self.dim,
+            num_nodes=self.seq_nodes,
+            state=expanded_state,
+            val=expanded_val,
+        )
+        s_layer = self._apply_sequence_mask(s_layer, slot_mask_flat)
+        compressed_b: Layer | None = None
+
+        for op in self.s_warmup:
+            s_layer = _apply_scaled_delta(s_layer, op.compute_delta(s_layer), 0.25)
+            s_layer = _stabilize_layer(s_layer, self.sequence_val_norm)
+            s_layer = self._apply_sequence_mask(s_layer, slot_mask_flat)
+        for block in self.joint_blocks:
+            s_layer, compressed_b = block(s_layer, compressed_b)
+            s_layer = self._apply_sequence_mask(s_layer, slot_mask_flat)
+        for op in self.s_refine:
+            s_layer = _apply_scaled_delta(s_layer, op.compute_delta(s_layer), 0.25)
+            s_layer = _stabilize_layer(s_layer, self.sequence_val_norm)
+            s_layer = self._apply_sequence_mask(s_layer, slot_mask_flat)
+
+        prediction_slot = self.readout_norm(
+            self.read_prediction_slots(s_layer, prediction_indices_flat)
+        )
+        logits = self.lm_head(prediction_slot).reshape(*batch_shape, self.seq_nodes, self.vocab_size)
+        if return_layers:
+            return logits, s_layer, compressed_b
+        return logits
+
+    def forward(
+        self,
+        token_ids: Tensor,
+        *,
+        return_layers: bool = False,
+        teacher_forcing: bool = False,
+        full_sequence_causal: bool = False,
+    ) -> Tensor | tuple[Tensor, Layer, Layer | None]:
+        if teacher_forcing and full_sequence_causal:
+            raise ValueError("teacher_forcing and full_sequence_causal cannot both be enabled.")
+        if full_sequence_causal:
+            return self.forward_full_sequence_causal(token_ids, return_layers=return_layers)
+        if teacher_forcing:
+            return self.forward_teacher_forcing(token_ids, return_layers=return_layers)
         s_layer = self.initialize_sequence_layer(token_ids)
         compressed_b: Layer | None = None
 
@@ -500,20 +640,39 @@ def sample_next_token_batch(
     seq_len: int,
     batch_size: int,
     device: torch.device | str,
+    teacher_forcing: bool = False,
+    full_sequence_causal: bool = False,
 ) -> NextTokenBatch:
+    if teacher_forcing and full_sequence_causal:
+        raise ValueError("teacher_forcing and full_sequence_causal cannot both be enabled.")
     max_start = tokens.numel() - seq_len - 1
     starts = torch.randint(0, max_start + 1, (batch_size,))
     context = torch.stack([tokens[start : start + seq_len] for start in starts], dim=0)
-    target = torch.stack([tokens[start + seq_len] for start in starts], dim=0)
+    if teacher_forcing or full_sequence_causal:
+        target = torch.stack([tokens[start + 1 : start + seq_len + 1] for start in starts], dim=0)
+    else:
+        target = torch.stack([tokens[start + seq_len] for start in starts], dim=0)
     return NextTokenBatch(context=context.to(device), target=target.to(device))
 
 
 def compute_next_token_loss(
     model: nn.Module,
     batch: NextTokenBatch,
+    *,
+    teacher_forcing: bool = False,
+    full_sequence_causal: bool = False,
 ) -> tuple[Tensor, Tensor]:
-    logits = model(batch.context)
-    loss = F.cross_entropy(logits, batch.target)
+    if teacher_forcing and full_sequence_causal:
+        raise ValueError("teacher_forcing and full_sequence_causal cannot both be enabled.")
+    logits = model(
+        batch.context,
+        teacher_forcing=teacher_forcing,
+        full_sequence_causal=full_sequence_causal,
+    )
+    loss = F.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]),
+        batch.target.reshape(-1),
+    )
     return loss, logits
 
 
@@ -526,6 +685,8 @@ def estimate_next_token_loss(
     batch_size: int,
     device: torch.device | str,
     eval_steps: int,
+    teacher_forcing: bool = False,
+    full_sequence_causal: bool = False,
 ) -> float:
     was_training = model.training
     model.eval()
@@ -536,8 +697,15 @@ def estimate_next_token_loss(
             seq_len=seq_len,
             batch_size=batch_size,
             device=device,
+            teacher_forcing=teacher_forcing,
+            full_sequence_causal=full_sequence_causal,
         )
-        loss, _ = compute_next_token_loss(model, batch)
+        loss, _ = compute_next_token_loss(
+            model,
+            batch,
+            teacher_forcing=teacher_forcing,
+            full_sequence_causal=full_sequence_causal,
+        )
         losses.append(float(loss.item()))
     if was_training:
         model.train()
@@ -558,6 +726,9 @@ def train_next_token_model(
     learning_rate: float,
     weight_decay: float = 0.0,
     grad_clip: float | None = 1.0,
+    teacher_forcing: bool = False,
+    full_sequence_causal: bool = False,
+    progress_callback: Callable[[int, int, float], None] | None = None,
 ) -> TrainingHistory:
     model.to(device)
     model.train()
@@ -575,13 +746,22 @@ def train_next_token_model(
             seq_len=seq_len,
             batch_size=batch_size,
             device=device,
+            teacher_forcing=teacher_forcing,
+            full_sequence_causal=full_sequence_causal,
         )
         optimizer.zero_grad(set_to_none=True)
-        loss, _ = compute_next_token_loss(model, batch)
+        loss, _ = compute_next_token_loss(
+            model,
+            batch,
+            teacher_forcing=teacher_forcing,
+            full_sequence_causal=full_sequence_causal,
+        )
         loss.backward()
         if grad_clip is not None:
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
         optimizer.step()
+        if progress_callback is not None:
+            progress_callback(step, steps, float(loss.item()))
 
         if step % eval_interval == 0 or step == 1 or step == steps:
             train_losses.append(
@@ -592,6 +772,8 @@ def train_next_token_model(
                     batch_size=batch_size,
                     device=device,
                     eval_steps=eval_steps,
+                    teacher_forcing=teacher_forcing,
+                    full_sequence_causal=full_sequence_causal,
                 )
             )
             val_losses.append(
@@ -602,6 +784,8 @@ def train_next_token_model(
                     batch_size=batch_size,
                     device=device,
                     eval_steps=eval_steps,
+                    teacher_forcing=teacher_forcing,
+                    full_sequence_causal=full_sequence_causal,
                 )
             )
 

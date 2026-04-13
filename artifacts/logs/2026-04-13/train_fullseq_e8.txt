@@ -1,0 +1,141 @@
+using device: cuda
+tokenizer=subword/bpe | tokenizer_vocab=512 | corpus_chars=5,077,489 | train_tokens=1,897,789 | val_tokens=210,866
+tokenizer_model=C:\Users\alber\AppData\Local\Temp\jakal_net_tokenizers\progressive_b_subword_bpe_512_442781528131.model
+model_params=640,218 | dim=128 | seq_len=64 | warmup=3 | stages=3/8/2 | refine=3
+schedule_steps=59,304 | approx_epochs=8.000 | steps_per_epoch=7,413 | batch_size=256 | objective=full_sequence_causal
+causal_path=sequence_only_joint_blocks
+progress | step=    1/59304 | epoch=0.000 |   0.0% | minibatch_loss=6.4133 | elapsed=1.0s
+progress | step=  500/59304 | epoch=0.067 |   0.8% | minibatch_loss=5.5905 | elapsed=83.3s
+progress | step= 1000/59304 | epoch=0.135 |   1.7% | minibatch_loss=5.5714 | elapsed=168.6s
+progress | step= 1500/59304 | epoch=0.202 |   2.5% | minibatch_loss=5.5642 | elapsed=255.9s
+progress | step= 2000/59304 | epoch=0.270 |   3.4% | minibatch_loss=5.5763 | elapsed=345.1s
+progress | step= 2500/59304 | epoch=0.337 |   4.2% | minibatch_loss=5.5650 | elapsed=433.5s
+progress | step= 3000/59304 | epoch=0.405 |   5.1% | minibatch_loss=5.5694 | elapsed=521.9s
+progress | step= 3500/59304 | epoch=0.472 |   5.9% | minibatch_loss=5.5734 | elapsed=612.0s
+progress | step= 4000/59304 | epoch=0.540 |   6.7% | minibatch_loss=5.5642 | elapsed=702.2s
+progress | step= 4500/59304 | epoch=0.607 |   7.6% | minibatch_loss=5.5920 | elapsed=792.2s
+progress | step= 5000/59304 | epoch=0.674 |   8.4% | minibatch_loss=5.5592 | elapsed=883.3s
+progress | step= 5500/59304 | epoch=0.742 |   9.3% | minibatch_loss=5.5770 | elapsed=976.4s
+progress | step= 6000/59304 | epoch=0.809 |  10.1% | minibatch_loss=5.5553 | elapsed=1071.4s
+progress | step= 6500/59304 | epoch=0.877 |  11.0% | minibatch_loss=5.5727 | elapsed=1167.4s
+progress | step= 7000/59304 | epoch=0.944 |  11.8% | minibatch_loss=5.5787 | elapsed=1260.2s
+progress | step= 7500/59304 | epoch=1.012 |  12.6% | minibatch_loss=5.5773 | elapsed=1357.0s
+progress | step= 8000/59304 | epoch=1.079 |  13.5% | minibatch_loss=5.5717 | elapsed=1450.7s
+progress | step= 8500/59304 | epoch=1.147 |  14.3% | minibatch_loss=5.5629 | elapsed=1543.4s
+progress | step= 9000/59304 | epoch=1.214 |  15.2% | minibatch_loss=5.5857 | elapsed=1638.0s
+progress | step= 9500/59304 | epoch=1.282 |  16.0% | minibatch_loss=5.5780 | elapsed=1737.9s
+progress | step=10000/59304 | epoch=1.349 |  16.9% | minibatch_loss=5.5672 | elapsed=1842.2s
+progress | step=10500/59304 | epoch=1.416 |  17.7% | minibatch_loss=5.5781 | elapsed=1944.2s
+progress | step=11000/59304 | epoch=1.484 |  18.5% | minibatch_loss=5.5696 | elapsed=2044.7s
+progress | step=11500/59304 | epoch=1.551 |  19.4% | minibatch_loss=5.5740 | elapsed=2146.2s
+progress | step=12000/59304 | epoch=1.619 |  20.2% | minibatch_loss=5.5631 | elapsed=2240.3s
+progress | step=12500/59304 | epoch=1.686 |  21.1% | minibatch_loss=5.5609 | elapsed=2335.1s
+progress | step=13000/59304 | epoch=1.754 |  21.9% | minibatch_loss=5.5618 | elapsed=2433.0s
+progress | step=13500/59304 | epoch=1.821 |  22.8% | minibatch_loss=5.5642 | elapsed=2531.1s
+progress | step=14000/59304 | epoch=1.889 |  23.6% | minibatch_loss=5.5669 | elapsed=2629.1s
+progress | step=14500/59304 | epoch=1.956 |  24.5% | minibatch_loss=5.5586 | elapsed=2727.1s
+progress | step=15000/59304 | epoch=2.023 |  25.3% | minibatch_loss=5.5633 | elapsed=2826.4s
+progress | step=15500/59304 | epoch=2.091 |  26.1% | minibatch_loss=5.5799 | elapsed=2924.4s
+progress | step=16000/59304 | epoch=2.158 |  27.0% | minibatch_loss=5.5508 | elapsed=3022.8s
+progress | step=16500/59304 | epoch=2.226 |  27.8% | minibatch_loss=5.5806 | elapsed=3126.4s
+progress | step=17000/59304 | epoch=2.293 |  28.7% | minibatch_loss=5.5807 | elapsed=3229.1s
+progress | step=17500/59304 | epoch=2.361 |  29.5% | minibatch_loss=5.5502 | elapsed=3336.4s
+progress | step=18000/59304 | epoch=2.428 |  30.4% | minibatch_loss=5.5877 | elapsed=3440.5s
+progress | step=18500/59304 | epoch=2.496 |  31.2% | minibatch_loss=5.5599 | elapsed=3544.1s
+progress | step=19000/59304 | epoch=2.563 |  32.0% | minibatch_loss=5.5522 | elapsed=3638.7s
+progress | step=19500/59304 | epoch=2.631 |  32.9% | minibatch_loss=5.5659 | elapsed=3731.9s
+progress | step=20000/59304 | epoch=2.698 |  33.7% | minibatch_loss=5.5580 | elapsed=3825.7s
+progress | step=20500/59304 | epoch=2.765 |  34.6% | minibatch_loss=5.5559 | elapsed=3918.7s
+progress | step=21000/59304 | epoch=2.833 |  35.4% | minibatch_loss=5.5445 | elapsed=4011.3s
+progress | step=21500/59304 | epoch=2.900 |  36.3% | minibatch_loss=5.5603 | elapsed=4103.4s
+progress | step=22000/59304 | epoch=2.968 |  37.1% | minibatch_loss=5.5664 | elapsed=4195.7s
+progress | step=22500/59304 | epoch=3.035 |  37.9% | minibatch_loss=5.5570 | elapsed=4289.1s
+progress | step=23000/59304 | epoch=3.103 |  38.8% | minibatch_loss=5.5598 | elapsed=4382.9s
+progress | step=23500/59304 | epoch=3.170 |  39.6% | minibatch_loss=5.5427 | elapsed=4475.3s
+progress | step=24000/59304 | epoch=3.238 |  40.5% | minibatch_loss=5.5642 | elapsed=4567.7s
+progress | step=24500/59304 | epoch=3.305 |  41.3% | minibatch_loss=5.5514 | elapsed=4660.0s
+progress | step=25000/59304 | epoch=3.372 |  42.2% | minibatch_loss=5.5371 | elapsed=4752.2s
+progress | step=25500/59304 | epoch=3.440 |  43.0% | minibatch_loss=5.5642 | elapsed=4844.6s
+progress | step=26000/59304 | epoch=3.507 |  43.8% | minibatch_loss=5.5542 | elapsed=4937.2s
+progress | step=26500/59304 | epoch=3.575 |  44.7% | minibatch_loss=5.5607 | elapsed=5029.4s
+progress | step=27000/59304 | epoch=3.642 |  45.5% | minibatch_loss=5.5686 | elapsed=5121.6s
+progress | step=27500/59304 | epoch=3.710 |  46.4% | minibatch_loss=5.5562 | elapsed=5214.1s
+progress | step=28000/59304 | epoch=3.777 |  47.2% | minibatch_loss=5.5635 | elapsed=5306.2s
+progress | step=28500/59304 | epoch=3.845 |  48.1% | minibatch_loss=5.5654 | elapsed=5398.3s
+progress | step=29000/59304 | epoch=3.912 |  48.9% | minibatch_loss=5.5613 | elapsed=5490.5s
+progress | step=29500/59304 | epoch=3.979 |  49.7% | minibatch_loss=5.5727 | elapsed=5582.6s
+progress | step=30000/59304 | epoch=4.047 |  50.6% | minibatch_loss=5.5618 | elapsed=5675.8s
+progress | step=30500/59304 | epoch=4.114 |  51.4% | minibatch_loss=5.5554 | elapsed=5767.9s
+progress | step=31000/59304 | epoch=4.182 |  52.3% | minibatch_loss=5.5781 | elapsed=5859.8s
+progress | step=31500/59304 | epoch=4.249 |  53.1% | minibatch_loss=5.5451 | elapsed=5951.8s
+progress | step=32000/59304 | epoch=4.317 |  54.0% | minibatch_loss=5.5525 | elapsed=6043.5s
+progress | step=32500/59304 | epoch=4.384 |  54.8% | minibatch_loss=5.5596 | elapsed=6135.2s
+progress | step=33000/59304 | epoch=4.452 |  55.6% | minibatch_loss=5.5539 | elapsed=6226.9s
+progress | step=33500/59304 | epoch=4.519 |  56.5% | minibatch_loss=5.5555 | elapsed=6318.9s
+progress | step=34000/59304 | epoch=4.587 |  57.3% | minibatch_loss=5.5545 | elapsed=6410.6s
+progress | step=34500/59304 | epoch=4.654 |  58.2% | minibatch_loss=5.5731 | elapsed=6502.5s
+progress | step=35000/59304 | epoch=4.721 |  59.0% | minibatch_loss=5.5393 | elapsed=6594.5s
+progress | step=35500/59304 | epoch=4.789 |  59.9% | minibatch_loss=5.5335 | elapsed=6686.5s
+progress | step=36000/59304 | epoch=4.856 |  60.7% | minibatch_loss=5.5477 | elapsed=6781.2s
+progress | step=36500/59304 | epoch=4.924 |  61.5% | minibatch_loss=5.5611 | elapsed=6879.1s
+progress | step=37000/59304 | epoch=4.991 |  62.4% | minibatch_loss=5.5387 | elapsed=6977.0s
+progress | step=37500/59304 | epoch=5.059 |  63.2% | minibatch_loss=5.5534 | elapsed=7076.4s
+progress | step=38000/59304 | epoch=5.126 |  64.1% | minibatch_loss=5.5566 | elapsed=7174.3s
+progress | step=38500/59304 | epoch=5.194 |  64.9% | minibatch_loss=5.5534 | elapsed=7272.4s
+progress | step=39000/59304 | epoch=5.261 |  65.8% | minibatch_loss=5.5457 | elapsed=7370.5s
+progress | step=39500/59304 | epoch=5.328 |  66.6% | minibatch_loss=5.5533 | elapsed=7468.5s
+progress | step=40000/59304 | epoch=5.396 |  67.4% | minibatch_loss=5.5511 | elapsed=7566.5s
+progress | step=40500/59304 | epoch=5.463 |  68.3% | minibatch_loss=5.5658 | elapsed=7664.4s
+progress | step=41000/59304 | epoch=5.531 |  69.1% | minibatch_loss=5.5366 | elapsed=7762.5s
+progress | step=41500/59304 | epoch=5.598 |  70.0% | minibatch_loss=5.5558 | elapsed=7860.5s
+progress | step=42000/59304 | epoch=5.666 |  70.8% | minibatch_loss=5.5287 | elapsed=7958.5s
+progress | step=42500/59304 | epoch=5.733 |  71.7% | minibatch_loss=5.5505 | elapsed=8056.5s
+progress | step=43000/59304 | epoch=5.801 |  72.5% | minibatch_loss=5.5510 | elapsed=8154.5s
+progress | step=43500/59304 | epoch=5.868 |  73.4% | minibatch_loss=5.5229 | elapsed=8252.6s
+progress | step=44000/59304 | epoch=5.936 |  74.2% | minibatch_loss=5.5370 | elapsed=8350.6s
+progress | step=44500/59304 | epoch=6.003 |  75.0% | minibatch_loss=5.5452 | elapsed=8449.9s
+progress | step=45000/59304 | epoch=6.070 |  75.9% | minibatch_loss=5.5263 | elapsed=8548.0s
+progress | step=45500/59304 | epoch=6.138 |  76.7% | minibatch_loss=5.5354 | elapsed=8646.1s
+progress | step=46000/59304 | epoch=6.205 |  77.6% | minibatch_loss=5.5411 | elapsed=8744.1s
+progress | step=46500/59304 | epoch=6.273 |  78.4% | minibatch_loss=5.5451 | elapsed=8842.1s
+progress | step=47000/59304 | epoch=6.340 |  79.3% | minibatch_loss=5.5463 | elapsed=8940.1s
+progress | step=47500/59304 | epoch=6.408 |  80.1% | minibatch_loss=5.5394 | elapsed=9038.1s
+progress | step=48000/59304 | epoch=6.475 |  80.9% | minibatch_loss=5.5272 | elapsed=9136.1s
+progress | step=48500/59304 | epoch=6.543 |  81.8% | minibatch_loss=5.5243 | elapsed=9234.2s
+progress | step=49000/59304 | epoch=6.610 |  82.6% | minibatch_loss=5.5258 | elapsed=9332.1s
+progress | step=49500/59304 | epoch=6.677 |  83.5% | minibatch_loss=5.5337 | elapsed=9430.2s
+progress | step=50000/59304 | epoch=6.745 |  84.3% | minibatch_loss=5.5333 | elapsed=9528.2s
+progress | step=50500/59304 | epoch=6.812 |  85.2% | minibatch_loss=5.5570 | elapsed=9626.2s
+progress | step=51000/59304 | epoch=6.880 |  86.0% | minibatch_loss=5.5413 | elapsed=9724.2s
+progress | step=51500/59304 | epoch=6.947 |  86.8% | minibatch_loss=5.5314 | elapsed=9822.2s
+progress | step=52000/59304 | epoch=7.015 |  87.7% | minibatch_loss=5.5582 | elapsed=9921.4s
+progress | step=52500/59304 | epoch=7.082 |  88.5% | minibatch_loss=5.5493 | elapsed=10019.4s
+progress | step=53000/59304 | epoch=7.150 |  89.4% | minibatch_loss=5.5480 | elapsed=10117.3s
+progress | step=53500/59304 | epoch=7.217 |  90.2% | minibatch_loss=5.5404 | elapsed=10215.3s
+progress | step=54000/59304 | epoch=7.285 |  91.1% | minibatch_loss=5.5377 | elapsed=10313.3s
+progress | step=54500/59304 | epoch=7.352 |  91.9% | minibatch_loss=5.5475 | elapsed=10411.3s
+progress | step=55000/59304 | epoch=7.419 |  92.7% | minibatch_loss=5.5168 | elapsed=10509.4s
+progress | step=55500/59304 | epoch=7.487 |  93.6% | minibatch_loss=5.5280 | elapsed=10607.4s
+progress | step=56000/59304 | epoch=7.554 |  94.4% | minibatch_loss=5.5120 | elapsed=10705.7s
+progress | step=56500/59304 | epoch=7.622 |  95.3% | minibatch_loss=5.5406 | elapsed=10803.6s
+progress | step=57000/59304 | epoch=7.689 |  96.1% | minibatch_loss=5.5385 | elapsed=10901.6s
+progress | step=57500/59304 | epoch=7.757 |  97.0% | minibatch_loss=5.5435 | elapsed=10999.6s
+progress | step=58000/59304 | epoch=7.824 |  97.8% | minibatch_loss=5.5198 | elapsed=11097.6s
+progress | step=58500/59304 | epoch=7.892 |  98.6% | minibatch_loss=5.5307 | elapsed=11195.7s
+progress | step=59000/59304 | epoch=7.959 |  99.5% | minibatch_loss=5.5169 | elapsed=11293.7s
+progress | step=59304/59304 | epoch=8.000 | 100.0% | minibatch_loss=5.5161 | elapsed=11353.5s
+eval 01 | step=    1 | epoch=0.000 | train_loss=6.3991 | train_ppl=601.32 | val_loss=6.3984 | val_ppl=600.86
+eval 02 | step= 7413 | epoch=1.000 | train_loss=5.5678 | train_ppl=261.85 | val_loss=5.5798 | val_ppl=265.02
+eval 03 | step=14826 | epoch=2.000 | train_loss=5.5654 | train_ppl=261.24 | val_loss=5.5740 | val_ppl=263.48
+eval 04 | step=22239 | epoch=3.000 | train_loss=5.5575 | train_ppl=259.17 | val_loss=5.5697 | val_ppl=262.35
+eval 05 | step=29652 | epoch=4.000 | train_loss=5.5603 | train_ppl=259.90 | val_loss=5.5649 | val_ppl=261.09
+eval 06 | step=37065 | epoch=5.000 | train_loss=5.5506 | train_ppl=257.38 | val_loss=5.5639 | val_ppl=260.85
+eval 07 | step=44478 | epoch=6.000 | train_loss=5.5457 | train_ppl=256.12 | val_loss=5.5656 | val_ppl=261.29
+eval 08 | step=51891 | epoch=7.000 | train_loss=5.5487 | train_ppl=256.90 | val_loss=5.5555 | val_ppl=258.64
+eval 09 | step=59304 | epoch=8.000 | train_loss=5.5231 | train_ppl=250.40 | val_loss=5.5345 | val_ppl=253.27
+
+--- prompt ---
+### Alice ### [Illustration] Alice¡¯s Adventures in Wonderland by Lewis Carroll THE MILLENNIUM FULCRU
+
+--- sample ---
+### Alice ### [Illustration] Alice¡¯s Adventures in Wonderland by Lewis Carroll THE MILLENNIUM FULCRU a,h,,.pc to of.i theing.hssAe, ered CTAe S_LLRETE theoNe  to Oo.AR aym theyst of  theerse CRI

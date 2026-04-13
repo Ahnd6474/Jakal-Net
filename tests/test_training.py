@@ -35,6 +35,37 @@ class TrainingTests(unittest.TestCase):
         self.assertEqual(batch.context.shape, (4, 5))
         self.assertEqual(batch.target.shape, (4,))
 
+    def test_full_sequence_causal_sampling_and_loss(self) -> None:
+        torch.manual_seed(7)
+        text = "full sequence causal objective keeps every position supervised. " * 8
+        vocab = build_char_vocab(text)
+        tokens = vocab.encode(text)
+        model = ProgressiveBExampleLM(
+            vocab_size=vocab.size,
+            dim=12,
+            seq_nodes=8,
+            warmup_layers=1,
+            final_refine_layers=1,
+        )
+
+        batch = sample_next_token_batch(
+            tokens,
+            seq_len=8,
+            batch_size=2,
+            device="cpu",
+            full_sequence_causal=True,
+        )
+        loss, logits = compute_next_token_loss(
+            model,
+            batch,
+            full_sequence_causal=True,
+        )
+
+        self.assertEqual(batch.context.shape, (2, 8))
+        self.assertEqual(batch.target.shape, (2, 8))
+        self.assertEqual(logits.shape, (2, 8, vocab.size))
+        self.assertTrue(torch.isfinite(loss))
+
     def test_training_loop_runs_and_returns_history(self) -> None:
         torch.manual_seed(30)
         text = "progressive b activation helps stable training. " * 12
@@ -91,6 +122,39 @@ class TrainingTests(unittest.TestCase):
             device="cpu",
         )
         self.assertEqual(generated.shape, (13,))
+
+    def test_full_sequence_causal_training_loop_runs(self) -> None:
+        torch.manual_seed(31)
+        text = "causal sequence objective should train without prefix expansion. " * 10
+        vocab = build_char_vocab(text)
+        tokens = vocab.encode(text)
+        train_tokens, val_tokens = split_train_val(tokens, train_fraction=0.8)
+        model = ProgressiveBExampleLM(
+            vocab_size=vocab.size,
+            dim=12,
+            seq_nodes=8,
+            warmup_layers=1,
+            final_refine_layers=1,
+        )
+
+        history = train_next_token_model(
+            model,
+            train_tokens,
+            val_tokens,
+            seq_len=8,
+            batch_size=4,
+            device="cpu",
+            steps=3,
+            eval_interval=2,
+            eval_steps=1,
+            learning_rate=1e-3,
+            full_sequence_causal=True,
+        )
+
+        self.assertGreaterEqual(len(history.train_losses), 2)
+        self.assertEqual(len(history.train_losses), len(history.val_losses))
+        self.assertTrue(all(torch.isfinite(torch.tensor(history.train_losses))))
+        self.assertTrue(all(torch.isfinite(torch.tensor(history.val_losses))))
 
 
 if __name__ == "__main__":
