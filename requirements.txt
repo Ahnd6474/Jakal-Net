@@ -1,2 +1,2 @@
-numpy==2.4.4
+-r requirements-base.txt
 torch==2.4.1

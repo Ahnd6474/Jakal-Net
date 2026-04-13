@@ -45,6 +45,34 @@ python -m pip install -r requirements.txt
 
 `requirements.txt` currently installs the CPU build of PyTorch. If you want a CUDA build, install the matching `torch` wheel first and then install the rest of the dependencies around it.
 
+For NVIDIA GPUs on Windows, use a separate CUDA environment:
+
+```powershell
+.\scripts\setup_cuda_env.ps1
+```
+
+That script creates `.venv-cuda`, installs the shared Python dependencies from `requirements-base.txt`, and then installs the CUDA-enabled PyTorch wheel that matches this repository's current torch pin.
+
+If you prefer the manual path:
+
+```powershell
+py -m venv .venv-cuda
+.\.venv-cuda\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements-base.txt
+python -m pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cu124
+```
+
+If you plan to build native CUDA kernels later, install the NVIDIA CUDA Toolkit separately. The setup script can do that too:
+
+```powershell
+.\scripts\setup_cuda_env.ps1 -InstallToolkit
+```
+
+That toolkit step requires an elevated PowerShell session because the NVIDIA installer triggers UAC.
+
+Visual Studio Build Tools 2022 are also required for native extension builds on Windows.
+
 For DirectML on Windows, use a separate environment:
 
 ```powershell
@@ -91,6 +119,26 @@ To try the Intel GPU through DirectML:
 $env:PYTHONPATH = "src"
 .\.venv-dml\Scripts\python.exe scripts\smoke_test.py --device directml
 ```
+
+To use an NVIDIA GPU through CUDA:
+
+```powershell
+$env:PYTHONPATH = "src"
+.\.venv-cuda\Scripts\python.exe scripts\smoke_test.py --device cuda
+```
+
+You should see:
+
+```text
+using device: cuda
+smoke test passed
+```
+
+Current state of the backend split:
+
+- `device="cuda"` already works through the PyTorch `kernel` path.
+- `implementation="native"` is still a CPU C++ backend today.
+- Native CUDA kernels will require the CUDA Toolkit and additional `.cu` sources; the environment above prepares for that direction without changing the current operator behavior.
 
 To run the progressive B example through an actual next-token training loop:
 
