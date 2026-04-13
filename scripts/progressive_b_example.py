@@ -49,8 +49,9 @@ def _make_sparse_or_dense_propagation(
     implementation: str,
     window: int | None = None,
     topk: int | None = None,
+    pairwise_fn: nn.Module | None = None,
 ) -> Propagation | SparsePropagation:
-    pairwise = DiagonalBilinearPairwise(dim=dim)
+    pairwise = DiagonalBilinearPairwise(dim=dim) if pairwise_fn is None else pairwise_fn
     if sparse_type == "window":
         if window is None:
             raise ValueError("window propagation requires window.")
@@ -181,6 +182,9 @@ class ProgressiveBJointBlock(nn.Module):
         s_delta_scale: float = 0.25,
         b_delta_scale: float = 0.20,
         cross_delta_scale: float = 0.15,
+        s_pairwise_fn: nn.Module | None = None,
+        expanded_pairwise_fn: nn.Module | None = None,
+        compressed_pairwise_fn: nn.Module | None = None,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -202,6 +206,7 @@ class ProgressiveBJointBlock(nn.Module):
             sparse_type="window",
             window=s_window,
             implementation=implementation,
+            pairwise_fn=s_pairwise_fn,
         )
         self.expand_transition = _make_transition(
             dim=dim,
@@ -215,6 +220,7 @@ class ProgressiveBJointBlock(nn.Module):
             window=expanded_window,
             topk=min(expanded_topk, expanded_nodes),
             implementation=implementation,
+            pairwise_fn=expanded_pairwise_fn,
         )
         self.b_to_s = _make_transition(
             dim=dim,
@@ -240,6 +246,7 @@ class ProgressiveBJointBlock(nn.Module):
             window=compressed_window,
             topk=min(compressed_topk, compressed_nodes),
             implementation=implementation,
+            pairwise_fn=compressed_pairwise_fn,
         )
         self.compressed_adapter = Transition(
             route_fn=LinearRoute(src_dim=dim, dst_nodes=compressed_nodes),
@@ -350,6 +357,9 @@ class ProgressiveBExampleLM(nn.Module):
         nn.init.zeros_(self.state_init.weight)
         nn.init.zeros_(self.state_init.bias)
         self.sequence_val_norm = nn.LayerNorm(dim)
+        shared_s_pairwise = DiagonalBilinearPairwise(dim=dim)
+        shared_expanded_pairwise = DiagonalBilinearPairwise(dim=dim)
+        shared_compressed_pairwise = DiagonalBilinearPairwise(dim=dim)
         self.s_warmup = nn.ModuleList(
             [
                 _make_sparse_or_dense_propagation(
@@ -357,6 +367,7 @@ class ProgressiveBExampleLM(nn.Module):
                     sparse_type="window",
                     window=s_window,
                     implementation=implementation,
+                    pairwise_fn=shared_s_pairwise,
                 )
                 for _ in range(warmup_layers)
             ]
@@ -380,6 +391,9 @@ class ProgressiveBExampleLM(nn.Module):
                     expanded_window=expanded_window,
                     compressed_window=compressed_window,
                     implementation=implementation,
+                    s_pairwise_fn=shared_s_pairwise,
+                    expanded_pairwise_fn=shared_expanded_pairwise,
+                    compressed_pairwise_fn=shared_compressed_pairwise,
                 )
                 for stage in self.stage_specs
                 for _ in range(stage.num_layers)
@@ -392,6 +406,7 @@ class ProgressiveBExampleLM(nn.Module):
                     sparse_type="window",
                     window=s_window,
                     implementation=implementation,
+                    pairwise_fn=shared_s_pairwise,
                 )
                 for _ in range(final_refine_layers)
             ]
