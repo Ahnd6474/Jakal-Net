@@ -105,6 +105,35 @@ class ProgressiveBArchitectureTests(unittest.TestCase):
         self.assertEqual(compressed_b.num_nodes, 6)
         self.assertEqual(compressed_b.val.shape, (4, 6, 8))
 
+    def test_example_lm_shares_pairwise_by_role(self) -> None:
+        model = ProgressiveBExampleLM(
+            vocab_size=32,
+            dim=8,
+            seq_nodes=8,
+            warmup_layers=2,
+            final_refine_layers=2,
+        )
+
+        self.assertIs(model.s_warmup[0].pairwise_fn, model.s_warmup[1].pairwise_fn)
+        self.assertIs(model.s_warmup[0].pairwise_fn, model.joint_blocks[0].s_propagation.pairwise_fn)
+        self.assertIs(model.s_warmup[0].pairwise_fn, model.s_refine[0].pairwise_fn)
+        self.assertIs(
+            model.joint_blocks[0].expanded_propagation.pairwise_fn,
+            model.joint_blocks[1].expanded_propagation.pairwise_fn,
+        )
+        self.assertIs(
+            model.joint_blocks[0].compressed_propagation.pairwise_fn,
+            model.joint_blocks[1].compressed_propagation.pairwise_fn,
+        )
+        self.assertIsNot(
+            model.joint_blocks[0].s_propagation.pairwise_fn,
+            model.joint_blocks[0].expanded_propagation.pairwise_fn,
+        )
+        self.assertIsNot(
+            model.joint_blocks[0].expanded_propagation.pairwise_fn,
+            model.joint_blocks[0].compressed_propagation.pairwise_fn,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
