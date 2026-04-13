@@ -309,6 +309,7 @@ def main() -> None:
     parser.add_argument("--sample-tokens", type=int, default=80)
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--sample-topk", type=int)
+    parser.add_argument("--teacher-forcing-chunk-size", type=int)
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -371,6 +372,14 @@ def main() -> None:
     parameter_count = count_parameters(model)
     teacher_forcing = args.training_objective == "teacher_forcing"
     full_sequence_causal = args.training_objective == "full_sequence_causal"
+    teacher_forcing_chunk_size = args.teacher_forcing_chunk_size
+    if teacher_forcing_chunk_size is not None and teacher_forcing_chunk_size <= 0:
+        raise ValueError("teacher-forcing-chunk-size must be positive.")
+    if teacher_forcing_chunk_size is not None and not teacher_forcing:
+        raise ValueError(
+            "--teacher-forcing-chunk-size is only supported with "
+            "--training-objective teacher_forcing."
+        )
 
     print(
         f"tokenizer={tokenizer_label} | tokenizer_vocab={vocab.size:,} | "
@@ -391,6 +400,11 @@ def main() -> None:
     )
     if full_sequence_causal:
         print("causal_path=sequence_only_joint_blocks")
+    elif teacher_forcing and teacher_forcing_chunk_size is not None:
+        print(
+            "causal_path=teacher_forcing_joint_blocks"
+            f" | teacher_forcing_chunk_size={teacher_forcing_chunk_size}"
+        )
 
     start_time = time.perf_counter()
 
@@ -422,6 +436,7 @@ def main() -> None:
         weight_decay=args.weight_decay,
         teacher_forcing=teacher_forcing,
         full_sequence_causal=full_sequence_causal,
+        teacher_forcing_chunk_size=teacher_forcing_chunk_size,
         progress_callback=progress_callback,
     )
 

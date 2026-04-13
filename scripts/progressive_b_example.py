@@ -497,41 +497,36 @@ class ProgressiveBExampleLM(nn.Module):
             return logits, s_layer, None
         return logits
 
-    def forward_teacher_forcing(
-        self, token_ids: Tensor, *, return_layers: bool = False
-    ) -> Tensor | tuple[Tensor, Layer, Layer | None]:
-        if token_ids.shape[-1] != self.seq_nodes:
-            raise ValueError(
-                "teacher forcing expects token_ids.shape[-1] to equal seq_nodes, "
-                f"got {token_ids.shape[-1]} and {self.seq_nodes}."
-            )
-
-        base_layer = self.initialize_sequence_layer(token_ids)
+    def _forward_teacher_forcing_chunk(
+        self,
+        base_layer: Layer,
+        prediction_indices: Tensor,
+    ) -> tuple[Tensor, Layer, Layer | None]:
         batch_shape = tuple(base_layer.batch_shape)
         flat_batch = math.prod(batch_shape) if batch_shape else 1
-        device = token_ids.device
+        device = base_layer.state.device
+        chunk_size = prediction_indices.numel()
 
-        visible_upto = torch.arange(self.seq_nodes, device=device)
-        base_mask = visible_upto.view(self.seq_nodes, 1) >= torch.arange(
+        base_mask = prediction_indices.view(chunk_size, 1) >= torch.arange(
             self.seq_nodes, device=device
         ).view(1, self.seq_nodes)
         slot_mask = base_mask.unsqueeze(0).expand(flat_batch, -1, -1)
-        prediction_indices = visible_upto.view(1, self.seq_nodes).expand(flat_batch, -1)
+        prediction_indices = prediction_indices.view(1, chunk_size).expand(flat_batch, -1)
 
         expanded_state = (
             base_layer.state.reshape(flat_batch, self.seq_nodes)
             .unsqueeze(1)
-            .expand(flat_batch, self.seq_nodes, self.seq_nodes)
-            .reshape(flat_batch * self.seq_nodes, self.seq_nodes)
+            .expand(flat_batch, chunk_size, self.seq_nodes)
+            .reshape(flat_batch * chunk_size, self.seq_nodes)
         )
         expanded_val = (
             base_layer.val.reshape(flat_batch, self.seq_nodes, self.dim)
             .unsqueeze(1)
-            .expand(flat_batch, self.seq_nodes, self.seq_nodes, self.dim)
-            .reshape(flat_batch * self.seq_nodes, self.seq_nodes, self.dim)
+            .expand(flat_batch, chunk_size, self.seq_nodes, self.dim)
+            .reshape(flat_batch * chunk_size, self.seq_nodes, self.dim)
         )
-        slot_mask_flat = slot_mask.reshape(flat_batch * self.seq_nodes, self.seq_nodes)
-        prediction_indices_flat = prediction_indices.reshape(flat_batch * self.seq_nodes)
+        slot_mask_flat = slot_mask.reshape(flat_batch * chunk_size, self.seq_nodes)
+        prediction_indices_flat = prediction_indices.reshape(flat_batch * chunk_size)
 
         s_layer = Layer(
             dim=self.dim,
@@ -557,10 +552,55 @@ class ProgressiveBExampleLM(nn.Module):
         prediction_slot = self.readout_norm(
             self.read_prediction_slots(s_layer, prediction_indices_flat)
         )
-        logits = self.lm_head(prediction_slot).reshape(*batch_shape, self.seq_nodes, self.vocab_size)
+        logits = self.lm_head(prediction_slot).reshape(
+            *batch_shape,
+            chunk_size,
+            self.vocab_size,
+        )
+        return logits, s_layer, compressed_b
+
+    def forward_teacher_forcing(
+        self,
+        token_ids: Tensor,
+        *,
+        return_layers: bool = False,
+        teacher_forcing_chunk_size: int | None = None,
+    ) -> Tensor | tuple[Tensor, Layer, Layer | None]:
+        if token_ids.shape[-1] != self.seq_nodes:
+            raise ValueError(
+                "teacher forcing expects token_ids.shape[-1] to equal seq_nodes, "
+                f"got {token_ids.shape[-1]} and {self.seq_nodes}."
+            )
+        if teacher_forcing_chunk_size is not None and teacher_forcing_chunk_size <= 0:
+            raise ValueError("teacher_forcing_chunk_size must be positive when provided.")
+
+        base_layer = self.initialize_sequence_layer(token_ids)
+        chunk_size = teacher_forcing_chunk_size or self.seq_nodes
+        if chunk_size >= self.seq_nodes:
+            logits, s_layer, compressed_b = self._forward_teacher_forcing_chunk(
+                base_layer,
+                torch.arange(self.seq_nodes, device=token_ids.device),
+            )
+            if return_layers:
+                return logits, s_layer, compressed_b
+            return logits
+
         if return_layers:
-            return logits, s_layer, compressed_b
-        return logits
+            raise ValueError(
+                "return_layers is not supported when teacher_forcing_chunk_size is smaller "
+                "than seq_nodes."
+            )
+
+        logits_chunks: list[Tensor] = []
+        for chunk_start in range(0, self.seq_nodes, chunk_size):
+            chunk_end = min(self.seq_nodes, chunk_start + chunk_size)
+            prediction_indices = torch.arange(chunk_start, chunk_end, device=token_ids.device)
+            logits_chunk, _, _ = self._forward_teacher_forcing_chunk(
+                base_layer,
+                prediction_indices,
+            )
+            logits_chunks.append(logits_chunk)
+        return torch.cat(logits_chunks, dim=-2)
 
     def forward(
         self,
@@ -569,13 +609,18 @@ class ProgressiveBExampleLM(nn.Module):
         return_layers: bool = False,
         teacher_forcing: bool = False,
         full_sequence_causal: bool = False,
+        teacher_forcing_chunk_size: int | None = None,
     ) -> Tensor | tuple[Tensor, Layer, Layer | None]:
         if teacher_forcing and full_sequence_causal:
             raise ValueError("teacher_forcing and full_sequence_causal cannot both be enabled.")
         if full_sequence_causal:
             return self.forward_full_sequence_causal(token_ids, return_layers=return_layers)
         if teacher_forcing:
-            return self.forward_teacher_forcing(token_ids, return_layers=return_layers)
+            return self.forward_teacher_forcing(
+                token_ids,
+                return_layers=return_layers,
+                teacher_forcing_chunk_size=teacher_forcing_chunk_size,
+            )
         s_layer = self.initialize_sequence_layer(token_ids)
         compressed_b: Layer | None = None
 
@@ -661,6 +706,7 @@ def compute_next_token_loss(
     *,
     teacher_forcing: bool = False,
     full_sequence_causal: bool = False,
+    teacher_forcing_chunk_size: int | None = None,
 ) -> tuple[Tensor, Tensor]:
     if teacher_forcing and full_sequence_causal:
         raise ValueError("teacher_forcing and full_sequence_causal cannot both be enabled.")
@@ -668,6 +714,7 @@ def compute_next_token_loss(
         batch.context,
         teacher_forcing=teacher_forcing,
         full_sequence_causal=full_sequence_causal,
+        teacher_forcing_chunk_size=teacher_forcing_chunk_size,
     )
     loss = F.cross_entropy(
         logits.reshape(-1, logits.shape[-1]),
@@ -687,6 +734,7 @@ def estimate_next_token_loss(
     eval_steps: int,
     teacher_forcing: bool = False,
     full_sequence_causal: bool = False,
+    teacher_forcing_chunk_size: int | None = None,
 ) -> float:
     was_training = model.training
     model.eval()
@@ -705,6 +753,7 @@ def estimate_next_token_loss(
             batch,
             teacher_forcing=teacher_forcing,
             full_sequence_causal=full_sequence_causal,
+            teacher_forcing_chunk_size=teacher_forcing_chunk_size,
         )
         losses.append(float(loss.item()))
     if was_training:
@@ -728,6 +777,7 @@ def train_next_token_model(
     grad_clip: float | None = 1.0,
     teacher_forcing: bool = False,
     full_sequence_causal: bool = False,
+    teacher_forcing_chunk_size: int | None = None,
     progress_callback: Callable[[int, int, float], None] | None = None,
 ) -> TrainingHistory:
     model.to(device)
@@ -755,6 +805,7 @@ def train_next_token_model(
             batch,
             teacher_forcing=teacher_forcing,
             full_sequence_causal=full_sequence_causal,
+            teacher_forcing_chunk_size=teacher_forcing_chunk_size,
         )
         loss.backward()
         if grad_clip is not None:
@@ -774,6 +825,7 @@ def train_next_token_model(
                     eval_steps=eval_steps,
                     teacher_forcing=teacher_forcing,
                     full_sequence_causal=full_sequence_causal,
+                    teacher_forcing_chunk_size=teacher_forcing_chunk_size,
                 )
             )
             val_losses.append(
@@ -786,6 +838,7 @@ def train_next_token_model(
                     eval_steps=eval_steps,
                     teacher_forcing=teacher_forcing,
                     full_sequence_causal=full_sequence_causal,
+                    teacher_forcing_chunk_size=teacher_forcing_chunk_size,
                 )
             )
 

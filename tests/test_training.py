@@ -66,6 +66,41 @@ class TrainingTests(unittest.TestCase):
         self.assertEqual(logits.shape, (2, 8, vocab.size))
         self.assertTrue(torch.isfinite(loss))
 
+    def test_teacher_forcing_chunked_matches_full_teacher_forcing(self) -> None:
+        torch.manual_seed(11)
+        text = "teacher forcing with chunking should preserve logits exactly. " * 8
+        vocab = build_char_vocab(text)
+        tokens = vocab.encode(text)
+        model = ProgressiveBExampleLM(
+            vocab_size=vocab.size,
+            dim=12,
+            seq_nodes=8,
+            warmup_layers=1,
+            final_refine_layers=1,
+        )
+
+        batch = sample_next_token_batch(
+            tokens,
+            seq_len=8,
+            batch_size=2,
+            device="cpu",
+            teacher_forcing=True,
+        )
+        full_loss, full_logits = compute_next_token_loss(
+            model,
+            batch,
+            teacher_forcing=True,
+        )
+        chunked_loss, chunked_logits = compute_next_token_loss(
+            model,
+            batch,
+            teacher_forcing=True,
+            teacher_forcing_chunk_size=3,
+        )
+
+        torch.testing.assert_close(chunked_logits, full_logits)
+        torch.testing.assert_close(chunked_loss, full_loss)
+
     def test_training_loop_runs_and_returns_history(self) -> None:
         torch.manual_seed(30)
         text = "progressive b activation helps stable training. " * 12
@@ -91,6 +126,40 @@ class TrainingTests(unittest.TestCase):
             eval_interval=2,
             eval_steps=2,
             learning_rate=1e-3,
+        )
+
+        self.assertGreaterEqual(len(history.train_losses), 2)
+        self.assertEqual(len(history.train_losses), len(history.val_losses))
+        self.assertTrue(all(torch.isfinite(torch.tensor(history.train_losses))))
+        self.assertTrue(all(torch.isfinite(torch.tensor(history.val_losses))))
+
+    def test_teacher_forcing_chunked_training_loop_runs(self) -> None:
+        torch.manual_seed(32)
+        text = "chunked teacher forcing should keep the B path active while limiting memory. " * 8
+        vocab = build_char_vocab(text)
+        tokens = vocab.encode(text)
+        train_tokens, val_tokens = split_train_val(tokens, train_fraction=0.8)
+        model = ProgressiveBExampleLM(
+            vocab_size=vocab.size,
+            dim=12,
+            seq_nodes=8,
+            warmup_layers=1,
+            final_refine_layers=1,
+        )
+
+        history = train_next_token_model(
+            model,
+            train_tokens,
+            val_tokens,
+            seq_len=8,
+            batch_size=4,
+            device="cpu",
+            steps=3,
+            eval_interval=2,
+            eval_steps=1,
+            learning_rate=1e-3,
+            teacher_forcing=True,
+            teacher_forcing_chunk_size=3,
         )
 
         self.assertGreaterEqual(len(history.train_losses), 2)
