@@ -7,6 +7,7 @@ from jakal_net import (
     DiagonalBilinearPairwise,
     Layer,
     LinearRoute,
+    MLPRoute,
     Propagation,
     SparsePropagation,
     SparseTransition,
@@ -307,6 +308,35 @@ class JakalNetModuleTests(unittest.TestCase):
 
         self.assert_delta_close(reference.compute_delta(src, dst), kernel.compute_delta(src, dst))
 
+    def test_dense_transition_kernel_matches_reference_with_mlp_route(self) -> None:
+        torch.manual_seed(15)
+        src = Layer(
+            dim=4,
+            num_nodes=7,
+            state=torch.randn(2, 7),
+            val=torch.randn(2, 7, 4),
+        )
+        dst = Layer.zeros(dim=6, num_nodes=5, batch_shape=(2,))
+        route_fn = MLPRoute(src_dim=4, dst_nodes=5, hidden_dim=9)
+
+        reference = Transition(
+            route_fn=route_fn,
+            state_activation_fn=lambda x: torch.nn.functional.softplus(x) + 0.1,
+            val_proj_fn=lambda val: val[..., :3].repeat_interleave(2, dim=-1),
+            state_proj_fn=_state_proj_fn,
+            implementation="reference",
+        )
+        kernel = Transition(
+            route_fn=MLPRoute(src_dim=4, dst_nodes=5, hidden_dim=9),
+            state_activation_fn=lambda x: torch.nn.functional.softplus(x) + 0.1,
+            val_proj_fn=lambda val: val[..., :3].repeat_interleave(2, dim=-1),
+            state_proj_fn=_state_proj_fn,
+            implementation="kernel",
+        )
+        kernel.route_fn.load_state_dict(reference.route_fn.state_dict())
+
+        self.assert_delta_close(reference.compute_delta(src, dst), kernel.compute_delta(src, dst))
+
     def test_sparse_transition_streaming_matches_reference(self) -> None:
         torch.manual_seed(4)
         src = Layer(
@@ -359,6 +389,37 @@ class JakalNetModuleTests(unittest.TestCase):
         )
         kernel = SparseTransition(
             route_fn=LinearRoute(src_dim=3, dst_nodes=6),
+            topk=2,
+            state_activation_fn=lambda x: x + 1.25,
+            val_proj_fn=lambda val: torch.cat((val, val[..., :1]), dim=-1),
+            state_proj_fn=_state_proj_fn,
+            implementation="kernel",
+        )
+        kernel.route_fn.load_state_dict(reference.route_fn.state_dict())
+
+        self.assert_delta_close(reference.compute_delta(src, dst), kernel.compute_delta(src, dst))
+
+    def test_sparse_transition_kernel_matches_reference_with_mlp_route(self) -> None:
+        torch.manual_seed(16)
+        src = Layer(
+            dim=3,
+            num_nodes=8,
+            state=torch.randn(2, 8),
+            val=torch.randn(2, 8, 3),
+        )
+        dst = Layer.zeros(dim=4, num_nodes=6, batch_shape=(2,))
+        route_fn = MLPRoute(src_dim=3, dst_nodes=6, hidden_dim=7)
+
+        reference = SparseTransition(
+            route_fn=route_fn,
+            topk=2,
+            state_activation_fn=lambda x: x + 1.25,
+            val_proj_fn=lambda val: torch.cat((val, val[..., :1]), dim=-1),
+            state_proj_fn=_state_proj_fn,
+            implementation="reference",
+        )
+        kernel = SparseTransition(
+            route_fn=MLPRoute(src_dim=3, dst_nodes=6, hidden_dim=7),
             topk=2,
             state_activation_fn=lambda x: x + 1.25,
             val_proj_fn=lambda val: torch.cat((val, val[..., :1]), dim=-1),

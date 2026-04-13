@@ -17,3 +17,9 @@ Thumbs.db
 .venv-dml
 .tmp
 .tmp-dml
+build_native/
+native/build/
+*.pyd
+*.obj
+*.lib
+*.exp

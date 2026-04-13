@@ -1,0 +1,358 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from math import prod
+
+import torch
+from torch import Tensor
+from torch.nn import functional as F
+
+from jakal_net.modules import (
+    BilinearPairwise,
+    DiagonalBilinearPairwise,
+    LinearRoute,
+    MLPRoute,
+)
+
+
+@dataclass(slots=True)
+class OnlineSoftmaxState:
+    max_logits: Tensor
+    exp_sums: Tensor
+    weighted_values: Tensor
+
+
+@dataclass(slots=True)
+class OnlineSoftmaxStats:
+    max_logits: Tensor
+    exp_sums: Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class PairwiseKernelSpec:
+    kind: str
+    weight: Tensor
+    bias: Tensor | None
+
+
+@dataclass(frozen=True, slots=True)
+class RouteKernelSpec:
+    kind: str
+    in_weight: Tensor
+    in_bias: Tensor | None
+    out_weight: Tensor | None = None
+    out_bias: Tensor | None = None
+
+
+def flatten_state(state: Tensor) -> Tensor:
+    return state.reshape(prod(state.shape[:-1]) or 1, state.shape[-1])
+
+
+def flatten_val(val: Tensor) -> Tensor:
+    return val.reshape(prod(val.shape[:-2]) or 1, val.shape[-2], val.shape[-1])
+
+
+def reshape_state(
+    flat_state: Tensor, batch_shape: torch.Size | tuple[int, ...], nodes: int
+) -> Tensor:
+    return flat_state.reshape(*batch_shape, nodes)
+
+
+def reshape_val(
+    flat_val: Tensor,
+    batch_shape: torch.Size | tuple[int, ...],
+    nodes: int,
+    dim: int,
+) -> Tensor:
+    return flat_val.reshape(*batch_shape, nodes, dim)
+
+
+def supports_pairwise_kernel(pairwise_fn: object) -> bool:
+    return isinstance(pairwise_fn, (DiagonalBilinearPairwise, BilinearPairwise))
+
+
+def supports_route_kernel(route_fn: object) -> bool:
+    return isinstance(route_fn, (LinearRoute, MLPRoute))
+
+
+def pairwise_kernel_spec(pairwise_fn: object) -> PairwiseKernelSpec:
+    if isinstance(pairwise_fn, DiagonalBilinearPairwise):
+        return PairwiseKernelSpec(
+            kind="diagonal_bilinear",
+            weight=pairwise_fn.weight,
+            bias=pairwise_fn.bias,
+        )
+    if isinstance(pairwise_fn, BilinearPairwise):
+        return PairwiseKernelSpec(
+            kind="bilinear",
+            weight=pairwise_fn.weight,
+            bias=pairwise_fn.bias,
+        )
+    raise TypeError("Unsupported pairwise_fn for native/kernel spec.")
+
+
+def route_kernel_spec(route_fn: object) -> RouteKernelSpec:
+    if isinstance(route_fn, LinearRoute):
+        return RouteKernelSpec(
+            kind="linear",
+            in_weight=route_fn.linear.weight,
+            in_bias=route_fn.linear.bias,
+        )
+    if isinstance(route_fn, MLPRoute):
+        first = route_fn.net[0]
+        second = route_fn.net[2]
+        return RouteKernelSpec(
+            kind="mlp",
+            in_weight=first.weight,
+            in_bias=first.bias,
+            out_weight=second.weight,
+            out_bias=second.bias,
+        )
+    raise TypeError("Unsupported route_fn for native/kernel spec.")
+
+
+def pairwise_scores_dense(
+    pairwise_fn: object, target_val: Tensor, source_val: Tensor
+) -> Tensor:
+    if isinstance(pairwise_fn, DiagonalBilinearPairwise):
+        target_proj = target_val * pairwise_fn.weight.view(1, 1, -1)
+        scores = torch.bmm(target_proj, source_val.transpose(1, 2))
+        if pairwise_fn.bias is not None:
+            scores = scores + pairwise_fn.bias
+        return scores
+
+    if isinstance(pairwise_fn, BilinearPairwise):
+        target_proj = torch.matmul(target_val, pairwise_fn.weight)
+        scores = torch.bmm(target_proj, source_val.transpose(1, 2))
+        if pairwise_fn.bias is not None:
+            scores = scores + pairwise_fn.bias
+        return scores
+
+    raise TypeError("Unsupported pairwise_fn for kernel path.")
+
+
+def route_logits(route_fn: object, src_val: Tensor) -> Tensor:
+    if isinstance(route_fn, LinearRoute):
+        return F.linear(src_val, route_fn.linear.weight, route_fn.linear.bias)
+    if isinstance(route_fn, MLPRoute):
+        hidden = prepare_route_context(route_fn, src_val)
+        return route_block_logits(
+            route_fn,
+            hidden,
+            start=0,
+            end=route_fn.net[2].out_features,
+        )
+    return route_fn(src_val)
+
+
+def prepare_route_context(route_fn: object, src_val: Tensor) -> Tensor:
+    if isinstance(route_fn, LinearRoute):
+        return src_val
+    if isinstance(route_fn, MLPRoute):
+        first = route_fn.net[0]
+        hidden = F.linear(src_val, first.weight, first.bias)
+        return F.silu(hidden)
+    raise TypeError("Unsupported route_fn for block kernel path.")
+
+
+def route_block_logits(
+    route_fn: object,
+    route_context: Tensor,
+    *,
+    start: int,
+    end: int,
+) -> Tensor:
+    if start < 0:
+        raise ValueError("start must be non-negative.")
+    if end < start:
+        raise ValueError("end must be greater than or equal to start.")
+
+    if isinstance(route_fn, LinearRoute):
+        weight = route_fn.linear.weight[start:end]
+        bias = None if route_fn.linear.bias is None else route_fn.linear.bias[start:end]
+        return F.linear(route_context, weight, bias)
+
+    if isinstance(route_fn, MLPRoute):
+        second = route_fn.net[2]
+        weight = second.weight[start:end]
+        bias = None if second.bias is None else second.bias[start:end]
+        return F.linear(route_context, weight, bias)
+
+    raise TypeError("Unsupported route_fn for block kernel path.")
+
+
+def masked_softmax(logits: Tensor, mask: Tensor, dim: int = -1) -> Tensor:
+    masked_logits = torch.full_like(logits, torch.finfo(logits.dtype).min)
+    masked_logits = torch.where(mask, logits, masked_logits)
+    return torch.softmax(masked_logits, dim=dim)
+
+
+def select_topk(scores: Tensor, topk: int, *, dim: int = -1) -> torch.return_types.topk:
+    if topk <= 0:
+        raise ValueError("topk must be positive.")
+    k = min(topk, scores.shape[dim])
+    return scores.topk(k=k, dim=dim)
+
+
+def build_topk_mask(scores: Tensor, topk: int, *, dim: int = -1) -> Tensor:
+    if topk <= 0:
+        raise ValueError("topk must be positive.")
+    if topk >= scores.shape[dim]:
+        return torch.ones_like(scores, dtype=torch.bool)
+    indices = select_topk(scores, topk, dim=dim).indices
+    mask = torch.zeros_like(scores, dtype=torch.bool)
+    return mask.scatter(dim, indices, True)
+
+
+def causal_window_mask(
+    target_start: int,
+    target_end: int,
+    source_start: int,
+    source_end: int,
+    window: int,
+    *,
+    device: torch.device | None = None,
+) -> Tensor:
+    if window < 0:
+        raise ValueError("window must be non-negative.")
+    target_idx = torch.arange(target_start, target_end, device=device).unsqueeze(-1)
+    source_idx = torch.arange(source_start, source_end, device=device).unsqueeze(0)
+    return (source_idx <= target_idx) & (source_idx >= target_idx - window)
+
+
+def normalize_slot_mask(
+    slot_mask: Tensor,
+    *,
+    batch_shape: torch.Size | tuple[int, ...],
+    num_nodes: int,
+    device: torch.device | str | None = None,
+) -> Tensor:
+    expected_shape = (*batch_shape, num_nodes)
+    mask = slot_mask.to(device=device, dtype=torch.bool)
+    if tuple(mask.shape) == expected_shape:
+        return mask
+    if tuple(mask.shape) == (num_nodes,):
+        view = (1,) * len(batch_shape) + (num_nodes,)
+        return mask.view(view).expand(expected_shape)
+    raise ValueError(
+        f"slot_mask must have shape {expected_shape} or {(num_nodes,)}, got {tuple(mask.shape)}."
+    )
+
+
+def apply_slot_mask_to_state(state: Tensor, slot_mask: Tensor) -> Tensor:
+    normalized = normalize_slot_mask(
+        slot_mask,
+        batch_shape=state.shape[:-1],
+        num_nodes=state.shape[-1],
+        device=state.device,
+    )
+    return state * normalized.to(dtype=state.dtype)
+
+
+def apply_slot_mask_to_val(val: Tensor, slot_mask: Tensor) -> Tensor:
+    normalized = normalize_slot_mask(
+        slot_mask,
+        batch_shape=val.shape[:-2],
+        num_nodes=val.shape[-2],
+        device=val.device,
+    )
+    return val * normalized.to(dtype=val.dtype).unsqueeze(-1)
+
+
+def pairwise_slot_mask(target_slot_mask: Tensor, source_slot_mask: Tensor) -> Tensor:
+    if target_slot_mask.shape[:-1] != source_slot_mask.shape[:-1]:
+        raise ValueError("target_slot_mask and source_slot_mask must share batch shape.")
+    return target_slot_mask.unsqueeze(-1) & source_slot_mask.unsqueeze(-2)
+
+
+def route_slot_mask(source_slot_mask: Tensor, dst_slot_mask: Tensor) -> Tensor:
+    if source_slot_mask.shape[:-1] != dst_slot_mask.shape[:-1]:
+        raise ValueError("source_slot_mask and dst_slot_mask must share batch shape.")
+    return source_slot_mask.unsqueeze(-1) & dst_slot_mask.unsqueeze(-2)
+
+
+def gather_state_by_indices(projected_state: Tensor, indices: Tensor) -> Tensor:
+    target_nodes = indices.shape[-2]
+    source_nodes = projected_state.shape[-1]
+    expanded_state = projected_state.unsqueeze(-2).expand(
+        *projected_state.shape[:-1], target_nodes, source_nodes
+    )
+    return torch.take_along_dim(expanded_state, indices, dim=-1)
+
+
+def gather_val_by_indices(projected_val: Tensor, indices: Tensor) -> Tensor:
+    target_nodes = indices.shape[-2]
+    source_nodes = projected_val.shape[-2]
+    dim = projected_val.shape[-1]
+    expanded_val = projected_val.unsqueeze(-3).expand(
+        *projected_val.shape[:-2], target_nodes, source_nodes, dim
+    )
+    gather_indices = indices.unsqueeze(-1).expand(*indices.shape, dim)
+    return torch.take_along_dim(expanded_val, gather_indices, dim=-2)
+
+
+def online_softmax_reduce_step(
+    state: OnlineSoftmaxState | None, logits: Tensor, values: Tensor
+) -> OnlineSoftmaxState:
+    if logits.shape[:-1] != values.shape[:-2]:
+        raise ValueError("values must match logits on every dimension except the last.")
+    if logits.shape[-1] != values.shape[-2]:
+        raise ValueError("values must align with the logits reduction dimension.")
+
+    block_max = logits.max(dim=-1).values
+    block_exp = torch.exp(logits - block_max.unsqueeze(-1))
+    block_sum = block_exp.sum(dim=-1)
+    block_weighted = (block_exp.unsqueeze(-1) * values).sum(dim=-2)
+
+    if state is None:
+        return OnlineSoftmaxState(
+            max_logits=block_max,
+            exp_sums=block_sum,
+            weighted_values=block_weighted,
+        )
+
+    next_max = torch.maximum(state.max_logits, block_max)
+    state_scale = torch.exp(state.max_logits - next_max)
+    block_scale = torch.exp(block_max - next_max)
+    extra_dims = (1,) * (state.weighted_values.ndim - state.max_logits.ndim)
+    return OnlineSoftmaxState(
+        max_logits=next_max,
+        exp_sums=state.exp_sums * state_scale + block_sum * block_scale,
+        weighted_values=state.weighted_values * state_scale.view(*state_scale.shape, *extra_dims)
+        + block_weighted * block_scale.view(*block_scale.shape, *extra_dims),
+    )
+
+
+def finalize_online_softmax(state: OnlineSoftmaxState, *, eps: float = 1e-12) -> Tensor:
+    denom = state.exp_sums.clamp_min(eps)
+    extra_dims = (1,) * (state.weighted_values.ndim - denom.ndim)
+    return state.weighted_values / denom.view(*denom.shape, *extra_dims)
+
+
+def online_softmax_stats_step(
+    state: OnlineSoftmaxStats | None, logits: Tensor
+) -> OnlineSoftmaxStats:
+    block_max = logits.max(dim=-1).values
+    block_exp = torch.exp(logits - block_max.unsqueeze(-1))
+    block_sum = block_exp.sum(dim=-1)
+
+    if state is None:
+        return OnlineSoftmaxStats(max_logits=block_max, exp_sums=block_sum)
+
+    next_max = torch.maximum(state.max_logits, block_max)
+    state_scale = torch.exp(state.max_logits - next_max)
+    block_scale = torch.exp(block_max - next_max)
+    return OnlineSoftmaxStats(
+        max_logits=next_max,
+        exp_sums=state.exp_sums * state_scale + block_sum * block_scale,
+    )
+
+
+def normalize_with_online_softmax(
+    logits: Tensor,
+    stats: OnlineSoftmaxStats,
+    *,
+    eps: float = 1e-12,
+) -> Tensor:
+    denom = stats.exp_sums.clamp_min(eps).unsqueeze(-1)
+    return torch.exp(logits - stats.max_logits.unsqueeze(-1)) / denom

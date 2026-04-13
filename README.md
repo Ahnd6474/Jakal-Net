@@ -92,6 +92,15 @@ $env:PYTHONPATH = "src"
 .\.venv-dml\Scripts\python.exe scripts\smoke_test.py --device directml
 ```
 
+To run the progressive B example through an actual next-token training loop:
+
+```powershell
+$env:PYTHONPATH = "src"
+.\.venv\Scripts\python.exe scripts\train_progressive_b_lm.py --steps 100 --seq-len 32 --dim 48
+```
+
+The training script uses a small built-in character corpus by default. You can point it at your own UTF-8 text file with `--text-file`.
+
 Here is the smallest useful Python example:
 
 ```python
@@ -134,8 +143,8 @@ What is not here yet:
 
 - Flash kernels
 - Encoders or decoders
-- Training loops
-- Dataset pipelines
+- Real tokenizer integrations
+- Large-scale dataset pipelines
 
 ## Why this shape?
 
@@ -393,6 +402,31 @@ op = SparseTransition(
 
 updated_dst = op(src, dst)
 ```
+
+### Progressive B example LM
+
+The progressive B model is kept as example code in [`scripts/progressive_b_example.py`](./scripts/progressive_b_example.py), not as part of the public `jakal_net` package surface.
+
+That example follows this flow:
+
+- `Embedding + position -> init(s, v)`
+- `S warmup` with window sparse propagation
+- `joint blocks` that expand, compress, and progressively gate the B path
+- `final S refine`
+- `prediction slot -> LM head`
+
+The B path is still built entirely from the existing public modules:
+
+- `SparsePropagation` for the S path
+- `Transition` or `SparseTransition` for B expansion, compression, and S/B exchange
+- `DiagonalBilinearPairwise` and `LinearRoute` as the default scorers and routers
+
+If you want to train the example instead of only running a forward pass, the helper code also lives in [`scripts/progressive_b_example.py`](./scripts/progressive_b_example.py):
+
+- `build_char_vocab`
+- `sample_next_token_batch`
+- `train_next_token_model`
+- `generate_next_tokens`
 
 ## Further reading
 

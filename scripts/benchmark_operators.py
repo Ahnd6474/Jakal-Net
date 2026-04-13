@@ -18,6 +18,7 @@ from jakal_net import (
     describe_device,
     Layer,
     LinearRoute,
+    native_status,
     Propagation,
     resolve_device,
     ScalarAffine,
@@ -217,6 +218,7 @@ def main() -> None:
     device = resolve_device(args.device)
     dtype = torch.float32
     print(f"using device: {describe_device(args.device)}")
+    print(f"native backend: {native_status().backend_name or 'unavailable'}")
 
     batch_shape = (4,)
     batch_factor = _batch_product(batch_shape)
@@ -255,6 +257,13 @@ def main() -> None:
         target_block_size=64,
         source_block_size=64,
     )
+    propagation_native = Propagation(
+        pairwise_fn=_clone_module(pairwise_template).to(device),
+        state_proj_fn=_clone_module(state_proj_template).to(device),
+        implementation="native",
+        target_block_size=64,
+        source_block_size=64,
+    )
 
     window_reference = SparsePropagation(
         pairwise_fn=_clone_module(pairwise_template).to(device),
@@ -276,6 +285,15 @@ def main() -> None:
         sparse_type="window",
         window=8,
         implementation="streaming",
+        target_block_size=64,
+        source_block_size=64,
+    )
+    window_native = SparsePropagation(
+        pairwise_fn=_clone_module(pairwise_template).to(device),
+        state_proj_fn=_clone_module(state_proj_template).to(device),
+        sparse_type="window",
+        window=8,
+        implementation="native",
         target_block_size=64,
         source_block_size=64,
     )
@@ -303,6 +321,15 @@ def main() -> None:
         target_block_size=64,
         source_block_size=64,
     )
+    topk_propagation_native = SparsePropagation(
+        pairwise_fn=_clone_module(pairwise_template).to(device),
+        state_proj_fn=_clone_module(state_proj_template).to(device),
+        sparse_type="topk",
+        topk=8,
+        implementation="native",
+        target_block_size=64,
+        source_block_size=64,
+    )
 
     transition_reference = Transition(
         route_fn=_clone_module(route_template).to(device),
@@ -322,6 +349,14 @@ def main() -> None:
         val_proj_fn=_clone_module(val_proj_template).to(device),
         implementation="streaming",
         src_block_size=64,
+    )
+    transition_native = Transition(
+        route_fn=_clone_module(route_template).to(device),
+        state_proj_fn=_clone_module(state_proj_template).to(device),
+        val_proj_fn=_clone_module(val_proj_template).to(device),
+        implementation="native",
+        src_block_size=64,
+        dst_block_size=64,
     )
 
     sparse_transition_reference = SparseTransition(
@@ -346,6 +381,15 @@ def main() -> None:
         implementation="streaming",
         src_block_size=64,
     )
+    sparse_transition_native = SparseTransition(
+        route_fn=_clone_module(route_template).to(device),
+        topk=8,
+        state_proj_fn=_clone_module(state_proj_template).to(device),
+        val_proj_fn=_clone_module(val_proj_template).to(device),
+        implementation="native",
+        src_block_size=64,
+        dst_block_size=64,
+    )
 
     benchmarks: list[tuple[str, list[tuple[str, Callable[[], object]]], int]] = [
         (
@@ -354,6 +398,7 @@ def main() -> None:
                 ("reference", lambda: propagation_reference.compute_delta(prop_layer)),
                 ("kernel", lambda: propagation_kernel.compute_delta(prop_layer)),
                 ("streaming", lambda: propagation_streaming.compute_delta(prop_layer)),
+                ("native", lambda: propagation_native.compute_delta(prop_layer)),
             ],
             batch_factor * prop_layer.num_nodes * prop_layer.num_nodes,
         ),
@@ -363,6 +408,7 @@ def main() -> None:
                 ("reference", lambda: window_reference.compute_delta(prop_layer)),
                 ("kernel", lambda: window_kernel.compute_delta(prop_layer)),
                 ("streaming", lambda: window_streaming.compute_delta(prop_layer)),
+                ("native", lambda: window_native.compute_delta(prop_layer)),
             ],
             batch_factor * _window_edge_count(prop_layer.num_nodes, 8),
         ),
@@ -372,6 +418,7 @@ def main() -> None:
                 ("reference", lambda: topk_propagation_reference.compute_delta(prop_layer)),
                 ("kernel", lambda: topk_propagation_kernel.compute_delta(prop_layer)),
                 ("streaming", lambda: topk_propagation_streaming.compute_delta(prop_layer)),
+                ("native", lambda: topk_propagation_native.compute_delta(prop_layer)),
             ],
             batch_factor * prop_layer.num_nodes * 8,
         ),
@@ -381,6 +428,7 @@ def main() -> None:
                 ("reference", lambda: transition_reference.compute_delta(trans_src, trans_dst)),
                 ("kernel", lambda: transition_kernel.compute_delta(trans_src, trans_dst)),
                 ("streaming", lambda: transition_streaming.compute_delta(trans_src, trans_dst)),
+                ("native", lambda: transition_native.compute_delta(trans_src, trans_dst)),
             ],
             batch_factor * trans_src.num_nodes * trans_dst.num_nodes,
         ),
@@ -390,6 +438,7 @@ def main() -> None:
                 ("reference", lambda: sparse_transition_reference.compute_delta(trans_src, trans_dst)),
                 ("kernel", lambda: sparse_transition_kernel.compute_delta(trans_src, trans_dst)),
                 ("streaming", lambda: sparse_transition_streaming.compute_delta(trans_src, trans_dst)),
+                ("native", lambda: sparse_transition_native.compute_delta(trans_src, trans_dst)),
             ],
             batch_factor * trans_src.num_nodes * 8,
         ),

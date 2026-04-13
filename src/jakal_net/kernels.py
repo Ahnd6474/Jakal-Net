@@ -1,57 +1,28 @@
 from __future__ import annotations
 
-from math import prod
 from typing import Callable
 
 import torch
 from torch import Tensor
-from torch.nn import functional as F
 
-from jakal_net.core import LayerDelta
-from jakal_net.modules import BilinearPairwise, DiagonalBilinearPairwise, LinearRoute
-
-
-def _flatten_state(state: Tensor) -> Tensor:
-    return state.reshape(prod(state.shape[:-1]) or 1, state.shape[-1])
-
-
-def _flatten_val(val: Tensor) -> Tensor:
-    return val.reshape(prod(val.shape[:-2]) or 1, val.shape[-2], val.shape[-1])
-
-
-def _reshape_state(flat_state: Tensor, batch_shape: torch.Size | tuple[int, ...], nodes: int) -> Tensor:
-    return flat_state.reshape(*batch_shape, nodes)
-
-
-def _reshape_val(
-    flat_val: Tensor,
-    batch_shape: torch.Size | tuple[int, ...],
-    nodes: int,
-    dim: int,
-) -> Tensor:
-    return flat_val.reshape(*batch_shape, nodes, dim)
-
-
-def supports_pairwise_kernel(pairwise_fn: object) -> bool:
-    return isinstance(pairwise_fn, (DiagonalBilinearPairwise, BilinearPairwise))
-
-
-def _pairwise_scores_dense(pairwise_fn: object, target_val: Tensor, source_val: Tensor) -> Tensor:
-    if isinstance(pairwise_fn, DiagonalBilinearPairwise):
-        target_proj = target_val * pairwise_fn.weight.view(1, 1, -1)
-        scores = torch.bmm(target_proj, source_val.transpose(1, 2))
-        if pairwise_fn.bias is not None:
-            scores = scores + pairwise_fn.bias
-        return scores
-
-    if isinstance(pairwise_fn, BilinearPairwise):
-        target_proj = torch.matmul(target_val, pairwise_fn.weight)
-        scores = torch.bmm(target_proj, source_val.transpose(1, 2))
-        if pairwise_fn.bias is not None:
-            scores = scores + pairwise_fn.bias
-        return scores
-
-    raise TypeError("Unsupported pairwise_fn for kernel path.")
+from jakal_net.core import LayerDelta, allocate_accumulator, iter_blocks
+from jakal_net.kernel_common import (
+    causal_window_mask,
+    flatten_state,
+    flatten_val,
+    gather_state_by_indices,
+    gather_val_by_indices,
+    normalize_with_online_softmax,
+    online_softmax_stats_step,
+    pairwise_scores_dense,
+    prepare_route_context,
+    reshape_state,
+    reshape_val,
+    route_block_logits,
+    select_topk,
+    supports_pairwise_kernel,
+    supports_route_kernel,
+)
 
 
 def propagation_dense_kernel(
@@ -61,23 +32,73 @@ def propagation_dense_kernel(
     layer_val: Tensor,
     projected_state: Tensor,
     projected_val: Tensor,
+    target_block_size: int | None = 128,
+    source_block_size: int | None = 128,
+    accumulator_dtype: torch.dtype | None = None,
 ) -> LayerDelta:
     batch_shape = layer_val.shape[:-2]
     num_nodes = layer_val.shape[-2]
     out_dim = projected_val.shape[-1]
 
-    flat_val = _flatten_val(layer_val)
-    flat_projected_state = _flatten_state(projected_state)
-    flat_projected_val = _flatten_val(projected_val)
+    flat_val = flatten_val(layer_val)
+    flat_projected_state = flatten_state(projected_state)
+    flat_projected_val = flatten_val(projected_val)
+    state_acc_dtype = allocate_accumulator(
+        (1,),
+        device=layer_val.device,
+        tensor_dtype=projected_state.dtype,
+        accumulator_dtype=accumulator_dtype,
+    ).dtype
+    val_acc_dtype = allocate_accumulator(
+        (1,),
+        device=layer_val.device,
+        tensor_dtype=projected_val.dtype,
+        accumulator_dtype=accumulator_dtype,
+    ).dtype
+    state_blocks: list[Tensor] = []
+    val_blocks: list[Tensor] = []
 
-    scores = _pairwise_scores_dense(pairwise_fn, flat_val, flat_val)
-    edges = edge_compress_fn(scores)
-    delta_state = torch.bmm(edges, flat_projected_state.unsqueeze(-1)).squeeze(-1)
-    delta_val = torch.bmm(edges, flat_projected_val)
+    for target_start, target_end in iter_blocks(
+        num_nodes, target_block_size, name="target_block_size"
+    ):
+        target_val = flat_val[:, target_start:target_end, :]
+        target_state_acc = allocate_accumulator(
+            (flat_val.shape[0], target_end - target_start),
+            device=layer_val.device,
+            tensor_dtype=projected_state.dtype,
+            accumulator_dtype=accumulator_dtype,
+        )
+        target_val_acc = allocate_accumulator(
+            (flat_val.shape[0], target_end - target_start, out_dim),
+            device=layer_val.device,
+            tensor_dtype=projected_val.dtype,
+            accumulator_dtype=accumulator_dtype,
+        )
+        for source_start, source_end in iter_blocks(
+            num_nodes, source_block_size, name="source_block_size"
+        ):
+            source_val = flat_val[:, source_start:source_end, :]
+            scores = pairwise_scores_dense(pairwise_fn, target_val, source_val)
+            edges = edge_compress_fn(scores)
+            state_edges = edges.to(dtype=state_acc_dtype)
+            val_edges = edges.to(dtype=val_acc_dtype)
+
+            target_state_acc += torch.bmm(
+                state_edges,
+                flat_projected_state[:, source_start:source_end]
+                .to(dtype=state_acc_dtype)
+                .unsqueeze(-1),
+            ).squeeze(-1)
+            target_val_acc += torch.bmm(
+                val_edges,
+                flat_projected_val[:, source_start:source_end, :].to(dtype=val_acc_dtype),
+            )
+        state_blocks.append(target_state_acc.to(dtype=projected_state.dtype))
+        val_blocks.append(target_val_acc.to(dtype=projected_val.dtype))
 
     return LayerDelta(
-        delta_state=_reshape_state(delta_state, batch_shape, num_nodes),
-        delta_val=_reshape_val(delta_val, batch_shape, num_nodes, out_dim),
+        delta_state=reshape_state(torch.cat(state_blocks, dim=1), batch_shape, num_nodes),
+        delta_val=reshape_val(torch.cat(val_blocks, dim=1), batch_shape, num_nodes, out_dim),
     )
 
 
@@ -89,48 +110,91 @@ def propagation_window_kernel(
     projected_state: Tensor,
     projected_val: Tensor,
     window: int,
+    target_block_size: int | None = 128,
+    source_block_size: int | None = 128,
+    accumulator_dtype: torch.dtype | None = None,
 ) -> LayerDelta:
     if window < 0:
         raise ValueError("window must be non-negative.")
 
     batch_shape = layer_val.shape[:-2]
     num_nodes = layer_val.shape[-2]
-    val_dim = layer_val.shape[-1]
     out_dim = projected_val.shape[-1]
-    flat_val = _flatten_val(layer_val)
-    flat_projected_state = _flatten_state(projected_state)
-    flat_projected_val = _flatten_val(projected_val)
 
-    if isinstance(pairwise_fn, DiagonalBilinearPairwise):
-        target_proj = flat_val * pairwise_fn.weight.view(1, 1, val_dim)
-        source_basis = flat_val
-        bias = pairwise_fn.bias
-    elif isinstance(pairwise_fn, BilinearPairwise):
-        target_proj = torch.matmul(flat_val, pairwise_fn.weight)
-        source_basis = flat_val
-        bias = pairwise_fn.bias
-    else:
-        raise TypeError("Unsupported pairwise_fn for kernel path.")
+    flat_val = flatten_val(layer_val)
+    flat_projected_state = flatten_state(projected_state)
+    flat_projected_val = flatten_val(projected_val)
+    state_acc_dtype = allocate_accumulator(
+        (1,),
+        device=layer_val.device,
+        tensor_dtype=projected_state.dtype,
+        accumulator_dtype=accumulator_dtype,
+    ).dtype
+    val_acc_dtype = allocate_accumulator(
+        (1,),
+        device=layer_val.device,
+        tensor_dtype=projected_val.dtype,
+        accumulator_dtype=accumulator_dtype,
+    ).dtype
+    state_blocks: list[Tensor] = []
+    val_blocks: list[Tensor] = []
 
-    padded_source = F.pad(source_basis, (0, 0, window, 0))
-    source_windows = padded_source.unfold(1, window + 1, 1).permute(0, 1, 3, 2)
-    scores = (target_proj.unsqueeze(-2) * source_windows).sum(dim=-1)
-    if bias is not None:
-        scores = scores + bias
+    for target_start, target_end in iter_blocks(
+        num_nodes, target_block_size, name="target_block_size"
+    ):
+        target_val = flat_val[:, target_start:target_end, :]
+        source_floor = max(0, target_start - window)
+        source_ceiling = target_end
+        target_state_acc = allocate_accumulator(
+            (flat_val.shape[0], target_end - target_start),
+            device=layer_val.device,
+            tensor_dtype=projected_state.dtype,
+            accumulator_dtype=accumulator_dtype,
+        )
+        target_val_acc = allocate_accumulator(
+            (flat_val.shape[0], target_end - target_start, out_dim),
+            device=layer_val.device,
+            tensor_dtype=projected_val.dtype,
+            accumulator_dtype=accumulator_dtype,
+        )
 
-    edges = edge_compress_fn(scores)
+        for source_offset_start, source_offset_end in iter_blocks(
+            source_ceiling - source_floor,
+            source_block_size,
+            name="source_block_size",
+        ):
+            source_start = source_floor + source_offset_start
+            source_end = source_floor + source_offset_end
+            source_val = flat_val[:, source_start:source_end, :]
+            scores = pairwise_scores_dense(pairwise_fn, target_val, source_val)
+            mask = causal_window_mask(
+                target_start,
+                target_end,
+                source_start,
+                source_end,
+                window,
+                device=layer_val.device,
+            ).view(1, target_end - target_start, source_end - source_start)
+            edges = edge_compress_fn(scores) * mask.to(dtype=scores.dtype)
+            state_edges = edges.to(dtype=state_acc_dtype)
+            val_edges = edges.to(dtype=val_acc_dtype)
 
-    padded_state = F.pad(flat_projected_state, (window, 0))
-    state_windows = padded_state.unfold(1, window + 1, 1)
-    delta_state = (edges * state_windows).sum(dim=-1)
-
-    padded_val = F.pad(flat_projected_val, (0, 0, window, 0))
-    val_windows = padded_val.unfold(1, window + 1, 1).permute(0, 1, 3, 2)
-    delta_val = (edges.unsqueeze(-1) * val_windows).sum(dim=-2)
+            target_state_acc += torch.bmm(
+                state_edges,
+                flat_projected_state[:, source_start:source_end]
+                .to(dtype=state_acc_dtype)
+                .unsqueeze(-1),
+            ).squeeze(-1)
+            target_val_acc += torch.bmm(
+                val_edges,
+                flat_projected_val[:, source_start:source_end, :].to(dtype=val_acc_dtype),
+            )
+        state_blocks.append(target_state_acc.to(dtype=projected_state.dtype))
+        val_blocks.append(target_val_acc.to(dtype=projected_val.dtype))
 
     return LayerDelta(
-        delta_state=_reshape_state(delta_state, batch_shape, num_nodes),
-        delta_val=_reshape_val(delta_val, batch_shape, num_nodes, out_dim),
+        delta_state=reshape_state(torch.cat(state_blocks, dim=1), batch_shape, num_nodes),
+        delta_val=reshape_val(torch.cat(val_blocks, dim=1), batch_shape, num_nodes, out_dim),
     )
 
 
@@ -142,6 +206,9 @@ def propagation_topk_kernel(
     projected_state: Tensor,
     projected_val: Tensor,
     topk: int,
+    target_block_size: int | None = 128,
+    source_block_size: int | None = 128,
+    accumulator_dtype: torch.dtype | None = None,
 ) -> LayerDelta:
     if topk <= 0:
         raise ValueError("topk must be positive.")
@@ -149,35 +216,102 @@ def propagation_topk_kernel(
     batch_shape = layer_val.shape[:-2]
     num_nodes = layer_val.shape[-2]
     out_dim = projected_val.shape[-1]
-    flat_val = _flatten_val(layer_val)
-    flat_projected_state = _flatten_state(projected_state)
-    flat_projected_val = _flatten_val(projected_val)
-
-    scores = _pairwise_scores_dense(pairwise_fn, flat_val, flat_val)
     k = min(topk, num_nodes)
-    topk_values, topk_indices = scores.topk(k=k, dim=-1)
-    edges = edge_compress_fn(topk_values)
 
-    state_index = topk_indices
-    state_source = flat_projected_state.unsqueeze(-2).expand(-1, num_nodes, -1)
-    selected_state = torch.take_along_dim(state_source, state_index, dim=-1)
-    delta_state = (edges * selected_state).sum(dim=-1)
+    flat_val = flatten_val(layer_val)
+    flat_projected_state = flatten_state(projected_state)
+    flat_projected_val = flatten_val(projected_val)
+    state_acc_dtype = allocate_accumulator(
+        (1,),
+        device=layer_val.device,
+        tensor_dtype=projected_state.dtype,
+        accumulator_dtype=accumulator_dtype,
+    ).dtype
+    val_acc_dtype = allocate_accumulator(
+        (1,),
+        device=layer_val.device,
+        tensor_dtype=projected_val.dtype,
+        accumulator_dtype=accumulator_dtype,
+    ).dtype
+    state_blocks: list[Tensor] = []
+    val_blocks: list[Tensor] = []
 
-    val_index = topk_indices.unsqueeze(-1).expand(-1, -1, -1, out_dim)
-    val_source = flat_projected_val.unsqueeze(-3).expand(-1, num_nodes, -1, -1)
-    selected_val = torch.take_along_dim(val_source, val_index, dim=-2)
-    delta_val = (edges.unsqueeze(-1) * selected_val).sum(dim=-2)
+    if k == num_nodes:
+        return propagation_dense_kernel(
+            pairwise_fn=pairwise_fn,
+            edge_compress_fn=edge_compress_fn,
+            layer_val=layer_val,
+            projected_state=projected_state,
+            projected_val=projected_val,
+            target_block_size=target_block_size,
+            source_block_size=source_block_size,
+            accumulator_dtype=accumulator_dtype,
+        )
+
+    for target_start, target_end in iter_blocks(
+        num_nodes, target_block_size, name="target_block_size"
+    ):
+        target_val = flat_val[:, target_start:target_end, :]
+        target_nodes = target_end - target_start
+        best_scores: Tensor | None = None
+        best_indices: Tensor | None = None
+
+        for source_start, source_end in iter_blocks(
+            num_nodes, source_block_size, name="source_block_size"
+        ):
+            source_val = flat_val[:, source_start:source_end, :]
+            scores = pairwise_scores_dense(pairwise_fn, target_val, source_val)
+
+            if best_scores is None or best_indices is None:
+                best_scores = torch.full(
+                    (flat_val.shape[0], target_nodes, k),
+                    fill_value=torch.finfo(scores.dtype).min,
+                    device=layer_val.device,
+                    dtype=scores.dtype,
+                )
+                best_indices = torch.zeros(
+                    (flat_val.shape[0], target_nodes, k),
+                    device=layer_val.device,
+                    dtype=torch.long,
+                )
+
+            source_indices = torch.arange(
+                source_start, source_end, device=layer_val.device, dtype=torch.long
+            ).view(1, 1, source_end - source_start)
+            source_indices = source_indices.expand(flat_val.shape[0], target_nodes, -1)
+
+            candidate_scores = torch.cat((best_scores, scores), dim=-1)
+            candidate_indices = torch.cat((best_indices, source_indices), dim=-1)
+            selected = select_topk(candidate_scores, k, dim=-1)
+            best_scores = selected.values
+            best_indices = torch.take_along_dim(
+                candidate_indices, selected.indices, dim=-1
+            )
+
+        if best_scores is None or best_indices is None:
+            continue
+
+        edges = edge_compress_fn(best_scores)
+        selected_state = gather_state_by_indices(flat_projected_state, best_indices)
+        selected_val = gather_val_by_indices(flat_projected_val, best_indices)
+
+        state_blocks.append(
+            (
+                edges.to(dtype=state_acc_dtype)
+                * selected_state.to(dtype=state_acc_dtype)
+            ).sum(dim=-1).to(dtype=projected_state.dtype)
+        )
+        val_blocks.append(
+            (
+                edges.to(dtype=val_acc_dtype).unsqueeze(-1)
+                * selected_val.to(dtype=val_acc_dtype)
+            ).sum(dim=-2).to(dtype=projected_val.dtype)
+        )
 
     return LayerDelta(
-        delta_state=_reshape_state(delta_state, batch_shape, num_nodes),
-        delta_val=_reshape_val(delta_val, batch_shape, num_nodes, out_dim),
+        delta_state=reshape_state(torch.cat(state_blocks, dim=1), batch_shape, num_nodes),
+        delta_val=reshape_val(torch.cat(val_blocks, dim=1), batch_shape, num_nodes, out_dim),
     )
-
-
-def _route_logits(route_fn: object, src_val: Tensor) -> Tensor:
-    if isinstance(route_fn, LinearRoute):
-        return F.linear(src_val, route_fn.linear.weight, route_fn.linear.bias)
-    return route_fn(src_val)
 
 
 def transition_dense_kernel(
@@ -188,29 +322,103 @@ def transition_dense_kernel(
     projected_state: Tensor,
     projected_val: Tensor,
     dst_nodes: int,
+    src_block_size: int | None = 128,
+    dst_block_size: int | None = 128,
+    accumulator_dtype: torch.dtype | None = None,
 ) -> LayerDelta:
+    if not supports_route_kernel(route_fn):
+        raise TypeError("Unsupported route_fn for dense transition kernel path.")
+
     batch_shape = src_val.shape[:-2]
     src_nodes = src_val.shape[-2]
     out_dim = projected_val.shape[-1]
 
-    flat_src_val = _flatten_val(src_val)
-    flat_sender_strength = _flatten_state(sender_strength)
-    flat_projected_state = _flatten_state(projected_state)
-    flat_projected_val = _flatten_val(projected_val)
+    flat_src_val = flatten_val(src_val)
+    flat_sender_strength = flatten_state(sender_strength)
+    flat_projected_state = flatten_state(projected_state)
+    flat_projected_val = flatten_val(projected_val)
+    batch_flat = flat_src_val.shape[0]
 
-    logits = _route_logits(route_fn, flat_src_val)
-    if logits.shape != (flat_src_val.shape[0], src_nodes, dst_nodes):
-        raise ValueError("route_fn returned an unexpected shape in kernel path.")
-    routes = torch.softmax(logits, dim=-1)
-    weighted_routes = routes * flat_sender_strength.unsqueeze(-1)
-    transport = weighted_routes.transpose(1, 2).contiguous()
+    delta_state = allocate_accumulator(
+        (batch_flat, dst_nodes),
+        device=src_val.device,
+        tensor_dtype=projected_state.dtype,
+        accumulator_dtype=accumulator_dtype,
+    )
+    delta_val = allocate_accumulator(
+        (batch_flat, dst_nodes, out_dim),
+        device=src_val.device,
+        tensor_dtype=projected_val.dtype,
+        accumulator_dtype=accumulator_dtype,
+    )
+    state_acc_dtype = delta_state.dtype
+    val_acc_dtype = delta_val.dtype
 
-    delta_state = torch.bmm(transport, flat_projected_state.unsqueeze(-1)).squeeze(-1)
-    delta_val = torch.bmm(transport, flat_projected_val)
+    for src_start, src_end in iter_blocks(src_nodes, src_block_size, name="src_block_size"):
+        src_block = flat_src_val[:, src_start:src_end, :]
+        block_nodes = src_end - src_start
+        route_context = prepare_route_context(route_fn, src_block)
+        softmax_stats = None
+
+        for dst_start, dst_end in iter_blocks(
+            dst_nodes, dst_block_size, name="dst_block_size"
+        ):
+            logits_block = route_block_logits(
+                route_fn,
+                route_context,
+                start=dst_start,
+                end=dst_end,
+            )
+            expected_shape = (batch_flat, block_nodes, dst_end - dst_start)
+            if tuple(logits_block.shape) != expected_shape:
+                raise ValueError(
+                    "route_fn returned an unexpected block shape in kernel path, "
+                    f"expected {expected_shape}, got {tuple(logits_block.shape)}."
+                )
+            softmax_stats = online_softmax_stats_step(softmax_stats, logits_block)
+
+        if softmax_stats is None:
+            continue
+
+        state_sender = (
+            flat_sender_strength[:, src_start:src_end].to(dtype=state_acc_dtype)
+            * flat_projected_state[:, src_start:src_end].to(dtype=state_acc_dtype)
+        )
+        val_sender = (
+            flat_sender_strength[:, src_start:src_end]
+            .to(dtype=val_acc_dtype)
+            .unsqueeze(-1)
+            * flat_projected_val[:, src_start:src_end, :].to(dtype=val_acc_dtype)
+        )
+
+        for dst_start, dst_end in iter_blocks(
+            dst_nodes, dst_block_size, name="dst_block_size"
+        ):
+            logits_block = route_block_logits(
+                route_fn,
+                route_context,
+                start=dst_start,
+                end=dst_end,
+            )
+            routes_block = normalize_with_online_softmax(
+                logits_block, softmax_stats
+            )
+            delta_state[:, dst_start:dst_end] += torch.bmm(
+                routes_block.to(dtype=state_acc_dtype).transpose(1, 2).contiguous(),
+                state_sender.unsqueeze(-1),
+            ).squeeze(-1)
+            delta_val[:, dst_start:dst_end, :] += torch.bmm(
+                routes_block.to(dtype=val_acc_dtype).transpose(1, 2).contiguous(),
+                val_sender,
+            )
 
     return LayerDelta(
-        delta_state=_reshape_state(delta_state, batch_shape, dst_nodes),
-        delta_val=_reshape_val(delta_val, batch_shape, dst_nodes, out_dim),
+        delta_state=reshape_state(
+            delta_state.to(dtype=projected_state.dtype), batch_shape, dst_nodes
+        ),
+        delta_val=reshape_val(
+            delta_val.to(dtype=projected_val.dtype), batch_shape, dst_nodes, out_dim
+        ),
     )
 
 
@@ -223,25 +431,20 @@ def transition_topk_kernel(
     projected_val: Tensor,
     dst_nodes: int,
     topk: int,
+    src_block_size: int | None = 128,
+    dst_block_size: int | None = 128,
+    accumulator_dtype: torch.dtype | None = None,
 ) -> LayerDelta:
     if topk <= 0:
         raise ValueError("topk must be positive.")
+    if not supports_route_kernel(route_fn):
+        raise TypeError("Unsupported route_fn for sparse transition kernel path.")
 
     batch_shape = src_val.shape[:-2]
     src_nodes = src_val.shape[-2]
     out_dim = projected_val.shape[-1]
-    batch_flat = prod(batch_shape) or 1
-
-    flat_src_val = _flatten_val(src_val)
-    flat_sender_strength = _flatten_state(sender_strength)
-    flat_projected_state = _flatten_state(projected_state)
-    flat_projected_val = _flatten_val(projected_val)
-
-    logits = _route_logits(route_fn, flat_src_val)
-    if logits.shape != (batch_flat, src_nodes, dst_nodes):
-        raise ValueError("route_fn returned an unexpected shape in kernel path.")
-
     k = min(topk, dst_nodes)
+
     if k == dst_nodes:
         return transition_dense_kernel(
             route_fn=route_fn,
@@ -250,32 +453,109 @@ def transition_topk_kernel(
             projected_state=projected_state,
             projected_val=projected_val,
             dst_nodes=dst_nodes,
+            src_block_size=src_block_size,
+            dst_block_size=dst_block_size,
+            accumulator_dtype=accumulator_dtype,
         )
 
-    topk_values, topk_indices = logits.topk(k=k, dim=-1)
-    routes = torch.softmax(topk_values, dim=-1)
-    weighted_routes = routes * flat_sender_strength.unsqueeze(-1)
+    flat_src_val = flatten_val(src_val)
+    flat_sender_strength = flatten_state(sender_strength)
+    flat_projected_state = flatten_state(projected_state)
+    flat_projected_val = flatten_val(projected_val)
+    batch_flat = flat_src_val.shape[0]
 
-    delta_state = torch.zeros(
-        batch_flat, dst_nodes, device=src_val.device, dtype=projected_state.dtype
+    delta_state = allocate_accumulator(
+        (batch_flat, dst_nodes),
+        device=src_val.device,
+        tensor_dtype=projected_state.dtype,
+        accumulator_dtype=accumulator_dtype,
     )
-    state_contrib = (
-        weighted_routes * flat_projected_state.unsqueeze(-1)
-    ).reshape(batch_flat, -1)
-    delta_state.scatter_add_(dim=-1, index=topk_indices.reshape(batch_flat, -1), src=state_contrib)
+    delta_val = allocate_accumulator(
+        (batch_flat, dst_nodes, out_dim),
+        device=src_val.device,
+        tensor_dtype=projected_val.dtype,
+        accumulator_dtype=accumulator_dtype,
+    )
+    state_acc_dtype = delta_state.dtype
+    val_acc_dtype = delta_val.dtype
 
-    delta_val = torch.zeros(
-        batch_flat, dst_nodes, out_dim, device=src_val.device, dtype=projected_val.dtype
-    )
-    val_contrib = (
-        weighted_routes.unsqueeze(-1) * flat_projected_val.unsqueeze(-2)
-    ).reshape(batch_flat, -1, out_dim)
-    scatter_index = topk_indices.unsqueeze(-1).expand(-1, -1, -1, out_dim).reshape(
-        batch_flat, -1, out_dim
-    )
-    delta_val.scatter_add_(dim=1, index=scatter_index, src=val_contrib)
+    for src_start, src_end in iter_blocks(src_nodes, src_block_size, name="src_block_size"):
+        src_block = flat_src_val[:, src_start:src_end, :]
+        block_nodes = src_end - src_start
+        route_context = prepare_route_context(route_fn, src_block)
+        best_values = torch.full(
+            (batch_flat, block_nodes, k),
+            fill_value=torch.finfo(src_block.dtype).min,
+            device=src_val.device,
+            dtype=src_block.dtype,
+        )
+        best_indices = torch.zeros(
+            (batch_flat, block_nodes, k),
+            device=src_val.device,
+            dtype=torch.long,
+        )
+
+        for dst_start, dst_end in iter_blocks(
+            dst_nodes, dst_block_size, name="dst_block_size"
+        ):
+            logits_block = route_block_logits(
+                route_fn,
+                route_context,
+                start=dst_start,
+                end=dst_end,
+            )
+            expected_shape = (batch_flat, block_nodes, dst_end - dst_start)
+            if tuple(logits_block.shape) != expected_shape:
+                raise ValueError(
+                    "route_fn returned an unexpected block shape in kernel path, "
+                    f"expected {expected_shape}, got {tuple(logits_block.shape)}."
+                )
+
+            block_indices = torch.arange(
+                dst_start, dst_end, device=src_val.device, dtype=torch.long
+            ).view(1, 1, dst_end - dst_start)
+            block_indices = block_indices.expand(batch_flat, block_nodes, -1)
+            candidate_values = torch.cat((best_values, logits_block), dim=-1)
+            candidate_indices = torch.cat((best_indices, block_indices), dim=-1)
+            selected = select_topk(candidate_values, k, dim=-1)
+            best_values = selected.values
+            best_indices = torch.take_along_dim(
+                candidate_indices, selected.indices, dim=-1
+            )
+
+        routes = torch.softmax(best_values, dim=-1)
+        state_contrib = (
+            routes.to(dtype=state_acc_dtype)
+            * (
+                flat_sender_strength[:, src_start:src_end].to(dtype=state_acc_dtype)
+                * flat_projected_state[:, src_start:src_end].to(dtype=state_acc_dtype)
+            ).unsqueeze(-1)
+        ).reshape(batch_flat, -1)
+        delta_state.scatter_add_(
+            dim=-1,
+            index=best_indices.reshape(batch_flat, -1),
+            src=state_contrib,
+        )
+
+        val_contrib = (
+            routes.to(dtype=val_acc_dtype).unsqueeze(-1)
+            * (
+                flat_sender_strength[:, src_start:src_end]
+                .to(dtype=val_acc_dtype)
+                .unsqueeze(-1)
+                * flat_projected_val[:, src_start:src_end, :].to(dtype=val_acc_dtype)
+            ).unsqueeze(-2)
+        ).reshape(batch_flat, -1, out_dim)
+        scatter_index = best_indices.unsqueeze(-1).expand(-1, -1, -1, out_dim).reshape(
+            batch_flat, -1, out_dim
+        )
+        delta_val.scatter_add_(dim=1, index=scatter_index, src=val_contrib)
 
     return LayerDelta(
-        delta_state=_reshape_state(delta_state, batch_shape, dst_nodes),
-        delta_val=_reshape_val(delta_val, batch_shape, dst_nodes, out_dim),
+        delta_state=reshape_state(
+            delta_state.to(dtype=projected_state.dtype), batch_shape, dst_nodes
+        ),
+        delta_val=reshape_val(
+            delta_val.to(dtype=projected_val.dtype), batch_shape, dst_nodes, out_dim
+        ),
     )

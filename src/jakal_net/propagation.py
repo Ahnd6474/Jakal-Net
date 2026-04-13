@@ -11,14 +11,21 @@ from jakal_net.core import (
     Layer,
     LayerDelta,
     SparsePropagationType,
+    allocate_accumulator,
     apply_optional_layer_fn,
     iter_blocks,
-    resolve_accumulator_dtype,
     validate_implementation,
     validate_pairwise_block_scores,
     validate_pairwise_scores,
     validate_projected_state,
     validate_projected_val,
+)
+from jakal_net.kernel_common import (
+    build_topk_mask,
+    causal_window_mask,
+    gather_state_by_indices,
+    gather_val_by_indices,
+    select_topk,
 )
 from jakal_net.kernels import (
     propagation_dense_kernel,
@@ -26,54 +33,20 @@ from jakal_net.kernels import (
     propagation_window_kernel,
     supports_pairwise_kernel,
 )
+from jakal_net.native_backend import (
+    native_supports,
+    native_supports_device,
+    propagation_dense_native,
+    propagation_topk_native,
+    propagation_window_native,
+)
 
 
-def _causal_window_mask(
-    target_start: int,
-    target_end: int,
-    source_start: int,
-    source_end: int,
-    window: int,
-    *,
-    device: torch.device | None = None,
-) -> Tensor:
-    if window < 0:
-        raise ValueError("window must be non-negative.")
-    target_idx = torch.arange(target_start, target_end, device=device).unsqueeze(-1)
-    source_idx = torch.arange(source_start, source_end, device=device).unsqueeze(0)
-    return (source_idx <= target_idx) & (source_idx >= target_idx - window)
-
-
-def _topk_mask(scores: Tensor, topk: int) -> Tensor:
-    if topk <= 0:
-        raise ValueError("topk must be positive.")
-    k = min(topk, scores.shape[-1])
-    if k == scores.shape[-1]:
-        return torch.ones_like(scores, dtype=torch.bool)
-    indices = scores.topk(k=k, dim=-1).indices
-    mask = torch.zeros_like(scores, dtype=torch.bool)
-    mask.scatter_(-1, indices, True)
-    return mask
-
-
-def _gather_state_by_indices(projected_state: Tensor, indices: Tensor) -> Tensor:
-    target_nodes = indices.shape[-2]
-    source_nodes = projected_state.shape[-1]
-    expanded_state = projected_state.unsqueeze(-2).expand(
-        *projected_state.shape[:-1], target_nodes, source_nodes
-    )
-    return torch.take_along_dim(expanded_state, indices, dim=-1)
-
-
-def _gather_val_by_indices(projected_val: Tensor, indices: Tensor) -> Tensor:
-    target_nodes = indices.shape[-2]
-    source_nodes = projected_val.shape[-2]
-    dim = projected_val.shape[-1]
-    expanded_val = projected_val.unsqueeze(-3).expand(
-        *projected_val.shape[:-2], target_nodes, source_nodes, dim
-    )
-    gather_indices = indices.unsqueeze(-1).expand(*indices.shape, dim)
-    return torch.take_along_dim(expanded_val, gather_indices, dim=-2)
+def _native_edge_compress_name(edge_compress_fn: Callable[[Tensor], Tensor]) -> str | None:
+    name = getattr(edge_compress_fn, "__name__", "")
+    if edge_compress_fn is F.softsign or name == "softsign":
+        return "softsign"
+    return None
 
 
 class Propagation(nn.Module):
@@ -124,17 +97,17 @@ class Propagation(nn.Module):
     def _allocate_delta_buffers(
         self, layer: Layer, projected_state: Tensor, projected_val: Tensor
     ) -> tuple[Tensor, Tensor]:
-        state_acc_dtype = resolve_accumulator_dtype(
-            projected_state.dtype, self.accumulator_dtype
+        delta_state = allocate_accumulator(
+            layer.state.shape,
+            device=layer.state.device,
+            tensor_dtype=projected_state.dtype,
+            accumulator_dtype=self.accumulator_dtype,
         )
-        val_acc_dtype = resolve_accumulator_dtype(
-            projected_val.dtype, self.accumulator_dtype
-        )
-        delta_state = torch.zeros(
-            layer.state.shape, device=layer.state.device, dtype=state_acc_dtype
-        )
-        delta_val = torch.zeros(
-            layer.val.shape, device=layer.val.device, dtype=val_acc_dtype
+        delta_val = allocate_accumulator(
+            layer.val.shape,
+            device=layer.val.device,
+            tensor_dtype=projected_val.dtype,
+            accumulator_dtype=self.accumulator_dtype,
         )
         return delta_state, delta_val
 
@@ -189,10 +162,9 @@ class Propagation(nn.Module):
             delta_val=delta_val.to(projected_val.dtype),
         )
 
-    def compute_delta(self, layer: Layer) -> LayerDelta:
+    def _compute_delta_kernel_preferred(self, layer: Layer) -> LayerDelta:
         if (
             layer.val.device.type == "privateuseone"
-            and self.implementation != "reference"
             and supports_pairwise_kernel(self.pairwise_fn)
         ):
             projected_state, projected_val = self._project_inputs(layer)
@@ -202,20 +174,50 @@ class Propagation(nn.Module):
                 layer_val=layer.val,
                 projected_state=projected_state,
                 projected_val=projected_val,
+                target_block_size=self.target_block_size,
+                source_block_size=self.source_block_size,
+                accumulator_dtype=self.accumulator_dtype,
             )
-        if self.implementation == "reference":
-            return self._compute_delta_reference(layer)
-        if self.implementation == "kernel":
-            if supports_pairwise_kernel(self.pairwise_fn):
+        if supports_pairwise_kernel(self.pairwise_fn):
+            projected_state, projected_val = self._project_inputs(layer)
+            return propagation_dense_kernel(
+                pairwise_fn=self.pairwise_fn,
+                edge_compress_fn=self.edge_compress_fn,
+                layer_val=layer.val,
+                projected_state=projected_state,
+                projected_val=projected_val,
+                target_block_size=self.target_block_size,
+                source_block_size=self.source_block_size,
+                accumulator_dtype=self.accumulator_dtype,
+            )
+        return self._compute_delta_streaming(layer)
+
+    def compute_delta(self, layer: Layer) -> LayerDelta:
+        if self.implementation == "native":
+            edge_compress_name = _native_edge_compress_name(self.edge_compress_fn)
+            if (
+                edge_compress_name is not None
+                and supports_pairwise_kernel(self.pairwise_fn)
+                and native_supports("propagation_dense")
+                and native_supports_device(layer.val.device.type)
+            ):
                 projected_state, projected_val = self._project_inputs(layer)
-                return propagation_dense_kernel(
+                return propagation_dense_native(
                     pairwise_fn=self.pairwise_fn,
-                    edge_compress_fn=self.edge_compress_fn,
+                    edge_compress_name=edge_compress_name,
                     layer_val=layer.val,
                     projected_state=projected_state,
                     projected_val=projected_val,
+                    target_block_size=self.target_block_size or layer.num_nodes,
+                    source_block_size=self.source_block_size or layer.num_nodes,
                 )
-            return self._compute_delta_streaming(layer)
+            return self._compute_delta_kernel_preferred(layer)
+        if self.implementation == "reference":
+            return self._compute_delta_reference(layer)
+        if self.implementation == "kernel":
+            return self._compute_delta_kernel_preferred(layer)
+        if layer.val.device.type == "privateuseone":
+            return self._compute_delta_reference(layer)
         return self._compute_delta_streaming(layer)
 
     def forward(self, layer: Layer) -> LayerDelta | Layer:
@@ -276,7 +278,7 @@ class SparsePropagation(Propagation):
         edges = self.edge_compress_fn(scores)
 
         if self.sparse_type == "window":
-            mask_2d = _causal_window_mask(
+            mask_2d = causal_window_mask(
                 0,
                 layer.num_nodes,
                 0,
@@ -287,7 +289,7 @@ class SparsePropagation(Propagation):
             view_shape = (1,) * (scores.ndim - 2) + mask_2d.shape
             mask = mask_2d.view(view_shape)
         else:
-            mask = _topk_mask(scores, self.topk or layer.num_nodes)
+            mask = build_topk_mask(scores, self.topk or layer.num_nodes)
 
         masked_edges = edges * mask.to(dtype=edges.dtype)
         delta_state = torch.einsum("...ij,...j->...i", masked_edges, projected_state)
@@ -325,7 +327,7 @@ class SparsePropagation(Propagation):
                     target_nodes=target_end - target_start,
                     source_nodes=global_source_end - global_source_start,
                 )
-                mask_2d = _causal_window_mask(
+                mask_2d = causal_window_mask(
                     target_start,
                     target_end,
                     global_source_start,
@@ -410,7 +412,7 @@ class SparsePropagation(Propagation):
 
                 candidate_scores = torch.cat((best_scores, scores), dim=-1)
                 candidate_indices = torch.cat((best_indices, source_indices), dim=-1)
-                selected = candidate_scores.topk(k=k, dim=-1)
+                selected = select_topk(candidate_scores, k, dim=-1)
                 best_scores = selected.values
                 best_indices = torch.take_along_dim(
                     candidate_indices, selected.indices, dim=-1
@@ -420,8 +422,8 @@ class SparsePropagation(Propagation):
                 continue
 
             compressed_edges = self.edge_compress_fn(best_scores)
-            selected_state = _gather_state_by_indices(projected_state, best_indices)
-            selected_val = _gather_val_by_indices(projected_val, best_indices)
+            selected_state = gather_state_by_indices(projected_state, best_indices)
+            selected_val = gather_val_by_indices(projected_val, best_indices)
 
             delta_state[..., target_start:target_end] = (
                 compressed_edges.to(dtype=state_acc_dtype)
@@ -442,60 +444,100 @@ class SparsePropagation(Propagation):
             return self._compute_window_delta_streaming(layer)
         return self._compute_topk_delta_streaming(layer)
 
-    def compute_delta(self, layer: Layer) -> LayerDelta:
+    def _compute_delta_kernel_preferred(self, layer: Layer) -> LayerDelta:
         if layer.val.device.type == "privateuseone" and supports_pairwise_kernel(
             self.pairwise_fn
         ):
             projected_state, projected_val = self._project_inputs(layer)
             if self.sparse_type == "window":
-                if self.implementation != "reference":
-                    return propagation_window_kernel(
+                return propagation_window_kernel(
+                    pairwise_fn=self.pairwise_fn,
+                    edge_compress_fn=self.edge_compress_fn,
+                    layer_val=layer.val,
+                    projected_state=projected_state,
+                    projected_val=projected_val,
+                    window=self.window or 0,
+                    target_block_size=self.target_block_size,
+                    source_block_size=self.source_block_size,
+                    accumulator_dtype=self.accumulator_dtype,
+                )
+            return propagation_topk_kernel(
+                pairwise_fn=self.pairwise_fn,
+                edge_compress_fn=self.edge_compress_fn,
+                layer_val=layer.val,
+                projected_state=projected_state,
+                projected_val=projected_val,
+                topk=self.topk or layer.num_nodes,
+                target_block_size=self.target_block_size,
+                source_block_size=self.source_block_size,
+                accumulator_dtype=self.accumulator_dtype,
+            )
+        if supports_pairwise_kernel(self.pairwise_fn):
+            projected_state, projected_val = self._project_inputs(layer)
+            if self.sparse_type == "window":
+                return propagation_window_kernel(
+                    pairwise_fn=self.pairwise_fn,
+                    edge_compress_fn=self.edge_compress_fn,
+                    layer_val=layer.val,
+                    projected_state=projected_state,
+                    projected_val=projected_val,
+                    window=self.window or 0,
+                    target_block_size=self.target_block_size,
+                    source_block_size=self.source_block_size,
+                    accumulator_dtype=self.accumulator_dtype,
+                )
+            return propagation_topk_kernel(
+                pairwise_fn=self.pairwise_fn,
+                edge_compress_fn=self.edge_compress_fn,
+                layer_val=layer.val,
+                projected_state=projected_state,
+                projected_val=projected_val,
+                topk=self.topk or layer.num_nodes,
+                target_block_size=self.target_block_size,
+                source_block_size=self.source_block_size,
+                accumulator_dtype=self.accumulator_dtype,
+            )
+        return self._compute_delta_streaming(layer)
+
+    def compute_delta(self, layer: Layer) -> LayerDelta:
+        if self.implementation == "native":
+            edge_compress_name = _native_edge_compress_name(self.edge_compress_fn)
+            if (
+                edge_compress_name is not None
+                and supports_pairwise_kernel(self.pairwise_fn)
+                and native_supports_device(layer.val.device.type)
+            ):
+                projected_state, projected_val = self._project_inputs(layer)
+                if self.sparse_type == "window" and native_supports("propagation_window"):
+                    return propagation_window_native(
                         pairwise_fn=self.pairwise_fn,
-                        edge_compress_fn=self.edge_compress_fn,
+                        edge_compress_name=edge_compress_name,
                         layer_val=layer.val,
                         projected_state=projected_state,
                         projected_val=projected_val,
                         window=self.window or 0,
+                        target_block_size=self.target_block_size or layer.num_nodes,
+                        source_block_size=self.source_block_size or layer.num_nodes,
                     )
-            elif self.sparse_type == "topk":
-                if self.implementation != "reference":
-                    return propagation_topk_kernel(
+                if self.sparse_type == "topk" and native_supports("propagation_topk"):
+                    return propagation_topk_native(
                         pairwise_fn=self.pairwise_fn,
-                        edge_compress_fn=self.edge_compress_fn,
+                        edge_compress_name=edge_compress_name,
                         layer_val=layer.val,
                         projected_state=projected_state,
                         projected_val=projected_val,
                         topk=self.topk or layer.num_nodes,
+                        target_block_size=self.target_block_size or layer.num_nodes,
+                        source_block_size=self.source_block_size or layer.num_nodes,
                     )
-                return propagation_topk_kernel(
-                    pairwise_fn=self.pairwise_fn,
-                    edge_compress_fn=self.edge_compress_fn,
-                    layer_val=layer.val,
-                    projected_state=projected_state,
-                    projected_val=projected_val,
-                    topk=self.topk or layer.num_nodes,
-                )
+            return self._compute_delta_kernel_preferred(layer)
+        if layer.val.device.type == "privateuseone":
+            if self.sparse_type == "topk":
+                return self._compute_delta_kernel_preferred(layer)
+            if self.implementation == "streaming":
+                return self._compute_delta_reference(layer)
         if self.implementation == "reference":
             return self._compute_delta_reference(layer)
         if self.implementation == "kernel":
-            if supports_pairwise_kernel(self.pairwise_fn):
-                projected_state, projected_val = self._project_inputs(layer)
-                if self.sparse_type == "window":
-                    return propagation_window_kernel(
-                        pairwise_fn=self.pairwise_fn,
-                        edge_compress_fn=self.edge_compress_fn,
-                        layer_val=layer.val,
-                        projected_state=projected_state,
-                        projected_val=projected_val,
-                        window=self.window or 0,
-                    )
-                return propagation_topk_kernel(
-                    pairwise_fn=self.pairwise_fn,
-                    edge_compress_fn=self.edge_compress_fn,
-                    layer_val=layer.val,
-                    projected_state=projected_state,
-                    projected_val=projected_val,
-                    topk=self.topk or layer.num_nodes,
-                )
-            return self._compute_delta_streaming(layer)
+            return self._compute_delta_kernel_preferred(layer)
         return self._compute_delta_streaming(layer)

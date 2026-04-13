@@ -11,22 +11,28 @@ from jakal_net.core import (
     Layer,
     LayerDelta,
     MergeMode,
+    allocate_accumulator,
     apply_optional_layer_fn,
     iter_blocks,
-    resolve_accumulator_dtype,
     validate_implementation,
     validate_merge_mode,
     validate_projected_state,
     validate_route_block_logits,
     validate_route_logits,
 )
+from jakal_net.kernel_common import (
+    build_topk_mask,
+    masked_softmax,
+    select_topk,
+    supports_route_kernel,
+)
 from jakal_net.kernels import transition_dense_kernel, transition_topk_kernel
-
-
-def _masked_softmax(logits: Tensor, mask: Tensor, dim: int) -> Tensor:
-    masked_logits = torch.full_like(logits, torch.finfo(logits.dtype).min)
-    masked_logits = torch.where(mask, logits, masked_logits)
-    return torch.softmax(masked_logits, dim=dim)
+from jakal_net.native_backend import (
+    native_supports,
+    native_supports_device,
+    transition_dense_native,
+    transition_topk_native,
+)
 
 
 class Transition(nn.Module):
@@ -41,6 +47,7 @@ class Transition(nn.Module):
         merge_mode: MergeMode = "add",
         implementation: ImplementationMode = "streaming",
         src_block_size: int | None = 128,
+        dst_block_size: int | None = 128,
         accumulator_dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
@@ -54,6 +61,7 @@ class Transition(nn.Module):
         self.merge_mode = merge_mode
         self.implementation = implementation
         self.src_block_size = src_block_size
+        self.dst_block_size = dst_block_size
         self.accumulator_dtype = accumulator_dtype
 
     def compute_route_logits(self, src_layer: Layer, dst_layer: Layer) -> Tensor:
@@ -88,17 +96,17 @@ class Transition(nn.Module):
     def _allocate_delta_buffers(
         self, dst_layer: Layer, projected_val: Tensor, projected_state: Tensor
     ) -> tuple[Tensor, Tensor]:
-        state_acc_dtype = resolve_accumulator_dtype(
-            projected_state.dtype, self.accumulator_dtype
+        delta_state = allocate_accumulator(
+            dst_layer.state.shape,
+            device=dst_layer.state.device,
+            tensor_dtype=projected_state.dtype,
+            accumulator_dtype=self.accumulator_dtype,
         )
-        val_acc_dtype = resolve_accumulator_dtype(
-            projected_val.dtype, self.accumulator_dtype
-        )
-        delta_state = torch.zeros(
-            dst_layer.state.shape, device=dst_layer.state.device, dtype=state_acc_dtype
-        )
-        delta_val = torch.zeros(
-            dst_layer.val.shape, device=dst_layer.val.device, dtype=val_acc_dtype
+        delta_val = allocate_accumulator(
+            dst_layer.val.shape,
+            device=dst_layer.val.device,
+            tensor_dtype=projected_val.dtype,
+            accumulator_dtype=self.accumulator_dtype,
         )
         return delta_state, delta_val
 
@@ -153,10 +161,12 @@ class Transition(nn.Module):
             delta_val=delta_val.to(projected_val.dtype),
         )
 
-    def compute_delta(self, src_layer: Layer, dst_layer: Layer) -> LayerDelta:
-        if self.implementation == "reference":
+    def _compute_delta_kernel_preferred(
+        self, src_layer: Layer, dst_layer: Layer
+    ) -> LayerDelta:
+        if src_layer.val.device.type == "privateuseone":
             return self._compute_delta_reference(src_layer, dst_layer)
-        if self.implementation == "kernel":
+        if supports_route_kernel(self.route_fn):
             projected_val, projected_state, sender_strength = self._project_inputs(
                 src_layer, dst_layer
             )
@@ -167,7 +177,37 @@ class Transition(nn.Module):
                 projected_state=projected_state,
                 projected_val=projected_val,
                 dst_nodes=dst_layer.num_nodes,
+                src_block_size=self.src_block_size,
+                dst_block_size=self.dst_block_size,
+                accumulator_dtype=self.accumulator_dtype,
             )
+        return self._compute_delta_streaming(src_layer, dst_layer)
+
+    def compute_delta(self, src_layer: Layer, dst_layer: Layer) -> LayerDelta:
+        if self.implementation == "native":
+            if (
+                supports_route_kernel(self.route_fn)
+                and native_supports("transition_dense")
+                and native_supports_device(src_layer.val.device.type)
+            ):
+                projected_val, projected_state, sender_strength = self._project_inputs(
+                    src_layer, dst_layer
+                )
+                return transition_dense_native(
+                    route_fn=self.route_fn,
+                    sender_strength=sender_strength,
+                    src_val=src_layer.val,
+                    projected_state=projected_state,
+                    projected_val=projected_val,
+                    dst_nodes=dst_layer.num_nodes,
+                    src_block_size=self.src_block_size or src_layer.num_nodes,
+                    dst_block_size=self.dst_block_size or dst_layer.num_nodes,
+                )
+            return self._compute_delta_kernel_preferred(src_layer, dst_layer)
+        if self.implementation == "reference":
+            return self._compute_delta_reference(src_layer, dst_layer)
+        if self.implementation == "kernel":
+            return self._compute_delta_kernel_preferred(src_layer, dst_layer)
         return self._compute_delta_streaming(src_layer, dst_layer)
 
     def forward(self, src_layer: Layer, dst_layer: Layer) -> Layer:
@@ -189,6 +229,7 @@ class SparseTransition(Transition):
         merge_mode: MergeMode = "add",
         implementation: ImplementationMode = "streaming",
         src_block_size: int | None = 128,
+        dst_block_size: int | None = 128,
         accumulator_dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__(
@@ -200,6 +241,7 @@ class SparseTransition(Transition):
             merge_mode=merge_mode,
             implementation=implementation,
             src_block_size=src_block_size,
+            dst_block_size=dst_block_size,
             accumulator_dtype=accumulator_dtype,
         )
         if topk <= 0:
@@ -212,10 +254,8 @@ class SparseTransition(Transition):
         if k == dst_layer.num_nodes:
             routes = torch.softmax(logits, dim=-1)
         else:
-            indices = logits.topk(k=k, dim=-1).indices
-            mask = torch.zeros_like(logits, dtype=torch.bool)
-            mask.scatter_(-1, indices, True)
-            routes = _masked_softmax(logits, mask, dim=-1)
+            mask = build_topk_mask(logits, k, dim=-1)
+            routes = masked_softmax(logits, mask, dim=-1)
 
         projected_val, projected_state, sender_strength = self._project_inputs(
             src_layer, dst_layer
@@ -233,13 +273,13 @@ class SparseTransition(Transition):
         if k == dst_layer.num_nodes:
             routes = torch.softmax(logits, dim=-1)
         else:
-            topk_indices = logits.topk(k=k, dim=-1).indices
+            topk_indices = select_topk(logits, k, dim=-1).indices
             dst_index = torch.arange(
                 dst_layer.num_nodes, device=logits.device, dtype=topk_indices.dtype
             )
             dst_index = dst_index.view((1,) * topk_indices.ndim + (dst_layer.num_nodes,))
             mask = (topk_indices.unsqueeze(-1) == dst_index).any(dim=-2)
-            routes = _masked_softmax(logits, mask, dim=-1)
+            routes = masked_softmax(logits, mask, dim=-1)
 
         projected_val, projected_state, sender_strength = self._project_inputs(
             src_layer, dst_layer
@@ -275,7 +315,9 @@ class SparseTransition(Transition):
                 dst_nodes=dst_layer.num_nodes,
             )
 
-            topk_values, topk_indices = logits.topk(k=k, dim=-1)
+            topk_selected = select_topk(logits, k, dim=-1)
+            topk_values = topk_selected.values
+            topk_indices = topk_selected.indices
             routes = torch.softmax(topk_values, dim=-1)
             weighted_routes = routes * sender_strength[..., src_start:src_end].unsqueeze(-1)
 
@@ -310,12 +352,12 @@ class SparseTransition(Transition):
             delta_val=delta_val.to(projected_val.dtype),
         )
 
-    def compute_delta(self, src_layer: Layer, dst_layer: Layer) -> LayerDelta:
+    def _compute_delta_kernel_preferred(
+        self, src_layer: Layer, dst_layer: Layer
+    ) -> LayerDelta:
         if src_layer.val.device.type == "privateuseone":
             return self._compute_delta_directml_fallback(src_layer, dst_layer)
-        if self.implementation == "reference":
-            return self._compute_delta_reference(src_layer, dst_layer)
-        if self.implementation == "kernel":
+        if supports_route_kernel(self.route_fn):
             projected_val, projected_state, sender_strength = self._project_inputs(
                 src_layer, dst_layer
             )
@@ -327,5 +369,38 @@ class SparseTransition(Transition):
                 projected_val=projected_val,
                 dst_nodes=dst_layer.num_nodes,
                 topk=self.topk,
+                src_block_size=self.src_block_size,
+                dst_block_size=self.dst_block_size,
+                accumulator_dtype=self.accumulator_dtype,
             )
+        return self._compute_delta_streaming(src_layer, dst_layer)
+
+    def compute_delta(self, src_layer: Layer, dst_layer: Layer) -> LayerDelta:
+        if self.implementation == "native":
+            if (
+                supports_route_kernel(self.route_fn)
+                and native_supports("transition_topk")
+                and native_supports_device(src_layer.val.device.type)
+            ):
+                projected_val, projected_state, sender_strength = self._project_inputs(
+                    src_layer, dst_layer
+                )
+                return transition_topk_native(
+                    route_fn=self.route_fn,
+                    sender_strength=sender_strength,
+                    src_val=src_layer.val,
+                    projected_state=projected_state,
+                    projected_val=projected_val,
+                    dst_nodes=dst_layer.num_nodes,
+                    topk=self.topk,
+                    src_block_size=self.src_block_size or src_layer.num_nodes,
+                    dst_block_size=self.dst_block_size or dst_layer.num_nodes,
+                )
+            return self._compute_delta_kernel_preferred(src_layer, dst_layer)
+        if src_layer.val.device.type == "privateuseone":
+            return self._compute_delta_directml_fallback(src_layer, dst_layer)
+        if self.implementation == "reference":
+            return self._compute_delta_reference(src_layer, dst_layer)
+        if self.implementation == "kernel":
+            return self._compute_delta_kernel_preferred(src_layer, dst_layer)
         return self._compute_delta_streaming(src_layer, dst_layer)

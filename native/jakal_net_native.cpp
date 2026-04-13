@@ -1,0 +1,686 @@
+#include <algorithm>
+#include <numeric>
+#include <stdexcept>
+#include <string>
+#include <tuple>
+#include <vector>
+
+#include <torch/extension.h>
+
+namespace {
+
+int64_t product(const c10::IntArrayRef sizes, int64_t start, int64_t end) {
+  int64_t value = 1;
+  for (int64_t index = start; index < end; ++index) {
+    value *= sizes[index];
+  }
+  return value;
+}
+
+std::vector<int64_t> batch_shape(const torch::Tensor& tensor, int64_t trailing_dims) {
+  const auto dims = tensor.dim();
+  std::vector<int64_t> result;
+  result.reserve(std::max<int64_t>(0, dims - trailing_dims));
+  for (int64_t index = 0; index < dims - trailing_dims; ++index) {
+    result.push_back(tensor.size(index));
+  }
+  return result;
+}
+
+torch::Tensor flatten_state(const torch::Tensor& state) {
+  const auto flat_batch = product(state.sizes(), 0, state.dim() - 1);
+  return state.reshape({flat_batch, state.size(-1)});
+}
+
+torch::Tensor flatten_val(const torch::Tensor& val) {
+  const auto flat_batch = product(val.sizes(), 0, val.dim() - 2);
+  return val.reshape({flat_batch, val.size(-2), val.size(-1)});
+}
+
+torch::Tensor reshape_state(
+    const torch::Tensor& flat_state,
+    const std::vector<int64_t>& batch_sizes,
+    int64_t nodes) {
+  std::vector<int64_t> shape = batch_sizes;
+  shape.push_back(nodes);
+  return flat_state.reshape(shape);
+}
+
+torch::Tensor reshape_val(
+    const torch::Tensor& flat_val,
+    const std::vector<int64_t>& batch_sizes,
+    int64_t nodes,
+    int64_t dim) {
+  std::vector<int64_t> shape = batch_sizes;
+  shape.push_back(nodes);
+  shape.push_back(dim);
+  return flat_val.reshape(shape);
+}
+
+void require_cpu(const torch::Tensor& tensor, const std::string& name) {
+  if (!tensor.device().is_cpu()) {
+    throw std::runtime_error(name + " must be a CPU tensor in the native CPU backend.");
+  }
+}
+
+void require_known_edge_compress(const std::string& edge_compress_name) {
+  if (edge_compress_name != "softsign") {
+    throw std::runtime_error(
+        "Only edge_compress_name='softsign' is supported by the CPU native backend.");
+  }
+}
+
+torch::ScalarType accumulator_dtype(torch::ScalarType input_dtype) {
+  if (input_dtype == torch::kFloat16 || input_dtype == torch::kBFloat16) {
+    return torch::kFloat32;
+  }
+  return input_dtype;
+}
+
+torch::Tensor allocate_accumulator(
+    const std::vector<int64_t>& shape,
+    const torch::Tensor& reference,
+    torch::ScalarType dtype) {
+  return torch::zeros(shape, reference.options().dtype(dtype));
+}
+
+torch::Tensor softsign(const torch::Tensor& tensor) {
+  return tensor / (1 + tensor.abs());
+}
+
+torch::Tensor linear3d(
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    const c10::optional<torch::Tensor>& bias) {
+  auto output = torch::matmul(input, weight.transpose(0, 1));
+  if (bias.has_value()) {
+    output = output + bias.value().view({1, 1, -1});
+  }
+  return output;
+}
+
+c10::optional<torch::Tensor> slice_optional_tensor(
+    const c10::optional<torch::Tensor>& tensor,
+    int64_t start,
+    int64_t end) {
+  if (!tensor.has_value()) {
+    return c10::nullopt;
+  }
+  return tensor.value().slice(0, start, end).contiguous();
+}
+
+torch::Tensor pairwise_scores(
+    const std::string& pairwise_kind,
+    const torch::Tensor& target_val,
+    const torch::Tensor& source_val,
+    const torch::Tensor& weight,
+    const c10::optional<torch::Tensor>& bias) {
+  if (pairwise_kind == "diagonal_bilinear") {
+    auto target_proj = target_val * weight.view({1, 1, -1});
+    auto scores = torch::bmm(target_proj, source_val.transpose(1, 2));
+    if (bias.has_value()) {
+      scores = scores + bias.value();
+    }
+    return scores;
+  }
+
+  if (pairwise_kind == "bilinear") {
+    auto target_proj = torch::matmul(target_val, weight);
+    auto scores = torch::bmm(target_proj, source_val.transpose(1, 2));
+    if (bias.has_value()) {
+      scores = scores + bias.value();
+    }
+    return scores;
+  }
+
+  throw std::runtime_error("Unsupported pairwise kernel kind: " + pairwise_kind);
+}
+
+torch::Tensor prepare_route_context(
+    const std::string& route_kind,
+    const torch::Tensor& src_val,
+    const torch::Tensor& in_weight,
+    const c10::optional<torch::Tensor>& in_bias) {
+  if (route_kind == "linear") {
+    return src_val;
+  }
+  if (route_kind == "mlp") {
+    auto hidden = linear3d(src_val, in_weight, in_bias);
+    return hidden * torch::sigmoid(hidden);
+  }
+  throw std::runtime_error("Unsupported route kernel kind: " + route_kind);
+}
+
+torch::Tensor route_block_logits(
+    const std::string& route_kind,
+    const torch::Tensor& route_context,
+    const torch::Tensor& in_weight,
+    const c10::optional<torch::Tensor>& in_bias,
+    const c10::optional<torch::Tensor>& out_weight,
+    const c10::optional<torch::Tensor>& out_bias,
+    int64_t start,
+    int64_t end) {
+  if (route_kind == "linear") {
+    auto weight_slice = in_weight.slice(0, start, end).contiguous();
+    auto bias_slice = slice_optional_tensor(in_bias, start, end);
+    return linear3d(route_context, weight_slice, bias_slice);
+  }
+  if (route_kind == "mlp") {
+    if (!out_weight.has_value()) {
+      throw std::runtime_error("MLP route kernel is missing output weight.");
+    }
+    auto weight_slice = out_weight.value().slice(0, start, end).contiguous();
+    auto bias_slice = slice_optional_tensor(out_bias, start, end);
+    return linear3d(route_context, weight_slice, bias_slice);
+  }
+  throw std::runtime_error("Unsupported route kernel kind: " + route_kind);
+}
+
+torch::Tensor causal_window_mask(
+    int64_t target_start,
+    int64_t target_end,
+    int64_t source_start,
+    int64_t source_end,
+    int64_t window,
+    torch::Device device) {
+  auto options = torch::TensorOptions().dtype(torch::kLong).device(device);
+  auto target_index = torch::arange(target_start, target_end, options).unsqueeze(-1);
+  auto source_index = torch::arange(source_start, source_end, options).unsqueeze(0);
+  return source_index.le(target_index) & source_index.ge(target_index - window);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> gather_by_indices(
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    const torch::Tensor& indices) {
+  const auto batch_flat = projected_state.size(0);
+  const auto target_nodes = indices.size(1);
+  const auto source_nodes = projected_state.size(1);
+  const auto out_dim = projected_val.size(2);
+
+  auto expanded_state =
+      projected_state.unsqueeze(1).expand({batch_flat, target_nodes, source_nodes});
+  auto gathered_state = expanded_state.gather(2, indices);
+
+  auto expanded_val =
+      projected_val.unsqueeze(1).expand({batch_flat, target_nodes, source_nodes, out_dim});
+  auto gather_index =
+      indices.unsqueeze(-1).expand({batch_flat, target_nodes, indices.size(2), out_dim});
+  auto gathered_val = expanded_val.gather(2, gather_index);
+  return {gathered_state, gathered_val};
+}
+
+std::vector<std::string> supported_ops() {
+  return {
+      "propagation_dense",
+      "propagation_window",
+      "propagation_topk",
+      "transition_dense",
+      "transition_topk",
+  };
+}
+
+std::vector<std::string> supported_devices() {
+  return {"cpu"};
+}
+
+std::string backend_name() {
+  return "aten_cpp_cpu";
+}
+
+std::tuple<torch::Tensor, torch::Tensor> propagation_dense(
+    const std::string& pairwise_kind,
+    const torch::Tensor& weight,
+    const c10::optional<torch::Tensor>& bias,
+    const std::string& edge_compress_name,
+    const torch::Tensor& layer_val,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    int64_t target_block_size,
+    int64_t source_block_size) {
+  require_known_edge_compress(edge_compress_name);
+  require_cpu(layer_val, "layer_val");
+  require_cpu(projected_state, "projected_state");
+  require_cpu(projected_val, "projected_val");
+
+  auto batch_sizes = batch_shape(layer_val, 2);
+  auto flat_val = flatten_val(layer_val).contiguous();
+  auto flat_projected_state = flatten_state(projected_state).contiguous();
+  auto flat_projected_val = flatten_val(projected_val).contiguous();
+  const auto batch_flat = flat_val.size(0);
+  const auto num_nodes = flat_val.size(1);
+  const auto out_dim = flat_projected_val.size(2);
+
+  const auto state_acc_dtype = accumulator_dtype(projected_state.scalar_type());
+  const auto val_acc_dtype = accumulator_dtype(projected_val.scalar_type());
+  std::vector<torch::Tensor> state_blocks;
+  std::vector<torch::Tensor> val_blocks;
+
+  const auto target_step = target_block_size <= 0 ? num_nodes : std::min(target_block_size, num_nodes);
+  const auto source_step = source_block_size <= 0 ? num_nodes : std::min(source_block_size, num_nodes);
+
+  for (int64_t target_start = 0; target_start < num_nodes; target_start += target_step) {
+    const auto target_end = std::min(target_start + target_step, num_nodes);
+    auto target_val = flat_val.slice(1, target_start, target_end);
+    auto target_state_acc = allocate_accumulator(
+        {batch_flat, target_end - target_start}, flat_projected_state, state_acc_dtype);
+    auto target_val_acc = allocate_accumulator(
+        {batch_flat, target_end - target_start, out_dim}, flat_projected_val, val_acc_dtype);
+
+    for (int64_t source_start = 0; source_start < num_nodes; source_start += source_step) {
+      const auto source_end = std::min(source_start + source_step, num_nodes);
+      auto source_val = flat_val.slice(1, source_start, source_end);
+      auto scores = pairwise_scores(pairwise_kind, target_val, source_val, weight, bias);
+      auto edges = softsign(scores);
+      auto state_edges = edges.to(state_acc_dtype);
+      auto val_edges = edges.to(val_acc_dtype);
+      auto source_state =
+          flat_projected_state.slice(1, source_start, source_end).to(state_acc_dtype);
+      auto source_proj_val =
+          flat_projected_val.slice(1, source_start, source_end).to(val_acc_dtype);
+
+      target_state_acc = target_state_acc +
+                         torch::bmm(state_edges, source_state.unsqueeze(-1)).squeeze(-1);
+      target_val_acc = target_val_acc + torch::bmm(val_edges, source_proj_val);
+    }
+
+    state_blocks.push_back(target_state_acc.to(projected_state.scalar_type()));
+    val_blocks.push_back(target_val_acc.to(projected_val.scalar_type()));
+  }
+
+  return {
+      reshape_state(torch::cat(state_blocks, 1), batch_sizes, num_nodes),
+      reshape_val(torch::cat(val_blocks, 1), batch_sizes, num_nodes, out_dim),
+  };
+}
+
+std::tuple<torch::Tensor, torch::Tensor> propagation_window(
+    const std::string& pairwise_kind,
+    const torch::Tensor& weight,
+    const c10::optional<torch::Tensor>& bias,
+    const std::string& edge_compress_name,
+    const torch::Tensor& layer_val,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    int64_t window,
+    int64_t target_block_size,
+    int64_t source_block_size) {
+  require_known_edge_compress(edge_compress_name);
+  require_cpu(layer_val, "layer_val");
+  require_cpu(projected_state, "projected_state");
+  require_cpu(projected_val, "projected_val");
+  if (window < 0) {
+    throw std::runtime_error("window must be non-negative.");
+  }
+
+  auto batch_sizes = batch_shape(layer_val, 2);
+  auto flat_val = flatten_val(layer_val).contiguous();
+  auto flat_projected_state = flatten_state(projected_state).contiguous();
+  auto flat_projected_val = flatten_val(projected_val).contiguous();
+  const auto batch_flat = flat_val.size(0);
+  const auto num_nodes = flat_val.size(1);
+  const auto out_dim = flat_projected_val.size(2);
+
+  const auto state_acc_dtype = accumulator_dtype(projected_state.scalar_type());
+  const auto val_acc_dtype = accumulator_dtype(projected_val.scalar_type());
+  std::vector<torch::Tensor> state_blocks;
+  std::vector<torch::Tensor> val_blocks;
+
+  const auto target_step = target_block_size <= 0 ? num_nodes : std::min(target_block_size, num_nodes);
+  const auto source_step = source_block_size <= 0 ? num_nodes : std::min(source_block_size, num_nodes);
+
+  for (int64_t target_start = 0; target_start < num_nodes; target_start += target_step) {
+    const auto target_end = std::min(target_start + target_step, num_nodes);
+    auto target_val = flat_val.slice(1, target_start, target_end);
+    const auto source_floor = std::max<int64_t>(0, target_start - window);
+    const auto source_ceiling = target_end;
+    auto target_state_acc = allocate_accumulator(
+        {batch_flat, target_end - target_start}, flat_projected_state, state_acc_dtype);
+    auto target_val_acc = allocate_accumulator(
+        {batch_flat, target_end - target_start, out_dim}, flat_projected_val, val_acc_dtype);
+
+    for (int64_t source_start = source_floor; source_start < source_ceiling; source_start += source_step) {
+      const auto source_end = std::min(source_start + source_step, source_ceiling);
+      auto source_val = flat_val.slice(1, source_start, source_end);
+      auto scores = pairwise_scores(pairwise_kind, target_val, source_val, weight, bias);
+      auto mask = causal_window_mask(
+                      target_start, target_end, source_start, source_end, window, layer_val.device())
+                      .unsqueeze(0)
+                      .to(scores.scalar_type());
+      auto edges = softsign(scores) * mask;
+      auto state_edges = edges.to(state_acc_dtype);
+      auto val_edges = edges.to(val_acc_dtype);
+      auto source_state =
+          flat_projected_state.slice(1, source_start, source_end).to(state_acc_dtype);
+      auto source_proj_val =
+          flat_projected_val.slice(1, source_start, source_end).to(val_acc_dtype);
+
+      target_state_acc = target_state_acc +
+                         torch::bmm(state_edges, source_state.unsqueeze(-1)).squeeze(-1);
+      target_val_acc = target_val_acc + torch::bmm(val_edges, source_proj_val);
+    }
+
+    state_blocks.push_back(target_state_acc.to(projected_state.scalar_type()));
+    val_blocks.push_back(target_val_acc.to(projected_val.scalar_type()));
+  }
+
+  return {
+      reshape_state(torch::cat(state_blocks, 1), batch_sizes, num_nodes),
+      reshape_val(torch::cat(val_blocks, 1), batch_sizes, num_nodes, out_dim),
+  };
+}
+
+std::tuple<torch::Tensor, torch::Tensor> propagation_topk(
+    const std::string& pairwise_kind,
+    const torch::Tensor& weight,
+    const c10::optional<torch::Tensor>& bias,
+    const std::string& edge_compress_name,
+    const torch::Tensor& layer_val,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    int64_t topk,
+    int64_t target_block_size,
+    int64_t source_block_size) {
+  require_known_edge_compress(edge_compress_name);
+  require_cpu(layer_val, "layer_val");
+  require_cpu(projected_state, "projected_state");
+  require_cpu(projected_val, "projected_val");
+  if (topk <= 0) {
+    throw std::runtime_error("topk must be positive.");
+  }
+
+  auto batch_sizes = batch_shape(layer_val, 2);
+  auto flat_val = flatten_val(layer_val).contiguous();
+  auto flat_projected_state = flatten_state(projected_state).contiguous();
+  auto flat_projected_val = flatten_val(projected_val).contiguous();
+  const auto batch_flat = flat_val.size(0);
+  const auto num_nodes = flat_val.size(1);
+  const auto out_dim = flat_projected_val.size(2);
+  const auto k = std::min<int64_t>(topk, num_nodes);
+
+  if (k == num_nodes) {
+    return propagation_dense(
+        pairwise_kind,
+        weight,
+        bias,
+        edge_compress_name,
+        layer_val,
+        projected_state,
+        projected_val,
+        target_block_size,
+        source_block_size);
+  }
+
+  const auto state_acc_dtype = accumulator_dtype(projected_state.scalar_type());
+  const auto val_acc_dtype = accumulator_dtype(projected_val.scalar_type());
+  std::vector<torch::Tensor> state_blocks;
+  std::vector<torch::Tensor> val_blocks;
+
+  const auto target_step = target_block_size <= 0 ? num_nodes : std::min(target_block_size, num_nodes);
+  const auto source_step = source_block_size <= 0 ? num_nodes : std::min(source_block_size, num_nodes);
+
+  for (int64_t target_start = 0; target_start < num_nodes; target_start += target_step) {
+    const auto target_end = std::min(target_start + target_step, num_nodes);
+    const auto target_nodes = target_end - target_start;
+    auto target_val = flat_val.slice(1, target_start, target_end);
+    auto best_scores = torch::full(
+        {batch_flat, target_nodes, k},
+        -std::numeric_limits<float>::infinity(),
+        flat_val.options());
+    auto best_indices = torch::zeros(
+        {batch_flat, target_nodes, k},
+        flat_val.options().dtype(torch::kLong));
+
+    for (int64_t source_start = 0; source_start < num_nodes; source_start += source_step) {
+      const auto source_end = std::min(source_start + source_step, num_nodes);
+      auto source_val = flat_val.slice(1, source_start, source_end);
+      auto scores = pairwise_scores(pairwise_kind, target_val, source_val, weight, bias);
+      auto source_indices = torch::arange(
+                                source_start,
+                                source_end,
+                                flat_val.options().dtype(torch::kLong))
+                                .view({1, 1, source_end - source_start})
+                                .expand({batch_flat, target_nodes, source_end - source_start});
+      auto candidate_scores = torch::cat({best_scores, scores}, -1);
+      auto candidate_indices = torch::cat({best_indices, source_indices}, -1);
+      auto topk_result = candidate_scores.topk(k, -1, true, true);
+      best_scores = std::get<0>(topk_result);
+      best_indices = candidate_indices.gather(-1, std::get<1>(topk_result));
+    }
+
+    auto gathered = gather_by_indices(flat_projected_state, flat_projected_val, best_indices);
+    auto selected_state = std::get<0>(gathered);
+    auto selected_val = std::get<1>(gathered);
+    auto edges = softsign(best_scores);
+    auto state_block =
+        (edges.to(state_acc_dtype) * selected_state.to(state_acc_dtype)).sum(-1);
+    auto val_block =
+        (edges.to(val_acc_dtype).unsqueeze(-1) * selected_val.to(val_acc_dtype)).sum(-2);
+    state_blocks.push_back(state_block.to(projected_state.scalar_type()));
+    val_blocks.push_back(val_block.to(projected_val.scalar_type()));
+  }
+
+  return {
+      reshape_state(torch::cat(state_blocks, 1), batch_sizes, num_nodes),
+      reshape_val(torch::cat(val_blocks, 1), batch_sizes, num_nodes, out_dim),
+  };
+}
+
+std::tuple<torch::Tensor, torch::Tensor> transition_dense(
+    const std::string& route_kind,
+    const torch::Tensor& in_weight,
+    const c10::optional<torch::Tensor>& in_bias,
+    const c10::optional<torch::Tensor>& out_weight,
+    const c10::optional<torch::Tensor>& out_bias,
+    const torch::Tensor& sender_strength,
+    const torch::Tensor& src_val,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    int64_t dst_nodes,
+    int64_t src_block_size,
+    int64_t dst_block_size) {
+  require_cpu(sender_strength, "sender_strength");
+  require_cpu(src_val, "src_val");
+  require_cpu(projected_state, "projected_state");
+  require_cpu(projected_val, "projected_val");
+
+  auto batch_sizes = batch_shape(src_val, 2);
+  auto flat_src_val = flatten_val(src_val).contiguous();
+  auto flat_sender_strength = flatten_state(sender_strength).contiguous();
+  auto flat_projected_state = flatten_state(projected_state).contiguous();
+  auto flat_projected_val = flatten_val(projected_val).contiguous();
+  const auto batch_flat = flat_src_val.size(0);
+  const auto src_nodes = flat_src_val.size(1);
+  const auto out_dim = flat_projected_val.size(2);
+
+  const auto state_acc_dtype = accumulator_dtype(projected_state.scalar_type());
+  const auto val_acc_dtype = accumulator_dtype(projected_val.scalar_type());
+  auto delta_state = allocate_accumulator({batch_flat, dst_nodes}, flat_projected_state, state_acc_dtype);
+  auto delta_val = allocate_accumulator({batch_flat, dst_nodes, out_dim}, flat_projected_val, val_acc_dtype);
+
+  const auto src_step = src_block_size <= 0 ? src_nodes : std::min(src_block_size, src_nodes);
+  const auto dst_step = dst_block_size <= 0 ? dst_nodes : std::min(dst_block_size, dst_nodes);
+
+  for (int64_t src_start = 0; src_start < src_nodes; src_start += src_step) {
+    const auto src_end = std::min(src_start + src_step, src_nodes);
+    const auto block_nodes = src_end - src_start;
+    auto src_block = flat_src_val.slice(1, src_start, src_end);
+    auto route_context = prepare_route_context(route_kind, src_block, in_weight, in_bias);
+
+    torch::Tensor running_max;
+    torch::Tensor running_sum;
+    bool initialized = false;
+
+    for (int64_t dst_start = 0; dst_start < dst_nodes; dst_start += dst_step) {
+      const auto dst_end = std::min(dst_start + dst_step, dst_nodes);
+      auto logits = route_block_logits(
+          route_kind, route_context, in_weight, in_bias, out_weight, out_bias, dst_start, dst_end);
+      auto block_max = std::get<0>(logits.max(-1));
+      auto block_exp = torch::exp(logits - block_max.unsqueeze(-1));
+      auto block_sum = block_exp.sum(-1);
+
+      if (!initialized) {
+        running_max = block_max;
+        running_sum = block_sum;
+        initialized = true;
+      } else {
+        auto next_max = torch::maximum(running_max, block_max);
+        auto running_scale = torch::exp(running_max - next_max);
+        auto block_scale = torch::exp(block_max - next_max);
+        running_sum = running_sum * running_scale + block_sum * block_scale;
+        running_max = next_max;
+      }
+    }
+
+    auto state_sender =
+        (flat_sender_strength.slice(1, src_start, src_end).to(state_acc_dtype) *
+         flat_projected_state.slice(1, src_start, src_end).to(state_acc_dtype));
+    auto val_sender =
+        (flat_sender_strength.slice(1, src_start, src_end).to(val_acc_dtype).unsqueeze(-1) *
+         flat_projected_val.slice(1, src_start, src_end).to(val_acc_dtype));
+
+    for (int64_t dst_start = 0; dst_start < dst_nodes; dst_start += dst_step) {
+      const auto dst_end = std::min(dst_start + dst_step, dst_nodes);
+      auto logits = route_block_logits(
+          route_kind, route_context, in_weight, in_bias, out_weight, out_bias, dst_start, dst_end);
+      auto routes = torch::exp(logits - running_max.unsqueeze(-1)) / running_sum.unsqueeze(-1);
+      auto transport = routes.transpose(1, 2).contiguous();
+      delta_state.slice(1, dst_start, dst_end) =
+          delta_state.slice(1, dst_start, dst_end) +
+          torch::bmm(transport.to(state_acc_dtype), state_sender.unsqueeze(-1)).squeeze(-1);
+      delta_val.slice(1, dst_start, dst_end) =
+          delta_val.slice(1, dst_start, dst_end) +
+          torch::bmm(transport.to(val_acc_dtype), val_sender);
+    }
+  }
+
+  return {
+      reshape_state(delta_state.to(projected_state.scalar_type()), batch_sizes, dst_nodes),
+      reshape_val(delta_val.to(projected_val.scalar_type()), batch_sizes, dst_nodes, out_dim),
+  };
+}
+
+std::tuple<torch::Tensor, torch::Tensor> transition_topk(
+    const std::string& route_kind,
+    const torch::Tensor& in_weight,
+    const c10::optional<torch::Tensor>& in_bias,
+    const c10::optional<torch::Tensor>& out_weight,
+    const c10::optional<torch::Tensor>& out_bias,
+    const torch::Tensor& sender_strength,
+    const torch::Tensor& src_val,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    int64_t dst_nodes,
+    int64_t topk,
+    int64_t src_block_size,
+    int64_t dst_block_size) {
+  require_cpu(sender_strength, "sender_strength");
+  require_cpu(src_val, "src_val");
+  require_cpu(projected_state, "projected_state");
+  require_cpu(projected_val, "projected_val");
+  if (topk <= 0) {
+    throw std::runtime_error("topk must be positive.");
+  }
+
+  const auto k = std::min<int64_t>(topk, dst_nodes);
+  if (k == dst_nodes) {
+    return transition_dense(
+        route_kind,
+        in_weight,
+        in_bias,
+        out_weight,
+        out_bias,
+        sender_strength,
+        src_val,
+        projected_state,
+        projected_val,
+        dst_nodes,
+        src_block_size,
+        dst_block_size);
+  }
+
+  auto batch_sizes = batch_shape(src_val, 2);
+  auto flat_src_val = flatten_val(src_val).contiguous();
+  auto flat_sender_strength = flatten_state(sender_strength).contiguous();
+  auto flat_projected_state = flatten_state(projected_state).contiguous();
+  auto flat_projected_val = flatten_val(projected_val).contiguous();
+  const auto batch_flat = flat_src_val.size(0);
+  const auto src_nodes = flat_src_val.size(1);
+  const auto out_dim = flat_projected_val.size(2);
+
+  const auto state_acc_dtype = accumulator_dtype(projected_state.scalar_type());
+  const auto val_acc_dtype = accumulator_dtype(projected_val.scalar_type());
+  auto delta_state = allocate_accumulator({batch_flat, dst_nodes}, flat_projected_state, state_acc_dtype);
+  auto delta_val = allocate_accumulator({batch_flat, dst_nodes, out_dim}, flat_projected_val, val_acc_dtype);
+
+  const auto src_step = src_block_size <= 0 ? src_nodes : std::min(src_block_size, src_nodes);
+  const auto dst_step = dst_block_size <= 0 ? dst_nodes : std::min(dst_block_size, dst_nodes);
+
+  for (int64_t src_start = 0; src_start < src_nodes; src_start += src_step) {
+    const auto src_end = std::min(src_start + src_step, src_nodes);
+    const auto block_nodes = src_end - src_start;
+    auto src_block = flat_src_val.slice(1, src_start, src_end);
+    auto route_context = prepare_route_context(route_kind, src_block, in_weight, in_bias);
+    auto best_values = torch::full(
+        {batch_flat, block_nodes, k},
+        -std::numeric_limits<float>::infinity(),
+        flat_src_val.options());
+    auto best_indices = torch::zeros(
+        {batch_flat, block_nodes, k},
+        flat_src_val.options().dtype(torch::kLong));
+
+    for (int64_t dst_start = 0; dst_start < dst_nodes; dst_start += dst_step) {
+      const auto dst_end = std::min(dst_start + dst_step, dst_nodes);
+      auto logits = route_block_logits(
+          route_kind, route_context, in_weight, in_bias, out_weight, out_bias, dst_start, dst_end);
+      auto block_indices = torch::arange(
+                               dst_start,
+                               dst_end,
+                               flat_src_val.options().dtype(torch::kLong))
+                               .view({1, 1, dst_end - dst_start})
+                               .expand({batch_flat, block_nodes, dst_end - dst_start});
+      auto candidate_values = torch::cat({best_values, logits}, -1);
+      auto candidate_indices = torch::cat({best_indices, block_indices}, -1);
+      auto topk_result = candidate_values.topk(k, -1, true, true);
+      best_values = std::get<0>(topk_result);
+      best_indices = candidate_indices.gather(-1, std::get<1>(topk_result));
+    }
+
+    auto routes = torch::softmax(best_values, -1);
+    auto state_sender =
+        (flat_sender_strength.slice(1, src_start, src_end).to(state_acc_dtype) *
+         flat_projected_state.slice(1, src_start, src_end).to(state_acc_dtype))
+            .unsqueeze(-1);
+    auto state_contrib = (routes.to(state_acc_dtype) * state_sender).reshape({batch_flat, -1});
+    delta_state.scatter_add_(1, best_indices.reshape({batch_flat, -1}), state_contrib);
+
+    auto val_sender =
+        (flat_sender_strength.slice(1, src_start, src_end).to(val_acc_dtype).unsqueeze(-1) *
+         flat_projected_val.slice(1, src_start, src_end).to(val_acc_dtype))
+            .unsqueeze(-2);
+    auto val_contrib =
+        (routes.to(val_acc_dtype).unsqueeze(-1) * val_sender).reshape({batch_flat, -1, out_dim});
+    auto scatter_index =
+        best_indices.unsqueeze(-1).expand({batch_flat, block_nodes, k, out_dim}).reshape(
+            {batch_flat, -1, out_dim});
+    delta_val.scatter_add_(1, scatter_index, val_contrib);
+  }
+
+  return {
+      reshape_state(delta_state.to(projected_state.scalar_type()), batch_sizes, dst_nodes),
+      reshape_val(delta_val.to(projected_val.scalar_type()), batch_sizes, dst_nodes, out_dim),
+  };
+}
+
+}  // namespace
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("supported_ops", &supported_ops, "List supported native ops");
+  m.def("supported_devices", &supported_devices, "List supported native devices");
+  m.def("backend_name", &backend_name, "Return native backend name");
+  m.def("propagation_dense", &propagation_dense, "Native dense propagation");
+  m.def("propagation_window", &propagation_window, "Native window propagation");
+  m.def("propagation_topk", &propagation_topk, "Native top-k propagation");
+  m.def("transition_dense", &transition_dense, "Native dense transition");
+  m.def("transition_topk", &transition_topk, "Native sparse transition");
+}

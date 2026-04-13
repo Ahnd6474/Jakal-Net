@@ -8,7 +8,23 @@ from torch import Tensor
 
 MergeMode = Literal["add", "replace"]
 SparsePropagationType = Literal["window", "topk"]
-ImplementationMode = Literal["reference", "streaming", "kernel"]
+ImplementationMode = Literal["reference", "streaming", "kernel", "native"]
+
+
+@dataclass(frozen=True, slots=True)
+class BlockSpan:
+    start: int
+    end: int
+
+    def __post_init__(self) -> None:
+        if self.start < 0:
+            raise ValueError("BlockSpan.start must be non-negative.")
+        if self.end < self.start:
+            raise ValueError("BlockSpan.end must be greater than or equal to start.")
+
+    @property
+    def size(self) -> int:
+        return self.end - self.start
 
 
 @dataclass(slots=True)
@@ -121,7 +137,7 @@ def validate_merge_mode(merge_mode: MergeMode) -> None:
 
 
 def validate_implementation(implementation: ImplementationMode) -> None:
-    if implementation not in {"reference", "streaming", "kernel"}:
+    if implementation not in {"reference", "streaming", "kernel", "native"}:
         raise ValueError(f"Unsupported implementation: {implementation!r}.")
 
 
@@ -211,9 +227,16 @@ def resolve_block_size(block_size: int | None, total_size: int, *, name: str) ->
 
 
 def iter_blocks(total_size: int, block_size: int | None, *, name: str) -> Iterator[tuple[int, int]]:
+    for span in iter_block_spans(total_size, block_size, name=name):
+        yield span.start, span.end
+
+
+def iter_block_spans(
+    total_size: int, block_size: int | None, *, name: str
+) -> Iterator[BlockSpan]:
     resolved = resolve_block_size(block_size, total_size, name=name)
     for start in range(0, total_size, resolved):
-        yield start, min(start + resolved, total_size)
+        yield BlockSpan(start=start, end=min(start + resolved, total_size))
 
 
 def resolve_accumulator_dtype(
@@ -224,3 +247,14 @@ def resolve_accumulator_dtype(
     if tensor_dtype in {torch.float16, torch.bfloat16}:
         return torch.float32
     return tensor_dtype
+
+
+def allocate_accumulator(
+    shape: torch.Size | tuple[int, ...],
+    *,
+    device: torch.device | str,
+    tensor_dtype: torch.dtype,
+    accumulator_dtype: torch.dtype | None = None,
+) -> Tensor:
+    dtype = resolve_accumulator_dtype(tensor_dtype, accumulator_dtype)
+    return torch.zeros(shape, device=device, dtype=dtype)
