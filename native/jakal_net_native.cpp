@@ -7,6 +7,21 @@
 
 #include <torch/extension.h>
 
+#if __has_include(<torch/cuda.h>)
+#include <torch/cuda.h>
+#define JAKAL_NET_HAS_TORCH_CUDA_HEADER 1
+#else
+#define JAKAL_NET_HAS_TORCH_CUDA_HEADER 0
+#endif
+
+#include "jakal_net_native_cuda.h"
+
+#ifndef WITH_CUDA
+bool jakal_net_compiled_with_cuda_source() {
+  return false;
+}
+#endif
+
 namespace {
 
 int64_t product(const c10::IntArrayRef sizes, int64_t start, int64_t end) {
@@ -57,9 +72,18 @@ torch::Tensor reshape_val(
   return flat_val.reshape(shape);
 }
 
-void require_cpu(const torch::Tensor& tensor, const std::string& name) {
-  if (!tensor.device().is_cpu()) {
-    throw std::runtime_error(name + " must be a CPU tensor in the native CPU backend.");
+bool supports_cuda_runtime() {
+#if JAKAL_NET_HAS_TORCH_CUDA_HEADER
+  return torch::cuda::is_available();
+#else
+  return false;
+#endif
+}
+
+void require_supported_device(const torch::Tensor& tensor, const std::string& name) {
+  if (!tensor.device().is_cpu() && !tensor.device().is_cuda()) {
+    throw std::runtime_error(
+        name + " must be a CPU or CUDA tensor in the native backend.");
   }
 }
 
@@ -221,10 +245,20 @@ std::vector<std::string> supported_ops() {
 }
 
 std::vector<std::string> supported_devices() {
-  return {"cpu"};
+  auto devices = std::vector<std::string>{"cpu"};
+  if (supports_cuda_runtime()) {
+    devices.push_back("cuda");
+  }
+  return devices;
 }
 
 std::string backend_name() {
+  if (supports_cuda_runtime()) {
+    if (jakal_net_compiled_with_cuda_source()) {
+      return "aten_cpp_cuda";
+    }
+    return "aten_cpp_dispatch_cuda";
+  }
   return "aten_cpp_cpu";
 }
 
@@ -239,9 +273,9 @@ std::tuple<torch::Tensor, torch::Tensor> propagation_dense(
     int64_t target_block_size,
     int64_t source_block_size) {
   require_known_edge_compress(edge_compress_name);
-  require_cpu(layer_val, "layer_val");
-  require_cpu(projected_state, "projected_state");
-  require_cpu(projected_val, "projected_val");
+  require_supported_device(layer_val, "layer_val");
+  require_supported_device(projected_state, "projected_state");
+  require_supported_device(projected_val, "projected_val");
 
   auto batch_sizes = batch_shape(layer_val, 2);
   auto flat_val = flatten_val(layer_val).contiguous();
@@ -306,9 +340,9 @@ std::tuple<torch::Tensor, torch::Tensor> propagation_window(
     int64_t target_block_size,
     int64_t source_block_size) {
   require_known_edge_compress(edge_compress_name);
-  require_cpu(layer_val, "layer_val");
-  require_cpu(projected_state, "projected_state");
-  require_cpu(projected_val, "projected_val");
+  require_supported_device(layer_val, "layer_val");
+  require_supported_device(projected_state, "projected_state");
+  require_supported_device(projected_val, "projected_val");
   if (window < 0) {
     throw std::runtime_error("window must be non-negative.");
   }
@@ -382,9 +416,9 @@ std::tuple<torch::Tensor, torch::Tensor> propagation_topk(
     int64_t target_block_size,
     int64_t source_block_size) {
   require_known_edge_compress(edge_compress_name);
-  require_cpu(layer_val, "layer_val");
-  require_cpu(projected_state, "projected_state");
-  require_cpu(projected_val, "projected_val");
+  require_supported_device(layer_val, "layer_val");
+  require_supported_device(projected_state, "projected_state");
+  require_supported_device(projected_val, "projected_val");
   if (topk <= 0) {
     throw std::runtime_error("topk must be positive.");
   }
@@ -479,10 +513,10 @@ std::tuple<torch::Tensor, torch::Tensor> transition_dense(
     int64_t dst_nodes,
     int64_t src_block_size,
     int64_t dst_block_size) {
-  require_cpu(sender_strength, "sender_strength");
-  require_cpu(src_val, "src_val");
-  require_cpu(projected_state, "projected_state");
-  require_cpu(projected_val, "projected_val");
+  require_supported_device(sender_strength, "sender_strength");
+  require_supported_device(src_val, "src_val");
+  require_supported_device(projected_state, "projected_state");
+  require_supported_device(projected_val, "projected_val");
 
   auto batch_sizes = batch_shape(src_val, 2);
   auto flat_src_val = flatten_val(src_val).contiguous();
@@ -574,10 +608,10 @@ std::tuple<torch::Tensor, torch::Tensor> transition_topk(
     int64_t topk,
     int64_t src_block_size,
     int64_t dst_block_size) {
-  require_cpu(sender_strength, "sender_strength");
-  require_cpu(src_val, "src_val");
-  require_cpu(projected_state, "projected_state");
-  require_cpu(projected_val, "projected_val");
+  require_supported_device(sender_strength, "sender_strength");
+  require_supported_device(src_val, "src_val");
+  require_supported_device(projected_state, "projected_state");
+  require_supported_device(projected_val, "projected_val");
   if (topk <= 0) {
     throw std::runtime_error("topk must be positive.");
   }
