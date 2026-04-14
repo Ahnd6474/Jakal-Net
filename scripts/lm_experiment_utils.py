@@ -313,19 +313,21 @@ def _load_hf_dataset_texts(
 
     dataset = load_dataset(dataset_name, config_name, split=split, streaming=streaming)
     texts: list[str] = []
+    skipped_rows = 0
     iterator = dataset if streaming else iter(dataset)
-    for index, row in enumerate(iterator):
-        if max_samples is not None and index >= max_samples:
+    for row in iterator:
+        if max_samples is not None and len(texts) >= max_samples:
             break
         extracted = _extract_text_from_json_record(row, (text_key,))
         if extracted is None:
-            raise ValueError(
-                f"Could not find text key {text_key!r} in Hugging Face dataset row."
-            )
+            skipped_rows += 1
+            continue
         texts.append(extracted)
     if not texts:
         raise ValueError(
-            f"Hugging Face dataset {dataset_name!r} split {split!r} did not yield any text."
+            "Hugging Face dataset "
+            f"{dataset_name!r} split {split!r} did not yield any usable text. "
+            f"Skipped {skipped_rows} rows without {text_key!r} content."
         )
     return texts
 

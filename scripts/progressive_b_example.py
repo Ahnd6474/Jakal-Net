@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 import torch
 from torch import Tensor, nn
@@ -11,6 +11,7 @@ from torch.nn import functional as F
 from jakal_net import (
     BilinearPairwiseRoute,
     DiagonalBilinearPairwise,
+    HadamardMLPPairwise,
     Layer,
     LayerDelta,
     LearnedPositionEncoding,
@@ -23,25 +24,82 @@ from jakal_net import (
 from jakal_net.kernel_common import apply_slot_mask_to_state, apply_slot_mask_to_val
 
 
-def _scale_delta(delta: LayerDelta, scale: float) -> LayerDelta:
-    if scale == 1.0:
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x: Tensor) -> Tensor:
+        rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return x * rms * self.weight
+
+
+class TemperatureScaledRoute(nn.Module):
+    def __init__(self, route_fn: nn.Module, temperature: float) -> None:
+        super().__init__()
+        if temperature <= 0.0:
+            raise ValueError("temperature must be positive.")
+        self.route_fn = route_fn
+        self.temperature = temperature
+        self.expects_pairwise_inputs = getattr(route_fn, "expects_pairwise_inputs", False)
+
+    def forward(self, *args: Tensor) -> Tensor:
+        return self.route_fn(*args) / self.temperature
+
+
+def _scale_delta(
+    delta: LayerDelta,
+    *,
+    state_scale: float = 1.0,
+    val_scale: float = 1.0,
+) -> LayerDelta:
+    if state_scale == 1.0 and val_scale == 1.0:
         return delta
     return LayerDelta(
-        delta_state=delta.delta_state * scale,
-        delta_val=delta.delta_val * scale,
+        delta_state=delta.delta_state * state_scale,
+        delta_val=delta.delta_val * val_scale,
     )
 
 
-def _apply_scaled_delta(layer: Layer, delta: LayerDelta, scale: float) -> Layer:
-    if scale == 0.0:
+def _apply_scaled_delta(
+    layer: Layer,
+    delta: LayerDelta,
+    *,
+    state_scale: float = 1.0,
+    val_scale: float = 1.0,
+) -> Layer:
+    if state_scale == 0.0 and val_scale == 0.0:
         return layer
-    return layer.apply_delta(_scale_delta(delta, scale))
+    return layer.apply_delta(
+        _scale_delta(delta, state_scale=state_scale, val_scale=val_scale)
+    )
 
 
-def _stabilize_layer(layer: Layer, val_norm: nn.LayerNorm) -> Layer:
+def _make_value_norm(dim: int, norm_kind: str) -> nn.Module:
+    if norm_kind == "identity":
+        return nn.Identity()
+    if norm_kind == "layernorm":
+        return nn.LayerNorm(dim)
+    if norm_kind == "rmsnorm":
+        return RMSNorm(dim)
+    raise ValueError(f"Unsupported norm kind: {norm_kind!r}.")
+
+
+def _normalize_layer_values(layer: Layer, val_norm: nn.Module) -> Layer:
+    return layer.with_tensors(val=val_norm(layer.val))
+
+
+def _stabilize_layer(
+    layer: Layer,
+    val_norm: nn.Module,
+    *,
+    apply_value_norm: bool,
+) -> Layer:
+    val = val_norm(layer.val) if apply_value_norm else layer.val
     return layer.with_tensors(
         state=torch.tanh(layer.state),
-        val=val_norm(layer.val),
+        val=val,
     )
 
 
@@ -68,8 +126,15 @@ def _make_sparse_or_dense_propagation(
     window: int | None = None,
     topk: int | None = None,
     pairwise_fn: nn.Module | None = None,
+    residual: bool = True,
 ) -> Propagation | SparsePropagation:
     pairwise = DiagonalBilinearPairwise(dim=dim) if pairwise_fn is None else pairwise_fn
+    if sparse_type == "dense":
+        return Propagation(
+            pairwise_fn=pairwise,
+            implementation=implementation,
+            residual=residual,
+        )
     if sparse_type == "window":
         if window is None:
             raise ValueError("window propagation requires window.")
@@ -78,6 +143,7 @@ def _make_sparse_or_dense_propagation(
             sparse_type="window",
             window=window,
             implementation=implementation,
+            residual=residual,
         )
     if sparse_type == "topk":
         if topk is None:
@@ -87,6 +153,7 @@ def _make_sparse_or_dense_propagation(
             sparse_type="topk",
             topk=topk,
             implementation=implementation,
+            residual=residual,
         )
     raise ValueError(f"Unsupported sparse_type: {sparse_type!r}.")
 
@@ -95,11 +162,20 @@ def _make_transition(
     *,
     dim: int,
     route_topk: int,
+    route_mode: str,
+    route_hidden_dim: int | None,
+    route_temperature: float,
     implementation: str,
     merge_mode: str = "add",
 ) -> Transition | SparseTransition:
-    route_fn = SourceTargetHadamardMLPRoute(src_dim=dim, dst_dim=dim)
-    if route_topk <= 0:
+    route_fn: nn.Module = SourceTargetHadamardMLPRoute(
+        src_dim=dim,
+        dst_dim=dim,
+        hidden_dim=route_hidden_dim,
+    )
+    if route_temperature != 1.0:
+        route_fn = TemperatureScaledRoute(route_fn, route_temperature)
+    if route_mode == "dense" or route_topk <= 0:
         return Transition(
             route_fn=route_fn,
             implementation=implementation,
@@ -146,35 +222,61 @@ def build_progressive_b_stage_specs(
     lite_layers: int = 2,
     mid_layers: int = 2,
     full_layers: int = 1,
+    lite_expand_ratio: float = 1.05,
+    lite_compress_ratio: float = 0.90,
+    lite_alpha_b: float = 0.3,
+    lite_beta_s_to_b: float = 0.25,
+    lite_beta_b_to_s: float = 0.15,
+    mid_expand_ratio: float = 1.10,
+    mid_compress_ratio: float = 0.80,
+    mid_alpha_b: float = 0.65,
+    mid_beta_s_to_b: float = 0.55,
+    mid_beta_b_to_s: float = 0.35,
+    full_expand_ratio: float = 1.20,
+    full_compress_ratio: float = 0.70,
+    full_alpha_b: float = 1.0,
+    full_beta_s_to_b: float = 0.9,
+    full_beta_b_to_s: float = 0.8,
 ) -> list[ProgressiveBStageSpec]:
     if seq_nodes <= 0:
         raise ValueError("seq_nodes must be positive.")
-    return [
-        ProgressiveBStageSpec(
+    specs: list[ProgressiveBStageSpec] = []
+    if lite_layers > 0:
+        specs.append(
+            ProgressiveBStageSpec(
             num_layers=lite_layers,
-            expanded_nodes=max(1, math.ceil(seq_nodes * 1.05)),
-            compressed_nodes=max(1, math.ceil(seq_nodes * 0.90)),
-            alpha_b=0.3,
-            beta_s_to_b=0.25,
-            beta_b_to_s=0.15,
-        ),
-        ProgressiveBStageSpec(
+            expanded_nodes=max(1, math.ceil(seq_nodes * lite_expand_ratio)),
+            compressed_nodes=max(1, math.ceil(seq_nodes * lite_compress_ratio)),
+            alpha_b=lite_alpha_b,
+            beta_s_to_b=lite_beta_s_to_b,
+            beta_b_to_s=lite_beta_b_to_s,
+        )
+        )
+    if mid_layers > 0:
+        specs.append(
+            ProgressiveBStageSpec(
             num_layers=mid_layers,
-            expanded_nodes=max(1, math.ceil(seq_nodes * 1.10)),
-            compressed_nodes=max(1, math.ceil(seq_nodes * 0.80)),
-            alpha_b=0.65,
-            beta_s_to_b=0.55,
-            beta_b_to_s=0.35,
-        ),
-        ProgressiveBStageSpec(
+            expanded_nodes=max(1, math.ceil(seq_nodes * mid_expand_ratio)),
+            compressed_nodes=max(1, math.ceil(seq_nodes * mid_compress_ratio)),
+            alpha_b=mid_alpha_b,
+            beta_s_to_b=mid_beta_s_to_b,
+            beta_b_to_s=mid_beta_b_to_s,
+        )
+        )
+    if full_layers > 0:
+        specs.append(
+            ProgressiveBStageSpec(
             num_layers=full_layers,
-            expanded_nodes=max(1, math.ceil(seq_nodes * 1.20)),
-            compressed_nodes=max(1, math.ceil(seq_nodes * 0.70)),
-            alpha_b=1.0,
-            beta_s_to_b=0.9,
-            beta_b_to_s=0.8,
-        ),
-    ]
+            expanded_nodes=max(1, math.ceil(seq_nodes * full_expand_ratio)),
+            compressed_nodes=max(1, math.ceil(seq_nodes * full_compress_ratio)),
+            alpha_b=full_alpha_b,
+            beta_s_to_b=full_beta_s_to_b,
+            beta_b_to_s=full_beta_b_to_s,
+        )
+        )
+    if not specs:
+        raise ValueError("At least one stage must have a positive layer count.")
+    return specs
 
 
 class ProgressiveBJointBlock(nn.Module):
@@ -192,14 +294,26 @@ class ProgressiveBJointBlock(nn.Module):
         route_topk: int = 4,
         expanded_topk: int = 4,
         compressed_topk: int = 4,
+        sequence_sparse_type: str = "window",
         expanded_sparse_type: str = "topk",
         compressed_sparse_type: str = "topk",
+        route_mode: str = "topk",
+        value_norm_kind: str = "layernorm",
+        norm_position: str = "post",
         expanded_window: int | None = None,
         compressed_window: int | None = None,
         implementation: str = "streaming",
+        propagation_residual: bool = True,
+        value_residual_scale: float = 1.0,
+        state_residual_scale: float = 1.0,
+        alpha_scale: float = 1.0,
+        beta_s_to_b_scale: float = 1.0,
+        beta_b_to_s_scale: float = 1.0,
         s_delta_scale: float = 0.25,
         b_delta_scale: float = 0.20,
         cross_delta_scale: float = 0.15,
+        route_temperature: float = 1.0,
+        route_hidden_dim: int | None = None,
         s_pairwise_fn: nn.Module | None = None,
         expanded_pairwise_fn: nn.Module | None = None,
         compressed_pairwise_fn: nn.Module | None = None,
@@ -214,25 +328,43 @@ class ProgressiveBJointBlock(nn.Module):
         self.beta_b_to_s = beta_b_to_s
         self.expanded_ratio = expanded_nodes / seq_nodes
         self.compressed_ratio = compressed_nodes / seq_nodes
+        self.route_mode = route_mode
+        self.value_norm_kind = value_norm_kind
+        self.norm_position = norm_position
+        self.alpha_scale = alpha_scale
+        self.beta_s_to_b_scale = beta_s_to_b_scale
+        self.beta_b_to_s_scale = beta_b_to_s_scale
+        self.runtime_b_schedule_scale = 1.0
+        self.value_residual_scale = value_residual_scale
+        self.state_residual_scale = state_residual_scale
         self.s_delta_scale = s_delta_scale
         self.b_delta_scale = b_delta_scale
         self.cross_delta_scale = cross_delta_scale
-        self.s_val_norm = nn.LayerNorm(dim)
-        self.expanded_val_norm = nn.LayerNorm(dim)
-        self.compressed_val_norm = nn.LayerNorm(dim)
+        self.propagation_residual = propagation_residual
+        self.route_temperature = route_temperature
+        self.route_hidden_dim = route_hidden_dim
+        self.track_stats = False
+        self.last_runtime_stats: dict[str, float] | None = None
+        self.s_val_norm = _make_value_norm(dim, value_norm_kind)
+        self.expanded_val_norm = _make_value_norm(dim, value_norm_kind)
+        self.compressed_val_norm = _make_value_norm(dim, value_norm_kind)
         self.expanded_position_encoding = LearnedPositionEncoding(dim)
         self.compressed_position_encoding = LearnedPositionEncoding(dim)
 
         self.s_propagation = _make_sparse_or_dense_propagation(
             dim=dim,
-            sparse_type="window",
+            sparse_type=sequence_sparse_type,
             window=s_window,
             implementation=implementation,
             pairwise_fn=s_pairwise_fn,
+            residual=propagation_residual,
         )
         self.expand_transition = _make_transition(
             dim=dim,
             route_topk=route_topk,
+            route_mode=route_mode,
+            route_hidden_dim=route_hidden_dim,
+            route_temperature=route_temperature,
             implementation=implementation,
         )
         self.expanded_propagation = _make_sparse_or_dense_propagation(
@@ -242,20 +374,30 @@ class ProgressiveBJointBlock(nn.Module):
             topk=min(expanded_topk, expanded_nodes),
             implementation=implementation,
             pairwise_fn=expanded_pairwise_fn,
+            residual=propagation_residual,
         )
         self.b_to_s = _make_transition(
             dim=dim,
             route_topk=route_topk,
+            route_mode=route_mode,
+            route_hidden_dim=route_hidden_dim,
+            route_temperature=route_temperature,
             implementation=implementation,
         )
         self.compress_transition = _make_transition(
             dim=dim,
             route_topk=route_topk,
+            route_mode=route_mode,
+            route_hidden_dim=route_hidden_dim,
+            route_temperature=route_temperature,
             implementation=implementation,
         )
         self.s_to_b = _make_transition(
             dim=dim,
             route_topk=route_topk,
+            route_mode=route_mode,
+            route_hidden_dim=route_hidden_dim,
+            route_temperature=route_temperature,
             implementation=implementation,
         )
         self.compressed_propagation = _make_sparse_or_dense_propagation(
@@ -265,12 +407,63 @@ class ProgressiveBJointBlock(nn.Module):
             topk=min(compressed_topk, compressed_nodes),
             implementation=implementation,
             pairwise_fn=compressed_pairwise_fn,
+            residual=propagation_residual,
         )
         self.compressed_adapter = Transition(
             route_fn=BilinearPairwiseRoute(src_dim=dim, dst_dim=dim),
             merge_mode="add",
             implementation=implementation,
         )
+
+    def set_track_stats(self, enabled: bool) -> None:
+        self.track_stats = enabled
+        for transition in (
+            self.expand_transition,
+            self.b_to_s,
+            self.compress_transition,
+            self.s_to_b,
+        ):
+            if hasattr(transition, "track_stats"):
+                transition.track_stats = enabled
+                if not enabled:
+                    transition.last_stats = None
+
+    def _prepare_operator_input(self, layer: Layer, val_norm: nn.Module) -> Layer:
+        if self.norm_position != "pre":
+            return layer
+        return _normalize_layer_values(layer, val_norm)
+
+    def _finalize_layer(self, layer: Layer, val_norm: nn.Module) -> Layer:
+        return _stabilize_layer(
+            layer,
+            val_norm,
+            apply_value_norm=self.norm_position == "post",
+        )
+
+    def _scaled_apply(
+        self,
+        layer: Layer,
+        delta: LayerDelta,
+        *,
+        path_scale: float,
+    ) -> Layer:
+        return _apply_scaled_delta(
+            layer,
+            delta,
+            state_scale=path_scale * self.state_residual_scale,
+            val_scale=path_scale * self.value_residual_scale,
+        )
+
+    @staticmethod
+    def _delta_norm(delta: LayerDelta) -> tuple[float, float]:
+        state_norm = float(delta.delta_state.norm(dim=-1).mean().item())
+        val_norm = float(delta.delta_val.norm(dim=-1).mean().item())
+        return state_norm, val_norm
+
+    def set_b_schedule_scale(self, scale: float) -> None:
+        if scale < 0.0:
+            raise ValueError("B schedule scale must be non-negative.")
+        self.runtime_b_schedule_scale = scale
 
     def _resolve_b_nodes(self, seq_nodes: int) -> tuple[int, int]:
         expanded_nodes = max(1, math.ceil(seq_nodes * self.expanded_ratio))
@@ -325,69 +518,127 @@ class ProgressiveBJointBlock(nn.Module):
         return self.compressed_adapter(compressed_b, adapted)
 
     def forward_sequence_only(self, s_layer: Layer) -> Layer:
-        s_layer = _apply_scaled_delta(
-            s_layer,
-            self.s_propagation.compute_delta(s_layer),
-            self.s_delta_scale,
+        delta = self.s_propagation.compute_delta(
+            self._prepare_operator_input(s_layer, self.s_val_norm)
         )
-        return _stabilize_layer(s_layer, self.s_val_norm)
+        s_layer = self._scaled_apply(
+            s_layer,
+            delta,
+            path_scale=self.s_delta_scale,
+        )
+        return self._finalize_layer(s_layer, self.s_val_norm)
 
     def forward(self, s_layer: Layer, compressed_b: Layer | None = None) -> tuple[Layer, Layer]:
         expanded_nodes, compressed_nodes = self._resolve_b_nodes(s_layer.num_nodes)
-        s_layer = _apply_scaled_delta(
-            s_layer,
-            self.s_propagation.compute_delta(s_layer),
-            self.s_delta_scale,
+        alpha_b = self.alpha_b * self.alpha_scale * self.runtime_b_schedule_scale
+        beta_s_to_b = self.beta_s_to_b * self.beta_s_to_b_scale
+        beta_b_to_s = self.beta_b_to_s * self.beta_b_to_s_scale
+        stats: dict[str, float] = {}
+        s_delta = self.s_propagation.compute_delta(
+            self._prepare_operator_input(s_layer, self.s_val_norm)
         )
-        s_layer = _stabilize_layer(s_layer, self.s_val_norm)
+        s_layer = self._scaled_apply(
+            s_layer,
+            s_delta,
+            path_scale=self.s_delta_scale,
+        )
+        if self.track_stats:
+            s_state_norm, s_val_norm = self._delta_norm(s_delta)
+            stats["sequence_delta_state_norm"] = s_state_norm
+            stats["sequence_delta_val_norm"] = s_val_norm
+        s_layer = self._finalize_layer(s_layer, self.s_val_norm)
         compressed_b = self._prepare_compressed_layer(
             s_layer,
             compressed_b,
             compressed_nodes,
         )
-        compressed_b = _stabilize_layer(compressed_b, self.compressed_val_norm)
+        compressed_b = self._finalize_layer(compressed_b, self.compressed_val_norm)
 
         expanded_b = self._make_b_layer(
             s_layer,
             expanded_nodes,
             self.expanded_position_encoding,
         )
-        expanded_b = _apply_scaled_delta(
-            expanded_b,
-            self.expand_transition.compute_delta(compressed_b, expanded_b),
-            self.alpha_b * self.b_delta_scale,
+        expand_transition_delta = self.expand_transition.compute_delta(
+            self._prepare_operator_input(compressed_b, self.compressed_val_norm),
+            self._prepare_operator_input(expanded_b, self.expanded_val_norm),
         )
-        expanded_b = _apply_scaled_delta(
+        expanded_b = self._scaled_apply(
             expanded_b,
-            self.expanded_propagation.compute_delta(expanded_b),
-            self.alpha_b * self.b_delta_scale,
+            expand_transition_delta,
+            path_scale=alpha_b * self.b_delta_scale,
         )
-        expanded_b = _stabilize_layer(expanded_b, self.expanded_val_norm)
+        expanded_prop_delta = self.expanded_propagation.compute_delta(
+            self._prepare_operator_input(expanded_b, self.expanded_val_norm)
+        )
+        expanded_b = self._scaled_apply(
+            expanded_b,
+            expanded_prop_delta,
+            path_scale=alpha_b * self.b_delta_scale,
+        )
+        expanded_b = self._finalize_layer(expanded_b, self.expanded_val_norm)
 
-        s_layer = _apply_scaled_delta(
-            s_layer,
-            self.b_to_s.compute_delta(expanded_b, s_layer),
-            self.alpha_b * self.beta_b_to_s * self.cross_delta_scale,
+        b_to_s_delta = self.b_to_s.compute_delta(
+            self._prepare_operator_input(expanded_b, self.expanded_val_norm),
+            self._prepare_operator_input(s_layer, self.s_val_norm),
         )
-        s_layer = _stabilize_layer(s_layer, self.s_val_norm)
+        s_layer = self._scaled_apply(
+            s_layer,
+            b_to_s_delta,
+            path_scale=alpha_b * beta_b_to_s * self.cross_delta_scale,
+        )
+        s_layer = self._finalize_layer(s_layer, self.s_val_norm)
 
         next_compressed = compressed_b.clone()
-        next_compressed = _apply_scaled_delta(
-            next_compressed,
-            self.compress_transition.compute_delta(expanded_b, next_compressed),
-            self.alpha_b * self.b_delta_scale,
+        compress_delta = self.compress_transition.compute_delta(
+            self._prepare_operator_input(expanded_b, self.expanded_val_norm),
+            self._prepare_operator_input(next_compressed, self.compressed_val_norm),
         )
-        next_compressed = _apply_scaled_delta(
+        next_compressed = self._scaled_apply(
             next_compressed,
-            self.s_to_b.compute_delta(s_layer, next_compressed),
-            self.alpha_b * self.beta_s_to_b * self.cross_delta_scale,
+            compress_delta,
+            path_scale=alpha_b * self.b_delta_scale,
         )
-        next_compressed = _apply_scaled_delta(
+        s_to_b_delta = self.s_to_b.compute_delta(
+            self._prepare_operator_input(s_layer, self.s_val_norm),
+            self._prepare_operator_input(next_compressed, self.compressed_val_norm),
+        )
+        next_compressed = self._scaled_apply(
             next_compressed,
-            self.compressed_propagation.compute_delta(next_compressed),
-            self.alpha_b * self.b_delta_scale,
+            s_to_b_delta,
+            path_scale=alpha_b * beta_s_to_b * self.cross_delta_scale,
         )
-        next_compressed = _stabilize_layer(next_compressed, self.compressed_val_norm)
+        compressed_prop_delta = self.compressed_propagation.compute_delta(
+            self._prepare_operator_input(next_compressed, self.compressed_val_norm)
+        )
+        next_compressed = self._scaled_apply(
+            next_compressed,
+            compressed_prop_delta,
+            path_scale=alpha_b * self.b_delta_scale,
+        )
+        next_compressed = self._finalize_layer(next_compressed, self.compressed_val_norm)
+        if self.track_stats:
+            for prefix, transition in (
+                ("expand", self.expand_transition),
+                ("b_to_s", self.b_to_s),
+                ("compress", self.compress_transition),
+                ("s_to_b", self.s_to_b),
+            ):
+                if getattr(transition, "last_stats", None):
+                    for key, value in transition.last_stats.items():
+                        stats[f"{prefix}_{key}"] = value
+            for prefix, delta in (
+                ("expand_transition", expand_transition_delta),
+                ("expanded_propagation", expanded_prop_delta),
+                ("b_to_s", b_to_s_delta),
+                ("compress_transition", compress_delta),
+                ("s_to_b", s_to_b_delta),
+                ("compressed_propagation", compressed_prop_delta),
+            ):
+                state_norm, val_norm = self._delta_norm(delta)
+                stats[f"{prefix}_state_norm"] = state_norm
+                stats[f"{prefix}_val_norm"] = val_norm
+            self.last_runtime_stats = stats
         return s_layer, next_compressed
 
 
@@ -405,11 +656,29 @@ class ProgressiveBExampleLM(nn.Module):
         route_topk: int = 4,
         expanded_topk: int = 4,
         compressed_topk: int = 4,
+        sequence_sparse_type: str = "window",
         expanded_sparse_type: str = "topk",
         compressed_sparse_type: str = "topk",
+        route_mode: str = "topk",
+        value_norm_kind: str = "layernorm",
+        norm_position: str = "post",
         expanded_window: int | None = None,
         compressed_window: int | None = None,
         implementation: str = "streaming",
+        propagation_residual: bool = True,
+        value_residual_scale: float = 1.0,
+        state_residual_scale: float = 1.0,
+        alpha_scale: float = 1.0,
+        beta_s_to_b_scale: float = 1.0,
+        beta_b_to_s_scale: float = 1.0,
+        s_delta_scale: float = 0.25,
+        b_delta_scale: float = 0.20,
+        cross_delta_scale: float = 0.15,
+        route_temperature: float = 1.0,
+        route_hidden_dim: int | None = None,
+        state_init_mode: str = "zero",
+        pairwise_kind: str = "diagonal_bilinear",
+        pairwise_hidden_dim: int | None = None,
         prediction_slot_index: int = -1,
     ) -> None:
         super().__init__()
@@ -417,25 +686,61 @@ class ProgressiveBExampleLM(nn.Module):
         self.dim = dim
         self.seq_nodes = seq_nodes
         self.prediction_slot_index = prediction_slot_index
+        self.propagation_residual = propagation_residual
+        self.route_mode = route_mode
+        self.sequence_sparse_type = sequence_sparse_type
+        self.value_norm_kind = value_norm_kind
+        self.norm_position = norm_position
+        self.value_residual_scale = value_residual_scale
+        self.state_residual_scale = state_residual_scale
+        self.alpha_scale = alpha_scale
+        self.beta_s_to_b_scale = beta_s_to_b_scale
+        self.beta_b_to_s_scale = beta_b_to_s_scale
+        self.s_delta_scale = s_delta_scale
+        self.b_delta_scale = b_delta_scale
+        self.cross_delta_scale = cross_delta_scale
+        self.route_temperature = route_temperature
+        self.route_hidden_dim = route_hidden_dim
+        self.state_init_mode = state_init_mode
+        self.pairwise_kind = pairwise_kind
+        self.pairwise_hidden_dim = pairwise_hidden_dim
         self.stage_specs = tuple(stage_specs or build_progressive_b_stage_specs(seq_nodes))
+        self.track_stats = False
+        self.last_runtime_stats: dict[str, float] | None = None
 
         self.token_embedding = nn.Embedding(vocab_size, dim)
         self.position_encoding = LearnedPositionEncoding(dim)
         self.state_init = nn.Linear(dim, 1)
-        nn.init.zeros_(self.state_init.weight)
-        nn.init.zeros_(self.state_init.bias)
-        self.sequence_val_norm = nn.LayerNorm(dim)
-        shared_s_pairwise = DiagonalBilinearPairwise(dim=dim)
-        shared_expanded_pairwise = DiagonalBilinearPairwise(dim=dim)
-        shared_compressed_pairwise = DiagonalBilinearPairwise(dim=dim)
+        if state_init_mode == "zero":
+            nn.init.zeros_(self.state_init.weight)
+            nn.init.zeros_(self.state_init.bias)
+        elif state_init_mode == "neg_half":
+            nn.init.zeros_(self.state_init.weight)
+            nn.init.constant_(self.state_init.bias, -0.5)
+        elif state_init_mode == "normal":
+            nn.init.normal_(self.state_init.weight, mean=0.0, std=0.02)
+            nn.init.zeros_(self.state_init.bias)
+        else:
+            raise ValueError(f"Unsupported state_init_mode: {state_init_mode!r}.")
+        self.sequence_val_norm = _make_value_norm(dim, value_norm_kind)
+        if pairwise_kind == "diagonal_bilinear":
+            pairwise_factory = lambda: DiagonalBilinearPairwise(dim=dim)
+        elif pairwise_kind == "hadamard_mlp":
+            pairwise_factory = lambda: HadamardMLPPairwise(dim=dim, hidden_dim=pairwise_hidden_dim)
+        else:
+            raise ValueError(f"Unsupported pairwise_kind: {pairwise_kind!r}.")
+        shared_s_pairwise = pairwise_factory()
+        shared_expanded_pairwise = pairwise_factory()
+        shared_compressed_pairwise = pairwise_factory()
         self.s_warmup = nn.ModuleList(
             [
                 _make_sparse_or_dense_propagation(
                     dim=dim,
-                    sparse_type="window",
+                    sparse_type=sequence_sparse_type,
                     window=s_window,
                     implementation=implementation,
                     pairwise_fn=shared_s_pairwise,
+                    residual=propagation_residual,
                 )
                 for _ in range(warmup_layers)
             ]
@@ -454,11 +759,26 @@ class ProgressiveBExampleLM(nn.Module):
                     route_topk=route_topk,
                     expanded_topk=expanded_topk,
                     compressed_topk=compressed_topk,
+                    sequence_sparse_type=sequence_sparse_type,
                     expanded_sparse_type=expanded_sparse_type,
                     compressed_sparse_type=compressed_sparse_type,
+                    route_mode=route_mode,
+                    value_norm_kind=value_norm_kind,
+                    norm_position=norm_position,
                     expanded_window=expanded_window,
                     compressed_window=compressed_window,
                     implementation=implementation,
+                    propagation_residual=propagation_residual,
+                    value_residual_scale=value_residual_scale,
+                    state_residual_scale=state_residual_scale,
+                    alpha_scale=alpha_scale,
+                    beta_s_to_b_scale=beta_s_to_b_scale,
+                    beta_b_to_s_scale=beta_b_to_s_scale,
+                    s_delta_scale=s_delta_scale,
+                    b_delta_scale=b_delta_scale,
+                    cross_delta_scale=cross_delta_scale,
+                    route_temperature=route_temperature,
+                    route_hidden_dim=route_hidden_dim,
                     s_pairwise_fn=shared_s_pairwise,
                     expanded_pairwise_fn=shared_expanded_pairwise,
                     compressed_pairwise_fn=shared_compressed_pairwise,
@@ -471,16 +791,27 @@ class ProgressiveBExampleLM(nn.Module):
             [
                 _make_sparse_or_dense_propagation(
                     dim=dim,
-                    sparse_type="window",
+                    sparse_type=sequence_sparse_type,
                     window=s_window,
                     implementation=implementation,
                     pairwise_fn=shared_s_pairwise,
+                    residual=propagation_residual,
                 )
                 for _ in range(final_refine_layers)
             ]
         )
-        self.readout_norm = nn.LayerNorm(dim)
+        self.readout_norm = _make_value_norm(dim, value_norm_kind)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
+
+    def set_b_schedule_scale(self, scale: float) -> None:
+        for block in self.joint_blocks:
+            block.set_b_schedule_scale(scale)
+
+    def set_track_stats(self, enabled: bool) -> None:
+        self.track_stats = enabled
+        self.last_runtime_stats = None
+        for block in self.joint_blocks:
+            block.set_track_stats(enabled)
 
     def initialize_sequence_layer(
         self,
@@ -503,10 +834,87 @@ class ProgressiveBExampleLM(nn.Module):
             state=state,
             val=combined,
         )
-        layer = _stabilize_layer(layer, self.sequence_val_norm)
+        layer = _stabilize_layer(
+            layer,
+            self.sequence_val_norm,
+            apply_value_norm=self.norm_position == "post",
+        )
         if slot_mask is not None:
             layer = _apply_layer_slot_mask(layer, slot_mask)
         return layer
+
+    def _prepare_sequence_input(self, s_layer: Layer) -> Layer:
+        if self.norm_position != "pre":
+            return s_layer
+        return _normalize_layer_values(s_layer, self.sequence_val_norm)
+
+    def _apply_sequence_delta(self, s_layer: Layer, delta: LayerDelta, *, scale: float) -> Layer:
+        return _apply_scaled_delta(
+            s_layer,
+            delta,
+            state_scale=scale * self.state_residual_scale,
+            val_scale=scale * self.value_residual_scale,
+        )
+
+    def _finalize_sequence_layer(self, s_layer: Layer) -> Layer:
+        return _stabilize_layer(
+            s_layer,
+            self.sequence_val_norm,
+            apply_value_norm=self.norm_position == "post",
+        )
+
+    def _collect_layer_stats(self, prefix: str, layer: Layer | None) -> dict[str, float]:
+        if layer is None:
+            return {}
+        state = layer.state.detach()
+        val = layer.val.detach()
+        softplus_state = F.softplus(state)
+        stats = {
+            f"{prefix}_state_mean": float(state.mean().item()),
+            f"{prefix}_state_std": float(state.std(unbiased=False).item()),
+            f"{prefix}_softplus_state_mean": float(softplus_state.mean().item()),
+            f"{prefix}_softplus_state_std": float(softplus_state.std(unbiased=False).item()),
+            f"{prefix}_saturation_ratio": float((state.abs() > 4.0).to(dtype=torch.float32).mean().item()),
+            f"{prefix}_val_variance": float(val.var(unbiased=False).item()),
+            f"{prefix}_active_slot_ratio": float((softplus_state > 1e-3).to(dtype=torch.float32).mean().item()),
+        }
+        if layer.num_nodes > 1:
+            flat_val = val.reshape(-1, layer.num_nodes, self.dim)
+            left = flat_val[:, :-1, :]
+            right = flat_val[:, 1:, :]
+            cosine = F.cosine_similarity(left, right, dim=-1).mean()
+            stats[f"{prefix}_adjacent_cosine"] = float(cosine.item())
+        return stats
+
+    def collect_runtime_stats(self, token_ids: Tensor) -> dict[str, float]:
+        was_training = self.training
+        self.eval()
+        self.set_track_stats(True)
+        try:
+            with torch.no_grad():
+                device = next(self.parameters()).device
+                token_ids = token_ids.to(device)
+                _, s_layer, compressed_b = self(token_ids, return_layers=True)
+            stats = {}
+            stats.update(self._collect_layer_stats("s", s_layer))
+            stats.update(self._collect_layer_stats("b", compressed_b))
+            block_stats: list[dict[str, float]] = [
+                block.last_runtime_stats
+                for block in self.joint_blocks
+                if block.last_runtime_stats
+            ]
+            if block_stats:
+                keys = sorted({key for item in block_stats for key in item})
+                for key in keys:
+                    values = [item[key] for item in block_stats if key in item]
+                    if values:
+                        stats[f"blocks/{key}_mean"] = float(sum(values) / len(values))
+            self.last_runtime_stats = stats
+            return stats
+        finally:
+            self.set_track_stats(False)
+            if was_training:
+                self.train()
 
     def read_prediction_slot(self, s_layer: Layer) -> Tensor:
         index = self.prediction_slot_index
@@ -535,13 +943,15 @@ class ProgressiveBExampleLM(nn.Module):
         # This path keeps strict causality by using the causal S operators only.
         s_layer = self.initialize_sequence_layer(token_ids)
         for op in self.s_warmup:
-            s_layer = _apply_scaled_delta(s_layer, op.compute_delta(s_layer), 0.25)
-            s_layer = _stabilize_layer(s_layer, self.sequence_val_norm)
+            delta = op.compute_delta(self._prepare_sequence_input(s_layer))
+            s_layer = self._apply_sequence_delta(s_layer, delta, scale=0.25)
+            s_layer = self._finalize_sequence_layer(s_layer)
         for block in self.joint_blocks:
             s_layer = block.forward_sequence_only(s_layer)
         for op in self.s_refine:
-            s_layer = _apply_scaled_delta(s_layer, op.compute_delta(s_layer), 0.25)
-            s_layer = _stabilize_layer(s_layer, self.sequence_val_norm)
+            delta = op.compute_delta(self._prepare_sequence_input(s_layer))
+            s_layer = self._apply_sequence_delta(s_layer, delta, scale=0.25)
+            s_layer = self._finalize_sequence_layer(s_layer)
 
         logits = self.lm_head(self.readout_norm(s_layer.val))
         if return_layers:
@@ -590,15 +1000,17 @@ class ProgressiveBExampleLM(nn.Module):
         compressed_b: Layer | None = None
 
         for op in self.s_warmup:
-            s_layer = _apply_scaled_delta(s_layer, op.compute_delta(s_layer), 0.25)
-            s_layer = _stabilize_layer(s_layer, self.sequence_val_norm)
+            delta = op.compute_delta(self._prepare_sequence_input(s_layer))
+            s_layer = self._apply_sequence_delta(s_layer, delta, scale=0.25)
+            s_layer = self._finalize_sequence_layer(s_layer)
             s_layer = self._apply_sequence_mask(s_layer, slot_mask_flat)
         for block in self.joint_blocks:
             s_layer, compressed_b = block(s_layer, compressed_b)
             s_layer = self._apply_sequence_mask(s_layer, slot_mask_flat)
         for op in self.s_refine:
-            s_layer = _apply_scaled_delta(s_layer, op.compute_delta(s_layer), 0.25)
-            s_layer = _stabilize_layer(s_layer, self.sequence_val_norm)
+            delta = op.compute_delta(self._prepare_sequence_input(s_layer))
+            s_layer = self._apply_sequence_delta(s_layer, delta, scale=0.25)
+            s_layer = self._finalize_sequence_layer(s_layer)
             s_layer = self._apply_sequence_mask(s_layer, slot_mask_flat)
 
         prediction_slot = self.readout_norm(
@@ -673,13 +1085,28 @@ class ProgressiveBExampleLM(nn.Module):
         compressed_b: Layer | None = None
 
         for op in self.s_warmup:
-            s_layer = _apply_scaled_delta(s_layer, op.compute_delta(s_layer), 0.25)
-            s_layer = _stabilize_layer(s_layer, self.sequence_val_norm)
+            delta = op.compute_delta(self._prepare_sequence_input(s_layer))
+            s_layer = self._apply_sequence_delta(s_layer, delta, scale=0.25)
+            s_layer = self._finalize_sequence_layer(s_layer)
         for block in self.joint_blocks:
             s_layer, compressed_b = block(s_layer, compressed_b)
         for op in self.s_refine:
-            s_layer = _apply_scaled_delta(s_layer, op.compute_delta(s_layer), 0.25)
-            s_layer = _stabilize_layer(s_layer, self.sequence_val_norm)
+            delta = op.compute_delta(self._prepare_sequence_input(s_layer))
+            s_layer = self._apply_sequence_delta(s_layer, delta, scale=0.25)
+            s_layer = self._finalize_sequence_layer(s_layer)
+
+        if self.track_stats:
+            stats = {}
+            stats.update(self._collect_layer_stats("s", s_layer))
+            stats.update(self._collect_layer_stats("b", compressed_b))
+            block_stats = [block.last_runtime_stats for block in self.joint_blocks if block.last_runtime_stats]
+            if block_stats:
+                keys = sorted({key for item in block_stats for key in item})
+                for key in keys:
+                    values = [item[key] for item in block_stats if key in item]
+                    if values:
+                        stats[f"blocks/{key}_mean"] = float(sum(values) / len(values))
+            self.last_runtime_stats = stats
 
         prediction_slot = self.readout_norm(self.read_prediction_slot(s_layer))
         logits = self.lm_head(prediction_slot)
@@ -714,6 +1141,7 @@ class NextTokenBatch:
 class TrainingHistory:
     eval_steps: tuple[int, ...]
     train_step_losses: tuple[float, ...]
+    grad_norms: tuple[float, ...]
     train_losses: tuple[float, ...]
     val_losses: tuple[float, ...]
 
@@ -757,19 +1185,27 @@ def compute_next_token_loss(
     teacher_forcing: bool = False,
     full_sequence_causal: bool = False,
     teacher_forcing_chunk_size: int | None = None,
+    autocast_device_type: str | None = None,
+    autocast_dtype: torch.dtype | None = None,
 ) -> tuple[Tensor, Tensor]:
     if teacher_forcing and full_sequence_causal:
         raise ValueError("teacher_forcing and full_sequence_causal cannot both be enabled.")
-    logits = model(
-        batch.context,
-        teacher_forcing=teacher_forcing,
-        full_sequence_causal=full_sequence_causal,
-        teacher_forcing_chunk_size=teacher_forcing_chunk_size,
-    )
-    loss = F.cross_entropy(
-        logits.reshape(-1, logits.shape[-1]),
-        batch.target.reshape(-1),
-    )
+    use_autocast = autocast_device_type is not None and autocast_dtype is not None
+    with torch.autocast(
+        device_type=autocast_device_type or "cpu",
+        dtype=autocast_dtype,
+        enabled=use_autocast,
+    ):
+        logits = model(
+            batch.context,
+            teacher_forcing=teacher_forcing,
+            full_sequence_causal=full_sequence_causal,
+            teacher_forcing_chunk_size=teacher_forcing_chunk_size,
+        )
+        loss = F.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]),
+            batch.target.reshape(-1),
+        )
     return loss, logits
 
 
@@ -785,6 +1221,8 @@ def estimate_next_token_loss(
     teacher_forcing: bool = False,
     full_sequence_causal: bool = False,
     teacher_forcing_chunk_size: int | None = None,
+    autocast_device_type: str | None = None,
+    autocast_dtype: torch.dtype | None = None,
 ) -> float:
     was_training = model.training
     model.eval()
@@ -804,6 +1242,8 @@ def estimate_next_token_loss(
             teacher_forcing=teacher_forcing,
             full_sequence_causal=full_sequence_causal,
             teacher_forcing_chunk_size=teacher_forcing_chunk_size,
+            autocast_device_type=autocast_device_type,
+            autocast_dtype=autocast_dtype,
         )
         losses.append(float(loss.item()))
     if was_training:
@@ -825,11 +1265,19 @@ def train_next_token_model(
     learning_rate: float,
     weight_decay: float = 0.0,
     grad_clip: float | None = 1.0,
+    grad_accum_steps: int = 1,
     teacher_forcing: bool = False,
     full_sequence_causal: bool = False,
     teacher_forcing_chunk_size: int | None = None,
+    step_setup_callback: Callable[[int, int], None] | None = None,
     progress_callback: Callable[[int, int, float], None] | None = None,
+    step_callback: Callable[[int, float, float], None] | None = None,
+    eval_callback: Callable[[int, float, float], None] | None = None,
+    autocast_device_type: str | None = None,
+    autocast_dtype: torch.dtype | None = None,
 ) -> TrainingHistory:
+    if grad_accum_steps <= 0:
+        raise ValueError("grad_accum_steps must be positive.")
     model.to(device)
     model.train()
     optimizer = torch.optim.AdamW(
@@ -839,66 +1287,90 @@ def train_next_token_model(
     )
     eval_steps_seen: list[int] = []
     train_step_losses: list[float] = []
+    grad_norms: list[float] = []
     train_losses: list[float] = []
     val_losses: list[float] = []
 
     for step in range(1, steps + 1):
-        batch = sample_next_token_batch(
-            train_tokens,
-            seq_len=seq_len,
-            batch_size=batch_size,
-            device=device,
-            teacher_forcing=teacher_forcing,
-            full_sequence_causal=full_sequence_causal,
-        )
+        if step_setup_callback is not None:
+            step_setup_callback(step, steps)
         optimizer.zero_grad(set_to_none=True)
-        loss, _ = compute_next_token_loss(
-            model,
-            batch,
-            teacher_forcing=teacher_forcing,
-            full_sequence_causal=full_sequence_causal,
-            teacher_forcing_chunk_size=teacher_forcing_chunk_size,
-        )
-        loss.backward()
+        accumulated_loss = 0.0
+        for _ in range(grad_accum_steps):
+            batch = sample_next_token_batch(
+                train_tokens,
+                seq_len=seq_len,
+                batch_size=batch_size,
+                device=device,
+                teacher_forcing=teacher_forcing,
+                full_sequence_causal=full_sequence_causal,
+            )
+            loss, _ = compute_next_token_loss(
+                model,
+                batch,
+                teacher_forcing=teacher_forcing,
+                full_sequence_causal=full_sequence_causal,
+                teacher_forcing_chunk_size=teacher_forcing_chunk_size,
+                autocast_device_type=autocast_device_type,
+                autocast_dtype=autocast_dtype,
+            )
+            accumulated_loss += float(loss.item())
+            (loss / grad_accum_steps).backward()
+        grad_norm = 0.0
         if grad_clip is not None:
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            grad_norm = float(
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip).item()
+            )
+        else:
+            grads = [parameter.grad.norm() for parameter in model.parameters() if parameter.grad is not None]
+            if grads:
+                grad_norm = float(torch.stack(grads).norm().item())
         optimizer.step()
-        train_step_losses.append(float(loss.item()))
+        step_loss = accumulated_loss / grad_accum_steps
+        train_step_losses.append(step_loss)
+        grad_norms.append(grad_norm)
         if progress_callback is not None:
-            progress_callback(step, steps, float(loss.item()))
+            progress_callback(step, steps, step_loss)
+        if step_callback is not None:
+            step_callback(step, step_loss, grad_norm)
 
         if step % eval_interval == 0 or step == 1 or step == steps:
             eval_steps_seen.append(step)
-            train_losses.append(
-                estimate_next_token_loss(
-                    model,
-                    train_tokens,
-                    seq_len=seq_len,
-                    batch_size=batch_size,
-                    device=device,
-                    eval_steps=eval_steps,
-                    teacher_forcing=teacher_forcing,
-                    full_sequence_causal=full_sequence_causal,
-                    teacher_forcing_chunk_size=teacher_forcing_chunk_size,
-                )
+            train_eval = estimate_next_token_loss(
+                model,
+                train_tokens,
+                seq_len=seq_len,
+                batch_size=batch_size,
+                device=device,
+                eval_steps=eval_steps,
+                teacher_forcing=teacher_forcing,
+                full_sequence_causal=full_sequence_causal,
+                teacher_forcing_chunk_size=teacher_forcing_chunk_size,
+                autocast_device_type=autocast_device_type,
+                autocast_dtype=autocast_dtype,
             )
-            val_losses.append(
-                estimate_next_token_loss(
-                    model,
-                    val_tokens,
-                    seq_len=seq_len,
-                    batch_size=batch_size,
-                    device=device,
-                    eval_steps=eval_steps,
-                    teacher_forcing=teacher_forcing,
-                    full_sequence_causal=full_sequence_causal,
-                    teacher_forcing_chunk_size=teacher_forcing_chunk_size,
-                )
+            val_eval = estimate_next_token_loss(
+                model,
+                val_tokens,
+                seq_len=seq_len,
+                batch_size=batch_size,
+                device=device,
+                eval_steps=eval_steps,
+                teacher_forcing=teacher_forcing,
+                full_sequence_causal=full_sequence_causal,
+                teacher_forcing_chunk_size=teacher_forcing_chunk_size,
+                autocast_device_type=autocast_device_type,
+                autocast_dtype=autocast_dtype,
             )
+            train_losses.append(train_eval)
+            val_losses.append(val_eval)
+            if eval_callback is not None:
+                eval_callback(step, train_eval, val_eval)
 
     return TrainingHistory(
         eval_steps=tuple(eval_steps_seen),
         train_step_losses=tuple(train_step_losses),
+        grad_norms=tuple(grad_norms),
         train_losses=tuple(train_losses),
         val_losses=tuple(val_losses),
     )
@@ -927,4 +1399,6 @@ def generate_next_tokens(
 
 
 def perplexity_from_loss(loss: float) -> float:
+    if loss > 80.0:
+        return float("inf")
     return float(math.exp(loss))

@@ -56,6 +56,31 @@ def _route_uses_pairwise_inputs(route_fn: object) -> bool:
     return positional_count >= 2
 
 
+def _summarize_routes(
+    routes: Tensor,
+    *,
+    topk_indices: Tensor | None = None,
+) -> dict[str, float]:
+    probs = routes.clamp_min(1e-12)
+    entropy = -(probs * probs.log()).sum(dim=-1).mean()
+    destination_load = routes.sum(dim=-2)
+    load_variance = destination_load.var(unbiased=False)
+    active_slots = (destination_load > 1e-6).to(dtype=torch.float32)
+    dead_slot_ratio = 1.0 - active_slots.mean()
+    overlap = torch.tensor(0.0, device=routes.device)
+    if topk_indices is not None and topk_indices.shape[-2] > 1:
+        current = topk_indices[..., 1:, :]
+        previous = topk_indices[..., :-1, :]
+        pairwise_overlap = (current.unsqueeze(-1) == previous.unsqueeze(-2)).any(dim=-1)
+        overlap = pairwise_overlap.to(dtype=torch.float32).mean()
+    return {
+        "entropy": float(entropy.item()),
+        "destination_load_variance": float(load_variance.item()),
+        "dead_slot_ratio": float(dead_slot_ratio.item()),
+        "topk_overlap": float(overlap.item()),
+    }
+
+
 class Transition(nn.Module):
     def __init__(
         self,
@@ -84,6 +109,8 @@ class Transition(nn.Module):
         self.src_block_size = src_block_size
         self.dst_block_size = dst_block_size
         self.accumulator_dtype = accumulator_dtype
+        self.track_stats = False
+        self.last_stats: dict[str, float] | None = None
 
     def _route_logits(self, src_val: Tensor, dst_val: Tensor) -> Tensor:
         if _route_uses_pairwise_inputs(self.route_fn):
@@ -212,6 +239,10 @@ class Transition(nn.Module):
         return self._compute_delta_streaming(src_layer, dst_layer)
 
     def compute_delta(self, src_layer: Layer, dst_layer: Layer) -> LayerDelta:
+        if self.track_stats:
+            logits = self.compute_route_logits(src_layer, dst_layer)
+            routes = torch.softmax(logits, dim=-1)
+            self.last_stats = _summarize_routes(routes)
         if self.implementation == "native":
             if (
                 not _route_uses_pairwise_inputs(self.route_fn)
@@ -407,6 +438,20 @@ class SparseTransition(Transition):
         return self._compute_delta_streaming(src_layer, dst_layer)
 
     def compute_delta(self, src_layer: Layer, dst_layer: Layer) -> LayerDelta:
+        if self.track_stats:
+            logits = self.compute_route_logits(src_layer, dst_layer)
+            k = min(self.topk, dst_layer.num_nodes)
+            if k == dst_layer.num_nodes:
+                routes = torch.softmax(logits, dim=-1)
+                topk_indices = None
+            else:
+                topk_selected = select_topk(logits, k, dim=-1)
+                topk_indices = topk_selected.indices
+                routes = torch.softmax(topk_selected.values, dim=-1)
+                dense_routes = torch.zeros_like(logits)
+                dense_routes.scatter_(-1, topk_indices, routes)
+                routes = dense_routes
+            self.last_stats = _summarize_routes(routes, topk_indices=topk_indices)
         if self.implementation == "native":
             if (
                 not _route_uses_pairwise_inputs(self.route_fn)

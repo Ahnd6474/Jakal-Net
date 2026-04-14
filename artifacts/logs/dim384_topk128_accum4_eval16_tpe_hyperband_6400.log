@@ -1,0 +1,128 @@
+parallel_workers=1
+[I 2026-04-14 12:58:23,928] A new study created in RDB with name: dim384_topk128_accum4_eval16_tpe_hyperband_6400
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+sentencepiece_trainer.cc(78) LOG(INFO) Starts training with : 
+trainer_spec {
+  input: /workspace/Jakal-Net/artifacts/tokenizers/dim384_topk128_accum4_eval16_tpe_hyperband_6400_subword_1024_1000000_corpus.txt
+  input_format: 
+  model_prefix: /workspace/Jakal-Net/artifacts/tokenizers/dim384_topk128_accum4_eval16_tpe_hyperband_6400_subword_1024_1000000
+  model_type: BPE
+  vocab_size: 1024
+  self_test_sample_size: 0
+  character_coverage: 0.9995
+  input_sentence_size: 0
+  shuffle_input_sentence: 1
+  seed_sentencepiece_size: 1000000
+  shrinking_factor: 0.75
+  max_sentence_length: 4192
+  num_threads: 16
+  num_sub_iterations: 2
+  max_sentencepiece_length: 16
+  split_by_unicode_script: 1
+  split_by_number: 1
+  split_by_whitespace: 1
+  split_digits: 1
+  pretokenization_delimiter: 
+  treat_whitespace_as_suffix: 0
+  allow_whitespace_only_pieces: 0
+  required_chars: 
+  byte_fallback: 0
+  vocabulary_output_piece_score: 1
+  train_extremely_large_corpus: 0
+  seed_sentencepieces_file: 
+  hard_vocab_limit: 0
+  use_all_vocab: 0
+  unk_id: 0
+  bos_id: -1
+  eos_id: -1
+  pad_id: -1
+  unk_piece: <unk>
+  bos_piece: <s>
+  eos_piece: </s>
+  pad_piece: <pad>
+  unk_surface:  ⁇ 
+  enable_differential_privacy: 0
+  differential_privacy_noise_level: 0
+  differential_privacy_clipping_threshold: 0
+}
+normalizer_spec {
+  name: nmt_nfkc
+  add_dummy_prefix: 1
+  remove_extra_whitespaces: 1
+  escape_whitespaces: 1
+  normalization_rule_tsv: 
+}
+denormalizer_spec {}
+trainer_interface.cc(355) LOG(INFO) SentenceIterator is not specified. Using MultiFileSentenceIterator.
+trainer_interface.cc(186) LOG(INFO) Loading corpus: /workspace/Jakal-Net/artifacts/tokenizers/dim384_topk128_accum4_eval16_tpe_hyperband_6400_subword_1024_1000000_corpus.txt
+trainer_interface.cc(411) LOG(INFO) Loaded all 2117 sentences
+trainer_interface.cc(427) LOG(INFO) Adding meta_piece: <unk>
+trainer_interface.cc(432) LOG(INFO) Normalizing sentences...
+trainer_interface.cc(541) LOG(INFO) all chars count=991536
+trainer_interface.cc(552) LOG(INFO) Done: 99.9513% characters are covered.
+trainer_interface.cc(562) LOG(INFO) Alphabet size=92
+trainer_interface.cc(563) LOG(INFO) Final character coverage=0.999513
+trainer_interface.cc(594) LOG(INFO) Done! preprocessed 2117 sentences.
+trainer_interface.cc(600) LOG(INFO) Tokenizing input sentences with whitespace: 2117
+trainer_interface.cc(611) LOG(INFO) Done! 18984
+bpe_model_trainer.cc(159) LOG(INFO) Updating active symbols. max_freq=20432 min_freq=3
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=5887 size=20 all=2231 active=1834 piece=▁f
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=3531 size=40 all=3168 active=2771 piece=ion
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=2057 size=60 all=4210 active=3813 piece=ct
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=1613 size=80 all=4982 active=4585 piece=id
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=1299 size=100 all=6052 active=5655 piece=ter
+bpe_model_trainer.cc(159) LOG(INFO) Updating active symbols. max_freq=1279 min_freq=100
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=1020 size=120 all=6967 active=1852 piece=▁is
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=852 size=140 all=7872 active=2757 piece=ies
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=665 size=160 all=8644 active=3529 piece=▁sh
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=595 size=180 all=9492 active=4377 piece=gh
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=527 size=200 all=10359 active=5244 piece=ian
+bpe_model_trainer.cc(159) LOG(INFO) Updating active symbols. max_freq=513 min_freq=86
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=448 size=220 all=11142 active=1730 piece=own
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=390 size=240 all=11840 active=2428 piece=oc
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=357 size=260 all=12403 active=2991 piece=▁rec
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=324 size=280 all=12942 active=3530 piece=▁Th
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=301 size=300 all=13263 active=3851 piece=per
+bpe_model_trainer.cc(159) LOG(INFO) Updating active symbols. max_freq=301 min_freq=73
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=282 size=320 all=13458 active=1155 piece=▁@.@
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=268 size=340 all=13892 active=1589 piece=ced
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=260 size=360 all=14277 active=1974 piece=▁Jordan
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=239 size=380 all=14581 active=2278 piece=ib
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=223 size=400 all=15024 active=2721 piece=▁Se
+bpe_model_trainer.cc(159) LOG(INFO) Updating active symbols. max_freq=223 min_freq=65
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=211 size=420 all=15306 active=1264 piece=ward
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=198 size=440 all=15698 active=1656 piece=▁fl
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=187 size=460 all=16029 active=1987 piece=▁act
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=177 size=480 all=16293 active=2251 piece=ions
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=171 size=500 all=16596 active=2554 piece=ational
+bpe_model_trainer.cc(159) LOG(INFO) Updating active symbols. max_freq=170 min_freq=58
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=161 size=520 all=16921 active=1307 piece=iet
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=154 size=540 all=17157 active=1543 piece=ang
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=150 size=560 all=17419 active=1805 piece=▁Townsend
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=144 size=580 all=17656 active=2042 piece=orld
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=135 size=600 all=17803 active=2189 piece=ute
+bpe_model_trainer.cc(159) LOG(INFO) Updating active symbols. max_freq=135 min_freq=53
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=129 size=620 all=18022 active=1206 piece=ug
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=126 size=640 all=18348 active=1532 piece=▁these
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=120 size=660 all=18556 active=1740 piece=▁no
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=117 size=680 all=18828 active=2012 piece=▁well
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=112 size=700 all=18970 active=2154 piece=ters
+bpe_model_trainer.cc(159) LOG(INFO) Updating active symbols. max_freq=112 min_freq=48
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=108 size=720 all=19151 active=1157 piece=ise
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=105 size=740 all=19438 active=1444 piece=ional
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=103 size=760 all=19638 active=1644 piece=▁class
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=100 size=780 all=19847 active=1853 piece=▁II
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=98 size=800 all=19977 active=1983 piece=▁ca
+bpe_model_trainer.cc(159) LOG(INFO) Updating active symbols. max_freq=98 min_freq=44
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=95 size=820 all=20176 active=1191 piece=▁plan
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=92 size=840 all=20365 active=1380 piece=ball
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=89 size=860 all=20528 active=1543 piece=pped
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=86 size=880 all=20640 active=1655 piece=aged
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=84 size=900 all=20746 active=1761 piece=▁Air
+bpe_model_trainer.cc(159) LOG(INFO) Updating active symbols. max_freq=84 min_freq=40
+bpe_model_trainer.cc(268) LOG(INFO) Added: freq=83 size=920 all=20900 active=1182 piece=▁called
+trainer_interface.cc(689) LOG(INFO) Saving model: /workspace/Jakal-Net/artifacts/tokenizers/dim384_topk128_accum4_eval16_tpe_hyperband_6400_subword_1024_1000000.model
+trainer_interface.cc(701) LOG(INFO) Saving vocabs: /workspace/Jakal-Net/artifacts/tokenizers/dim384_topk128_accum4_eval16_tpe_hyperband_6400_subword_1024_1000000.vocab
+experiment=custom | params=32,222,390 | dim=384 | warmup=4 | stages=5/5/0 | refine=3 | route_mode=topk | route_topk=128
+schedule_steps=6,400 | approx_epochs=0.077 | steps_per_epoch=83,176 | batch_size=1 | grad_accum_steps=4 | effective_batch_size=4 | objective=last_token
+progress | experiment=custom | step=    1/6400  | epoch=0.000 |   0.0% | minibatch_loss=7.2920 | elapsed=3.5s

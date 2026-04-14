@@ -33,6 +33,7 @@ from progressive_b_example import (
     build_char_vocab,
     build_progressive_b_stage_specs,
     perplexity_from_loss,
+    sample_next_token_batch,
     split_train_val,
     train_next_token_model,
 )
@@ -57,6 +58,10 @@ The final readout returns to S so token-level prediction remains anchored.
 DEFAULT_TOKENIZER_CACHE_DIR = Path(tempfile.gettempdir()) / "jakal_net_tokenizers"
 
 
+class TrialPrunedError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class SubwordVocab:
     processor: object
@@ -77,6 +82,34 @@ class SubwordVocab:
 
 def count_parameters(model: torch.nn.Module) -> int:
     return sum(parameter.numel() for parameter in model.parameters())
+
+
+def resolve_autocast_dtype(precision: str) -> torch.dtype | None:
+    if precision == "fp32":
+        return None
+    if precision == "bf16":
+        return torch.bfloat16
+    if precision == "fp16":
+        return torch.float16
+    raise ValueError(f"Unsupported precision: {precision!r}.")
+
+
+def resolve_b_schedule_scale(
+    *,
+    schedule: str,
+    step: int,
+    total_steps: int,
+    min_scale: float,
+    max_scale: float,
+) -> float:
+    if total_steps <= 1 or schedule == "constant":
+        return max_scale
+    progress = (step - 1) / (total_steps - 1)
+    if schedule == "up":
+        return min_scale + (max_scale - min_scale) * progress
+    if schedule == "down":
+        return max_scale - (max_scale - min_scale) * progress
+    raise ValueError(f"Unsupported B schedule: {schedule!r}.")
 
 
 def estimate_steps_per_epoch(
@@ -135,6 +168,7 @@ def build_subword_vocab(
     vocab_size: int,
     model_type: str,
     tokenizer_prefix: str | None,
+    character_coverage: float,
 ) -> SubwordVocab:
     if spm is None:
         raise ImportError(
@@ -165,7 +199,7 @@ def build_subword_vocab(
             model_prefix=str(prefix_path),
             model_type=model_type,
             vocab_size=vocab_size,
-            character_coverage=1.0,
+            character_coverage=character_coverage,
             bos_id=-1,
             eos_id=-1,
             pad_id=-1,
@@ -189,6 +223,7 @@ def build_tokenizer(
     subword_vocab_size: int,
     subword_model_type: str,
     tokenizer_prefix: str | None,
+    subword_character_coverage: float,
 ) -> tuple[object, str, Path | None]:
     if tokenizer == "char":
         return build_char_vocab(text), "char", None
@@ -199,6 +234,7 @@ def build_tokenizer(
             vocab_size=subword_vocab_size,
             model_type=subword_model_type,
             tokenizer_prefix=tokenizer_prefix,
+            character_coverage=subword_character_coverage,
         )
         return (
             subword_vocab,
@@ -283,13 +319,17 @@ def resolve_effective_model_config(
 
 def build_metrics_rows(history: TrainingHistory, *, steps_per_epoch: int) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for step, loss in enumerate(history.train_step_losses, start=1):
+    for step, (loss, grad_norm) in enumerate(
+        zip(history.train_step_losses, history.grad_norms, strict=True),
+        start=1,
+    ):
         rows.append(
             {
                 "record_type": "train_step",
                 "step": step,
                 "epoch": step / steps_per_epoch,
                 "minibatch_loss": loss,
+                "grad_norm": grad_norm,
             }
         )
     for step, train_loss, val_loss in zip(
@@ -336,22 +376,26 @@ def log_history_to_tensorboard(
     summary: dict[str, Any],
     prompt_text: str,
     generated_text: str,
+    include_scalars: bool = True,
 ) -> None:
     if writer is None:
         return
-    for step, loss in enumerate(history.train_step_losses, start=1):
-        writer.add_scalar("train/minibatch_loss", loss, step)
-        writer.add_scalar("train/epoch", step / steps_per_epoch, step)
-    for step, train_loss, val_loss in zip(
-        history.eval_steps,
-        history.train_losses,
-        history.val_losses,
-        strict=True,
-    ):
-        writer.add_scalar("eval/train_loss", train_loss, step)
-        writer.add_scalar("eval/val_loss", val_loss, step)
-        writer.add_scalar("eval/train_ppl", perplexity_from_loss(train_loss), step)
-        writer.add_scalar("eval/val_ppl", perplexity_from_loss(val_loss), step)
+    if include_scalars:
+        for step, loss in enumerate(history.train_step_losses, start=1):
+            writer.add_scalar("train/minibatch_loss", loss, step)
+            writer.add_scalar("train/epoch", step / steps_per_epoch, step)
+        for step, grad_norm in enumerate(history.grad_norms, start=1):
+            writer.add_scalar("train/grad_norm", grad_norm, step)
+        for step, train_loss, val_loss in zip(
+            history.eval_steps,
+            history.train_losses,
+            history.val_losses,
+            strict=True,
+        ):
+            writer.add_scalar("eval/train_loss", train_loss, step)
+            writer.add_scalar("eval/val_loss", val_loss, step)
+            writer.add_scalar("eval/train_ppl", perplexity_from_loss(train_loss), step)
+            writer.add_scalar("eval/val_ppl", perplexity_from_loss(val_loss), step)
     writer.add_text("sample/prompt", prompt_text)
     writer.add_text("sample/generated", generated_text)
     writer.add_hparams(
@@ -367,6 +411,26 @@ def log_history_to_tensorboard(
             "route_topk": int(summary["route_topk"]),
             "learning_rate": float(summary["learning_rate"]),
             "weight_decay": float(summary["weight_decay"]),
+            "value_norm_layernorm": bool(summary["value_norm_kind"] == "layernorm"),
+            "value_norm_rmsnorm": bool(summary["value_norm_kind"] == "rmsnorm"),
+            "norm_position_pre": bool(summary["norm_position"] == "pre"),
+            "propagation_residual": bool(summary["propagation_residual"]),
+            "route_mode_dense": bool(summary["route_mode"] == "dense"),
+            "sequence_dense": bool(summary["sequence_propagation"] == "dense"),
+            "expanded_dense": bool(summary["expanded_propagation"] == "dense"),
+            "compressed_dense": bool(summary["compressed_propagation"] == "dense"),
+            "subword_vocab_size": int(summary["subword_vocab_size"]),
+            "value_residual_scale": float(summary["value_residual_scale"]),
+            "state_residual_scale": float(summary["state_residual_scale"]),
+            "route_temperature": float(summary["route_temperature"]),
+            "alpha_scale": float(summary["alpha_scale"]),
+            "beta_s_to_b_scale": float(summary["beta_s_to_b_scale"]),
+            "beta_b_to_s_scale": float(summary["beta_b_to_s_scale"]),
+            "s_delta_scale": float(summary["s_delta_scale"]),
+            "b_delta_scale": float(summary["b_delta_scale"]),
+            "cross_delta_scale": float(summary["cross_delta_scale"]),
+            "b_schedule_min": float(summary["b_schedule_min"]),
+            "b_schedule_max": float(summary["b_schedule_max"]),
         },
         {
             "hparam/final_train_loss": float(summary["final_train_loss"]),
@@ -447,6 +511,7 @@ def save_run_artifacts(
         {
             "eval_steps": history.eval_steps,
             "train_step_losses": history.train_step_losses,
+            "grad_norms": history.grad_norms,
             "train_losses": history.train_losses,
             "val_losses": history.val_losses,
         },
@@ -474,12 +539,22 @@ def run_single_experiment(
     device: torch.device | str,
     teacher_forcing: bool,
     full_sequence_causal: bool,
+    trial: Any | None = None,
 ) -> dict[str, Any]:
     effective_config = resolve_effective_model_config(args, experiment_name)
+    autocast_dtype = resolve_autocast_dtype(args.precision)
+    autocast_device_type = device.type if isinstance(device, torch.device) else str(device)
+    if autocast_dtype is None or autocast_device_type != "cuda":
+        autocast_dtype = None
+        autocast_device_type = None
+    grad_accum_steps = int(getattr(args, "grad_accum_steps", 1))
+    if grad_accum_steps <= 0:
+        raise ValueError("grad-accum-steps must be positive.")
+    effective_batch_size = args.batch_size * grad_accum_steps
     steps_per_epoch = estimate_steps_per_epoch(
         token_count=int(train_tokens.numel()),
         seq_len=args.seq_len,
-        batch_size=args.batch_size,
+        batch_size=effective_batch_size,
     )
     if args.steps <= 0:
         raise ValueError("steps must be positive.")
@@ -497,7 +572,23 @@ def run_single_experiment(
         lite_layers=int(effective_config["lite_layers"]),
         mid_layers=int(effective_config["mid_layers"]),
         full_layers=int(effective_config["full_layers"]),
+        lite_expand_ratio=args.lite_expand_ratio,
+        lite_compress_ratio=args.lite_compress_ratio,
+        lite_alpha_b=args.lite_alpha_b,
+        lite_beta_s_to_b=args.lite_beta_s_to_b,
+        lite_beta_b_to_s=args.lite_beta_b_to_s,
+        mid_expand_ratio=args.mid_expand_ratio,
+        mid_compress_ratio=args.mid_compress_ratio,
+        mid_alpha_b=args.mid_alpha_b,
+        mid_beta_s_to_b=args.mid_beta_s_to_b,
+        mid_beta_b_to_s=args.mid_beta_b_to_s,
+        full_expand_ratio=args.full_expand_ratio,
+        full_compress_ratio=args.full_compress_ratio,
+        full_alpha_b=args.full_alpha_b,
+        full_beta_s_to_b=args.full_beta_s_to_b,
+        full_beta_b_to_s=args.full_beta_b_to_s,
     )
+    value_norm_kind = "identity" if args.disable_layer_norm else args.value_norm_kind
     model = ProgressiveBExampleLM(
         vocab_size=vocab.size,
         dim=int(effective_config["dim"]),
@@ -505,22 +596,40 @@ def run_single_experiment(
         warmup_layers=int(effective_config["warmup_layers"]),
         stage_specs=stage_specs,
         final_refine_layers=int(effective_config["final_refine_layers"]),
-        s_window=min(8, max(1, args.seq_len // 4)),
+        s_window=args.s_window,
         route_topk=int(effective_config["route_topk"]),
         expanded_topk=int(effective_config["route_topk"]),
         compressed_topk=max(1, min(2, int(effective_config["route_topk"]))),
+        sequence_sparse_type=args.sequence_propagation,
         expanded_sparse_type=args.expanded_propagation,
         compressed_sparse_type=args.compressed_propagation,
+        route_mode=args.route_mode,
+        value_norm_kind=value_norm_kind,
+        norm_position=args.norm_position,
         expanded_window=args.expanded_window,
         compressed_window=args.compressed_window,
         implementation=args.implementation,
+        propagation_residual=not args.disable_propagation_residual,
+        value_residual_scale=args.value_residual_scale,
+        state_residual_scale=args.state_residual_scale,
+        alpha_scale=args.alpha_scale,
+        beta_s_to_b_scale=args.beta_s_to_b_scale,
+        beta_b_to_s_scale=args.beta_b_to_s_scale,
+        s_delta_scale=args.s_delta_scale,
+        b_delta_scale=args.b_delta_scale,
+        cross_delta_scale=args.cross_delta_scale,
+        route_temperature=args.route_temperature,
+        route_hidden_dim=args.route_hidden_dim,
+        state_init_mode=args.state_init_mode,
+        pairwise_kind=args.pairwise_kind,
+        pairwise_hidden_dim=args.pairwise_hidden_dim,
     )
     parameter_count = count_parameters(model)
 
     run_dir = session_dir / slugify_run_name(experiment_name)
     run_dir.mkdir(parents=True, exist_ok=True)
     tensorboard_dir = (
-        Path(args.tensorboard_dir) / slugify_run_name(experiment_name)
+        Path(args.tensorboard_dir) / session_dir.name / slugify_run_name(experiment_name)
         if args.tensorboard_dir
         else run_dir / "tensorboard"
     )
@@ -529,15 +638,18 @@ def run_single_experiment(
         f"experiment={experiment_name} | params={parameter_count:,} | "
         f"dim={effective_config['dim']} | warmup={effective_config['warmup_layers']} | "
         f"stages={effective_config['lite_layers']}/{effective_config['mid_layers']}/{effective_config['full_layers']} | "
-        f"refine={effective_config['final_refine_layers']} | route_topk={effective_config['route_topk']}"
+        f"refine={effective_config['final_refine_layers']} | route_mode={args.route_mode} | "
+        f"route_topk={effective_config['route_topk']}"
     )
     print(
         f"schedule_steps={train_steps:,} | approx_epochs={requested_epochs:.3f} | "
         f"steps_per_epoch={steps_per_epoch:,} | batch_size={args.batch_size} | "
+        f"grad_accum_steps={grad_accum_steps} | effective_batch_size={effective_batch_size} | "
         f"objective={args.training_objective}"
     )
 
     start_time = time.perf_counter()
+    writer = maybe_create_summary_writer(enabled=args.tensorboard, tensorboard_dir=tensorboard_dir)
 
     def progress_callback(step: int, total_steps: int, minibatch_loss: float) -> None:
         if args.log_interval <= 0:
@@ -551,23 +663,80 @@ def run_single_experiment(
             f"minibatch_loss={minibatch_loss:.4f} | elapsed={elapsed:.1f}s"
         )
 
-    history = train_next_token_model(
-        model,
-        train_tokens,
-        val_tokens,
-        seq_len=args.seq_len,
-        batch_size=args.batch_size,
-        device=device,
-        steps=train_steps,
-        eval_interval=args.eval_interval,
-        eval_steps=args.eval_steps,
-        learning_rate=args.learning_rate,
-        weight_decay=args.weight_decay,
-        teacher_forcing=teacher_forcing,
-        full_sequence_causal=full_sequence_causal,
-        teacher_forcing_chunk_size=args.teacher_forcing_chunk_size,
-        progress_callback=progress_callback,
-    )
+    def step_tensorboard_callback(step: int, minibatch_loss: float, grad_norm: float) -> None:
+        if writer is None:
+            return
+        writer.add_scalar("train/minibatch_loss", minibatch_loss, step)
+        writer.add_scalar("train/epoch", step / steps_per_epoch, step)
+        writer.add_scalar("train/grad_norm", grad_norm, step)
+        if step == 1 or step == train_steps or (args.log_interval > 0 and step % args.log_interval == 0):
+            writer.flush()
+
+    def eval_tensorboard_callback(step: int, train_loss: float, val_loss: float) -> None:
+        if writer is None:
+            runtime_stats = None
+        else:
+            writer.add_scalar("eval/train_loss", train_loss, step)
+            writer.add_scalar("eval/val_loss", val_loss, step)
+            writer.add_scalar("eval/train_ppl", perplexity_from_loss(train_loss), step)
+            writer.add_scalar("eval/val_ppl", perplexity_from_loss(val_loss), step)
+            stats_batch = sample_next_token_batch(
+                train_tokens,
+                seq_len=args.seq_len,
+                batch_size=1,
+                device=device,
+                teacher_forcing=teacher_forcing,
+                full_sequence_causal=full_sequence_causal,
+            )
+            runtime_stats = model.collect_runtime_stats(stats_batch.context[:1])
+            for key, value in sorted(runtime_stats.items()):
+                writer.add_scalar(key, value, step)
+            writer.flush()
+        if trial is not None:
+            trial.report(val_loss, step)
+            if trial.should_prune():
+                raise TrialPrunedError(f"Trial pruned at step {step} with val_loss={val_loss:.4f}")
+
+    def step_setup_callback(step: int, total_steps: int) -> None:
+        model.set_b_schedule_scale(
+            resolve_b_schedule_scale(
+                schedule=args.b_schedule,
+                step=step,
+                total_steps=total_steps,
+                min_scale=args.b_schedule_min,
+                max_scale=args.b_schedule_max,
+            )
+        )
+
+    try:
+        history = train_next_token_model(
+            model,
+            train_tokens,
+            val_tokens,
+            seq_len=args.seq_len,
+            batch_size=args.batch_size,
+            device=device,
+            steps=train_steps,
+            eval_interval=args.eval_interval,
+            eval_steps=args.eval_steps,
+            learning_rate=args.learning_rate,
+            weight_decay=args.weight_decay,
+            grad_accum_steps=grad_accum_steps,
+            teacher_forcing=teacher_forcing,
+            full_sequence_causal=full_sequence_causal,
+            teacher_forcing_chunk_size=args.teacher_forcing_chunk_size,
+            step_setup_callback=step_setup_callback,
+            progress_callback=progress_callback,
+            step_callback=step_tensorboard_callback,
+            eval_callback=eval_tensorboard_callback,
+            autocast_device_type=autocast_device_type,
+            autocast_dtype=autocast_dtype,
+        )
+    except Exception:
+        if writer is not None:
+            writer.flush()
+            writer.close()
+        raise
     runtime_seconds = time.perf_counter() - start_time
     print_eval_table(history, steps_per_epoch=steps_per_epoch)
 
@@ -596,9 +765,12 @@ def run_single_experiment(
         "model_preset": effective_config["model_preset"],
         "tokenizer": tokenizer_label,
         "tokenizer_vocab_size": vocab.size,
+        "subword_vocab_size": args.subword_vocab_size if args.tokenizer == "subword" else None,
         "tokenizer_model_path": tokenizer_model_path,
         "seq_len": args.seq_len,
         "batch_size": args.batch_size,
+        "grad_accum_steps": grad_accum_steps,
+        "effective_batch_size": effective_batch_size,
         "dim": effective_config["dim"],
         "warmup_layers": effective_config["warmup_layers"],
         "final_refine_layers": effective_config["final_refine_layers"],
@@ -606,8 +778,33 @@ def run_single_experiment(
         "mid_layers": effective_config["mid_layers"],
         "full_layers": effective_config["full_layers"],
         "route_topk": effective_config["route_topk"],
+        "value_norm_kind": value_norm_kind,
+        "norm_position": args.norm_position,
+        "propagation_residual": not args.disable_propagation_residual,
+        "route_mode": args.route_mode,
+        "sequence_propagation": args.sequence_propagation,
+        "expanded_propagation": args.expanded_propagation,
+        "compressed_propagation": args.compressed_propagation,
+        "value_residual_scale": args.value_residual_scale,
+        "state_residual_scale": args.state_residual_scale,
+        "route_temperature": args.route_temperature,
+        "route_hidden_dim": args.route_hidden_dim,
+        "state_init_mode": args.state_init_mode,
+        "pairwise_kind": args.pairwise_kind,
+        "pairwise_hidden_dim": args.pairwise_hidden_dim,
+        "alpha_scale": args.alpha_scale,
+        "beta_s_to_b_scale": args.beta_s_to_b_scale,
+        "beta_b_to_s_scale": args.beta_b_to_s_scale,
+        "s_delta_scale": args.s_delta_scale,
+        "b_delta_scale": args.b_delta_scale,
+        "cross_delta_scale": args.cross_delta_scale,
+        "b_schedule": args.b_schedule,
+        "b_schedule_min": args.b_schedule_min,
+        "b_schedule_max": args.b_schedule_max,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
+        "precision": args.precision,
+        "s_window": args.s_window,
         "steps": train_steps,
         "approx_epochs": requested_epochs,
         "steps_per_epoch": steps_per_epoch,
@@ -629,6 +826,9 @@ def run_single_experiment(
         "corpus_truncated": corpus.truncated,
         "run_dir": run_dir,
         "tensorboard_dir": tensorboard_dir if args.tensorboard else None,
+        "final_runtime_stats": model.collect_runtime_stats(
+            prompt_ids[: args.seq_len].unsqueeze(0).to(device)
+        ),
     }
     metrics_rows = build_metrics_rows(history, steps_per_epoch=steps_per_epoch)
 
@@ -642,6 +842,29 @@ def run_single_experiment(
                 "tokenizer_model_path": None if tokenizer_model_path is None else str(tokenizer_model_path),
                 "seq_nodes": args.seq_len,
                 "implementation": args.implementation,
+                "value_norm_kind": value_norm_kind,
+                "norm_position": args.norm_position,
+                "propagation_residual": not args.disable_propagation_residual,
+                "route_mode": args.route_mode,
+                "sequence_propagation": args.sequence_propagation,
+                "expanded_propagation": args.expanded_propagation,
+                "compressed_propagation": args.compressed_propagation,
+                "value_residual_scale": args.value_residual_scale,
+                "state_residual_scale": args.state_residual_scale,
+                "route_temperature": args.route_temperature,
+                "route_hidden_dim": args.route_hidden_dim,
+                "state_init_mode": args.state_init_mode,
+                "pairwise_kind": args.pairwise_kind,
+                "pairwise_hidden_dim": args.pairwise_hidden_dim,
+                "alpha_scale": args.alpha_scale,
+                "beta_s_to_b_scale": args.beta_s_to_b_scale,
+                "beta_b_to_s_scale": args.beta_b_to_s_scale,
+                "s_delta_scale": args.s_delta_scale,
+                "b_delta_scale": args.b_delta_scale,
+                "cross_delta_scale": args.cross_delta_scale,
+                "b_schedule": args.b_schedule,
+                "b_schedule_min": args.b_schedule_min,
+                "b_schedule_max": args.b_schedule_max,
                 "stage_specs": [asdict(spec) for spec in stage_specs],
                 **{key: int(value) if isinstance(value, int) else value for key, value in effective_config.items()},
             },
@@ -672,7 +895,6 @@ def run_single_experiment(
         checkpoint_payload=checkpoint_payload,
     )
 
-    writer = maybe_create_summary_writer(enabled=args.tensorboard, tensorboard_dir=tensorboard_dir)
     try:
         log_history_to_tensorboard(
             writer,
@@ -681,6 +903,7 @@ def run_single_experiment(
             summary=summary,
             prompt_text=prompt_text,
             generated_text=generated_text,
+            include_scalars=False,
         )
     finally:
         if writer is not None:
@@ -740,6 +963,7 @@ def main() -> None:
         default="char",
     )
     parser.add_argument("--subword-vocab-size", type=int, default=256)
+    parser.add_argument("--subword-character-coverage", type=float, default=0.9995)
     parser.add_argument(
         "--subword-model-type",
         choices=("bpe", "unigram"),
@@ -768,32 +992,104 @@ def main() -> None:
     parser.add_argument("--lite-layers", type=int, default=2)
     parser.add_argument("--mid-layers", type=int, default=2)
     parser.add_argument("--full-layers", type=int, default=1)
+    parser.add_argument("--lite-expand-ratio", type=float, default=1.05)
+    parser.add_argument("--lite-compress-ratio", type=float, default=0.90)
+    parser.add_argument("--lite-alpha-b", type=float, default=0.3)
+    parser.add_argument("--lite-beta-s-to-b", type=float, default=0.25)
+    parser.add_argument("--lite-beta-b-to-s", type=float, default=0.15)
+    parser.add_argument("--mid-expand-ratio", type=float, default=1.10)
+    parser.add_argument("--mid-compress-ratio", type=float, default=0.80)
+    parser.add_argument("--mid-alpha-b", type=float, default=0.65)
+    parser.add_argument("--mid-beta-s-to-b", type=float, default=0.55)
+    parser.add_argument("--mid-beta-b-to-s", type=float, default=0.35)
+    parser.add_argument("--full-expand-ratio", type=float, default=1.20)
+    parser.add_argument("--full-compress-ratio", type=float, default=0.70)
+    parser.add_argument("--full-alpha-b", type=float, default=1.0)
+    parser.add_argument("--full-beta-s-to-b", type=float, default=0.9)
+    parser.add_argument("--full-beta-b-to-s", type=float, default=0.8)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--route-topk", type=int, default=4)
+    parser.add_argument(
+        "--value-norm-kind",
+        choices=("layernorm", "rmsnorm"),
+        default="layernorm",
+    )
+    parser.add_argument(
+        "--norm-position",
+        choices=("pre", "post"),
+        default="post",
+    )
+    parser.add_argument("--value-residual-scale", type=float, default=1.0)
+    parser.add_argument("--state-residual-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--state-init-mode",
+        choices=("zero", "neg_half", "normal"),
+        default="zero",
+    )
+    parser.add_argument("--s-window", type=int, default=8)
+    parser.add_argument("--route-temperature", type=float, default=1.0)
+    parser.add_argument("--route-hidden-dim", type=int)
+    parser.add_argument(
+        "--pairwise-kind",
+        choices=("diagonal_bilinear", "hadamard_mlp"),
+        default="diagonal_bilinear",
+    )
+    parser.add_argument("--pairwise-hidden-dim", type=int)
+    parser.add_argument(
+        "--precision",
+        choices=("fp32", "bf16", "fp16"),
+        default="fp32",
+    )
     parser.add_argument(
         "--implementation",
         choices=("reference", "streaming", "kernel", "native"),
         default="streaming",
     )
     parser.add_argument(
+        "--sequence-propagation",
+        choices=("window", "dense"),
+        default="window",
+    )
+    parser.add_argument(
         "--expanded-propagation",
-        choices=("topk", "window"),
+        choices=("dense", "topk", "window"),
         default="topk",
     )
     parser.add_argument(
         "--compressed-propagation",
-        choices=("topk", "window"),
+        choices=("dense", "topk", "window"),
         default="topk",
+    )
+    parser.add_argument(
+        "--route-mode",
+        choices=("topk", "dense"),
+        default="dense",
     )
     parser.add_argument("--expanded-window", type=int)
     parser.add_argument("--compressed-window", type=int)
+    parser.add_argument("--disable-layer-norm", action="store_true")
+    parser.add_argument("--disable-propagation-residual", action="store_true")
+    parser.add_argument("--alpha-scale", type=float, default=1.0)
+    parser.add_argument("--beta-s-to-b-scale", type=float, default=1.0)
+    parser.add_argument("--beta-b-to-s-scale", type=float, default=1.0)
+    parser.add_argument("--s-delta-scale", type=float, default=0.25)
+    parser.add_argument("--b-delta-scale", type=float, default=0.20)
+    parser.add_argument("--cross-delta-scale", type=float, default=0.15)
+    parser.add_argument(
+        "--b-schedule",
+        choices=("constant", "up", "down"),
+        default="constant",
+    )
+    parser.add_argument("--b-schedule-min", type=float, default=1.0)
+    parser.add_argument("--b-schedule-max", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--sample-tokens", type=int, default=80)
     parser.add_argument("--prompt-text")
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--sample-topk", type=int)
     parser.add_argument("--teacher-forcing-chunk-size", type=int)
+    parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--run-name", default="progressive_b")
     parser.add_argument("--output-dir", default="artifacts/training_runs")
     parser.add_argument("--tensorboard", action="store_true")
@@ -814,6 +1110,10 @@ def main() -> None:
             "--teacher-forcing-chunk-size is only supported with "
             "--training-objective teacher_forcing."
         )
+    if args.s_window <= 0:
+        raise ValueError("s-window must be positive.")
+    if args.route_temperature <= 0.0:
+        raise ValueError("route-temperature must be positive.")
 
     corpus = load_text_corpus(
         default_text=DEFAULT_TEXT,
@@ -844,6 +1144,7 @@ def main() -> None:
         subword_vocab_size=args.subword_vocab_size,
         subword_model_type=args.subword_model_type,
         tokenizer_prefix=args.tokenizer_prefix,
+        subword_character_coverage=args.subword_character_coverage,
     )
     tokens = vocab.encode(corpus.text)
     if tokens.numel() <= args.seq_len + 1:
