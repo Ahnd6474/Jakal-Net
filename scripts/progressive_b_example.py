@@ -712,6 +712,8 @@ class NextTokenBatch:
 
 @dataclass(frozen=True, slots=True)
 class TrainingHistory:
+    eval_steps: tuple[int, ...]
+    train_step_losses: tuple[float, ...]
     train_losses: tuple[float, ...]
     val_losses: tuple[float, ...]
 
@@ -835,6 +837,8 @@ def train_next_token_model(
         lr=learning_rate,
         weight_decay=weight_decay,
     )
+    eval_steps_seen: list[int] = []
+    train_step_losses: list[float] = []
     train_losses: list[float] = []
     val_losses: list[float] = []
 
@@ -859,10 +863,12 @@ def train_next_token_model(
         if grad_clip is not None:
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
         optimizer.step()
+        train_step_losses.append(float(loss.item()))
         if progress_callback is not None:
             progress_callback(step, steps, float(loss.item()))
 
         if step % eval_interval == 0 or step == 1 or step == steps:
+            eval_steps_seen.append(step)
             train_losses.append(
                 estimate_next_token_loss(
                     model,
@@ -891,6 +897,8 @@ def train_next_token_model(
             )
 
     return TrainingHistory(
+        eval_steps=tuple(eval_steps_seen),
+        train_step_losses=tuple(train_step_losses),
         train_losses=tuple(train_losses),
         val_losses=tuple(val_losses),
     )

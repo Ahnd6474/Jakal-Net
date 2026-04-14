@@ -103,6 +103,7 @@ export PYTHONPATH=src
 - `ipykernel` for the notebook kernel
 - `tqdm` for progress bars
 - `matplotlib` for training curves
+- `tensorboard` for event logging
 
 From the repository root:
 
@@ -173,7 +174,43 @@ $env:PYTHONPATH = "src"
 .\.venv\Scripts\python.exe scripts\train_progressive_b_lm.py --steps 100 --seq-len 32 --dim 48
 ```
 
-The training script uses a small built-in character corpus by default. You can point it at your own UTF-8 text file with `--text-file`.
+The training script uses a small built-in character corpus by default. It can now also load larger external corpora from:
+
+- a single UTF-8 file with `--text-file`
+- multiple files, directories, or globs with `--text-source`
+- JSONL corpora with `--jsonl-source --jsonl-text-key text`
+- Hugging Face datasets with `--hf-dataset --hf-split train --hf-text-key text`
+
+You can compare multiple model sizes in one session with `--sweep-presets tiny,small,base,medium`, and the script writes per-run artifacts under `artifacts/training_runs/`:
+
+- `summary.json` and `session_summary.json`
+- `metrics.jsonl` and `metrics.csv`
+- `sample_prompt.txt` and `sample_generated.txt`
+- TensorBoard event files under each run's `tensorboard/` directory when `--tensorboard` is enabled
+
+Example sweep over a local text corpus with TensorBoard logging:
+
+```powershell
+$env:PYTHONPATH = "src"
+.\.venv\Scripts\python.exe scripts\train_progressive_b_lm.py `
+  --text-file artifacts\data\sample.txt `
+  --training-objective teacher_forcing `
+  --teacher-forcing-chunk-size 8 `
+  --seq-len 32 `
+  --batch-size 8 `
+  --steps 50 `
+  --sweep-presets tiny,small,base `
+  --tensorboard `
+  --run-name sample_sweep
+```
+
+Then launch TensorBoard from the generated session directory:
+
+```powershell
+.\.venv\Scripts\python.exe -m tensorboard.main --logdir artifacts\training_runs
+```
+
+There is also a companion notebook for running these sweeps interactively: `notebooks/ar_model_sweep_experiments.ipynb`.
 
 Here is the smallest useful Python example:
 
@@ -218,7 +255,7 @@ What is not here yet:
 - Flash kernels
 - Encoders or decoders
 - Real tokenizer integrations
-- Large-scale dataset pipelines
+- Production-scale dataset pipelines
 
 ## Why this shape?
 
