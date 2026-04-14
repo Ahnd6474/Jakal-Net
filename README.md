@@ -7,6 +7,7 @@ This repository currently holds the core data structures and reference operators
 ## Table of contents
 
 - [Installation](#installation)
+- [Notebook setup](#notebook-setup)
 - [Quick start](#quick-start)
 - [What is Jakal-Net?](#what-is-jakal-net)
 - [Why this shape?](#why-this-shape)
@@ -94,6 +95,31 @@ Or in bash:
 ```bash
 export PYTHONPATH=src
 ```
+
+## Notebook setup
+
+`notebooks/ar_teacher_forced_training.ipynb` expects the shared dependencies from `requirements-base.txt` plus PyTorch. Installing `requirements.txt` now includes the notebook extras needed for a normal Jupyter workflow:
+
+- `ipykernel` for the notebook kernel
+- `tqdm` for progress bars
+- `matplotlib` for training curves
+
+From the repository root:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python -m ipykernel install --user --name jakal-net --display-name "Jakal-Net"
+```
+
+The notebook finds `src/` and `scripts/` automatically as long as you launch it from somewhere inside this repository tree.
+
+For corpus loading, set `TEXT_FILE` in the notebook to either:
+
+- an absolute path, or
+- a repository-relative path such as `artifacts\data\sample.txt`
+
+If `TEXT_FILE` is left empty, the notebook falls back to the built-in `DEFAULT_TEXT` sample corpus.
 
 ## Quick start
 

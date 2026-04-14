@@ -1,0 +1,3 @@
+Jakal-Net separates propagation from transition so sequence updates stay explicit.
+This sample corpus exists to verify notebook data loading from a real text file.
+Teacher-forced autoregressive training reads this file when TEXT_FILE points here.
