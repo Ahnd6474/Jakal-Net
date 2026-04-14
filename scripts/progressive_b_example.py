@@ -9,13 +9,15 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from jakal_net import (
+    BilinearPairwiseRoute,
     DiagonalBilinearPairwise,
     Layer,
     LayerDelta,
-    LinearRoute,
+    LearnedPositionEncoding,
     Propagation,
     SparsePropagation,
     SparseTransition,
+    SourceTargetHadamardMLPRoute,
     Transition,
 )
 from jakal_net.kernel_common import apply_slot_mask_to_state, apply_slot_mask_to_val
@@ -48,6 +50,14 @@ def _apply_layer_slot_mask(layer: Layer, slot_mask: Tensor) -> Layer:
         state=apply_slot_mask_to_state(layer.state, slot_mask),
         val=apply_slot_mask_to_val(layer.val, slot_mask),
     )
+
+
+def _expand_position_encoding(
+    position_encoding: Tensor,
+    batch_shape: tuple[int, ...],
+) -> Tensor:
+    view_shape = (1,) * len(batch_shape) + tuple(position_encoding.shape)
+    return position_encoding.view(view_shape).expand(*batch_shape, *position_encoding.shape)
 
 
 def _make_sparse_or_dense_propagation(
@@ -84,19 +94,19 @@ def _make_sparse_or_dense_propagation(
 def _make_transition(
     *,
     dim: int,
-    dst_nodes: int,
     route_topk: int,
     implementation: str,
     merge_mode: str = "add",
 ) -> Transition | SparseTransition:
-    if route_topk >= dst_nodes:
+    route_fn = SourceTargetHadamardMLPRoute(src_dim=dim, dst_dim=dim)
+    if route_topk <= 0:
         return Transition(
-            route_fn=LinearRoute(src_dim=dim, dst_nodes=dst_nodes),
+            route_fn=route_fn,
             implementation=implementation,
             merge_mode=merge_mode,
         )
     return SparseTransition(
-        route_fn=LinearRoute(src_dim=dim, dst_nodes=dst_nodes),
+        route_fn=route_fn,
         topk=route_topk,
         implementation=implementation,
         merge_mode=merge_mode,
@@ -202,12 +212,16 @@ class ProgressiveBJointBlock(nn.Module):
         self.alpha_b = alpha_b
         self.beta_s_to_b = beta_s_to_b
         self.beta_b_to_s = beta_b_to_s
+        self.expanded_ratio = expanded_nodes / seq_nodes
+        self.compressed_ratio = compressed_nodes / seq_nodes
         self.s_delta_scale = s_delta_scale
         self.b_delta_scale = b_delta_scale
         self.cross_delta_scale = cross_delta_scale
         self.s_val_norm = nn.LayerNorm(dim)
         self.expanded_val_norm = nn.LayerNorm(dim)
         self.compressed_val_norm = nn.LayerNorm(dim)
+        self.expanded_position_encoding = LearnedPositionEncoding(dim)
+        self.compressed_position_encoding = LearnedPositionEncoding(dim)
 
         self.s_propagation = _make_sparse_or_dense_propagation(
             dim=dim,
@@ -218,8 +232,7 @@ class ProgressiveBJointBlock(nn.Module):
         )
         self.expand_transition = _make_transition(
             dim=dim,
-            dst_nodes=expanded_nodes,
-            route_topk=min(route_topk, expanded_nodes),
+            route_topk=route_topk,
             implementation=implementation,
         )
         self.expanded_propagation = _make_sparse_or_dense_propagation(
@@ -232,20 +245,17 @@ class ProgressiveBJointBlock(nn.Module):
         )
         self.b_to_s = _make_transition(
             dim=dim,
-            dst_nodes=seq_nodes,
-            route_topk=min(route_topk, seq_nodes),
+            route_topk=route_topk,
             implementation=implementation,
         )
         self.compress_transition = _make_transition(
             dim=dim,
-            dst_nodes=compressed_nodes,
-            route_topk=min(route_topk, compressed_nodes),
+            route_topk=route_topk,
             implementation=implementation,
         )
         self.s_to_b = _make_transition(
             dim=dim,
-            dst_nodes=compressed_nodes,
-            route_topk=min(route_topk, compressed_nodes),
+            route_topk=route_topk,
             implementation=implementation,
         )
         self.compressed_propagation = _make_sparse_or_dense_propagation(
@@ -257,28 +267,61 @@ class ProgressiveBJointBlock(nn.Module):
             pairwise_fn=compressed_pairwise_fn,
         )
         self.compressed_adapter = Transition(
-            route_fn=LinearRoute(src_dim=dim, dst_nodes=compressed_nodes),
-            merge_mode="replace",
+            route_fn=BilinearPairwiseRoute(src_dim=dim, dst_dim=dim),
+            merge_mode="add",
             implementation=implementation,
         )
 
-    def _make_layer_like(self, reference: Layer, num_nodes: int) -> Layer:
-        return Layer.zeros(
-            dim=self.dim,
-            num_nodes=num_nodes,
-            batch_shape=tuple(reference.batch_shape),
+    def _resolve_b_nodes(self, seq_nodes: int) -> tuple[int, int]:
+        expanded_nodes = max(1, math.ceil(seq_nodes * self.expanded_ratio))
+        compressed_nodes = max(1, math.ceil(seq_nodes * self.compressed_ratio))
+        return expanded_nodes, compressed_nodes
+
+    def _make_b_layer(
+        self,
+        reference: Layer,
+        num_nodes: int,
+        position_encoding: LearnedPositionEncoding,
+    ) -> Layer:
+        batch_shape = tuple(reference.batch_shape)
+        state = torch.zeros(
+            *batch_shape,
+            num_nodes,
             device=reference.state.device,
             dtype=reference.state.dtype,
         )
+        base_position = position_encoding(
+            num_nodes,
+            device=reference.val.device,
+            dtype=reference.val.dtype,
+        )
+        val = _expand_position_encoding(base_position, batch_shape)
+        return Layer(
+            dim=self.dim,
+            num_nodes=num_nodes,
+            state=state,
+            val=val,
+        )
 
     def _prepare_compressed_layer(
-        self, s_layer: Layer, compressed_b: Layer | None
+        self,
+        s_layer: Layer,
+        compressed_b: Layer | None,
+        compressed_nodes: int,
     ) -> Layer:
         if compressed_b is None:
-            return self._make_layer_like(s_layer, self.compressed_nodes)
-        if compressed_b.num_nodes == self.compressed_nodes:
+            return self._make_b_layer(
+                s_layer,
+                compressed_nodes,
+                self.compressed_position_encoding,
+            )
+        if compressed_b.num_nodes == compressed_nodes:
             return compressed_b
-        adapted = self._make_layer_like(s_layer, self.compressed_nodes)
+        adapted = self._make_b_layer(
+            s_layer,
+            compressed_nodes,
+            self.compressed_position_encoding,
+        )
         return self.compressed_adapter(compressed_b, adapted)
 
     def forward_sequence_only(self, s_layer: Layer) -> Layer:
@@ -290,16 +333,25 @@ class ProgressiveBJointBlock(nn.Module):
         return _stabilize_layer(s_layer, self.s_val_norm)
 
     def forward(self, s_layer: Layer, compressed_b: Layer | None = None) -> tuple[Layer, Layer]:
+        expanded_nodes, compressed_nodes = self._resolve_b_nodes(s_layer.num_nodes)
         s_layer = _apply_scaled_delta(
             s_layer,
             self.s_propagation.compute_delta(s_layer),
             self.s_delta_scale,
         )
         s_layer = _stabilize_layer(s_layer, self.s_val_norm)
-        compressed_b = self._prepare_compressed_layer(s_layer, compressed_b)
+        compressed_b = self._prepare_compressed_layer(
+            s_layer,
+            compressed_b,
+            compressed_nodes,
+        )
         compressed_b = _stabilize_layer(compressed_b, self.compressed_val_norm)
 
-        expanded_b = self._make_layer_like(s_layer, self.expanded_nodes)
+        expanded_b = self._make_b_layer(
+            s_layer,
+            expanded_nodes,
+            self.expanded_position_encoding,
+        )
         expanded_b = _apply_scaled_delta(
             expanded_b,
             self.expand_transition.compute_delta(compressed_b, expanded_b),
@@ -368,7 +420,7 @@ class ProgressiveBExampleLM(nn.Module):
         self.stage_specs = tuple(stage_specs or build_progressive_b_stage_specs(seq_nodes))
 
         self.token_embedding = nn.Embedding(vocab_size, dim)
-        self.position_embedding = nn.Parameter(torch.zeros(seq_nodes, dim))
+        self.position_encoding = LearnedPositionEncoding(dim)
         self.state_init = nn.Linear(dim, 1)
         nn.init.zeros_(self.state_init.weight)
         nn.init.zeros_(self.state_init.bias)
@@ -436,13 +488,18 @@ class ProgressiveBExampleLM(nn.Module):
         *,
         slot_mask: Tensor | None = None,
     ) -> Layer:
+        num_nodes = token_ids.shape[-1]
         token_val = self.token_embedding(token_ids)
-        position_val = self.position_embedding.unsqueeze(0)
+        position_val = self.position_encoding(
+            num_nodes,
+            device=token_val.device,
+            dtype=token_val.dtype,
+        ).unsqueeze(0)
         combined = token_val + position_val
         state = self.state_init(combined).squeeze(-1)
         layer = Layer(
             dim=self.dim,
-            num_nodes=self.seq_nodes,
+            num_nodes=num_nodes,
             state=state,
             val=combined,
         )
@@ -475,12 +532,6 @@ class ProgressiveBExampleLM(nn.Module):
     def forward_full_sequence_causal(
         self, token_ids: Tensor, *, return_layers: bool = False
     ) -> Tensor | tuple[Tensor, Layer, None]:
-        if token_ids.shape[-1] != self.seq_nodes:
-            raise ValueError(
-                "full-sequence causal expects token_ids.shape[-1] to equal seq_nodes, "
-                f"got {token_ids.shape[-1]} and {self.seq_nodes}."
-            )
-
         # This path keeps strict causality by using the causal S operators only.
         s_layer = self.initialize_sequence_layer(token_ids)
         for op in self.s_warmup:
@@ -506,31 +557,32 @@ class ProgressiveBExampleLM(nn.Module):
         flat_batch = math.prod(batch_shape) if batch_shape else 1
         device = base_layer.state.device
         chunk_size = prediction_indices.numel()
+        num_nodes = base_layer.num_nodes
 
         base_mask = prediction_indices.view(chunk_size, 1) >= torch.arange(
-            self.seq_nodes, device=device
-        ).view(1, self.seq_nodes)
+            num_nodes, device=device
+        ).view(1, num_nodes)
         slot_mask = base_mask.unsqueeze(0).expand(flat_batch, -1, -1)
         prediction_indices = prediction_indices.view(1, chunk_size).expand(flat_batch, -1)
 
         expanded_state = (
-            base_layer.state.reshape(flat_batch, self.seq_nodes)
+            base_layer.state.reshape(flat_batch, num_nodes)
             .unsqueeze(1)
-            .expand(flat_batch, chunk_size, self.seq_nodes)
-            .reshape(flat_batch * chunk_size, self.seq_nodes)
+            .expand(flat_batch, chunk_size, num_nodes)
+            .reshape(flat_batch * chunk_size, num_nodes)
         )
         expanded_val = (
-            base_layer.val.reshape(flat_batch, self.seq_nodes, self.dim)
+            base_layer.val.reshape(flat_batch, num_nodes, self.dim)
             .unsqueeze(1)
-            .expand(flat_batch, chunk_size, self.seq_nodes, self.dim)
-            .reshape(flat_batch * chunk_size, self.seq_nodes, self.dim)
+            .expand(flat_batch, chunk_size, num_nodes, self.dim)
+            .reshape(flat_batch * chunk_size, num_nodes, self.dim)
         )
-        slot_mask_flat = slot_mask.reshape(flat_batch * chunk_size, self.seq_nodes)
+        slot_mask_flat = slot_mask.reshape(flat_batch * chunk_size, num_nodes)
         prediction_indices_flat = prediction_indices.reshape(flat_batch * chunk_size)
 
         s_layer = Layer(
             dim=self.dim,
-            num_nodes=self.seq_nodes,
+            num_nodes=num_nodes,
             state=expanded_state,
             val=expanded_val,
         )
@@ -566,20 +618,16 @@ class ProgressiveBExampleLM(nn.Module):
         return_layers: bool = False,
         teacher_forcing_chunk_size: int | None = None,
     ) -> Tensor | tuple[Tensor, Layer, Layer | None]:
-        if token_ids.shape[-1] != self.seq_nodes:
-            raise ValueError(
-                "teacher forcing expects token_ids.shape[-1] to equal seq_nodes, "
-                f"got {token_ids.shape[-1]} and {self.seq_nodes}."
-            )
         if teacher_forcing_chunk_size is not None and teacher_forcing_chunk_size <= 0:
             raise ValueError("teacher_forcing_chunk_size must be positive when provided.")
 
         base_layer = self.initialize_sequence_layer(token_ids)
-        chunk_size = teacher_forcing_chunk_size or self.seq_nodes
-        if chunk_size >= self.seq_nodes:
+        num_nodes = base_layer.num_nodes
+        chunk_size = teacher_forcing_chunk_size or num_nodes
+        if chunk_size >= num_nodes:
             logits, s_layer, compressed_b = self._forward_teacher_forcing_chunk(
                 base_layer,
-                torch.arange(self.seq_nodes, device=token_ids.device),
+                torch.arange(num_nodes, device=token_ids.device),
             )
             if return_layers:
                 return logits, s_layer, compressed_b
@@ -592,8 +640,8 @@ class ProgressiveBExampleLM(nn.Module):
             )
 
         logits_chunks: list[Tensor] = []
-        for chunk_start in range(0, self.seq_nodes, chunk_size):
-            chunk_end = min(self.seq_nodes, chunk_start + chunk_size)
+        for chunk_start in range(0, num_nodes, chunk_size):
+            chunk_end = min(num_nodes, chunk_start + chunk_size)
             prediction_indices = torch.arange(chunk_start, chunk_end, device=token_ids.device)
             logits_chunk, _, _ = self._forward_teacher_forcing_chunk(
                 base_layer,

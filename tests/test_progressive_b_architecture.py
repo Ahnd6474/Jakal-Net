@@ -105,6 +105,52 @@ class ProgressiveBArchitectureTests(unittest.TestCase):
         self.assertEqual(compressed_b.num_nodes, 6)
         self.assertEqual(compressed_b.val.shape, (4, 6, 8))
 
+    def test_joint_block_initializes_b_from_position_encoding(self) -> None:
+        torch.manual_seed(22)
+        s_layer = Layer(
+            dim=4,
+            num_nodes=9,
+            state=torch.randn(2, 9),
+            val=torch.randn(2, 9, 4),
+        )
+        block = ProgressiveBJointBlock(
+            dim=4,
+            seq_nodes=8,
+            expanded_nodes=10,
+            compressed_nodes=6,
+            alpha_b=0.5,
+            beta_s_to_b=0.4,
+            beta_b_to_s=0.2,
+            implementation="streaming",
+        )
+
+        prepared = block._prepare_compressed_layer(s_layer, None, 7)
+
+        self.assertTrue(torch.equal(prepared.state, torch.zeros_like(prepared.state)))
+        self.assertEqual(prepared.val.shape, (2, 7, 4))
+        self.assertFalse(torch.allclose(prepared.val[:, 0, :], prepared.val[:, -1, :]))
+
+    def test_example_lm_accepts_longer_sequence_than_reference_length(self) -> None:
+        torch.manual_seed(23)
+        model = ProgressiveBExampleLM(
+            vocab_size=32,
+            dim=8,
+            seq_nodes=8,
+            warmup_layers=1,
+            final_refine_layers=1,
+            implementation="streaming",
+        )
+        token_ids = torch.randint(0, 32, (2, 12))
+
+        logits, s_layer, compressed_b = model(token_ids, return_layers=True)
+
+        self.assertEqual(logits.shape, (2, 32))
+        self.assertEqual(s_layer.state.shape, (2, 12))
+        self.assertIsNotNone(compressed_b)
+        assert compressed_b is not None
+        self.assertEqual(compressed_b.num_nodes, 9)
+        self.assertEqual(compressed_b.val.shape, (2, 9, 8))
+
     def test_example_lm_shares_pairwise_by_role(self) -> None:
         model = ProgressiveBExampleLM(
             vocab_size=32,

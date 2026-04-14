@@ -29,10 +29,13 @@ from jakal_net.kernel_common import (
 )
 from jakal_net.modules import (
     BilinearPairwise,
+    BilinearPairwiseRoute,
     DiagonalBilinearPairwise,
     HadamardMLPPairwise,
+    LearnedPositionEncoding,
     LinearRoute,
     MLPRoute,
+    SourceTargetHadamardMLPRoute,
 )
 
 
@@ -76,6 +79,13 @@ class KernelCommonTests(unittest.TestCase):
             self.assertTrue(torch.allclose(expected, actual))
             self.assertTrue(supports_route_kernel(module))
 
+        self.assertFalse(
+            supports_route_kernel(BilinearPairwiseRoute(src_dim=5, dst_dim=5))
+        )
+        self.assertFalse(
+            supports_route_kernel(SourceTargetHadamardMLPRoute(src_dim=5, dst_dim=5))
+        )
+
     def test_route_block_logits_match_full_route_logits(self) -> None:
         torch.manual_seed(2)
         src_val = torch.randn(2, 4, 5)
@@ -92,6 +102,16 @@ class KernelCommonTests(unittest.TestCase):
             ]
             rebuilt = torch.cat(pieces, dim=-1)
             self.assertTrue(torch.allclose(full, rebuilt, atol=1e-6, rtol=1e-6))
+
+    def test_learned_position_encoding_generates_variable_lengths(self) -> None:
+        module = LearnedPositionEncoding(dim=4)
+
+        short = module(3)
+        long = module(7)
+
+        self.assertEqual(short.shape, (3, 4))
+        self.assertEqual(long.shape, (7, 4))
+        self.assertFalse(torch.allclose(long[0], long[-1]))
 
     def test_masked_softmax_only_uses_active_entries(self) -> None:
         logits = torch.tensor([[3.0, 1.0, -4.0]])

@@ -11,6 +11,7 @@ from jakal_net import (
     Propagation,
     SparsePropagation,
     SparseTransition,
+    SourceTargetHadamardMLPRoute,
     Transition,
 )
 
@@ -40,6 +41,13 @@ def _make_route_fn(src_dim: int, dst_nodes: int):
         return torch.einsum("...jd,dk->...jk", src_val, weight) + bias
 
     return route_fn
+
+
+def _pairwise_route_fn(src_val: torch.Tensor, dst_val: torch.Tensor) -> torch.Tensor:
+    src_bias = src_val.mean(dim=-1, keepdim=True)
+    dst_bias = dst_val.mean(dim=-1).unsqueeze(-2)
+    interaction = torch.einsum("...id,...kd->...ik", src_val, dst_val)
+    return interaction + 0.2 * src_bias - 0.15 * dst_bias
 
 
 class JakalNetModuleTests(unittest.TestCase):
@@ -337,6 +345,39 @@ class JakalNetModuleTests(unittest.TestCase):
 
         self.assert_delta_close(reference.compute_delta(src, dst), kernel.compute_delta(src, dst))
 
+    def test_dense_transition_pairwise_route_streaming_matches_reference(self) -> None:
+        torch.manual_seed(17)
+        src = Layer(
+            dim=4,
+            num_nodes=6,
+            state=torch.randn(2, 6),
+            val=torch.randn(2, 6, 4),
+        )
+        dst = Layer(
+            dim=4,
+            num_nodes=5,
+            state=torch.randn(2, 5),
+            val=torch.randn(2, 5, 4),
+        )
+
+        reference = Transition(
+            route_fn=_pairwise_route_fn,
+            state_activation_fn=lambda x: torch.nn.functional.softplus(x) + 0.1,
+            val_proj_fn=_val_proj_fn,
+            state_proj_fn=_state_proj_fn,
+            implementation="reference",
+        )
+        streaming = Transition(
+            route_fn=_pairwise_route_fn,
+            state_activation_fn=lambda x: torch.nn.functional.softplus(x) + 0.1,
+            val_proj_fn=_val_proj_fn,
+            state_proj_fn=_state_proj_fn,
+            implementation="streaming",
+            src_block_size=2,
+        )
+
+        self.assert_delta_close(reference.compute_delta(src, dst), streaming.compute_delta(src, dst))
+
     def test_sparse_transition_streaming_matches_reference(self) -> None:
         torch.manual_seed(4)
         src = Layer(
@@ -429,6 +470,43 @@ class JakalNetModuleTests(unittest.TestCase):
         kernel.route_fn.load_state_dict(reference.route_fn.state_dict())
 
         self.assert_delta_close(reference.compute_delta(src, dst), kernel.compute_delta(src, dst))
+
+    def test_sparse_transition_pairwise_route_streaming_matches_reference(self) -> None:
+        torch.manual_seed(18)
+        src = Layer(
+            dim=3,
+            num_nodes=7,
+            state=torch.randn(2, 7),
+            val=torch.randn(2, 7, 3),
+        )
+        dst = Layer(
+            dim=3,
+            num_nodes=4,
+            state=torch.randn(2, 4),
+            val=torch.randn(2, 4, 3),
+        )
+        route_fn = SourceTargetHadamardMLPRoute(src_dim=3, dst_dim=3, hidden_dim=5)
+
+        reference = SparseTransition(
+            route_fn=route_fn,
+            topk=2,
+            state_activation_fn=lambda x: x + 1.25,
+            val_proj_fn=_val_proj_fn,
+            state_proj_fn=_state_proj_fn,
+            implementation="reference",
+        )
+        streaming = SparseTransition(
+            route_fn=SourceTargetHadamardMLPRoute(src_dim=3, dst_dim=3, hidden_dim=5),
+            topk=2,
+            state_activation_fn=lambda x: x + 1.25,
+            val_proj_fn=_val_proj_fn,
+            state_proj_fn=_state_proj_fn,
+            implementation="streaming",
+            src_block_size=3,
+        )
+        streaming.route_fn.load_state_dict(reference.route_fn.state_dict())
+
+        self.assert_delta_close(reference.compute_delta(src, dst), streaming.compute_delta(src, dst))
 
     def test_transition_routes_with_state_activation_then_adds_to_dst(self) -> None:
         src = Layer(

@@ -56,6 +56,75 @@ class HadamardMLPPairwise(nn.Module):
         return self.proj_out(hidden).squeeze(-1)
 
 
+class BilinearPairwiseRoute(nn.Module):
+    expects_pairwise_inputs = True
+
+    def __init__(
+        self,
+        src_dim: int,
+        dst_dim: int | None = None,
+        *,
+        route_dim: int | None = None,
+        bias: bool = True,
+    ) -> None:
+        super().__init__()
+        target_dim = src_dim if dst_dim is None else dst_dim
+        width = max(src_dim, target_dim) if route_dim is None else route_dim
+        self.source_proj = nn.Linear(src_dim, width, bias=False)
+        self.target_proj = nn.Linear(target_dim, width, bias=False)
+        self.weight = nn.Parameter(torch.empty(width, width))
+        nn.init.xavier_uniform_(self.weight)
+        self.bias = nn.Parameter(torch.zeros(())) if bias else None
+
+    def forward(self, source_val: Tensor, target_val: Tensor) -> Tensor:
+        projected_source = self.source_proj(source_val)
+        projected_target = self.target_proj(target_val)
+        scores = torch.einsum(
+            "...id,df,...kf->...ik",
+            projected_source,
+            self.weight,
+            projected_target,
+        )
+        if self.bias is not None:
+            scores = scores + self.bias
+        return scores
+
+
+class SourceTargetHadamardMLPRoute(nn.Module):
+    expects_pairwise_inputs = True
+
+    def __init__(
+        self,
+        src_dim: int,
+        dst_dim: int | None = None,
+        *,
+        route_dim: int | None = None,
+        hidden_dim: int | None = None,
+    ) -> None:
+        super().__init__()
+        target_dim = src_dim if dst_dim is None else dst_dim
+        width = max(src_dim, target_dim) if route_dim is None else route_dim
+        hidden = width if hidden_dim is None else hidden_dim
+        self.source_proj = nn.Linear(src_dim, width)
+        self.target_proj = nn.Linear(target_dim, width)
+        self.proj_in = nn.Linear(width * 3, hidden)
+        self.proj_out = nn.Linear(hidden, 1)
+        self.activation = nn.SiLU()
+
+    def forward(self, source_val: Tensor, target_val: Tensor) -> Tensor:
+        projected_source = self.source_proj(source_val).unsqueeze(-2)
+        projected_target = self.target_proj(target_val).unsqueeze(-3)
+        interaction = projected_source * projected_target
+        source_features = projected_source.expand_as(interaction)
+        target_features = projected_target.expand_as(interaction)
+        features = torch.cat(
+            (source_features, target_features, interaction),
+            dim=-1,
+        )
+        hidden = self.activation(self.proj_in(features))
+        return self.proj_out(hidden).squeeze(-1)
+
+
 class LinearRoute(nn.Module):
     def __init__(self, src_dim: int, dst_nodes: int) -> None:
         super().__init__()
@@ -76,3 +145,39 @@ class MLPRoute(nn.Module):
 
     def forward(self, src_val: Tensor) -> Tensor:
         return self.net(src_val)
+
+
+class LearnedPositionEncoding(nn.Module):
+    def __init__(self, dim: int, hidden_dim: int | None = None) -> None:
+        super().__init__()
+        width = max(dim, 8) if hidden_dim is None else hidden_dim
+        self.net = nn.Sequential(
+            nn.Linear(1, width),
+            nn.SiLU(),
+            nn.Linear(width, dim),
+        )
+
+    def forward(
+        self,
+        num_nodes: int,
+        *,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> Tensor:
+        if num_nodes <= 0:
+            raise ValueError("num_nodes must be positive.")
+        base_dtype = self.net[0].weight.dtype
+        if num_nodes == 1:
+            positions = torch.zeros(1, 1, device=device, dtype=base_dtype)
+        else:
+            positions = torch.linspace(
+                0.0,
+                1.0,
+                steps=num_nodes,
+                device=device,
+                dtype=base_dtype,
+            ).unsqueeze(-1)
+        encoding = self.net(positions)
+        if dtype is not None:
+            encoding = encoding.to(dtype=dtype)
+        return encoding

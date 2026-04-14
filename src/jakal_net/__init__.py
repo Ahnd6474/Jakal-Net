@@ -3,22 +3,27 @@ from jakal_net.devices import describe_device, resolve_device
 from jakal_net.native_backend import native_available, native_status
 from jakal_net.modules import (
     BilinearPairwise,
+    BilinearPairwiseRoute,
     DiagonalBilinearPairwise,
     HadamardMLPPairwise,
+    LearnedPositionEncoding,
     LinearRoute,
     MLPRoute,
     ScalarAffine,
+    SourceTargetHadamardMLPRoute,
 )
 from jakal_net.propagation import Propagation, SparsePropagation
 from jakal_net.transition import SparseTransition, Transition
 
 __all__ = [
     "BilinearPairwise",
+    "BilinearPairwiseRoute",
     "describe_device",
     "DiagonalBilinearPairwise",
     "HadamardMLPPairwise",
     "Layer",
     "LayerDelta",
+    "LearnedPositionEncoding",
     "LinearRoute",
     "MLPRoute",
     "native_available",
@@ -28,5 +33,6 @@ __all__ = [
     "ScalarAffine",
     "SparsePropagation",
     "SparseTransition",
+    "SourceTargetHadamardMLPRoute",
     "Transition",
 ]

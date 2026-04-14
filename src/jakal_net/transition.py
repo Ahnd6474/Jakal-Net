@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from typing import Callable
 
 import torch
@@ -35,6 +36,26 @@ from jakal_net.native_backend import (
 )
 
 
+def _route_uses_pairwise_inputs(route_fn: object) -> bool:
+    if getattr(route_fn, "expects_pairwise_inputs", False):
+        return True
+
+    fn = route_fn.forward if isinstance(route_fn, nn.Module) else route_fn
+    try:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+
+    positional_count = 0
+    for parameter in signature.parameters.values():
+        if parameter.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            positional_count += 1
+    return positional_count >= 2
+
+
 class Transition(nn.Module):
     def __init__(
         self,
@@ -64,8 +85,13 @@ class Transition(nn.Module):
         self.dst_block_size = dst_block_size
         self.accumulator_dtype = accumulator_dtype
 
+    def _route_logits(self, src_val: Tensor, dst_val: Tensor) -> Tensor:
+        if _route_uses_pairwise_inputs(self.route_fn):
+            return self.route_fn(src_val, dst_val)
+        return self.route_fn(src_val)
+
     def compute_route_logits(self, src_layer: Layer, dst_layer: Layer) -> Tensor:
-        logits = self.route_fn(src_layer.val)
+        logits = self._route_logits(src_layer.val, dst_layer.val)
         validate_route_logits(logits, src_layer, dst_layer)
         return logits
 
@@ -135,7 +161,7 @@ class Transition(nn.Module):
             src_layer.num_nodes, self.src_block_size, name="src_block_size"
         ):
             src_val = src_layer.val[..., src_start:src_end, :]
-            logits = self.route_fn(src_val)
+            logits = self._route_logits(src_val, dst_layer.val)
             validate_route_block_logits(
                 logits=logits,
                 batch_shape=src_layer.batch_shape,
@@ -166,7 +192,9 @@ class Transition(nn.Module):
     ) -> LayerDelta:
         if src_layer.val.device.type == "privateuseone":
             return self._compute_delta_reference(src_layer, dst_layer)
-        if supports_route_kernel(self.route_fn):
+        if not _route_uses_pairwise_inputs(self.route_fn) and supports_route_kernel(
+            self.route_fn
+        ):
             projected_val, projected_state, sender_strength = self._project_inputs(
                 src_layer, dst_layer
             )
@@ -186,7 +214,8 @@ class Transition(nn.Module):
     def compute_delta(self, src_layer: Layer, dst_layer: Layer) -> LayerDelta:
         if self.implementation == "native":
             if (
-                supports_route_kernel(self.route_fn)
+                not _route_uses_pairwise_inputs(self.route_fn)
+                and supports_route_kernel(self.route_fn)
                 and native_supports("transition_dense")
                 and native_supports_device(src_layer.val.device.type)
             ):
@@ -307,7 +336,7 @@ class SparseTransition(Transition):
             src_layer.num_nodes, self.src_block_size, name="src_block_size"
         ):
             src_val = src_layer.val[..., src_start:src_end, :]
-            logits = self.route_fn(src_val)
+            logits = self._route_logits(src_val, dst_layer.val)
             validate_route_block_logits(
                 logits=logits,
                 batch_shape=src_layer.batch_shape,
@@ -357,7 +386,9 @@ class SparseTransition(Transition):
     ) -> LayerDelta:
         if src_layer.val.device.type == "privateuseone":
             return self._compute_delta_directml_fallback(src_layer, dst_layer)
-        if supports_route_kernel(self.route_fn):
+        if not _route_uses_pairwise_inputs(self.route_fn) and supports_route_kernel(
+            self.route_fn
+        ):
             projected_val, projected_state, sender_strength = self._project_inputs(
                 src_layer, dst_layer
             )
@@ -378,7 +409,8 @@ class SparseTransition(Transition):
     def compute_delta(self, src_layer: Layer, dst_layer: Layer) -> LayerDelta:
         if self.implementation == "native":
             if (
-                supports_route_kernel(self.route_fn)
+                not _route_uses_pairwise_inputs(self.route_fn)
+                and supports_route_kernel(self.route_fn)
                 and native_supports("transition_topk")
                 and native_supports_device(src_layer.val.device.type)
             ):
