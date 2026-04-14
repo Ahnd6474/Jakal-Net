@@ -7,14 +7,18 @@ from typing import Any, Callable, Sequence
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
+from torch.utils.data import DataLoader, IterableDataset
 
 from jakal_net import (
     BilinearPairwiseRoute,
     DiagonalBilinearPairwise,
+    DiagonalBilinearRoute,
     HadamardMLPPairwise,
     Layer,
     LayerDelta,
     LearnedPositionEncoding,
+    LowRankBilinearPairwise,
+    LowRankBilinearRoute,
     Propagation,
     SparsePropagation,
     SparseTransition,
@@ -163,16 +167,28 @@ def _make_transition(
     dim: int,
     route_topk: int,
     route_mode: str,
+    route_kind: str,
     route_hidden_dim: int | None,
     route_temperature: float,
     implementation: str,
     merge_mode: str = "add",
 ) -> Transition | SparseTransition:
-    route_fn: nn.Module = SourceTargetHadamardMLPRoute(
-        src_dim=dim,
-        dst_dim=dim,
-        hidden_dim=route_hidden_dim,
-    )
+    if route_kind == "diagonal_bilinear":
+        route_fn: nn.Module = DiagonalBilinearRoute(src_dim=dim, dst_dim=dim)
+    elif route_kind == "low_rank_bilinear":
+        route_fn = LowRankBilinearRoute(
+            src_dim=dim,
+            dst_dim=dim,
+            rank=route_hidden_dim or max(1, dim // 2),
+        )
+    elif route_kind == "hadamard_mlp":
+        route_fn = SourceTargetHadamardMLPRoute(
+            src_dim=dim,
+            dst_dim=dim,
+            hidden_dim=route_hidden_dim,
+        )
+    else:
+        raise ValueError(f"Unsupported route_kind: {route_kind!r}.")
     if route_temperature != 1.0:
         route_fn = TemperatureScaledRoute(route_fn, route_temperature)
     if route_mode == "dense" or route_topk <= 0:
@@ -313,6 +329,7 @@ class ProgressiveBJointBlock(nn.Module):
         b_delta_scale: float = 0.20,
         cross_delta_scale: float = 0.15,
         route_temperature: float = 1.0,
+        route_kind: str = "diagonal_bilinear",
         route_hidden_dim: int | None = None,
         s_pairwise_fn: nn.Module | None = None,
         expanded_pairwise_fn: nn.Module | None = None,
@@ -342,6 +359,7 @@ class ProgressiveBJointBlock(nn.Module):
         self.cross_delta_scale = cross_delta_scale
         self.propagation_residual = propagation_residual
         self.route_temperature = route_temperature
+        self.route_kind = route_kind
         self.route_hidden_dim = route_hidden_dim
         self.track_stats = False
         self.last_runtime_stats: dict[str, float] | None = None
@@ -363,6 +381,7 @@ class ProgressiveBJointBlock(nn.Module):
             dim=dim,
             route_topk=route_topk,
             route_mode=route_mode,
+            route_kind=route_kind,
             route_hidden_dim=route_hidden_dim,
             route_temperature=route_temperature,
             implementation=implementation,
@@ -380,6 +399,7 @@ class ProgressiveBJointBlock(nn.Module):
             dim=dim,
             route_topk=route_topk,
             route_mode=route_mode,
+            route_kind=route_kind,
             route_hidden_dim=route_hidden_dim,
             route_temperature=route_temperature,
             implementation=implementation,
@@ -388,6 +408,7 @@ class ProgressiveBJointBlock(nn.Module):
             dim=dim,
             route_topk=route_topk,
             route_mode=route_mode,
+            route_kind=route_kind,
             route_hidden_dim=route_hidden_dim,
             route_temperature=route_temperature,
             implementation=implementation,
@@ -396,6 +417,7 @@ class ProgressiveBJointBlock(nn.Module):
             dim=dim,
             route_topk=route_topk,
             route_mode=route_mode,
+            route_kind=route_kind,
             route_hidden_dim=route_hidden_dim,
             route_temperature=route_temperature,
             implementation=implementation,
@@ -675,6 +697,7 @@ class ProgressiveBExampleLM(nn.Module):
         b_delta_scale: float = 0.20,
         cross_delta_scale: float = 0.15,
         route_temperature: float = 1.0,
+        route_kind: str = "diagonal_bilinear",
         route_hidden_dim: int | None = None,
         state_init_mode: str = "zero",
         pairwise_kind: str = "diagonal_bilinear",
@@ -700,6 +723,7 @@ class ProgressiveBExampleLM(nn.Module):
         self.b_delta_scale = b_delta_scale
         self.cross_delta_scale = cross_delta_scale
         self.route_temperature = route_temperature
+        self.route_kind = route_kind
         self.route_hidden_dim = route_hidden_dim
         self.state_init_mode = state_init_mode
         self.pairwise_kind = pairwise_kind
@@ -725,6 +749,11 @@ class ProgressiveBExampleLM(nn.Module):
         self.sequence_val_norm = _make_value_norm(dim, value_norm_kind)
         if pairwise_kind == "diagonal_bilinear":
             pairwise_factory = lambda: DiagonalBilinearPairwise(dim=dim)
+        elif pairwise_kind == "low_rank_bilinear":
+            pairwise_factory = lambda: LowRankBilinearPairwise(
+                dim=dim,
+                rank=pairwise_hidden_dim or max(1, dim // 2),
+            )
         elif pairwise_kind == "hadamard_mlp":
             pairwise_factory = lambda: HadamardMLPPairwise(dim=dim, hidden_dim=pairwise_hidden_dim)
         else:
@@ -778,6 +807,7 @@ class ProgressiveBExampleLM(nn.Module):
                     b_delta_scale=b_delta_scale,
                     cross_delta_scale=cross_delta_scale,
                     route_temperature=route_temperature,
+                    route_kind=route_kind,
                     route_hidden_dim=route_hidden_dim,
                     s_pairwise_fn=shared_s_pairwise,
                     expanded_pairwise_fn=shared_expanded_pairwise,
@@ -1178,6 +1208,81 @@ def sample_next_token_batch(
     return NextTokenBatch(context=context.to(device), target=target.to(device))
 
 
+class NextTokenBatchDataset(IterableDataset[tuple[Tensor, Tensor]]):
+    def __init__(
+        self,
+        tokens: Tensor,
+        *,
+        seq_len: int,
+        batch_size: int,
+        teacher_forcing: bool = False,
+        full_sequence_causal: bool = False,
+    ) -> None:
+        super().__init__()
+        self.tokens = tokens.detach().cpu().contiguous()
+        self.seq_len = seq_len
+        self.batch_size = batch_size
+        self.teacher_forcing = teacher_forcing
+        self.full_sequence_causal = full_sequence_causal
+
+    def __iter__(self):
+        while True:
+            batch = sample_next_token_batch(
+                self.tokens,
+                seq_len=self.seq_len,
+                batch_size=self.batch_size,
+                device="cpu",
+                teacher_forcing=self.teacher_forcing,
+                full_sequence_causal=self.full_sequence_causal,
+            )
+            yield batch.context, batch.target
+
+
+def _make_train_batch_iterator(
+    tokens: Tensor,
+    *,
+    seq_len: int,
+    batch_size: int,
+    device: torch.device | str,
+    teacher_forcing: bool,
+    full_sequence_causal: bool,
+    data_workers: int,
+    prefetch_factor: int,
+):
+    target_device = torch.device(device)
+    if data_workers <= 0:
+        while True:
+            yield sample_next_token_batch(
+                tokens,
+                seq_len=seq_len,
+                batch_size=batch_size,
+                device=target_device,
+                teacher_forcing=teacher_forcing,
+                full_sequence_causal=full_sequence_causal,
+            )
+    else:
+        dataset = NextTokenBatchDataset(
+            tokens,
+            seq_len=seq_len,
+            batch_size=batch_size,
+            teacher_forcing=teacher_forcing,
+            full_sequence_causal=full_sequence_causal,
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=None,
+            num_workers=data_workers,
+            pin_memory=target_device.type == "cuda",
+            persistent_workers=True,
+            prefetch_factor=max(1, prefetch_factor),
+        )
+        for context, target in loader:
+            yield NextTokenBatch(
+                context=context.to(target_device, non_blocking=True),
+                target=target.to(target_device, non_blocking=True),
+            )
+
+
 def compute_next_token_loss(
     model: nn.Module,
     batch: NextTokenBatch,
@@ -1269,6 +1374,8 @@ def train_next_token_model(
     teacher_forcing: bool = False,
     full_sequence_causal: bool = False,
     teacher_forcing_chunk_size: int | None = None,
+    data_workers: int = 0,
+    prefetch_factor: int = 2,
     step_setup_callback: Callable[[int, int], None] | None = None,
     progress_callback: Callable[[int, int, float], None] | None = None,
     step_callback: Callable[[int, float, float], None] | None = None,
@@ -1290,6 +1397,16 @@ def train_next_token_model(
     grad_norms: list[float] = []
     train_losses: list[float] = []
     val_losses: list[float] = []
+    batch_iter = _make_train_batch_iterator(
+        train_tokens,
+        seq_len=seq_len,
+        batch_size=batch_size,
+        device=device,
+        teacher_forcing=teacher_forcing,
+        full_sequence_causal=full_sequence_causal,
+        data_workers=data_workers,
+        prefetch_factor=prefetch_factor,
+    )
 
     for step in range(1, steps + 1):
         if step_setup_callback is not None:
@@ -1297,14 +1414,7 @@ def train_next_token_model(
         optimizer.zero_grad(set_to_none=True)
         accumulated_loss = 0.0
         for _ in range(grad_accum_steps):
-            batch = sample_next_token_batch(
-                train_tokens,
-                seq_len=seq_len,
-                batch_size=batch_size,
-                device=device,
-                teacher_forcing=teacher_forcing,
-                full_sequence_causal=full_sequence_causal,
-            )
+            batch = next(batch_iter)
             loss, _ = compute_next_token_loss(
                 model,
                 batch,
@@ -1314,6 +1424,8 @@ def train_next_token_model(
                 autocast_device_type=autocast_device_type,
                 autocast_dtype=autocast_dtype,
             )
+            if not torch.isfinite(loss).item():
+                raise FloatingPointError(f"Non-finite loss at step {step}: {loss.item()}")
             accumulated_loss += float(loss.item())
             (loss / grad_accum_steps).backward()
         grad_norm = 0.0
@@ -1325,6 +1437,8 @@ def train_next_token_model(
             grads = [parameter.grad.norm() for parameter in model.parameters() if parameter.grad is not None]
             if grads:
                 grad_norm = float(torch.stack(grads).norm().item())
+        if not math.isfinite(grad_norm):
+            raise FloatingPointError(f"Non-finite grad norm at step {step}: {grad_norm}")
         optimizer.step()
         step_loss = accumulated_loss / grad_accum_steps
         train_step_losses.append(step_loss)

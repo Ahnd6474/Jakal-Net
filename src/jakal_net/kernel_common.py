@@ -10,8 +10,12 @@ from torch.nn import functional as F
 from jakal_net.modules import (
     BilinearPairwise,
     DiagonalBilinearPairwise,
+    DiagonalBilinearRoute,
     LinearRoute,
+    LowRankBilinearPairwise,
+    LowRankBilinearRoute,
     MLPRoute,
+    BilinearPairwiseRoute,
 )
 
 
@@ -44,6 +48,16 @@ class RouteKernelSpec:
     out_bias: Tensor | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class PairwiseRouteKernelSpec:
+    kind: str
+    source_weight: Tensor | None
+    target_weight: Tensor | None
+    core_weight: Tensor
+    bias: Tensor | None
+    temperature: float = 1.0
+
+
 def flatten_state(state: Tensor) -> Tensor:
     return state.reshape(prod(state.shape[:-1]) or 1, state.shape[-1])
 
@@ -68,11 +82,28 @@ def reshape_val(
 
 
 def supports_pairwise_kernel(pairwise_fn: object) -> bool:
-    return isinstance(pairwise_fn, (DiagonalBilinearPairwise, BilinearPairwise))
+    return isinstance(
+        pairwise_fn,
+        (DiagonalBilinearPairwise, BilinearPairwise, LowRankBilinearPairwise),
+    )
 
 
 def supports_route_kernel(route_fn: object) -> bool:
     return isinstance(route_fn, (LinearRoute, MLPRoute))
+
+
+def _unwrap_temperature_scaled_route(route_fn: object) -> tuple[object, float]:
+    temperature = float(getattr(route_fn, "temperature", 1.0))
+    inner = getattr(route_fn, "route_fn", route_fn)
+    return inner, temperature
+
+
+def supports_pairwise_route_kernel(route_fn: object) -> bool:
+    inner, _ = _unwrap_temperature_scaled_route(route_fn)
+    return isinstance(
+        inner,
+        (DiagonalBilinearRoute, LowRankBilinearRoute, BilinearPairwiseRoute),
+    )
 
 
 def pairwise_kernel_spec(pairwise_fn: object) -> PairwiseKernelSpec:
@@ -80,6 +111,12 @@ def pairwise_kernel_spec(pairwise_fn: object) -> PairwiseKernelSpec:
         return PairwiseKernelSpec(
             kind="diagonal_bilinear",
             weight=pairwise_fn.weight,
+            bias=pairwise_fn.bias,
+        )
+    if isinstance(pairwise_fn, LowRankBilinearPairwise):
+        return PairwiseKernelSpec(
+            kind="bilinear",
+            weight=pairwise_fn.effective_weight(),
             bias=pairwise_fn.bias,
         )
     if isinstance(pairwise_fn, BilinearPairwise):
@@ -111,12 +148,52 @@ def route_kernel_spec(route_fn: object) -> RouteKernelSpec:
     raise TypeError("Unsupported route_fn for native/kernel spec.")
 
 
+def pairwise_route_kernel_spec(route_fn: object) -> PairwiseRouteKernelSpec:
+    inner, temperature = _unwrap_temperature_scaled_route(route_fn)
+    if isinstance(inner, DiagonalBilinearRoute):
+        return PairwiseRouteKernelSpec(
+            kind="diagonal_bilinear_route",
+            source_weight=None,
+            target_weight=None,
+            core_weight=inner.weight,
+            bias=inner.bias,
+            temperature=temperature,
+        )
+    if isinstance(inner, LowRankBilinearRoute):
+        return PairwiseRouteKernelSpec(
+            kind="low_rank_bilinear_route",
+            source_weight=inner.source_proj.weight,
+            target_weight=inner.target_proj.weight,
+            core_weight=inner.weight,
+            bias=inner.bias,
+            temperature=temperature,
+        )
+    if isinstance(inner, BilinearPairwiseRoute):
+        return PairwiseRouteKernelSpec(
+            kind="full_bilinear_route",
+            source_weight=inner.source_proj.weight,
+            target_weight=inner.target_proj.weight,
+            core_weight=inner.weight,
+            bias=inner.bias,
+            temperature=temperature,
+        )
+    raise TypeError("Unsupported pairwise route_fn for native/kernel spec.")
+
+
 def pairwise_scores_dense(
     pairwise_fn: object, target_val: Tensor, source_val: Tensor
 ) -> Tensor:
     if isinstance(pairwise_fn, DiagonalBilinearPairwise):
         target_proj = target_val * pairwise_fn.weight.view(1, 1, -1)
         scores = torch.bmm(target_proj, source_val.transpose(1, 2))
+        if pairwise_fn.bias is not None:
+            scores = scores + pairwise_fn.bias
+        return scores
+
+    if isinstance(pairwise_fn, LowRankBilinearPairwise):
+        projected_target = pairwise_fn.target_proj(target_val)
+        projected_source = pairwise_fn.source_proj(source_val) * pairwise_fn.weight
+        scores = torch.bmm(projected_target, projected_source.transpose(1, 2))
         if pairwise_fn.bias is not None:
             scores = scores + pairwise_fn.bias
         return scores

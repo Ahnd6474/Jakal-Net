@@ -619,6 +619,7 @@ def run_single_experiment(
         b_delta_scale=args.b_delta_scale,
         cross_delta_scale=args.cross_delta_scale,
         route_temperature=args.route_temperature,
+        route_kind=args.route_kind,
         route_hidden_dim=args.route_hidden_dim,
         state_init_mode=args.state_init_mode,
         pairwise_kind=args.pairwise_kind,
@@ -639,13 +640,14 @@ def run_single_experiment(
         f"dim={effective_config['dim']} | warmup={effective_config['warmup_layers']} | "
         f"stages={effective_config['lite_layers']}/{effective_config['mid_layers']}/{effective_config['full_layers']} | "
         f"refine={effective_config['final_refine_layers']} | route_mode={args.route_mode} | "
-        f"route_topk={effective_config['route_topk']}"
+        f"route_topk={effective_config['route_topk']} | route_kind={args.route_kind}"
     )
     print(
         f"schedule_steps={train_steps:,} | approx_epochs={requested_epochs:.3f} | "
         f"steps_per_epoch={steps_per_epoch:,} | batch_size={args.batch_size} | "
         f"grad_accum_steps={grad_accum_steps} | effective_batch_size={effective_batch_size} | "
-        f"objective={args.training_objective}"
+        f"objective={args.training_objective} | data_workers={args.data_workers} | "
+        f"prefetch_factor={args.prefetch_factor}"
     )
 
     start_time = time.perf_counter()
@@ -725,6 +727,8 @@ def run_single_experiment(
             teacher_forcing=teacher_forcing,
             full_sequence_causal=full_sequence_causal,
             teacher_forcing_chunk_size=args.teacher_forcing_chunk_size,
+            data_workers=args.data_workers,
+            prefetch_factor=args.prefetch_factor,
             step_setup_callback=step_setup_callback,
             progress_callback=progress_callback,
             step_callback=step_tensorboard_callback,
@@ -771,6 +775,8 @@ def run_single_experiment(
         "batch_size": args.batch_size,
         "grad_accum_steps": grad_accum_steps,
         "effective_batch_size": effective_batch_size,
+        "data_workers": args.data_workers,
+        "prefetch_factor": args.prefetch_factor,
         "dim": effective_config["dim"],
         "warmup_layers": effective_config["warmup_layers"],
         "final_refine_layers": effective_config["final_refine_layers"],
@@ -788,6 +794,7 @@ def run_single_experiment(
         "value_residual_scale": args.value_residual_scale,
         "state_residual_scale": args.state_residual_scale,
         "route_temperature": args.route_temperature,
+        "route_kind": args.route_kind,
         "route_hidden_dim": args.route_hidden_dim,
         "state_init_mode": args.state_init_mode,
         "pairwise_kind": args.pairwise_kind,
@@ -852,6 +859,7 @@ def run_single_experiment(
                 "value_residual_scale": args.value_residual_scale,
                 "state_residual_scale": args.state_residual_scale,
                 "route_temperature": args.route_temperature,
+                "route_kind": args.route_kind,
                 "route_hidden_dim": args.route_hidden_dim,
                 "state_init_mode": args.state_init_mode,
                 "pairwise_kind": args.pairwise_kind,
@@ -976,6 +984,8 @@ def main() -> None:
     parser.add_argument("--eval-steps", type=int, default=10)
     parser.add_argument("--log-interval", type=int, default=25)
     parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--data-workers", type=int, default=0)
+    parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--seq-len", type=int, default=32)
     parser.add_argument(
         "--model-preset",
@@ -1029,10 +1039,15 @@ def main() -> None:
     )
     parser.add_argument("--s-window", type=int, default=8)
     parser.add_argument("--route-temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--route-kind",
+        choices=("diagonal_bilinear", "low_rank_bilinear", "hadamard_mlp"),
+        default="diagonal_bilinear",
+    )
     parser.add_argument("--route-hidden-dim", type=int)
     parser.add_argument(
         "--pairwise-kind",
-        choices=("diagonal_bilinear", "hadamard_mlp"),
+        choices=("diagonal_bilinear", "low_rank_bilinear", "hadamard_mlp"),
         default="diagonal_bilinear",
     )
     parser.add_argument("--pairwise-hidden-dim", type=int)
@@ -1114,6 +1129,10 @@ def main() -> None:
         raise ValueError("s-window must be positive.")
     if args.route_temperature <= 0.0:
         raise ValueError("route-temperature must be positive.")
+    if args.data_workers < 0:
+        raise ValueError("data-workers must be non-negative.")
+    if args.prefetch_factor <= 0:
+        raise ValueError("prefetch-factor must be positive.")
 
     corpus = load_text_corpus(
         default_text=DEFAULT_TEXT,

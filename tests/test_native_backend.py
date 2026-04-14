@@ -8,8 +8,10 @@ import torch
 from jakal_net import (
     BilinearPairwise,
     DiagonalBilinearPairwise,
+    DiagonalBilinearRoute,
     Layer,
     LinearRoute,
+    LowRankBilinearRoute,
     MLPRoute,
     Propagation,
     SparsePropagation,
@@ -386,6 +388,56 @@ class CudaNativeBackendTests(unittest.TestCase):
             native_delta = native.compute_delta(src, dst)
         self.assertGreater(wrapped.call_count, 0)
         self.assert_delta_close(reference_delta, native_delta)
+
+    def test_sparse_transition_native_pairwise_routes_match_reference_on_cuda(self) -> None:
+        torch.manual_seed(34)
+        src = Layer(
+            dim=4,
+            num_nodes=7,
+            state=torch.randn(2, 7, device=self.device),
+            val=torch.randn(2, 7, 4, device=self.device),
+        )
+        dst = Layer(
+            dim=4,
+            num_nodes=6,
+            state=torch.randn(2, 6, device=self.device),
+            val=torch.randn(2, 6, 4, device=self.device),
+        )
+
+        module = native_backend._native_module()
+        for route_fn in (
+            DiagonalBilinearRoute(src_dim=4, dst_dim=4).to(self.device),
+            LowRankBilinearRoute(src_dim=4, dst_dim=4, rank=3).to(self.device),
+        ):
+            reference = SparseTransition(
+                route_fn=route_fn,
+                topk=2,
+                state_activation_fn=lambda x: x + 1.25,
+                val_proj_fn=_val_proj_fn,
+                state_proj_fn=_state_proj_fn,
+                implementation="reference",
+            )
+            native = SparseTransition(
+                route_fn=type(route_fn)(src_dim=4, dst_dim=4, **({"rank": 3} if isinstance(route_fn, LowRankBilinearRoute) else {})).to(self.device),
+                topk=2,
+                state_activation_fn=lambda x: x + 1.25,
+                val_proj_fn=_val_proj_fn,
+                state_proj_fn=_state_proj_fn,
+                implementation="native",
+                src_block_size=3,
+                dst_block_size=2,
+            )
+            native.route_fn.load_state_dict(reference.route_fn.state_dict())
+
+            reference_delta = reference.compute_delta(src, dst)
+            with mock.patch.object(
+                module,
+                "transition_pairwise_topk",
+                wraps=module.transition_pairwise_topk,
+            ) as wrapped:
+                native_delta = native.compute_delta(src, dst)
+            self.assertGreater(wrapped.call_count, 0)
+            self.assert_delta_close(reference_delta, native_delta)
 
 
 if __name__ == "__main__":

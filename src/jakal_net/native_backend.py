@@ -12,8 +12,10 @@ from torch import Tensor
 from jakal_net.core import LayerDelta
 from jakal_net.kernel_common import (
     pairwise_kernel_spec,
+    pairwise_route_kernel_spec,
     route_kernel_spec,
     supports_pairwise_kernel,
+    supports_pairwise_route_kernel,
     supports_route_kernel,
 )
 
@@ -312,6 +314,39 @@ def transition_topk_native(
         projected_state,
         projected_val,
         dst_nodes,
+        topk,
+        src_block_size,
+        dst_block_size,
+    ))
+
+
+def transition_pairwise_topk_native(
+    *,
+    route_fn: object,
+    sender_strength: Tensor,
+    src_val: Tensor,
+    dst_val: Tensor,
+    projected_state: Tensor,
+    projected_val: Tensor,
+    topk: int,
+    src_block_size: int,
+    dst_block_size: int,
+) -> Any:
+    if not supports_pairwise_route_kernel(route_fn):
+        raise TypeError("Unsupported pairwise route_fn for native sparse transition.")
+    spec = pairwise_route_kernel_spec(route_fn)
+    return _to_layer_delta(_native_module().transition_pairwise_topk(
+        spec.kind,
+        spec.source_weight,
+        spec.target_weight,
+        spec.core_weight,
+        spec.bias,
+        float(spec.temperature),
+        sender_strength,
+        src_val,
+        dst_val,
+        projected_state,
+        projected_val,
         topk,
         src_block_size,
         dst_block_size,

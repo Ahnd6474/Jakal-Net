@@ -63,6 +63,8 @@ def build_base_namespace(args: argparse.Namespace) -> SimpleNamespace:
         log_interval=args.log_interval,
         batch_size=args.batch_size,
         grad_accum_steps=args.grad_accum_steps,
+        data_workers=args.data_workers,
+        prefetch_factor=args.prefetch_factor,
         seq_len=args.seq_len,
         model_preset="custom",
         sweep_presets=None,
@@ -89,7 +91,7 @@ def build_base_namespace(args: argparse.Namespace) -> SimpleNamespace:
         full_beta_b_to_s=0.1,
         learning_rate=3e-4,
         weight_decay=1e-2,
-        route_topk=128,
+        route_topk=args.route_topk,
         value_norm_kind="rmsnorm",
         norm_position="pre",
         value_residual_scale=0.75,
@@ -97,6 +99,7 @@ def build_base_namespace(args: argparse.Namespace) -> SimpleNamespace:
         state_init_mode="neg_half",
         s_window=32,
         route_temperature=1.0,
+        route_kind="diagonal_bilinear",
         route_hidden_dim=192,
         pairwise_kind="diagonal_bilinear",
         pairwise_hidden_dim=None,
@@ -198,22 +201,29 @@ def apply_search_space(base_args: SimpleNamespace, trial: Any) -> str:
     )
     pairwise_kind = trial.suggest_categorical(
         "pairwise_kind",
-        ("diagonal_bilinear", "hadamard_mlp"),
+        ("diagonal_bilinear", "low_rank_bilinear"),
     )
     base_args.pairwise_kind = pairwise_kind
-    base_args.pairwise_hidden_dim = 192 if pairwise_kind == "hadamard_mlp" else None
+    route_kind = trial.suggest_categorical(
+        "route_kind",
+        ("diagonal_bilinear", "low_rank_bilinear"),
+    )
+    base_args.route_kind = route_kind
     route_hidden_dim = trial.suggest_categorical(
         "route_hidden_dim",
-        (128, 192, 256, 384),
+        (64, 128, 192, 256),
     )
     base_args.route_hidden_dim = int(route_hidden_dim)
+    base_args.pairwise_hidden_dim = (
+        int(route_hidden_dim) if pairwise_kind == "low_rank_bilinear" else None
+    )
     base_args.warmup_layers = trial.suggest_categorical("warmup_layers", (2, 3, 4))
     base_args.learning_rate = trial.suggest_categorical(
         "learning_rate",
         (2e-4, 3e-4, 4e-4),
     )
     base_args.run_name = f"{base_args.run_name}_trial_{trial.number:03d}"
-    return f"{value_norm}_{pairwise_kind}_{base_args.b_schedule}"
+    return f"{value_norm}_{pairwise_kind}_{route_kind}_{base_args.b_schedule}"
 
 
 def make_objective(
@@ -251,6 +261,9 @@ def make_objective(
             )
         except TrialPrunedError as exc:
             raise optuna.TrialPruned(str(exc)) from exc
+        except FloatingPointError as exc:
+            trial.set_user_attr("nonfinite", True)
+            raise optuna.TrialPruned(f"non-finite training value: {exc}") from exc
         except torch.OutOfMemoryError as exc:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -341,6 +354,12 @@ def spawn_parallel_workers(args: argparse.Namespace, worker_count: int) -> int:
             str(args.batch_size),
             "--grad-accum-steps",
             str(args.grad_accum_steps),
+            "--data-workers",
+            str(args.data_workers),
+            "--prefetch-factor",
+            str(args.prefetch_factor),
+            "--route-topk",
+            str(args.route_topk),
             "--steps",
             str(args.steps),
             "--eval-interval",
@@ -503,6 +522,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-len", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--grad-accum-steps", type=int, default=4)
+    parser.add_argument("--data-workers", type=int, default=0)
+    parser.add_argument("--prefetch-factor", type=int, default=2)
+    parser.add_argument("--route-topk", type=int, default=128)
     parser.add_argument("--steps", type=int, default=6400)
     parser.add_argument("--eval-interval", type=int, default=800)
     parser.add_argument("--eval-steps", type=int, default=16)
@@ -526,12 +548,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--precision",
         choices=("fp32", "bf16", "fp16"),
-        default="fp16",
+        default="bf16",
     )
     parser.add_argument(
         "--implementation",
         choices=("reference", "streaming", "kernel", "native"),
-        default="streaming",
+        default="native",
     )
     return parser.parse_args()
 

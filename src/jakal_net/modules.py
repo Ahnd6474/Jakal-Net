@@ -42,6 +42,29 @@ class BilinearPairwise(nn.Module):
         return scores
 
 
+class LowRankBilinearPairwise(nn.Module):
+    def __init__(self, dim: int, rank: int, *, bias: bool = True) -> None:
+        super().__init__()
+        if rank <= 0:
+            raise ValueError("rank must be positive.")
+        self.source_proj = nn.Linear(dim, rank, bias=False)
+        self.target_proj = nn.Linear(dim, rank, bias=False)
+        self.weight = nn.Parameter(torch.ones(rank))
+        self.bias = nn.Parameter(torch.zeros(())) if bias else None
+
+    def effective_weight(self) -> Tensor:
+        weighted_target = self.target_proj.weight.transpose(0, 1) * self.weight.view(1, -1)
+        return weighted_target @ self.source_proj.weight
+
+    def forward(self, target_val: Tensor, source_val: Tensor) -> Tensor:
+        projected_target = self.target_proj(target_val)
+        projected_source = self.source_proj(source_val) * self.weight
+        scores = torch.einsum("...ir,...jr->...ij", projected_target, projected_source)
+        if self.bias is not None:
+            scores = scores + self.bias
+        return scores
+
+
 class HadamardMLPPairwise(nn.Module):
     def __init__(self, dim: int, hidden_dim: int | None = None) -> None:
         super().__init__()
@@ -54,6 +77,60 @@ class HadamardMLPPairwise(nn.Module):
         interaction = target_val.unsqueeze(-2) * source_val.unsqueeze(-3)
         hidden = self.activation(self.proj_in(interaction))
         return self.proj_out(hidden).squeeze(-1)
+
+
+class DiagonalBilinearRoute(nn.Module):
+    expects_pairwise_inputs = True
+
+    def __init__(
+        self,
+        src_dim: int,
+        dst_dim: int | None = None,
+        *,
+        bias: bool = True,
+    ) -> None:
+        super().__init__()
+        target_dim = src_dim if dst_dim is None else dst_dim
+        if target_dim != src_dim:
+            raise ValueError("DiagonalBilinearRoute requires matching src/dst dimensions.")
+        self.weight = nn.Parameter(torch.ones(src_dim))
+        self.bias = nn.Parameter(torch.zeros(())) if bias else None
+
+    def forward(self, source_val: Tensor, target_val: Tensor) -> Tensor:
+        projected_source = source_val * self.weight
+        scores = torch.einsum("...id,...kd->...ik", projected_source, target_val)
+        if self.bias is not None:
+            scores = scores + self.bias
+        return scores
+
+
+class LowRankBilinearRoute(nn.Module):
+    expects_pairwise_inputs = True
+
+    def __init__(
+        self,
+        src_dim: int,
+        dst_dim: int | None = None,
+        *,
+        rank: int,
+        bias: bool = True,
+    ) -> None:
+        super().__init__()
+        if rank <= 0:
+            raise ValueError("rank must be positive.")
+        target_dim = src_dim if dst_dim is None else dst_dim
+        self.source_proj = nn.Linear(src_dim, rank, bias=False)
+        self.target_proj = nn.Linear(target_dim, rank, bias=False)
+        self.weight = nn.Parameter(torch.ones(rank))
+        self.bias = nn.Parameter(torch.zeros(())) if bias else None
+
+    def forward(self, source_val: Tensor, target_val: Tensor) -> Tensor:
+        projected_source = self.source_proj(source_val) * self.weight
+        projected_target = self.target_proj(target_val)
+        scores = torch.einsum("...ir,...kr->...ik", projected_source, projected_target)
+        if self.bias is not None:
+            scores = scores + self.bias
+        return scores
 
 
 class BilinearPairwiseRoute(nn.Module):

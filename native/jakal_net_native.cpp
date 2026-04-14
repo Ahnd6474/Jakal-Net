@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -200,6 +201,53 @@ torch::Tensor route_block_logits(
   throw std::runtime_error("Unsupported route kernel kind: " + route_kind);
 }
 
+torch::Tensor pairwise_route_block_logits(
+    const std::string& route_kind,
+    const torch::Tensor& src_val,
+    const torch::Tensor& dst_val,
+    const c10::optional<torch::Tensor>& source_weight,
+    const c10::optional<torch::Tensor>& target_weight,
+    const torch::Tensor& core_weight,
+    const c10::optional<torch::Tensor>& bias,
+    double temperature) {
+  if (temperature <= 0.0) {
+    throw std::runtime_error("route temperature must be positive.");
+  }
+
+  torch::Tensor scores;
+  if (route_kind == "diagonal_bilinear_route") {
+    auto weighted_source = src_val * core_weight.view({1, 1, -1});
+    scores = torch::bmm(weighted_source, dst_val.transpose(1, 2));
+  } else if (route_kind == "low_rank_bilinear_route") {
+    if (!source_weight.has_value() || !target_weight.has_value()) {
+      throw std::runtime_error("Low-rank route kernel is missing projection weights.");
+    }
+    auto projected_source =
+        torch::matmul(src_val, source_weight.value().transpose(0, 1)) *
+        core_weight.view({1, 1, -1});
+    auto projected_target = torch::matmul(dst_val, target_weight.value().transpose(0, 1));
+    scores = torch::bmm(projected_source, projected_target.transpose(1, 2));
+  } else if (route_kind == "full_bilinear_route") {
+    if (!source_weight.has_value() || !target_weight.has_value()) {
+      throw std::runtime_error("Full bilinear route kernel is missing projection weights.");
+    }
+    auto projected_source = torch::matmul(src_val, source_weight.value().transpose(0, 1));
+    auto projected_target = torch::matmul(dst_val, target_weight.value().transpose(0, 1));
+    auto weighted_source = torch::matmul(projected_source, core_weight);
+    scores = torch::bmm(weighted_source, projected_target.transpose(1, 2));
+  } else {
+    throw std::runtime_error("Unsupported pairwise route kernel kind: " + route_kind);
+  }
+
+  if (bias.has_value()) {
+    scores = scores + bias.value();
+  }
+  if (temperature != 1.0) {
+    scores = scores / temperature;
+  }
+  return scores;
+}
+
 torch::Tensor causal_window_mask(
     int64_t target_start,
     int64_t target_end,
@@ -240,6 +288,7 @@ std::vector<std::string> supported_ops() {
       "propagation_window",
       "propagation_topk",
       "transition_dense",
+      "transition_pairwise_topk",
       "transition_topk",
   };
 }
@@ -706,6 +755,113 @@ std::tuple<torch::Tensor, torch::Tensor> transition_topk(
   };
 }
 
+std::tuple<torch::Tensor, torch::Tensor> transition_pairwise_topk(
+    const std::string& route_kind,
+    const c10::optional<torch::Tensor>& source_weight,
+    const c10::optional<torch::Tensor>& target_weight,
+    const torch::Tensor& core_weight,
+    const c10::optional<torch::Tensor>& bias,
+    double temperature,
+    const torch::Tensor& sender_strength,
+    const torch::Tensor& src_val,
+    const torch::Tensor& dst_val,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    int64_t topk,
+    int64_t src_block_size,
+    int64_t dst_block_size) {
+  require_supported_device(sender_strength, "sender_strength");
+  require_supported_device(src_val, "src_val");
+  require_supported_device(dst_val, "dst_val");
+  require_supported_device(projected_state, "projected_state");
+  require_supported_device(projected_val, "projected_val");
+  if (topk <= 0) {
+    throw std::runtime_error("topk must be positive.");
+  }
+
+  auto batch_sizes = batch_shape(src_val, 2);
+  auto flat_src_val = flatten_val(src_val).contiguous();
+  auto flat_dst_val = flatten_val(dst_val).contiguous();
+  auto flat_sender_strength = flatten_state(sender_strength).contiguous();
+  auto flat_projected_state = flatten_state(projected_state).contiguous();
+  auto flat_projected_val = flatten_val(projected_val).contiguous();
+  const auto batch_flat = flat_src_val.size(0);
+  const auto src_nodes = flat_src_val.size(1);
+  const auto dst_nodes = flat_dst_val.size(1);
+  const auto out_dim = flat_projected_val.size(2);
+  const auto k = std::min<int64_t>(topk, dst_nodes);
+
+  const auto state_acc_dtype = accumulator_dtype(projected_state.scalar_type());
+  const auto val_acc_dtype = accumulator_dtype(projected_val.scalar_type());
+  auto delta_state = allocate_accumulator({batch_flat, dst_nodes}, flat_projected_state, state_acc_dtype);
+  auto delta_val = allocate_accumulator({batch_flat, dst_nodes, out_dim}, flat_projected_val, val_acc_dtype);
+
+  const auto src_step = src_block_size <= 0 ? src_nodes : std::min(src_block_size, src_nodes);
+  const auto dst_step = dst_block_size <= 0 ? dst_nodes : std::min(dst_block_size, dst_nodes);
+
+  for (int64_t src_start = 0; src_start < src_nodes; src_start += src_step) {
+    const auto src_end = std::min(src_start + src_step, src_nodes);
+    const auto block_nodes = src_end - src_start;
+    auto src_block = flat_src_val.slice(1, src_start, src_end);
+    auto best_values = torch::full(
+        {batch_flat, block_nodes, k},
+        -std::numeric_limits<float>::infinity(),
+        flat_src_val.options());
+    auto best_indices = torch::zeros(
+        {batch_flat, block_nodes, k},
+        flat_src_val.options().dtype(torch::kLong));
+
+    for (int64_t dst_start = 0; dst_start < dst_nodes; dst_start += dst_step) {
+      const auto dst_end = std::min(dst_start + dst_step, dst_nodes);
+      auto dst_block = flat_dst_val.slice(1, dst_start, dst_end);
+      auto logits = pairwise_route_block_logits(
+          route_kind,
+          src_block,
+          dst_block,
+          source_weight,
+          target_weight,
+          core_weight,
+          bias,
+          temperature);
+      auto block_indices = torch::arange(
+                               dst_start,
+                               dst_end,
+                               flat_src_val.options().dtype(torch::kLong))
+                               .view({1, 1, dst_end - dst_start})
+                               .expand({batch_flat, block_nodes, dst_end - dst_start});
+      auto candidate_values = torch::cat({best_values, logits}, -1);
+      auto candidate_indices = torch::cat({best_indices, block_indices}, -1);
+      auto topk_result = candidate_values.topk(k, -1, true, true);
+      best_values = std::get<0>(topk_result);
+      best_indices = candidate_indices.gather(-1, std::get<1>(topk_result));
+    }
+
+    auto routes = torch::softmax(best_values, -1);
+    auto state_sender =
+        (flat_sender_strength.slice(1, src_start, src_end).to(state_acc_dtype) *
+         flat_projected_state.slice(1, src_start, src_end).to(state_acc_dtype))
+            .unsqueeze(-1);
+    auto state_contrib = (routes.to(state_acc_dtype) * state_sender).reshape({batch_flat, -1});
+    delta_state.scatter_add_(1, best_indices.reshape({batch_flat, -1}), state_contrib);
+
+    auto val_sender =
+        (flat_sender_strength.slice(1, src_start, src_end).to(val_acc_dtype).unsqueeze(-1) *
+         flat_projected_val.slice(1, src_start, src_end).to(val_acc_dtype))
+            .unsqueeze(-2);
+    auto val_contrib =
+        (routes.to(val_acc_dtype).unsqueeze(-1) * val_sender).reshape({batch_flat, -1, out_dim});
+    auto scatter_index =
+        best_indices.unsqueeze(-1).expand({batch_flat, block_nodes, k, out_dim}).reshape(
+            {batch_flat, -1, out_dim});
+    delta_val.scatter_add_(1, scatter_index, val_contrib);
+  }
+
+  return {
+      reshape_state(delta_state.to(projected_state.scalar_type()), batch_sizes, dst_nodes),
+      reshape_val(delta_val.to(projected_val.scalar_type()), batch_sizes, dst_nodes, out_dim),
+  };
+}
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -716,5 +872,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("propagation_window", &propagation_window, "Native window propagation");
   m.def("propagation_topk", &propagation_topk, "Native top-k propagation");
   m.def("transition_dense", &transition_dense, "Native dense transition");
+  m.def("transition_pairwise_topk", &transition_pairwise_topk, "Native pairwise sparse transition");
   m.def("transition_topk", &transition_topk, "Native sparse transition");
 }
