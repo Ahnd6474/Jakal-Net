@@ -172,6 +172,11 @@ def _make_transition(
     route_temperature: float,
     implementation: str,
     merge_mode: str = "add",
+    edge_dropout_p: float = 0.0,
+    usage_dropout_base: float = 0.0,
+    usage_dropout_scale: float = 0.0,
+    usage_dropout_max: float = 0.0,
+    usage_ema_decay: float = 0.99,
 ) -> Transition | SparseTransition:
     if route_kind == "diagonal_bilinear":
         route_fn: nn.Module = DiagonalBilinearRoute(src_dim=dim, dst_dim=dim)
@@ -202,6 +207,11 @@ def _make_transition(
         topk=route_topk,
         implementation=implementation,
         merge_mode=merge_mode,
+        edge_dropout_p=edge_dropout_p,
+        usage_dropout_base=usage_dropout_base,
+        usage_dropout_scale=usage_dropout_scale,
+        usage_dropout_max=usage_dropout_max,
+        usage_ema_decay=usage_ema_decay,
     )
 
 
@@ -331,6 +341,11 @@ class ProgressiveBJointBlock(nn.Module):
         route_temperature: float = 1.0,
         route_kind: str = "diagonal_bilinear",
         route_hidden_dim: int | None = None,
+        edge_dropout_p: float = 0.0,
+        usage_dropout_base: float = 0.0,
+        usage_dropout_scale: float = 0.0,
+        usage_dropout_max: float = 0.0,
+        usage_ema_decay: float = 0.99,
         s_pairwise_fn: nn.Module | None = None,
         expanded_pairwise_fn: nn.Module | None = None,
         compressed_pairwise_fn: nn.Module | None = None,
@@ -361,6 +376,11 @@ class ProgressiveBJointBlock(nn.Module):
         self.route_temperature = route_temperature
         self.route_kind = route_kind
         self.route_hidden_dim = route_hidden_dim
+        self.edge_dropout_p = edge_dropout_p
+        self.usage_dropout_base = usage_dropout_base
+        self.usage_dropout_scale = usage_dropout_scale
+        self.usage_dropout_max = usage_dropout_max
+        self.usage_ema_decay = usage_ema_decay
         self.track_stats = False
         self.last_runtime_stats: dict[str, float] | None = None
         self.s_val_norm = _make_value_norm(dim, value_norm_kind)
@@ -385,6 +405,11 @@ class ProgressiveBJointBlock(nn.Module):
             route_hidden_dim=route_hidden_dim,
             route_temperature=route_temperature,
             implementation=implementation,
+            edge_dropout_p=edge_dropout_p,
+            usage_dropout_base=usage_dropout_base,
+            usage_dropout_scale=usage_dropout_scale,
+            usage_dropout_max=usage_dropout_max,
+            usage_ema_decay=usage_ema_decay,
         )
         self.expanded_propagation = _make_sparse_or_dense_propagation(
             dim=dim,
@@ -403,6 +428,11 @@ class ProgressiveBJointBlock(nn.Module):
             route_hidden_dim=route_hidden_dim,
             route_temperature=route_temperature,
             implementation=implementation,
+            edge_dropout_p=edge_dropout_p,
+            usage_dropout_base=usage_dropout_base,
+            usage_dropout_scale=usage_dropout_scale,
+            usage_dropout_max=usage_dropout_max,
+            usage_ema_decay=usage_ema_decay,
         )
         self.compress_transition = _make_transition(
             dim=dim,
@@ -412,6 +442,11 @@ class ProgressiveBJointBlock(nn.Module):
             route_hidden_dim=route_hidden_dim,
             route_temperature=route_temperature,
             implementation=implementation,
+            edge_dropout_p=edge_dropout_p,
+            usage_dropout_base=usage_dropout_base,
+            usage_dropout_scale=usage_dropout_scale,
+            usage_dropout_max=usage_dropout_max,
+            usage_ema_decay=usage_ema_decay,
         )
         self.s_to_b = _make_transition(
             dim=dim,
@@ -421,6 +456,11 @@ class ProgressiveBJointBlock(nn.Module):
             route_hidden_dim=route_hidden_dim,
             route_temperature=route_temperature,
             implementation=implementation,
+            edge_dropout_p=edge_dropout_p,
+            usage_dropout_base=usage_dropout_base,
+            usage_dropout_scale=usage_dropout_scale,
+            usage_dropout_max=usage_dropout_max,
+            usage_ema_decay=usage_ema_decay,
         )
         self.compressed_propagation = _make_sparse_or_dense_propagation(
             dim=dim,
@@ -699,6 +739,11 @@ class ProgressiveBExampleLM(nn.Module):
         route_temperature: float = 1.0,
         route_kind: str = "diagonal_bilinear",
         route_hidden_dim: int | None = None,
+        edge_dropout_p: float = 0.0,
+        usage_dropout_base: float = 0.0,
+        usage_dropout_scale: float = 0.0,
+        usage_dropout_max: float = 0.0,
+        usage_ema_decay: float = 0.99,
         state_init_mode: str = "zero",
         pairwise_kind: str = "diagonal_bilinear",
         pairwise_hidden_dim: int | None = None,
@@ -725,6 +770,11 @@ class ProgressiveBExampleLM(nn.Module):
         self.route_temperature = route_temperature
         self.route_kind = route_kind
         self.route_hidden_dim = route_hidden_dim
+        self.edge_dropout_p = edge_dropout_p
+        self.usage_dropout_base = usage_dropout_base
+        self.usage_dropout_scale = usage_dropout_scale
+        self.usage_dropout_max = usage_dropout_max
+        self.usage_ema_decay = usage_ema_decay
         self.state_init_mode = state_init_mode
         self.pairwise_kind = pairwise_kind
         self.pairwise_hidden_dim = pairwise_hidden_dim
@@ -809,6 +859,11 @@ class ProgressiveBExampleLM(nn.Module):
                     route_temperature=route_temperature,
                     route_kind=route_kind,
                     route_hidden_dim=route_hidden_dim,
+                    edge_dropout_p=edge_dropout_p,
+                    usage_dropout_base=usage_dropout_base,
+                    usage_dropout_scale=usage_dropout_scale,
+                    usage_dropout_max=usage_dropout_max,
+                    usage_ema_decay=usage_ema_decay,
                     s_pairwise_fn=shared_s_pairwise,
                     expanded_pairwise_fn=shared_expanded_pairwise,
                     compressed_pairwise_fn=shared_compressed_pairwise,

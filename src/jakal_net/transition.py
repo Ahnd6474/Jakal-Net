@@ -293,6 +293,11 @@ class SparseTransition(Transition):
         src_block_size: int | None = 128,
         dst_block_size: int | None = 128,
         accumulator_dtype: torch.dtype | None = None,
+        edge_dropout_p: float = 0.0,
+        usage_dropout_base: float = 0.0,
+        usage_dropout_scale: float = 0.0,
+        usage_dropout_max: float = 0.0,
+        usage_ema_decay: float = 0.99,
     ) -> None:
         super().__init__(
             route_fn=route_fn,
@@ -309,15 +314,124 @@ class SparseTransition(Transition):
         if topk <= 0:
             raise ValueError("topk must be positive.")
         self.topk = topk
+        for name, value in (
+            ("edge_dropout_p", edge_dropout_p),
+            ("usage_dropout_base", usage_dropout_base),
+            ("usage_dropout_scale", usage_dropout_scale),
+            ("usage_dropout_max", usage_dropout_max),
+        ):
+            if not 0.0 <= value < 1.0:
+                raise ValueError(f"{name} must be in [0, 1), got {value}.")
+        if not 0.0 <= usage_ema_decay < 1.0:
+            raise ValueError(f"usage_ema_decay must be in [0, 1), got {usage_ema_decay}.")
+        self.edge_dropout_p = edge_dropout_p
+        self.usage_dropout_base = usage_dropout_base
+        self.usage_dropout_scale = usage_dropout_scale
+        self.usage_dropout_max = usage_dropout_max
+        self.usage_ema_decay = usage_ema_decay
+        self.register_buffer("dst_usage_ema", torch.empty(0), persistent=False)
+
+    @property
+    def _usage_dropout_enabled(self) -> bool:
+        return self.usage_dropout_max > 0.0 and (
+            self.usage_dropout_base > 0.0 or self.usage_dropout_scale > 0.0
+        )
+
+    @property
+    def _route_dropout_enabled(self) -> bool:
+        return self.edge_dropout_p > 0.0 or self._usage_dropout_enabled
+
+    def _dropout_active(self) -> bool:
+        return self.training and self._route_dropout_enabled
+
+    def _ensure_usage_ema(self, dst_nodes: int, *, device: torch.device) -> Tensor:
+        if self.dst_usage_ema.numel() != dst_nodes or self.dst_usage_ema.device != device:
+            self.dst_usage_ema = torch.ones(dst_nodes, device=device, dtype=torch.float32)
+        return self.dst_usage_ema
+
+    def _usage_dropout_prob(self, topk_indices: Tensor, dst_nodes: int) -> Tensor:
+        usage_ema = self._ensure_usage_ema(dst_nodes, device=topk_indices.device)
+        with torch.no_grad():
+            flat_indices = topk_indices.detach().reshape(-1)
+            counts = torch.bincount(flat_indices, minlength=dst_nodes).to(dtype=torch.float32)
+            mean_count = counts.mean().clamp_min(1e-6)
+            relative_load = counts / mean_count
+            usage_ema.mul_(self.usage_ema_decay).add_(
+                relative_load, alpha=1.0 - self.usage_ema_decay
+            )
+        selected_load = usage_ema.gather(0, topk_indices.reshape(-1)).reshape(topk_indices.shape)
+        prob = self.usage_dropout_base + self.usage_dropout_scale * (
+            selected_load - 1.0
+        ).clamp_min(0.0)
+        return prob.clamp(min=0.0, max=self.usage_dropout_max)
+
+    def _topk_routes(
+        self,
+        topk_values: Tensor,
+        topk_indices: Tensor,
+        *,
+        dst_nodes: int,
+    ) -> Tensor:
+        routes = torch.softmax(topk_values, dim=-1)
+        if not self._dropout_active():
+            return routes
+
+        if self.edge_dropout_p > 0.0:
+            drop_prob: Tensor | float = self.edge_dropout_p
+        else:
+            drop_prob = torch.zeros_like(routes, dtype=torch.float32)
+        if self._usage_dropout_enabled:
+            usage_prob = self._usage_dropout_prob(topk_indices, dst_nodes)
+            if isinstance(drop_prob, float):
+                drop_prob = 1.0 - (1.0 - drop_prob) * (1.0 - usage_prob)
+            else:
+                drop_prob = 1.0 - (1.0 - drop_prob) * (1.0 - usage_prob)
+        if isinstance(drop_prob, float):
+            keep_mask = torch.rand(routes.shape, device=routes.device) >= drop_prob
+        else:
+            keep_mask = torch.rand(routes.shape, device=routes.device) >= drop_prob.clamp(
+                max=0.95
+            )
+        all_dropped = ~keep_mask.any(dim=-1, keepdim=True)
+        if all_dropped.any():
+            top1_mask = torch.zeros_like(keep_mask)
+            top1_mask[..., :1] = True
+            keep_mask = torch.where(all_dropped, top1_mask, keep_mask)
+        routes = routes * keep_mask.to(dtype=routes.dtype)
+        return routes / routes.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+    def _select_routes_from_logits(
+        self,
+        logits: Tensor,
+        *,
+        k: int,
+        dst_nodes: int,
+    ) -> tuple[Tensor, Tensor]:
+        topk_selected = select_topk(logits, k, dim=-1)
+        topk_indices = topk_selected.indices
+        routes = self._topk_routes(topk_selected.values, topk_indices, dst_nodes=dst_nodes)
+        return routes, topk_indices
+
+    @staticmethod
+    def _scatter_dense_routes(
+        logits: Tensor,
+        routes: Tensor,
+        topk_indices: Tensor,
+    ) -> Tensor:
+        dense_routes = torch.zeros_like(logits)
+        dense_routes.scatter_(-1, topk_indices, routes)
+        return dense_routes
 
     def _compute_delta_reference(self, src_layer: Layer, dst_layer: Layer) -> LayerDelta:
         logits = self.compute_route_logits(src_layer, dst_layer)
         k = min(self.topk, dst_layer.num_nodes)
-        if k == dst_layer.num_nodes:
+        if k == dst_layer.num_nodes and not self._dropout_active():
             routes = torch.softmax(logits, dim=-1)
         else:
-            mask = build_topk_mask(logits, k, dim=-1)
-            routes = masked_softmax(logits, mask, dim=-1)
+            topk_routes, topk_indices = self._select_routes_from_logits(
+                logits, k=k, dst_nodes=dst_layer.num_nodes
+            )
+            routes = self._scatter_dense_routes(logits, topk_routes, topk_indices)
 
         projected_val, projected_state, sender_strength = self._project_inputs(
             src_layer, dst_layer
@@ -332,16 +446,13 @@ class SparseTransition(Transition):
     ) -> LayerDelta:
         logits = self.compute_route_logits(src_layer, dst_layer)
         k = min(self.topk, dst_layer.num_nodes)
-        if k == dst_layer.num_nodes:
+        if k == dst_layer.num_nodes and not self._dropout_active():
             routes = torch.softmax(logits, dim=-1)
         else:
-            topk_indices = select_topk(logits, k, dim=-1).indices
-            dst_index = torch.arange(
-                dst_layer.num_nodes, device=logits.device, dtype=topk_indices.dtype
+            topk_routes, topk_indices = self._select_routes_from_logits(
+                logits, k=k, dst_nodes=dst_layer.num_nodes
             )
-            dst_index = dst_index.view((1,) * topk_indices.ndim + (dst_layer.num_nodes,))
-            mask = (topk_indices.unsqueeze(-1) == dst_index).any(dim=-2)
-            routes = masked_softmax(logits, mask, dim=-1)
+            routes = self._scatter_dense_routes(logits, topk_routes, topk_indices)
 
         projected_val, projected_state, sender_strength = self._project_inputs(
             src_layer, dst_layer
@@ -423,7 +534,11 @@ class SparseTransition(Transition):
                 topk_values = topk_selected.values
                 topk_indices = topk_selected.indices
 
-            routes = torch.softmax(topk_values, dim=-1)
+            routes = self._topk_routes(
+                topk_values,
+                topk_indices,
+                dst_nodes=dst_layer.num_nodes,
+            )
             weighted_routes = routes * sender_strength[..., src_start:src_end].unsqueeze(-1)
 
             state_contrib = (
@@ -490,13 +605,15 @@ class SparseTransition(Transition):
                 routes = torch.softmax(logits, dim=-1)
                 topk_indices = None
             else:
-                topk_selected = select_topk(logits, k, dim=-1)
-                topk_indices = topk_selected.indices
-                routes = torch.softmax(topk_selected.values, dim=-1)
-                dense_routes = torch.zeros_like(logits)
-                dense_routes.scatter_(-1, topk_indices, routes)
-                routes = dense_routes
+                topk_routes, topk_indices = self._select_routes_from_logits(
+                    logits, k=k, dst_nodes=dst_layer.num_nodes
+                )
+                routes = self._scatter_dense_routes(logits, topk_routes, topk_indices)
             self.last_stats = _summarize_routes(routes, topk_indices=topk_indices)
+        if self._dropout_active():
+            if src_layer.val.device.type == "privateuseone":
+                return self._compute_delta_directml_fallback(src_layer, dst_layer)
+            return self._compute_delta_streaming(src_layer, dst_layer)
         if self.implementation == "native":
             if (
                 supports_pairwise_route_kernel(self.route_fn)

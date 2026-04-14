@@ -624,6 +624,11 @@ def run_single_experiment(
         state_init_mode=args.state_init_mode,
         pairwise_kind=args.pairwise_kind,
         pairwise_hidden_dim=args.pairwise_hidden_dim,
+        edge_dropout_p=args.edge_dropout_p,
+        usage_dropout_base=args.usage_dropout_base,
+        usage_dropout_scale=args.usage_dropout_scale,
+        usage_dropout_max=args.usage_dropout_max,
+        usage_ema_decay=args.usage_ema_decay,
     )
     parameter_count = count_parameters(model)
 
@@ -640,7 +645,9 @@ def run_single_experiment(
         f"dim={effective_config['dim']} | warmup={effective_config['warmup_layers']} | "
         f"stages={effective_config['lite_layers']}/{effective_config['mid_layers']}/{effective_config['full_layers']} | "
         f"refine={effective_config['final_refine_layers']} | route_mode={args.route_mode} | "
-        f"route_topk={effective_config['route_topk']} | route_kind={args.route_kind}"
+        f"route_topk={effective_config['route_topk']} | route_kind={args.route_kind} | "
+        f"edge_dropout={args.edge_dropout_p:.3f} | "
+        f"usage_dropout={args.usage_dropout_base:.3f}/{args.usage_dropout_scale:.3f}/{args.usage_dropout_max:.3f}"
     )
     print(
         f"schedule_steps={train_steps:,} | approx_epochs={requested_epochs:.3f} | "
@@ -799,6 +806,11 @@ def run_single_experiment(
         "state_init_mode": args.state_init_mode,
         "pairwise_kind": args.pairwise_kind,
         "pairwise_hidden_dim": args.pairwise_hidden_dim,
+        "edge_dropout_p": args.edge_dropout_p,
+        "usage_dropout_base": args.usage_dropout_base,
+        "usage_dropout_scale": args.usage_dropout_scale,
+        "usage_dropout_max": args.usage_dropout_max,
+        "usage_ema_decay": args.usage_ema_decay,
         "alpha_scale": args.alpha_scale,
         "beta_s_to_b_scale": args.beta_s_to_b_scale,
         "beta_b_to_s_scale": args.beta_b_to_s_scale,
@@ -864,6 +876,11 @@ def run_single_experiment(
                 "state_init_mode": args.state_init_mode,
                 "pairwise_kind": args.pairwise_kind,
                 "pairwise_hidden_dim": args.pairwise_hidden_dim,
+                "edge_dropout_p": args.edge_dropout_p,
+                "usage_dropout_base": args.usage_dropout_base,
+                "usage_dropout_scale": args.usage_dropout_scale,
+                "usage_dropout_max": args.usage_dropout_max,
+                "usage_ema_decay": args.usage_ema_decay,
                 "alpha_scale": args.alpha_scale,
                 "beta_s_to_b_scale": args.beta_s_to_b_scale,
                 "beta_b_to_s_scale": args.beta_b_to_s_scale,
@@ -1051,6 +1068,11 @@ def main() -> None:
         default="diagonal_bilinear",
     )
     parser.add_argument("--pairwise-hidden-dim", type=int)
+    parser.add_argument("--edge-dropout-p", type=float, default=0.0)
+    parser.add_argument("--usage-dropout-base", type=float, default=0.0)
+    parser.add_argument("--usage-dropout-scale", type=float, default=0.0)
+    parser.add_argument("--usage-dropout-max", type=float, default=0.0)
+    parser.add_argument("--usage-ema-decay", type=float, default=0.99)
     parser.add_argument(
         "--precision",
         choices=("fp32", "bf16", "fp16"),
@@ -1133,6 +1155,17 @@ def main() -> None:
         raise ValueError("data-workers must be non-negative.")
     if args.prefetch_factor <= 0:
         raise ValueError("prefetch-factor must be positive.")
+    for name in (
+        "edge_dropout_p",
+        "usage_dropout_base",
+        "usage_dropout_scale",
+        "usage_dropout_max",
+    ):
+        value = getattr(args, name)
+        if not 0.0 <= value < 1.0:
+            raise ValueError(f"{name.replace('_', '-')} must be in [0, 1).")
+    if not 0.0 <= args.usage_ema_decay < 1.0:
+        raise ValueError("usage-ema-decay must be in [0, 1).")
 
     corpus = load_text_corpus(
         default_text=DEFAULT_TEXT,
