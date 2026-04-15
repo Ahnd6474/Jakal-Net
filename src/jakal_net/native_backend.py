@@ -188,7 +188,7 @@ def _cuda_float_tensor(tensor: Tensor | None) -> bool:
     return (
         tensor is not None
         and tensor.device.type == "cuda"
-        and tensor.dtype in {torch.float32, torch.float64}
+        and tensor.dtype in {torch.float16, torch.bfloat16, torch.float32}
     )
 
 

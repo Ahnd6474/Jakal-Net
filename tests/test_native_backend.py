@@ -707,6 +707,62 @@ class CudaNativeBackendTests(unittest.TestCase):
                 expected = dict(reference_route.named_parameters())[name].grad
                 self.assertTrue(torch.allclose(parameter.grad, expected, atol=2e-5, rtol=2e-5))
 
+    def test_query_only_backward_supports_half_and_bfloat16_on_cuda(self) -> None:
+        module = native_backend._native_module()
+        if "query_topk_reduce_backward_cuda" not in set(module.supported_ops()):
+            self.skipTest("Native query backward kernels are unavailable.")
+
+        for dtype in (torch.float16, torch.bfloat16):
+            query_val = torch.randn(2, 3, 4, device=self.device, dtype=dtype, requires_grad=True)
+            source_val = torch.randn(2, 5, 4, device=self.device, dtype=dtype, requires_grad=True)
+            projected_state = torch.randn(2, 5, device=self.device, dtype=dtype, requires_grad=True)
+            projected_val = torch.randn(2, 5, 4, device=self.device, dtype=dtype, requires_grad=True)
+            pairwise = DiagonalBilinearPairwise(dim=4).to(device=self.device, dtype=dtype)
+            actual = propagation_query_topk_native(
+                pairwise_fn=pairwise,
+                edge_compress_name="softsign",
+                query_val=query_val,
+                source_val=source_val,
+                projected_state=projected_state,
+                projected_val=projected_val,
+                topk=3,
+                query_block_size=2,
+                source_block_size=0,
+            )
+            (actual.delta_state.float().square().sum() + actual.delta_val.float().square().sum()).backward()
+            self.assertEqual(query_val.grad.dtype, dtype)
+            self.assertEqual(source_val.grad.dtype, dtype)
+            self.assertEqual(pairwise.weight.grad.dtype, dtype)
+            self.assertTrue(torch.isfinite(query_val.grad.float()).all())
+            self.assertTrue(torch.isfinite(source_val.grad.float()).all())
+
+            src_val = torch.randn(2, 5, 4, device=self.device, dtype=dtype, requires_grad=True)
+            next_query = torch.randn(2, 3, 4, device=self.device, dtype=dtype, requires_grad=True)
+            sender_strength = (torch.rand(2, 5, device=self.device, dtype=dtype) + 0.2).requires_grad_()
+            next_projected_state = torch.randn(2, 5, device=self.device, dtype=dtype, requires_grad=True)
+            next_projected_val = torch.randn(2, 5, 4, device=self.device, dtype=dtype, requires_grad=True)
+            route = LowRankBilinearRoute(src_dim=4, dst_dim=4, rank=2).to(
+                device=self.device,
+                dtype=dtype,
+            )
+            transition = transition_query_topk_native(
+                route_fn=route,
+                sender_strength=sender_strength,
+                src_val=src_val,
+                query_val=next_query,
+                projected_state=next_projected_state,
+                projected_val=next_projected_val,
+                topk=3,
+                query_block_size=2,
+                source_block_size=0,
+            )
+            (transition.delta_state.float().square().sum() + transition.delta_val.float().square().sum()).backward()
+            self.assertEqual(src_val.grad.dtype, dtype)
+            self.assertEqual(next_query.grad.dtype, dtype)
+            self.assertEqual(route.weight.grad.dtype, dtype)
+            self.assertTrue(torch.isfinite(src_val.grad.float()).all())
+            self.assertTrue(torch.isfinite(next_query.grad.float()).all())
+
 
 if __name__ == "__main__":
     unittest.main()

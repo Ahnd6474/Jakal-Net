@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -68,6 +69,7 @@ ASSISTANT_TOKEN = "<|assistant|>"
 EOS_TOKEN = "<|eos|>"
 PAD_TOKEN = "<|pad|>"
 DIALOGUE_SPECIAL_TOKENS = (USER_TOKEN, ASSISTANT_TOKEN, EOS_TOKEN, PAD_TOKEN)
+SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+(?=[\"'(\[]?[A-Z0-9])")
 DEFAULT_DIALOGUE_MESSAGES = (
     (
         {"role": "user", "content": "오늘 학습 상태를 간단히 요약해줘."},
@@ -343,6 +345,10 @@ def _pairs_from_messages(messages: Sequence[dict[str, Any]]) -> list[DialoguePai
 def _pairs_from_record(record: Any) -> list[DialoguePairText]:
     if not isinstance(record, dict):
         return []
+    prefix = record.get("prefix")
+    response = record.get("response")
+    if isinstance(prefix, str) and prefix.strip() and isinstance(response, str) and response.strip():
+        return [DialoguePairText(prefix=prefix.strip(), response=response.strip())]
     messages = record.get("messages") or record.get("conversations")
     if isinstance(messages, list):
         normalized = [message for message in messages if isinstance(message, dict)]
@@ -369,6 +375,165 @@ def _pairs_from_record(record: Any) -> list[DialoguePairText]:
             )
         ]
     return []
+
+
+def split_prediction_units(text: str, *, min_chars: int = 8) -> list[str]:
+    units: list[str] = []
+    for paragraph in re.split(r"\n\s*\n+", text):
+        paragraph = paragraph.strip()
+        if not paragraph:
+            continue
+        line_candidates = [line.strip() for line in paragraph.splitlines() if line.strip()]
+        code_like = len(line_candidates) >= 3 and any(
+            token in paragraph for token in ("def ", "class ", "{", "}", "=>", ";</", "import ")
+        )
+        if code_like:
+            candidates = line_candidates
+        else:
+            normalized = re.sub(r"\s+", " ", paragraph)
+            candidates = [piece.strip() for piece in SENTENCE_BOUNDARY_RE.split(normalized)]
+            if len(candidates) <= 1 and len(line_candidates) > 1:
+                candidates = line_candidates
+        for candidate in candidates:
+            candidate = candidate.strip()
+            if len(candidate) >= min_chars:
+                units.append(candidate)
+    return units
+
+
+def make_next_sentence_pairs(
+    texts: Sequence[str],
+    *,
+    prefix_sentences: int = 1,
+    min_chars: int = 8,
+    max_pairs: int | None = None,
+) -> list[DialoguePairText]:
+    if prefix_sentences <= 0:
+        raise ValueError("prefix_sentences must be positive.")
+    pairs: list[DialoguePairText] = []
+    for text in texts:
+        units = split_prediction_units(text, min_chars=min_chars)
+        if len(units) <= prefix_sentences:
+            continue
+        for index in range(prefix_sentences, len(units)):
+            prefix = " ".join(units[index - prefix_sentences:index])
+            response = units[index]
+            pairs.append(DialoguePairText(prefix=prefix, response=response))
+            if max_pairs is not None and len(pairs) >= max_pairs:
+                return pairs
+    return pairs
+
+
+def load_next_sentence_pairs(
+    *,
+    default_text: str,
+    text_file: str | None,
+    text_sources: Sequence[str],
+    jsonl_sources: Sequence[str],
+    jsonl_text_keys: Sequence[str],
+    hf_dataset: str | None,
+    hf_config: str | None,
+    hf_split: str,
+    hf_text_key: str,
+    hf_streaming: bool,
+    max_samples: int | None,
+    max_chars: int | None,
+    separator: str,
+    prefix_sentences: int,
+    min_chars: int,
+) -> tuple[list[DialoguePairText], CorpusLoadResult]:
+    from lm_experiment_utils import _expand_sources
+
+    paths = _expand_sources(jsonl_sources, directory_suffixes=(".jsonl", ".json"))
+    explicit_pairs: list[DialoguePairText] = []
+    text_jsonl_paths: list[str] = []
+    for path in paths:
+        path_pairs: list[DialoguePairText] = []
+        with path.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                path_pairs.extend(_pairs_from_record(json.loads(line)))
+                if max_samples is not None and len(explicit_pairs) + len(path_pairs) >= max_samples:
+                    break
+        if path_pairs:
+            explicit_pairs.extend(path_pairs)
+        else:
+            text_jsonl_paths.append(str(path))
+        if max_samples is not None and len(explicit_pairs) >= max_samples:
+            explicit_pairs = explicit_pairs[:max_samples]
+            break
+
+    has_text_sources = bool(text_file or text_sources or text_jsonl_paths or hf_dataset or not explicit_pairs)
+    if has_text_sources:
+        corpus = load_text_corpus(
+            default_text=default_text,
+            text_file=text_file,
+            text_sources=text_sources,
+            jsonl_sources=text_jsonl_paths,
+            jsonl_text_keys=jsonl_text_keys,
+            hf_dataset=hf_dataset,
+            hf_config=hf_config,
+            hf_split=hf_split,
+            hf_text_key=hf_text_key,
+            hf_streaming=hf_streaming,
+            max_samples=max_samples if not explicit_pairs else None,
+            max_chars=max_chars if not explicit_pairs else None,
+            separator=separator,
+        )
+        generated_pairs = make_next_sentence_pairs(
+            [corpus.text],
+            prefix_sentences=prefix_sentences,
+            min_chars=min_chars,
+        )
+    else:
+        pair_text = "\n\n".join(f"{pair.prefix}\n{pair.response}" for pair in explicit_pairs)
+        corpus = CorpusLoadResult(
+            text=pair_text,
+            source_label="next_sentence_pairs",
+            text_path=None,
+            sample_count=len(explicit_pairs),
+            file_count=len(paths),
+            char_count=len(pair_text),
+            truncated=False,
+            metadata={"source_kind": "next_sentence_pairs", "jsonl_paths": [str(path) for path in paths]},
+        )
+        generated_pairs = []
+    pairs = explicit_pairs + generated_pairs
+    if max_samples is not None:
+        pairs = pairs[:max_samples]
+    if max_chars is not None and explicit_pairs:
+        selected: list[DialoguePairText] = []
+        total_chars = 0
+        for pair in pairs:
+            pair_chars = len(pair.prefix) + len(pair.response)
+            if total_chars + pair_chars > max_chars:
+                break
+            selected.append(pair)
+            total_chars += pair_chars
+        pairs = selected
+    if not pairs:
+        raise ValueError("No next-sentence pairs were loaded.")
+    pair_text = "\n\n".join(f"{pair.prefix}\n{pair.response}" for pair in pairs)
+    corpus = CorpusLoadResult(
+        text=pair_text,
+        source_label=f"next_sentence_pairs,{corpus.source_label}",
+        text_path=corpus.text_path,
+        sample_count=len(pairs),
+        file_count=corpus.file_count,
+        char_count=len(pair_text),
+        truncated=corpus.truncated,
+        metadata={
+            **corpus.metadata,
+            "source_kind": "next_sentence_pairs",
+            "explicit_pair_count": len(explicit_pairs),
+            "generated_pair_count": len(generated_pairs),
+            "prefix_sentences": prefix_sentences,
+            "sentence_min_chars": min_chars,
+        },
+    )
+    return pairs, corpus
 
 
 def _load_dialogue_pairs_from_jsonl(path: Path) -> list[DialoguePairText]:
@@ -939,10 +1104,10 @@ def run_single_experiment(
     if grad_accum_steps <= 0:
         raise ValueError("grad-accum-steps must be positive.")
     effective_batch_size = args.batch_size * grad_accum_steps
-    prefix_response = args.training_objective == "prefix_response"
-    if prefix_response:
+    response_objective = args.training_objective in {"prefix_response", "next_sentence_response"}
+    if response_objective:
         if train_response_pairs is None or val_response_pairs is None or special_token_ids is None:
-            raise ValueError("prefix_response requires encoded dialogue pairs and special ids.")
+            raise ValueError("response objectives require encoded pairs and special ids.")
         if args.response_len <= 0:
             raise ValueError("response-len must be positive.")
         steps_per_epoch = max(1, math.ceil(len(train_response_pairs) / effective_batch_size))
@@ -1058,7 +1223,7 @@ def run_single_experiment(
     writer = maybe_create_summary_writer(enabled=args.tensorboard, tensorboard_dir=tensorboard_dir)
 
     def make_eval_sample() -> tuple[str, str]:
-        if prefix_response:
+        if response_objective:
             assert train_response_pairs is not None
             assert special_token_ids is not None
             prompt_ids, prompt_text = select_prefix_response_prompt_tokens(
@@ -1119,7 +1284,7 @@ def run_single_experiment(
             writer.add_scalar("eval/val_loss", val_loss, step)
             writer.add_scalar("eval/train_ppl", perplexity_from_loss(train_loss), step)
             writer.add_scalar("eval/val_ppl", perplexity_from_loss(val_loss), step)
-            if prefix_response:
+            if response_objective:
                 assert train_response_pairs is not None
                 assert special_token_ids is not None
                 stats_batch = sample_prefix_response_batch(
@@ -1178,7 +1343,7 @@ def run_single_experiment(
         )
 
     try:
-        if prefix_response:
+        if response_objective:
             assert train_response_pairs is not None
             assert val_response_pairs is not None
             assert special_token_ids is not None
@@ -1242,7 +1407,7 @@ def run_single_experiment(
     runtime_seconds = time.perf_counter() - start_time
     print_eval_table(history, steps_per_epoch=steps_per_epoch)
 
-    if prefix_response:
+    if response_objective:
         assert special_token_ids is not None
         assert train_response_pairs is not None
         prompt_ids, prompt_text = select_prefix_response_prompt_tokens(
@@ -1292,6 +1457,8 @@ def run_single_experiment(
         "tokenizer_model_path": tokenizer_model_path,
         "seq_len": args.seq_len,
         "response_len": args.response_len,
+        "sentence_prefix_count": args.sentence_prefix_count,
+        "sentence_min_chars": args.sentence_min_chars,
         "batch_size": args.batch_size,
         "grad_accum_steps": grad_accum_steps,
         "effective_batch_size": effective_batch_size,
@@ -1494,7 +1661,13 @@ def main() -> None:
     parser.add_argument("--corpus-separator", default="\n\n")
     parser.add_argument(
         "--training-objective",
-        choices=("last_token", "teacher_forcing", "full_sequence_causal", "prefix_response"),
+        choices=(
+            "last_token",
+            "teacher_forcing",
+            "full_sequence_causal",
+            "prefix_response",
+            "next_sentence_response",
+        ),
         default="last_token",
     )
     parser.add_argument(
@@ -1533,6 +1706,18 @@ def main() -> None:
     parser.add_argument("--pretokenize-workers", type=int, default=0)
     parser.add_argument("--seq-len", type=int, default=32)
     parser.add_argument("--response-len", type=int, default=64)
+    parser.add_argument(
+        "--sentence-prefix-count",
+        type=int,
+        default=1,
+        help="For next_sentence_response, condition on this many previous sentence-like units.",
+    )
+    parser.add_argument(
+        "--sentence-min-chars",
+        type=int,
+        default=8,
+        help="For next_sentence_response, ignore sentence-like units shorter than this.",
+    )
     parser.add_argument(
         "--model-preset",
         choices=preset_choices,
@@ -1670,6 +1855,8 @@ def main() -> None:
     teacher_forcing = args.training_objective == "teacher_forcing"
     full_sequence_causal = args.training_objective == "full_sequence_causal"
     prefix_response = args.training_objective == "prefix_response"
+    next_sentence_response = args.training_objective == "next_sentence_response"
+    response_objective = prefix_response or next_sentence_response
     if args.teacher_forcing_chunk_size is not None and args.teacher_forcing_chunk_size <= 0:
         raise ValueError("teacher-forcing-chunk-size must be positive.")
     if args.teacher_forcing_chunk_size is not None and not teacher_forcing:
@@ -1689,6 +1876,10 @@ def main() -> None:
         raise ValueError("prefetch-factor must be positive.")
     if args.response_len <= 0:
         raise ValueError("response-len must be positive.")
+    if args.sentence_prefix_count <= 0:
+        raise ValueError("sentence-prefix-count must be positive.")
+    if args.sentence_min_chars <= 0:
+        raise ValueError("sentence-min-chars must be positive.")
     if args.subword_input_sentence_size < 0:
         raise ValueError("subword-input-sentence-size must be non-negative.")
     if args.subword_num_threads < 0:
@@ -1715,6 +1906,24 @@ def main() -> None:
             hf_streaming=args.hf_streaming,
             max_samples=args.corpus_max_samples,
             max_chars=args.corpus_max_chars,
+        )
+    elif next_sentence_response:
+        dialogue_pairs, corpus = load_next_sentence_pairs(
+            default_text=DEFAULT_TEXT,
+            text_file=args.text_file,
+            text_sources=args.text_source,
+            jsonl_sources=args.jsonl_source,
+            jsonl_text_keys=tuple(dict.fromkeys(args.jsonl_text_key)),
+            hf_dataset=args.hf_dataset,
+            hf_config=args.hf_config,
+            hf_split=args.hf_split,
+            hf_text_key=args.hf_text_key,
+            hf_streaming=args.hf_streaming,
+            max_samples=args.corpus_max_samples,
+            max_chars=args.corpus_max_chars,
+            separator=args.corpus_separator,
+            prefix_sentences=args.sentence_prefix_count,
+            min_chars=args.sentence_min_chars,
         )
     else:
         corpus = load_text_corpus(
@@ -1749,10 +1958,10 @@ def main() -> None:
         subword_character_coverage=args.subword_character_coverage,
         subword_input_sentence_size=args.subword_input_sentence_size,
         subword_num_threads=args.subword_num_threads,
-        user_defined_symbols=DIALOGUE_SPECIAL_TOKENS if prefix_response else (),
+        user_defined_symbols=DIALOGUE_SPECIAL_TOKENS if response_objective else (),
     )
-    special_token_ids = require_subword_special_ids(vocab) if prefix_response else None
-    if prefix_response:
+    special_token_ids = require_subword_special_ids(vocab) if response_objective else None
+    if response_objective:
         tokens = torch.empty(0, dtype=torch.long)
         train_tokens = tokens
         val_tokens = tokens
@@ -1763,12 +1972,12 @@ def main() -> None:
         train_tokens, val_tokens = split_train_val(tokens, train_fraction=0.9)
     train_response_pairs = None
     val_response_pairs = None
-    if prefix_response:
+    if response_objective:
         assert dialogue_pairs is not None
         train_pair_texts, val_pair_texts = split_dialogue_pairs(dialogue_pairs)
         effective_pretokenize_workers = min(args.pretokenize_workers, os.cpu_count() or 1)
         print(
-            "encoding_dialogue_pairs | "
+            "encoding_response_pairs | "
             f"train={len(train_pair_texts):,} | val={len(val_pair_texts):,} | "
             f"pretokenize_workers={effective_pretokenize_workers}"
         )
@@ -1784,16 +1993,16 @@ def main() -> None:
             workers=effective_pretokenize_workers,
         )
         print(
-            "encoded_dialogue_pairs | "
+            "encoded_response_pairs | "
             f"elapsed={time.perf_counter() - encode_start:.1f}s"
         )
     print(
         f"tokenizer={tokenizer_label} | tokenizer_vocab={vocab.size:,} | "
         f"train_tokens={train_tokens.numel():,} | val_tokens={val_tokens.numel():,}"
     )
-    if prefix_response:
+    if response_objective:
         print(
-            f"dialogue_pairs={len(dialogue_pairs or ()):,} | "
+            f"response_pairs={len(dialogue_pairs or ()):,} | "
             f"train_pairs={len(train_response_pairs or ()):,} | "
             f"val_pairs={len(val_response_pairs or ()):,} | response_len={args.response_len}"
         )

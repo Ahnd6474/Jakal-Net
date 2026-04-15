@@ -84,8 +84,8 @@ __global__ void query_topk_reduce_backward_state_kernel(
     const int64_t* __restrict__ indices,
     const scalar_t* __restrict__ projected_state,
     const scalar_t* __restrict__ grad_delta_state,
-    scalar_t* __restrict__ grad_edges,
-    scalar_t* __restrict__ grad_projected_state,
+    float* __restrict__ grad_edges,
+    float* __restrict__ grad_projected_state,
     int64_t batch_flat,
     int64_t query_nodes,
     int64_t source_nodes,
@@ -101,9 +101,10 @@ __global__ void query_topk_reduce_backward_state_kernel(
   const int64_t batch = query_linear / query_nodes;
   const int64_t query = query_linear - batch * query_nodes;
   const int64_t source_index = indices[linear];
-  const scalar_t grad_state = grad_delta_state[query_linear];
-  const scalar_t edge = edges[linear];
-  const scalar_t selected_state = projected_state[batch * source_nodes + source_index];
+  const float grad_state = static_cast<float>(grad_delta_state[query_linear]);
+  const float edge = static_cast<float>(edges[linear]);
+  const float selected_state =
+      static_cast<float>(projected_state[batch * source_nodes + source_index]);
 
   grad_edges[linear] = grad_state * selected_state;
   atomicAdd(&grad_projected_state[batch * source_nodes + source_index], grad_state * edge);
@@ -115,8 +116,8 @@ __global__ void query_topk_reduce_backward_val_kernel(
     const int64_t* __restrict__ indices,
     const scalar_t* __restrict__ projected_val,
     const scalar_t* __restrict__ grad_delta_val,
-    scalar_t* __restrict__ grad_edges,
-    scalar_t* __restrict__ grad_projected_val,
+    float* __restrict__ grad_edges,
+    float* __restrict__ grad_projected_val,
     int64_t batch_flat,
     int64_t query_nodes,
     int64_t source_nodes,
@@ -134,34 +135,34 @@ __global__ void query_topk_reduce_backward_val_kernel(
   const int64_t query_linear = rank_linear / k;
   const int64_t batch = query_linear / query_nodes;
   const int64_t source_index = indices[rank_linear];
-  const scalar_t grad_val = grad_delta_val[query_linear * out_dim + out];
-  const scalar_t edge = edges[rank_linear];
+  const float grad_val = static_cast<float>(grad_delta_val[query_linear * out_dim + out]);
+  const float edge = static_cast<float>(edges[rank_linear]);
   const int64_t source_offset = batch * source_nodes * out_dim + source_index * out_dim + out;
 
-  atomicAdd(&grad_edges[rank_linear], grad_val * projected_val[source_offset]);
+  atomicAdd(&grad_edges[rank_linear], grad_val * static_cast<float>(projected_val[source_offset]));
   atomicAdd(&grad_projected_val[source_offset], grad_val * edge);
 }
 
 template <typename scalar_t>
 __global__ void softsign_backward_kernel(
     const scalar_t* __restrict__ scores,
-    const scalar_t* __restrict__ grad_edges,
-    scalar_t* __restrict__ grad_scores,
+    const float* __restrict__ grad_edges,
+    float* __restrict__ grad_scores,
     int64_t total) {
   const int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
   if (linear >= total) {
     return;
   }
-  const scalar_t score = scores[linear];
-  const scalar_t denom = static_cast<scalar_t>(1) + (score < 0 ? -score : score);
+  const float score = static_cast<float>(scores[linear]);
+  const float denom = 1.0f + (score < 0.0f ? -score : score);
   grad_scores[linear] = grad_edges[linear] / (denom * denom);
 }
 
 template <typename scalar_t>
 __global__ void softmax_backward_kernel(
     const scalar_t* __restrict__ routes,
-    const scalar_t* __restrict__ grad_routes,
-    scalar_t* __restrict__ grad_scores,
+    const float* __restrict__ grad_routes,
+    float* __restrict__ grad_scores,
     int64_t rows,
     int64_t k) {
   const int64_t row = blockIdx.x * blockDim.x + threadIdx.x;
@@ -169,14 +170,14 @@ __global__ void softmax_backward_kernel(
     return;
   }
 
-  scalar_t dot = static_cast<scalar_t>(0);
+  float dot = 0.0f;
   const int64_t base = row * k;
   for (int64_t rank = 0; rank < k; ++rank) {
-    dot += routes[base + rank] * grad_routes[base + rank];
+    dot += static_cast<float>(routes[base + rank]) * grad_routes[base + rank];
   }
   for (int64_t rank = 0; rank < k; ++rank) {
     const int64_t offset = base + rank;
-    grad_scores[offset] = routes[offset] * (grad_routes[offset] - dot);
+    grad_scores[offset] = static_cast<float>(routes[offset]) * (grad_routes[offset] - dot);
   }
 }
 
@@ -186,12 +187,12 @@ __global__ void diagonal_pairwise_topk_backward_kernel(
     const scalar_t* __restrict__ source_val,
     const scalar_t* __restrict__ weight,
     const int64_t* __restrict__ indices,
-    const scalar_t* __restrict__ grad_scores,
-    scalar_t* __restrict__ grad_query,
-    scalar_t* __restrict__ grad_source,
-    scalar_t* __restrict__ grad_weight,
-    scalar_t* __restrict__ grad_bias,
-    scalar_t inv_temperature,
+    const float* __restrict__ grad_scores,
+    float* __restrict__ grad_query,
+    float* __restrict__ grad_source,
+    float* __restrict__ grad_weight,
+    float* __restrict__ grad_bias,
+    float inv_temperature,
     int64_t batch_flat,
     int64_t query_nodes,
     int64_t source_nodes,
@@ -210,10 +211,11 @@ __global__ void diagonal_pairwise_topk_backward_kernel(
   const int64_t batch = query_linear / query_nodes;
   const int64_t query = query_linear - batch * query_nodes;
   const int64_t source_index = indices[rank_linear];
-  const scalar_t g = grad_scores[rank_linear] * inv_temperature;
-  const scalar_t q = query_val[(batch * query_nodes + query) * dim + d];
-  const scalar_t s = source_val[(batch * source_nodes + source_index) * dim + d];
-  const scalar_t w = weight[d];
+  const float g = grad_scores[rank_linear] * inv_temperature;
+  const float q = static_cast<float>(query_val[(batch * query_nodes + query) * dim + d]);
+  const float s =
+      static_cast<float>(source_val[(batch * source_nodes + source_index) * dim + d]);
+  const float w = static_cast<float>(weight[d]);
 
   atomicAdd(&grad_query[(batch * query_nodes + query) * dim + d], g * s * w);
   atomicAdd(&grad_source[(batch * source_nodes + source_index) * dim + d], g * q * w);
@@ -233,14 +235,14 @@ __global__ void low_rank_pairwise_topk_backward_kernel(
     const scalar_t* __restrict__ projected_query,
     const scalar_t* __restrict__ projected_source,
     const int64_t* __restrict__ indices,
-    const scalar_t* __restrict__ grad_scores,
-    scalar_t* __restrict__ grad_query,
-    scalar_t* __restrict__ grad_source,
-    scalar_t* __restrict__ grad_source_weight,
-    scalar_t* __restrict__ grad_target_weight,
-    scalar_t* __restrict__ grad_core_weight,
-    scalar_t* __restrict__ grad_bias,
-    scalar_t inv_temperature,
+    const float* __restrict__ grad_scores,
+    float* __restrict__ grad_query,
+    float* __restrict__ grad_source,
+    float* __restrict__ grad_source_weight,
+    float* __restrict__ grad_target_weight,
+    float* __restrict__ grad_core_weight,
+    float* __restrict__ grad_bias,
+    float inv_temperature,
     int64_t batch_flat,
     int64_t query_nodes,
     int64_t source_nodes,
@@ -262,20 +264,23 @@ __global__ void low_rank_pairwise_topk_backward_kernel(
   const int64_t batch = query_linear / query_nodes;
   const int64_t query = query_linear - batch * query_nodes;
   const int64_t source_index = indices[topk_linear];
-  const scalar_t g = grad_scores[topk_linear] * inv_temperature;
-  const scalar_t projected_q = projected_query[(batch * query_nodes + query) * rank_dim + r];
-  const scalar_t projected_s = projected_source[(batch * source_nodes + source_index) * rank_dim + r];
-  const scalar_t core = core_weight[r];
-  const scalar_t q = query_val[(batch * query_nodes + query) * dim + d];
-  const scalar_t s = source_val[(batch * source_nodes + source_index) * dim + d];
+  const float g = grad_scores[topk_linear] * inv_temperature;
+  const float projected_q =
+      static_cast<float>(projected_query[(batch * query_nodes + query) * rank_dim + r]);
+  const float projected_s =
+      static_cast<float>(projected_source[(batch * source_nodes + source_index) * rank_dim + r]);
+  const float core = static_cast<float>(core_weight[r]);
+  const float q = static_cast<float>(query_val[(batch * query_nodes + query) * dim + d]);
+  const float s =
+      static_cast<float>(source_val[(batch * source_nodes + source_index) * dim + d]);
 
-  const scalar_t grad_projected_s = g * core * projected_q;
-  const scalar_t grad_projected_q = g * core * projected_s;
+  const float grad_projected_s = g * core * projected_q;
+  const float grad_projected_q = g * core * projected_s;
 
   atomicAdd(&grad_source[(batch * source_nodes + source_index) * dim + d],
-            grad_projected_s * source_weight[r * dim + d]);
+            grad_projected_s * static_cast<float>(source_weight[r * dim + d]));
   atomicAdd(&grad_query[(batch * query_nodes + query) * dim + d],
-            grad_projected_q * target_weight[r * dim + d]);
+            grad_projected_q * static_cast<float>(target_weight[r * dim + d]));
   atomicAdd(&grad_source_weight[r * dim + d], grad_projected_s * s);
   atomicAdd(&grad_target_weight[r * dim + d], grad_projected_q * q);
   if (d == 0) {
@@ -406,24 +411,30 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> jakal_net_query_topk_red
   const auto k = edges.size(2);
   const auto source_nodes = projected_state.size(1);
   const auto out_dim = projected_val.size(2);
-  auto grad_edges = torch::empty_like(edges);
-  auto grad_projected_state = torch::zeros_like(projected_state);
-  auto grad_projected_val = torch::zeros_like(projected_val);
+  auto float_options = edges.options().dtype(torch::kFloat32);
+  auto grad_edges = torch::empty(edges.sizes(), float_options);
+  auto grad_projected_state = torch::zeros(projected_state.sizes(), float_options);
+  auto grad_projected_val = torch::zeros(projected_val.sizes(), float_options);
 
   constexpr int threads = 256;
   const auto stream = at::cuda::getCurrentCUDAStream();
   const int64_t state_total = batch_flat * query_nodes * k;
   const int64_t val_total = batch_flat * query_nodes * k * out_dim;
 
-  AT_DISPATCH_FLOATING_TYPES(edges.scalar_type(), "query_topk_reduce_backward_cuda", [&] {
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf,
+      torch::kBFloat16,
+      edges.scalar_type(),
+      "query_topk_reduce_backward_cuda",
+      [&] {
     query_topk_reduce_backward_state_kernel<scalar_t>
         <<<(state_total + threads - 1) / threads, threads, 0, stream>>>(
             edges.data_ptr<scalar_t>(),
             indices.data_ptr<int64_t>(),
             projected_state.data_ptr<scalar_t>(),
             grad_delta_state.data_ptr<scalar_t>(),
-            grad_edges.data_ptr<scalar_t>(),
-            grad_projected_state.data_ptr<scalar_t>(),
+            grad_edges.data_ptr<float>(),
+            grad_projected_state.data_ptr<float>(),
             batch_flat,
             query_nodes,
             source_nodes,
@@ -436,15 +447,15 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> jakal_net_query_topk_red
             indices.data_ptr<int64_t>(),
             projected_val.data_ptr<scalar_t>(),
             grad_delta_val.data_ptr<scalar_t>(),
-            grad_edges.data_ptr<scalar_t>(),
-            grad_projected_val.data_ptr<scalar_t>(),
+            grad_edges.data_ptr<float>(),
+            grad_projected_val.data_ptr<float>(),
             batch_flat,
             query_nodes,
             source_nodes,
             out_dim,
             k);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-  });
+      });
 
   return {grad_edges, grad_projected_state, grad_projected_val};
 }
@@ -457,19 +468,24 @@ torch::Tensor jakal_net_softsign_backward_cuda(
   if (scores.sizes() != grad_edges.sizes()) {
     throw std::runtime_error("scores and grad_edges must share shape.");
   }
-  auto grad_scores = torch::empty_like(scores);
+  auto grad_scores = torch::empty(scores.sizes(), scores.options().dtype(torch::kFloat32));
   constexpr int threads = 256;
   const auto stream = at::cuda::getCurrentCUDAStream();
   const auto total = scores.numel();
-  AT_DISPATCH_FLOATING_TYPES(scores.scalar_type(), "softsign_backward_cuda", [&] {
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf,
+      torch::kBFloat16,
+      scores.scalar_type(),
+      "softsign_backward_cuda",
+      [&] {
     softsign_backward_kernel<scalar_t>
         <<<(total + threads - 1) / threads, threads, 0, stream>>>(
             scores.data_ptr<scalar_t>(),
-            grad_edges.data_ptr<scalar_t>(),
-            grad_scores.data_ptr<scalar_t>(),
+            grad_edges.data_ptr<float>(),
+            grad_scores.data_ptr<float>(),
             total);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-  });
+      });
   return grad_scores;
 }
 
@@ -481,21 +497,26 @@ torch::Tensor jakal_net_softmax_backward_cuda(
   if (routes.sizes() != grad_routes.sizes() || routes.dim() != 3) {
     throw std::runtime_error("routes and grad_routes must be shaped [batch, query_nodes, topk].");
   }
-  auto grad_scores = torch::empty_like(routes);
+  auto grad_scores = torch::empty(routes.sizes(), routes.options().dtype(torch::kFloat32));
   constexpr int threads = 256;
   const auto stream = at::cuda::getCurrentCUDAStream();
   const auto rows = routes.size(0) * routes.size(1);
   const auto k = routes.size(2);
-  AT_DISPATCH_FLOATING_TYPES(routes.scalar_type(), "softmax_backward_cuda", [&] {
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf,
+      torch::kBFloat16,
+      routes.scalar_type(),
+      "softmax_backward_cuda",
+      [&] {
     softmax_backward_kernel<scalar_t>
         <<<(rows + threads - 1) / threads, threads, 0, stream>>>(
             routes.data_ptr<scalar_t>(),
-            grad_routes.data_ptr<scalar_t>(),
-            grad_scores.data_ptr<scalar_t>(),
+            grad_routes.data_ptr<float>(),
+            grad_scores.data_ptr<float>(),
             rows,
             k);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-  });
+      });
   return grad_scores;
 }
 
@@ -521,34 +542,40 @@ jakal_net_diagonal_pairwise_topk_backward_cuda(
   const auto source_nodes = source_val.size(1);
   const auto dim = query_val.size(2);
   const auto k = indices.size(2);
-  auto grad_query = torch::zeros_like(query_val);
-  auto grad_source = torch::zeros_like(source_val);
-  auto grad_weight = torch::zeros_like(weight);
-  auto grad_bias = torch::zeros({}, weight.options());
+  auto float_options = query_val.options().dtype(torch::kFloat32);
+  auto grad_query = torch::zeros(query_val.sizes(), float_options);
+  auto grad_source = torch::zeros(source_val.sizes(), float_options);
+  auto grad_weight = torch::zeros(weight.sizes(), weight.options().dtype(torch::kFloat32));
+  auto grad_bias = torch::zeros({}, weight.options().dtype(torch::kFloat32));
 
   constexpr int threads = 256;
   const auto stream = at::cuda::getCurrentCUDAStream();
   const int64_t total = batch_flat * query_nodes * k * dim;
-  AT_DISPATCH_FLOATING_TYPES(query_val.scalar_type(), "diagonal_pairwise_topk_backward_cuda", [&] {
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf,
+      torch::kBFloat16,
+      query_val.scalar_type(),
+      "diagonal_pairwise_topk_backward_cuda",
+      [&] {
     diagonal_pairwise_topk_backward_kernel<scalar_t>
         <<<(total + threads - 1) / threads, threads, 0, stream>>>(
             query_val.data_ptr<scalar_t>(),
             source_val.data_ptr<scalar_t>(),
             weight.data_ptr<scalar_t>(),
             indices.data_ptr<int64_t>(),
-            grad_scores.data_ptr<scalar_t>(),
-            grad_query.data_ptr<scalar_t>(),
-            grad_source.data_ptr<scalar_t>(),
-            grad_weight.data_ptr<scalar_t>(),
-            grad_bias.data_ptr<scalar_t>(),
-            static_cast<scalar_t>(1.0 / temperature),
+            grad_scores.data_ptr<float>(),
+            grad_query.data_ptr<float>(),
+            grad_source.data_ptr<float>(),
+            grad_weight.data_ptr<float>(),
+            grad_bias.data_ptr<float>(),
+            static_cast<float>(1.0 / temperature),
             batch_flat,
             query_nodes,
             source_nodes,
             dim,
             k);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-  });
+      });
   return {grad_query, grad_source, grad_weight, grad_bias};
 }
 
@@ -583,17 +610,26 @@ jakal_net_low_rank_pairwise_topk_backward_cuda(
   const auto dim = query_val.size(2);
   const auto rank_dim = core_weight.size(0);
   const auto k = indices.size(2);
-  auto grad_query = torch::zeros_like(query_val);
-  auto grad_source = torch::zeros_like(source_val);
-  auto grad_source_weight = torch::zeros_like(source_weight);
-  auto grad_target_weight = torch::zeros_like(target_weight);
-  auto grad_core_weight = torch::zeros_like(core_weight);
-  auto grad_bias = torch::zeros({}, core_weight.options());
+  auto float_options = query_val.options().dtype(torch::kFloat32);
+  auto grad_query = torch::zeros(query_val.sizes(), float_options);
+  auto grad_source = torch::zeros(source_val.sizes(), float_options);
+  auto grad_source_weight =
+      torch::zeros(source_weight.sizes(), source_weight.options().dtype(torch::kFloat32));
+  auto grad_target_weight =
+      torch::zeros(target_weight.sizes(), target_weight.options().dtype(torch::kFloat32));
+  auto grad_core_weight =
+      torch::zeros(core_weight.sizes(), core_weight.options().dtype(torch::kFloat32));
+  auto grad_bias = torch::zeros({}, core_weight.options().dtype(torch::kFloat32));
 
   constexpr int threads = 256;
   const auto stream = at::cuda::getCurrentCUDAStream();
   const int64_t total = batch_flat * query_nodes * k * rank_dim * dim;
-  AT_DISPATCH_FLOATING_TYPES(query_val.scalar_type(), "low_rank_pairwise_topk_backward_cuda", [&] {
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf,
+      torch::kBFloat16,
+      query_val.scalar_type(),
+      "low_rank_pairwise_topk_backward_cuda",
+      [&] {
     low_rank_pairwise_topk_backward_kernel<scalar_t>
         <<<(total + threads - 1) / threads, threads, 0, stream>>>(
             query_val.data_ptr<scalar_t>(),
@@ -604,14 +640,14 @@ jakal_net_low_rank_pairwise_topk_backward_cuda(
             projected_query.data_ptr<scalar_t>(),
             projected_source.data_ptr<scalar_t>(),
             indices.data_ptr<int64_t>(),
-            grad_scores.data_ptr<scalar_t>(),
-            grad_query.data_ptr<scalar_t>(),
-            grad_source.data_ptr<scalar_t>(),
-            grad_source_weight.data_ptr<scalar_t>(),
-            grad_target_weight.data_ptr<scalar_t>(),
-            grad_core_weight.data_ptr<scalar_t>(),
-            grad_bias.data_ptr<scalar_t>(),
-            static_cast<scalar_t>(1.0 / temperature),
+            grad_scores.data_ptr<float>(),
+            grad_query.data_ptr<float>(),
+            grad_source.data_ptr<float>(),
+            grad_source_weight.data_ptr<float>(),
+            grad_target_weight.data_ptr<float>(),
+            grad_core_weight.data_ptr<float>(),
+            grad_bias.data_ptr<float>(),
+            static_cast<float>(1.0 / temperature),
             batch_flat,
             query_nodes,
             source_nodes,
@@ -619,6 +655,6 @@ jakal_net_low_rank_pairwise_topk_backward_cuda(
             rank_dim,
             k);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-  });
+      });
   return {grad_query, grad_source, grad_source_weight, grad_target_weight, grad_core_weight, grad_bias};
 }
