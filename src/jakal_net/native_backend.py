@@ -225,6 +225,33 @@ def _flatten_query_tensors(
     )
 
 
+def _coerce_query_reduce_backward_inputs(
+    edges: Tensor,
+    projected_state: Tensor,
+    projected_val: Tensor,
+    grad_delta_state: Tensor,
+    grad_delta_val: Tensor,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    dtypes = {
+        edges.dtype,
+        projected_state.dtype,
+        projected_val.dtype,
+        grad_delta_state.dtype,
+        grad_delta_val.dtype,
+    }
+    if len(dtypes) == 1:
+        return edges, projected_state, projected_val, grad_delta_state, grad_delta_val
+
+    target_dtype = projected_state.dtype
+    return (
+        edges.to(dtype=target_dtype),
+        projected_state.to(dtype=target_dtype),
+        projected_val.to(dtype=target_dtype),
+        grad_delta_state.to(dtype=target_dtype),
+        grad_delta_val.to(dtype=target_dtype),
+    )
+
+
 class _DiagonalPropagationQueryTopK(Function):
     @staticmethod
     def forward(
@@ -276,6 +303,19 @@ class _DiagonalPropagationQueryTopK(Function):
         flat_edges = torch.nn.functional.softsign(flat_scores).contiguous()
         flat_grad_state = grad_delta_state.reshape(-1, query_nodes).contiguous()
         flat_grad_val = grad_delta_val.reshape(-1, query_nodes, out_dim).contiguous()
+        (
+            flat_edges,
+            flat_projected_state,
+            flat_projected_val,
+            flat_grad_state,
+            flat_grad_val,
+        ) = _coerce_query_reduce_backward_inputs(
+            flat_edges,
+            flat_projected_state,
+            flat_projected_val,
+            flat_grad_state,
+            flat_grad_val,
+        )
         module = _native_module()
         grad_edges, grad_projected_state, grad_projected_val = module.query_topk_reduce_backward_cuda(
             flat_edges,
@@ -381,6 +421,19 @@ class _LowRankPropagationQueryTopK(Function):
         flat_edges = torch.nn.functional.softsign(flat_scores).contiguous()
         flat_grad_state = grad_delta_state.reshape(-1, query_nodes).contiguous()
         flat_grad_val = grad_delta_val.reshape(-1, query_nodes, out_dim).contiguous()
+        (
+            flat_edges,
+            flat_projected_state,
+            flat_projected_val,
+            flat_grad_state,
+            flat_grad_val,
+        ) = _coerce_query_reduce_backward_inputs(
+            flat_edges,
+            flat_projected_state,
+            flat_projected_val,
+            flat_grad_state,
+            flat_grad_val,
+        )
         module = _native_module()
         grad_edges, grad_projected_state, grad_projected_val = module.query_topk_reduce_backward_cuda(
             flat_edges,
@@ -497,6 +550,19 @@ class _DiagonalTransitionQueryTopK(Function):
         flat_indices = indices.reshape(-1, query_nodes, indices.shape[-1]).contiguous()
         flat_grad_state = grad_delta_state.reshape(-1, query_nodes).contiguous()
         flat_grad_val = grad_delta_val.reshape(-1, query_nodes, out_dim).contiguous()
+        (
+            flat_routes,
+            weighted_state,
+            weighted_val,
+            flat_grad_state,
+            flat_grad_val,
+        ) = _coerce_query_reduce_backward_inputs(
+            flat_routes,
+            weighted_state,
+            weighted_val,
+            flat_grad_state,
+            flat_grad_val,
+        )
         module = _native_module()
         grad_routes, grad_weighted_state, grad_weighted_val = module.query_topk_reduce_backward_cuda(
             flat_routes,
@@ -620,6 +686,19 @@ class _LowRankTransitionQueryTopK(Function):
         flat_indices = indices.reshape(-1, query_nodes, indices.shape[-1]).contiguous()
         flat_grad_state = grad_delta_state.reshape(-1, query_nodes).contiguous()
         flat_grad_val = grad_delta_val.reshape(-1, query_nodes, out_dim).contiguous()
+        (
+            flat_routes,
+            weighted_state,
+            weighted_val,
+            flat_grad_state,
+            flat_grad_val,
+        ) = _coerce_query_reduce_backward_inputs(
+            flat_routes,
+            weighted_state,
+            weighted_val,
+            flat_grad_state,
+            flat_grad_val,
+        )
         module = _native_module()
         grad_routes, grad_weighted_state, grad_weighted_val = module.query_topk_reduce_backward_cuda(
             flat_routes,

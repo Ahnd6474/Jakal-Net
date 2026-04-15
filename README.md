@@ -126,7 +126,7 @@ Small next-token smoke run:
 ```bash
 PYTHONPATH=src python scripts/train_progressive_b_lm.py \
   --device cuda \
-  --tokenizer subword \
+  --tokenizer byte_bpe \
   --subword-vocab-size 1024 \
   --seq-len 128 \
   --steps 100 \
@@ -143,8 +143,8 @@ PYTHONPATH=src python scripts/train_progressive_b_lm.py \
   --device cuda \
   --training-objective next_sentence_response \
   --jsonl-source artifacts/data/mixed_next_sentence_dialogue_science_wiki_code.jsonl \
-  --tokenizer subword \
-  --tokenizer-prefix artifacts/tokenizers/en_dialogue_subword_4096 \
+  --tokenizer byte_bpe \
+  --tokenizer-prefix artifacts/tokenizers/en_dialogue_byte_bpe_4096 \
   --subword-vocab-size 4096 \
   --seq-len 512 \
   --response-len 128 \

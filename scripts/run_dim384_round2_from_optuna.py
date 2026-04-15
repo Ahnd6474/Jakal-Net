@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--tokenizer-prefix",
-        default="/workspace/Jakal-Net/artifacts/tokenizers/wiki1m_subword1024_round1",
+        default="/workspace/Jakal-Net/artifacts/tokenizers/wiki1m_byte_bpe1024_round1",
     )
     parser.add_argument("--subword-vocab-size", type=int, default=1024)
     parser.add_argument("--subword-character-coverage", type=float, default=0.9995)
@@ -151,7 +151,7 @@ def main() -> int:
             "--training-objective",
             "last_token",
             "--tokenizer",
-            "subword",
+            "byte_bpe",
             "--subword-vocab-size",
             str(args.subword_vocab_size),
             "--subword-character-coverage",

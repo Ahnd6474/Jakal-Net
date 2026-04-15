@@ -1283,7 +1283,11 @@ class ProgressiveBExampleLM(nn.Module):
             apply_value_norm=self.norm_position == "post",
         )
 
-    def update_query_slot(self, source_layer: Layer, query_layer: Layer | None = None) -> Layer:
+    def apply_query_transition(
+        self,
+        source_layer: Layer,
+        query_layer: Layer | None = None,
+    ) -> Layer:
         if query_layer is None:
             query_layer = self.initialize_query_layer(source_layer)
         transition_delta = self.query_transition.compute_delta(
@@ -1296,10 +1300,17 @@ class ProgressiveBExampleLM(nn.Module):
             state_scale=self.cross_delta_scale * self.state_residual_scale,
             val_scale=self.cross_delta_scale * self.value_residual_scale,
         )
-        query_layer = self._finalize_query_layer(query_layer)
+        return self._finalize_query_layer(query_layer)
+
+    def apply_query_propagation(
+        self,
+        query_layer: Layer,
+        propagation_source_layer: Layer | None = None,
+    ) -> Layer:
+        source_layer = query_layer if propagation_source_layer is None else propagation_source_layer
         propagation_delta = self.query_propagation.compute_delta(
             self._prepare_query_input(query_layer),
-            self._prepare_sequence_input(source_layer),
+            self._prepare_query_input(source_layer),
         )
         query_layer = _apply_scaled_delta(
             query_layer,
@@ -1308,6 +1319,18 @@ class ProgressiveBExampleLM(nn.Module):
             val_scale=self.s_delta_scale * self.value_residual_scale,
         )
         return self._finalize_query_layer(query_layer)
+
+    def update_query_slot(
+        self,
+        source_layer: Layer,
+        query_layer: Layer | None = None,
+        *,
+        propagation_source_layer: Layer | None = None,
+    ) -> Layer:
+        query_layer = self.apply_query_transition(source_layer, query_layer)
+        if propagation_source_layer is None:
+            propagation_source_layer = query_layer
+        return self.apply_query_propagation(query_layer, propagation_source_layer)
 
     def forward_query_block(
         self,
@@ -1320,20 +1343,19 @@ class ProgressiveBExampleLM(nn.Module):
             raise ValueError("target_len must be positive.")
         s_layer, compressed_b = self.encode_prefix(token_ids)
         query_template = self.initialize_query_layer(s_layer, query_nodes=target_len)
-        updated_queries: list[Layer] = []
+        transitioned_queries = self.apply_query_transition(s_layer, query_template)
         updated_prefix: Layer | None = None
         for index in range(target_len):
             query_slot = Layer(
                 dim=self.dim,
                 num_nodes=1,
-                state=query_template.state[..., index : index + 1],
-                val=query_template.val[..., index : index + 1, :],
+                state=transitioned_queries.state[..., index : index + 1],
+                val=transitioned_queries.val[..., index : index + 1, :],
             )
-            source_layer = s_layer
+            propagation_source = query_slot
             if updated_prefix is not None:
-                source_layer = self._concat_layers(s_layer, updated_prefix)
-            query_slot = self.update_query_slot(source_layer, query_slot)
-            updated_queries.append(query_slot)
+                propagation_source = self._concat_layers(updated_prefix, query_slot)
+            query_slot = self.apply_query_propagation(query_slot, propagation_source)
             updated_prefix = (
                 query_slot
                 if updated_prefix is None
@@ -1353,7 +1375,8 @@ class ProgressiveBExampleLM(nn.Module):
         return_layers: bool = False,
     ) -> Tensor | tuple[Tensor, Layer, Layer | None]:
         s_layer, compressed_b = self.encode_prefix(token_ids)
-        query_layer = self.update_query_slot(s_layer)
+        query_layer = self.apply_query_transition(s_layer)
+        query_layer = self.apply_query_propagation(query_layer)
         query_slot = self.query_head_norm(query_layer.val[..., 0, :])
         logits = self.query_head(query_slot)
         if return_layers:

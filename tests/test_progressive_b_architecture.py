@@ -180,6 +180,41 @@ class ProgressiveBArchitectureTests(unittest.TestCase):
             model.joint_blocks[0].compressed_propagation.pairwise_fn,
         )
 
+    def test_query_block_batches_transition_and_limits_propagation_to_queries(self) -> None:
+        torch.manual_seed(24)
+        model = ProgressiveBExampleLM(
+            vocab_size=32,
+            dim=8,
+            seq_nodes=8,
+            warmup_layers=1,
+            final_refine_layers=1,
+            implementation="streaming",
+        )
+        token_ids = torch.randint(0, 32, (2, 8))
+
+        transition_calls: list[tuple[int, int]] = []
+        propagation_calls: list[tuple[int, int]] = []
+        original_transition = model.query_transition.compute_delta
+        original_propagation = model.query_propagation.compute_delta
+
+        def record_transition(src_layer, dst_layer):
+            transition_calls.append((src_layer.num_nodes, dst_layer.num_nodes))
+            return original_transition(src_layer, dst_layer)
+
+        def record_propagation(query_layer, source_layer):
+            propagation_calls.append((query_layer.num_nodes, source_layer.num_nodes))
+            return original_propagation(query_layer, source_layer)
+
+        model.query_transition.compute_delta = record_transition
+        model.query_propagation.compute_delta = record_propagation
+
+        logits = model.forward_query_block(token_ids, target_len=4)
+
+        self.assertEqual(logits.shape, (2, 4, 32))
+        self.assertEqual(transition_calls, [(8, 4)])
+        self.assertEqual(propagation_calls, [(1, 1), (1, 2), (1, 3), (1, 4)])
+
+
 
 if __name__ == "__main__":
     unittest.main()

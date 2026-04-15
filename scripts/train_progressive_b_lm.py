@@ -2193,7 +2193,7 @@ def main() -> None:
     parser.add_argument(
         "--tokenizer",
         choices=("char", "subword", "byte_bpe"),
-        default="char",
+        default="byte_bpe",
     )
     parser.add_argument("--subword-vocab-size", type=int, default=256)
     parser.add_argument("--subword-character-coverage", type=float, default=0.9995)
@@ -2201,13 +2201,13 @@ def main() -> None:
         "--subword-input-sentence-size",
         type=int,
         default=0,
-        help="Randomly sample this many sentences for SentencePiece training. 0 uses all sentences.",
+        help="Randomly sample this many sentences for tokenizer training. 0 uses all sentences.",
     )
     parser.add_argument(
         "--subword-num-threads",
         type=int,
         default=0,
-        help="SentencePiece worker threads. 0 uses os.cpu_count().",
+        help="Tokenizer trainer threads. 0 uses os.cpu_count().",
     )
     parser.add_argument(
         "--subword-model-type",

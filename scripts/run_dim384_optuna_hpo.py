@@ -51,7 +51,7 @@ def build_base_namespace(args: argparse.Namespace) -> SimpleNamespace:
         corpus_max_chars=args.corpus_max_chars,
         corpus_separator="\n\n",
         training_objective=args.training_objective,
-        tokenizer="subword",
+        tokenizer="byte_bpe",
         subword_vocab_size=args.subword_vocab_size,
         subword_character_coverage=args.subword_character_coverage,
         subword_model_type="bpe",
@@ -430,7 +430,7 @@ def run_worker(args: argparse.Namespace) -> int:
             Path.cwd()
             / "artifacts"
             / "tokenizers"
-            / f"{args.study_name}_subword_{args.subword_vocab_size}_{args.corpus_max_chars or 'full'}"
+            / f"{args.study_name}_byte_bpe_{args.subword_vocab_size}_{args.corpus_max_chars or 'full'}"
         )
         tokenizer_prefix.parent.mkdir(parents=True, exist_ok=True)
         args.tokenizer_prefix = str(tokenizer_prefix)
@@ -453,7 +453,7 @@ def run_worker(args: argparse.Namespace) -> int:
     vocab, tokenizer_label, tokenizer_model_path = build_tokenizer(
         corpus.text,
         text_path=None if corpus.text_path is None else str(corpus.text_path),
-        tokenizer="subword",
+        tokenizer="byte_bpe",
         subword_vocab_size=args.subword_vocab_size,
         subword_character_coverage=args.subword_character_coverage,
         subword_model_type="bpe",

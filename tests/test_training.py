@@ -1,5 +1,6 @@
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 import sys
 
 import torch
@@ -18,7 +19,42 @@ from progressive_b_example import (  # noqa: E402
 )
 
 
+from train_progressive_b_lm import (  # noqa: E402
+    ASSISTANT_TOKEN,
+    EOS_TOKEN,
+    PAD_TOKEN,
+    USER_TOKEN,
+    build_tokenizer,
+)
+
 class TrainingTests(unittest.TestCase):
+    def test_build_tokenizer_byte_bpe_with_special_tokens(self) -> None:
+        text = (
+            f"{USER_TOKEN}\nhello\n{ASSISTANT_TOKEN}\nworld\n{EOS_TOKEN}\n"
+            f"{USER_TOKEN}\nbyte bpe test\n{ASSISTANT_TOKEN}\nworks\n{PAD_TOKEN}\n"
+        )
+        with TemporaryDirectory() as tmpdir:
+            vocab, tokenizer_label, tokenizer_model_path = build_tokenizer(
+                text,
+                text_path=None,
+                tokenizer="byte_bpe",
+                subword_vocab_size=128,
+                subword_model_type="bpe",
+                tokenizer_prefix=str(Path(tmpdir) / "byte_bpe_test"),
+                subword_character_coverage=0.9995,
+                user_defined_symbols=(USER_TOKEN, ASSISTANT_TOKEN, EOS_TOKEN, PAD_TOKEN),
+            )
+
+            self.assertEqual(tokenizer_label, "byte_bpe")
+            self.assertIsNotNone(tokenizer_model_path)
+            assert tokenizer_model_path is not None
+            self.assertTrue(tokenizer_model_path.exists())
+            encoded = vocab.encode(text)
+            self.assertGreater(encoded.numel(), 0)
+            self.assertGreaterEqual(vocab.token_id(USER_TOKEN), 0)
+            decoded = vocab.decode(encoded[:16].tolist())
+            self.assertIsInstance(decoded, str)
+
     def test_char_vocab_roundtrip(self) -> None:
         vocab = build_char_vocab("abca")
         encoded = vocab.encode("caba")
