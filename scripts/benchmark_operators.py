@@ -17,7 +17,9 @@ from jakal_net import (
     DiagonalBilinearPairwise,
     describe_device,
     Layer,
+    LayerDelta,
     LinearRoute,
+    LowRankBilinearRoute,
     native_status,
     Propagation,
     resolve_device,
@@ -25,6 +27,10 @@ from jakal_net import (
     SparsePropagation,
     SparseTransition,
     Transition,
+)
+from jakal_net.native_backend import (
+    propagation_query_topk_native,
+    transition_query_topk_native,
 )
 
 
@@ -192,6 +198,66 @@ def _window_edge_count(num_nodes: int, window: int) -> int:
     return sum(min(index + 1, window + 1) for index in range(num_nodes))
 
 
+def _gather_state(projected_state: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    source_nodes = projected_state.shape[-1]
+    expanded = projected_state.unsqueeze(-2).expand(*indices.shape[:-1], source_nodes)
+    return torch.take_along_dim(expanded, indices, dim=-1)
+
+
+def _gather_val(projected_val: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    source_nodes = projected_val.shape[-2]
+    out_dim = projected_val.shape[-1]
+    expanded = projected_val.unsqueeze(-3).expand(*indices.shape[:-1], source_nodes, out_dim)
+    return torch.take_along_dim(
+        expanded,
+        indices.unsqueeze(-1).expand(*indices.shape, out_dim),
+        dim=-2,
+    )
+
+
+def _query_propagation_reference(
+    *,
+    pairwise_fn: nn.Module,
+    query_val: torch.Tensor,
+    source_val: torch.Tensor,
+    projected_state: torch.Tensor,
+    projected_val: torch.Tensor,
+    topk: int,
+) -> LayerDelta:
+    scores = pairwise_fn(query_val, source_val)
+    selected = torch.topk(scores, k=min(topk, source_val.shape[-2]), dim=-1)
+    edges = torch.nn.functional.softsign(selected.values)
+    return LayerDelta(
+        delta_state=(edges * _gather_state(projected_state, selected.indices)).sum(dim=-1),
+        delta_val=(
+            edges.unsqueeze(-1) * _gather_val(projected_val, selected.indices)
+        ).sum(dim=-2),
+    )
+
+
+def _query_transition_reference(
+    *,
+    route_fn: nn.Module,
+    sender_strength: torch.Tensor,
+    src_val: torch.Tensor,
+    query_val: torch.Tensor,
+    projected_state: torch.Tensor,
+    projected_val: torch.Tensor,
+    topk: int,
+) -> LayerDelta:
+    logits = route_fn(src_val, query_val).transpose(-1, -2)
+    selected = torch.topk(logits, k=min(topk, src_val.shape[-2]), dim=-1)
+    routes = torch.softmax(selected.values, dim=-1)
+    weighted_state = sender_strength * projected_state
+    weighted_val = sender_strength.unsqueeze(-1) * projected_val
+    return LayerDelta(
+        delta_state=(routes * _gather_state(weighted_state, selected.indices)).sum(dim=-1),
+        delta_val=(
+            routes.unsqueeze(-1) * _gather_val(weighted_val, selected.indices)
+        ).sum(dim=-2),
+    )
+
+
 def _format_result(result: BenchmarkResult) -> str:
     memory = "n/a" if result.peak_memory_mb is None else f"{result.peak_memory_mb:8.2f}"
     return (
@@ -234,11 +300,25 @@ def main() -> None:
         val=torch.randn_like(trans_src.val),
     )
     trans_dst = Layer.zeros(dim=64, num_nodes=128, batch_shape=batch_shape, device=device, dtype=dtype)
+    query_val = torch.randn(*batch_shape, 16, 64, device=device, dtype=dtype)
 
     pairwise_template = _make_cloneable(DiagonalBilinearPairwise(dim=64), 64).to(device)
     state_proj_template = _make_cloneable(ScalarAffine(), 1.0, 0.0).to(device)
     route_template = _make_cloneable(LinearRoute(src_dim=64, dst_nodes=128), 64, 128).to(device)
+    query_route_template = _make_cloneable(
+        LowRankBilinearRoute(src_dim=64, dst_dim=64, rank=16),
+        64,
+        64,
+        rank=16,
+    ).to(device)
     val_proj_template = _make_cloneable(nn.Linear(64, 64), 64, 64).to(device)
+    pairwise_template.requires_grad_(False)
+    query_route_template.requires_grad_(False)
+    state_proj_template.requires_grad_(False)
+    val_proj_template.requires_grad_(False)
+    query_projected_state = state_proj_template(trans_src.state)
+    query_projected_val = val_proj_template(trans_src.val)
+    query_sender_strength = torch.nn.functional.softplus(trans_src.state) + 0.1
 
     propagation_reference = Propagation(
         pairwise_fn=_clone_module(pairwise_template).to(device),
@@ -441,6 +521,69 @@ def main() -> None:
                 ("native", lambda: sparse_transition_native.compute_delta(trans_src, trans_dst)),
             ],
             batch_factor * trans_src.num_nodes * 8,
+        ),
+        (
+            "QueryPropagation(topk)",
+            [
+                (
+                    "reference",
+                    lambda: _query_propagation_reference(
+                        pairwise_fn=pairwise_template,
+                        query_val=query_val,
+                        source_val=trans_src.val,
+                        projected_state=query_projected_state,
+                        projected_val=query_projected_val,
+                        topk=32,
+                    ),
+                ),
+                (
+                    "native",
+                    lambda: propagation_query_topk_native(
+                        pairwise_fn=pairwise_template,
+                        edge_compress_name="softsign",
+                        query_val=query_val,
+                        source_val=trans_src.val,
+                        projected_state=query_projected_state,
+                        projected_val=query_projected_val,
+                        topk=32,
+                        query_block_size=8,
+                        source_block_size=0,
+                    ),
+                ),
+            ],
+            batch_factor * query_val.shape[-2] * 32,
+        ),
+        (
+            "QueryTransition(topk)",
+            [
+                (
+                    "reference",
+                    lambda: _query_transition_reference(
+                        route_fn=query_route_template,
+                        sender_strength=query_sender_strength,
+                        src_val=trans_src.val,
+                        query_val=query_val,
+                        projected_state=query_projected_state,
+                        projected_val=query_projected_val,
+                        topk=32,
+                    ),
+                ),
+                (
+                    "native",
+                    lambda: transition_query_topk_native(
+                        route_fn=query_route_template,
+                        sender_strength=query_sender_strength,
+                        src_val=trans_src.val,
+                        query_val=query_val,
+                        projected_state=query_projected_state,
+                        projected_val=query_projected_val,
+                        topk=32,
+                        query_block_size=8,
+                        source_block_size=0,
+                    ),
+                ),
+            ],
+            batch_factor * query_val.shape[-2] * 32,
         ),
     ]
 

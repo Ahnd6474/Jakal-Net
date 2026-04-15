@@ -10,6 +10,7 @@ from jakal_net import (
     DiagonalBilinearPairwise,
     DiagonalBilinearRoute,
     Layer,
+    LayerDelta,
     LinearRoute,
     LowRankBilinearRoute,
     MLPRoute,
@@ -20,7 +21,11 @@ from jakal_net import (
     native_status,
 )
 from jakal_net import native_available
-from jakal_net.native_backend import DISABLE_NATIVE_ENV
+from jakal_net.native_backend import (
+    DISABLE_NATIVE_ENV,
+    propagation_query_topk_native,
+    transition_query_topk_native,
+)
 import jakal_net.native_backend as native_backend
 
 
@@ -30,6 +35,23 @@ def _state_proj_fn(state: torch.Tensor) -> torch.Tensor:
 
 def _val_proj_fn(val: torch.Tensor) -> torch.Tensor:
     return val * 0.5 + 0.25
+
+
+def _gather_state(projected_state: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    source_nodes = projected_state.shape[-1]
+    expanded = projected_state.unsqueeze(-2).expand(*indices.shape[:-1], source_nodes)
+    return torch.take_along_dim(expanded, indices, dim=-1)
+
+
+def _gather_val(projected_val: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    source_nodes = projected_val.shape[-2]
+    out_dim = projected_val.shape[-1]
+    expanded = projected_val.unsqueeze(-3).expand(*indices.shape[:-1], source_nodes, out_dim)
+    return torch.take_along_dim(
+        expanded,
+        indices.unsqueeze(-1).expand(*indices.shape, out_dim),
+        dim=-2,
+    )
 
 
 class NativeBackendTests(unittest.TestCase):
@@ -438,6 +460,110 @@ class CudaNativeBackendTests(unittest.TestCase):
                 native_delta = native.compute_delta(src, dst)
             self.assertGreater(wrapped.call_count, 0)
             self.assert_delta_close(reference_delta, native_delta)
+
+    def test_query_topk_reduce_cuda_matches_reference(self) -> None:
+        torch.manual_seed(35)
+        module = native_backend._native_module()
+        if native_status().backend_name != "aten_cpp_cuda":
+            self.skipTest("Native CUDA source was not compiled.")
+
+        edges = torch.randn(2, 3, 4, device=self.device)
+        indices = torch.tensor(
+            [[[0, 3, 5, 1], [2, 1, 4, 0], [5, 4, 3, 2]],
+             [[1, 2, 3, 4], [0, 5, 4, 2], [3, 1, 0, 5]]],
+            device=self.device,
+            dtype=torch.long,
+        )
+        projected_state = torch.randn(2, 6, device=self.device)
+        projected_val = torch.randn(2, 6, 5, device=self.device)
+
+        expected_state = (edges * _gather_state(projected_state, indices)).sum(dim=-1)
+        expected_val = (edges.unsqueeze(-1) * _gather_val(projected_val, indices)).sum(dim=-2)
+        actual_state, actual_val = module.query_topk_reduce_cuda(
+            edges.contiguous(),
+            indices.contiguous(),
+            projected_state.contiguous(),
+            projected_val.contiguous(),
+        )
+
+        self.assertTrue(torch.allclose(expected_state, actual_state, atol=1e-5, rtol=1e-5))
+        self.assertTrue(torch.allclose(expected_val, actual_val, atol=1e-5, rtol=1e-5))
+
+    def test_query_only_native_ops_match_reference_on_cuda(self) -> None:
+        torch.manual_seed(36)
+        source = Layer(
+            dim=4,
+            num_nodes=9,
+            state=torch.randn(2, 9, device=self.device),
+            val=torch.randn(2, 9, 4, device=self.device),
+        )
+        query_val = torch.randn(2, 3, 4, device=self.device)
+        projected_state = _state_proj_fn(source.state)
+        projected_val = _val_proj_fn(source.val)
+
+        pairwise = DiagonalBilinearPairwise(dim=4).to(self.device)
+        scores = pairwise(query_val, source.val)
+        selected = torch.topk(scores, k=4, dim=-1)
+        edges = torch.nn.functional.softsign(selected.values)
+        expected_propagation = LayerDelta(
+            delta_state=(edges * _gather_state(projected_state, selected.indices)).sum(dim=-1),
+            delta_val=(
+                edges.unsqueeze(-1) * _gather_val(projected_val, selected.indices)
+            ).sum(dim=-2),
+        )
+
+        module = native_backend._native_module()
+        with mock.patch.object(
+            module,
+            "propagation_query_topk",
+            wraps=module.propagation_query_topk,
+        ) as wrapped:
+            actual_propagation = propagation_query_topk_native(
+                pairwise_fn=pairwise,
+                edge_compress_name="softsign",
+                query_val=query_val,
+                source_val=source.val,
+                projected_state=projected_state,
+                projected_val=projected_val,
+                topk=4,
+                query_block_size=2,
+                source_block_size=3,
+            )
+        self.assertGreater(wrapped.call_count, 0)
+        self.assert_delta_close(expected_propagation, actual_propagation)
+
+        route_fn = LowRankBilinearRoute(src_dim=4, dst_dim=4, rank=3).to(self.device)
+        sender_strength = torch.nn.functional.softplus(source.state) + 0.1
+        route_logits = route_fn(source.val, query_val).transpose(-1, -2)
+        selected_route = torch.topk(route_logits, k=4, dim=-1)
+        routes = torch.softmax(selected_route.values, dim=-1)
+        weighted_state = sender_strength * projected_state
+        weighted_val = sender_strength.unsqueeze(-1) * projected_val
+        expected_transition = LayerDelta(
+            delta_state=(routes * _gather_state(weighted_state, selected_route.indices)).sum(dim=-1),
+            delta_val=(
+                routes.unsqueeze(-1) * _gather_val(weighted_val, selected_route.indices)
+            ).sum(dim=-2),
+        )
+
+        with mock.patch.object(
+            module,
+            "transition_query_topk",
+            wraps=module.transition_query_topk,
+        ) as wrapped:
+            actual_transition = transition_query_topk_native(
+                route_fn=route_fn,
+                sender_strength=sender_strength,
+                src_val=source.val,
+                query_val=query_val,
+                projected_state=projected_state,
+                projected_val=projected_val,
+                topk=4,
+                query_block_size=2,
+                source_block_size=3,
+            )
+        self.assertGreater(wrapped.call_count, 0)
+        self.assert_delta_close(expected_transition, actual_transition)
 
 
 if __name__ == "__main__":
