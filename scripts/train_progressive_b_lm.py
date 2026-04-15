@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import math
 import tempfile
 import time
@@ -33,8 +34,10 @@ from progressive_b_example import (
     build_char_vocab,
     build_progressive_b_stage_specs,
     perplexity_from_loss,
+    sample_prefix_response_batch,
     sample_next_token_batch,
     split_train_val,
+    train_prefix_response_model,
     train_next_token_model,
 )
 
@@ -56,10 +59,35 @@ Then the B path grows from light compression to stronger hierarchical bottleneck
 The final readout returns to S so token-level prediction remains anchored.
 """.strip()
 DEFAULT_TOKENIZER_CACHE_DIR = Path(tempfile.gettempdir()) / "jakal_net_tokenizers"
+USER_TOKEN = "<|user|>"
+ASSISTANT_TOKEN = "<|assistant|>"
+EOS_TOKEN = "<|eos|>"
+PAD_TOKEN = "<|pad|>"
+DIALOGUE_SPECIAL_TOKENS = (USER_TOKEN, ASSISTANT_TOKEN, EOS_TOKEN, PAD_TOKEN)
+DEFAULT_DIALOGUE_MESSAGES = (
+    (
+        {"role": "user", "content": "오늘 학습 상태를 간단히 요약해줘."},
+        {"role": "assistant", "content": "현재 손실, 검증 지표, GPU 사용률을 함께 보고 병목을 구분하면 됩니다."},
+    ),
+    (
+        {"role": "user", "content": "라우팅이 한쪽으로 몰리면 어떻게 확인해?"},
+        {"role": "assistant", "content": "topk overlap, dead slot ratio, destination load variance를 같이 보면 됩니다."},
+    ),
+    (
+        {"role": "user", "content": "모델이 plateau에 들어간 것 같아."},
+        {"role": "assistant", "content": "minibatch loss보다 eval loss의 저점과 반등 시점을 먼저 확인하는 게 맞습니다."},
+    ),
+)
 
 
 class TrialPrunedError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class DialoguePairText:
+    prefix: str
+    response: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +106,14 @@ class SubwordVocab:
 
     def decode(self, token_ids: Sequence[int]) -> str:
         return str(self.processor.decode(list(map(int, token_ids))))
+
+    def token_id(self, piece: str) -> int:
+        idx = int(self.processor.piece_to_id(piece))
+        if idx < 0 or str(self.processor.id_to_piece(idx)) != piece:
+            raise ValueError(
+                f"Tokenizer {self.model_path} does not contain required piece {piece!r}."
+            )
+        return idx
 
 
 def count_parameters(model: torch.nn.Module) -> int:
@@ -169,6 +205,7 @@ def build_subword_vocab(
     model_type: str,
     tokenizer_prefix: str | None,
     character_coverage: float,
+    user_defined_symbols: Sequence[str] = (),
 ) -> SubwordVocab:
     if spm is None:
         raise ImportError(
@@ -200,6 +237,7 @@ def build_subword_vocab(
             model_type=model_type,
             vocab_size=vocab_size,
             character_coverage=character_coverage,
+            user_defined_symbols=list(user_defined_symbols),
             bos_id=-1,
             eos_id=-1,
             pad_id=-1,
@@ -224,6 +262,7 @@ def build_tokenizer(
     subword_model_type: str,
     tokenizer_prefix: str | None,
     subword_character_coverage: float,
+    user_defined_symbols: Sequence[str] = (),
 ) -> tuple[object, str, Path | None]:
     if tokenizer == "char":
         return build_char_vocab(text), "char", None
@@ -235,6 +274,7 @@ def build_tokenizer(
             model_type=subword_model_type,
             tokenizer_prefix=tokenizer_prefix,
             character_coverage=subword_character_coverage,
+            user_defined_symbols=user_defined_symbols,
         )
         return (
             subword_vocab,
@@ -242,6 +282,210 @@ def build_tokenizer(
             subword_vocab.model_path,
         )
     raise ValueError(f"Unsupported tokenizer: {tokenizer!r}.")
+
+
+def _message_role(message: dict[str, Any]) -> str:
+    role = message.get("role") or message.get("from") or message.get("speaker")
+    if not isinstance(role, str):
+        return ""
+    role = role.lower().strip()
+    if role in {"human", "user", "prompt"}:
+        return "user"
+    if role in {"assistant", "gpt", "bot", "response"}:
+        return "assistant"
+    return role
+
+
+def _message_content(message: dict[str, Any]) -> str:
+    for key in ("content", "value", "text"):
+        value = message.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _pairs_from_messages(messages: Sequence[dict[str, Any]]) -> list[DialoguePairText]:
+    pairs: list[DialoguePairText] = []
+    history: list[str] = []
+    for message in messages:
+        role = _message_role(message)
+        content = _message_content(message)
+        if not content:
+            continue
+        if role == "user":
+            history.append(f"{USER_TOKEN}\n{content}\n")
+        elif role == "assistant" and history:
+            prefix = "".join(history) + f"{ASSISTANT_TOKEN}\n"
+            pairs.append(DialoguePairText(prefix=prefix, response=content))
+            history.append(f"{ASSISTANT_TOKEN}\n{content}\n{EOS_TOKEN}\n")
+    return pairs
+
+
+def _pairs_from_record(record: Any) -> list[DialoguePairText]:
+    if not isinstance(record, dict):
+        return []
+    messages = record.get("messages") or record.get("conversations")
+    if isinstance(messages, list):
+        normalized = [message for message in messages if isinstance(message, dict)]
+        pairs = _pairs_from_messages(normalized)
+        if pairs:
+            return pairs
+    prompt = None
+    for key in ("prompt", "instruction", "question", "input"):
+        value = record.get(key)
+        if isinstance(value, str) and value.strip():
+            prompt = value.strip()
+            break
+    response = None
+    for key in ("response", "output", "answer", "completion"):
+        value = record.get(key)
+        if isinstance(value, str) and value.strip():
+            response = value.strip()
+            break
+    if prompt and response:
+        return [
+            DialoguePairText(
+                prefix=f"{USER_TOKEN}\n{prompt}\n{ASSISTANT_TOKEN}\n",
+                response=response,
+            )
+        ]
+    return []
+
+
+def _load_dialogue_pairs_from_jsonl(path: Path) -> list[DialoguePairText]:
+    pairs: list[DialoguePairText] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            extracted = _pairs_from_record(record)
+            if not extracted:
+                raise ValueError(f"No dialogue pair found in {path} line {line_number}.")
+            pairs.extend(extracted)
+    return pairs
+
+
+def _load_dialogue_pairs_from_hf(
+    *,
+    dataset_name: str,
+    config_name: str | None,
+    split: str,
+    streaming: bool,
+    max_samples: int | None,
+) -> list[DialoguePairText]:
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:
+        raise ImportError(
+            "The datasets package is required for Hugging Face dialogue loading."
+        ) from exc
+    dataset = load_dataset(dataset_name, config_name, split=split, streaming=streaming)
+    pairs: list[DialoguePairText] = []
+    rows_seen = 0
+    iterator = dataset if streaming else iter(dataset)
+    for row in iterator:
+        if max_samples is not None and rows_seen >= max_samples:
+            break
+        rows_seen += 1
+        pairs.extend(_pairs_from_record(row))
+    return pairs
+
+
+def load_dialogue_pairs(
+    *,
+    jsonl_sources: Sequence[str],
+    hf_dataset: str | None,
+    hf_config: str | None,
+    hf_split: str,
+    hf_streaming: bool,
+    max_samples: int | None,
+    max_chars: int | None,
+) -> tuple[list[DialoguePairText], CorpusLoadResult]:
+    from lm_experiment_utils import _expand_sources  # Local helper, kept private to this script.
+
+    paths = _expand_sources(jsonl_sources, directory_suffixes=(".jsonl", ".json"))
+    pairs: list[DialoguePairText] = []
+    for path in paths:
+        pairs.extend(_load_dialogue_pairs_from_jsonl(path))
+    if hf_dataset is not None:
+        pairs.extend(
+            _load_dialogue_pairs_from_hf(
+                dataset_name=hf_dataset,
+                config_name=hf_config,
+                split=hf_split,
+                streaming=hf_streaming,
+                max_samples=max_samples if not pairs else None,
+            )
+        )
+    if not pairs:
+        for messages in DEFAULT_DIALOGUE_MESSAGES:
+            pairs.extend(_pairs_from_messages(messages))
+    if max_samples is not None:
+        pairs = pairs[:max_samples]
+    if max_chars is not None:
+        selected: list[DialoguePairText] = []
+        total_chars = 0
+        for pair in pairs:
+            pair_chars = len(pair.prefix) + len(pair.response) + len(EOS_TOKEN)
+            if total_chars + pair_chars > max_chars:
+                break
+            selected.append(pair)
+            total_chars += pair_chars
+        pairs = selected
+    if not pairs:
+        raise ValueError("No dialogue pairs were loaded.")
+    text = "\n\n".join(f"{pair.prefix}{pair.response}\n{EOS_TOKEN}" for pair in pairs)
+    metadata = {
+        "source_kind": "dialogue_pairs",
+        "jsonl_paths": [str(path) for path in paths],
+        "hf_dataset": hf_dataset,
+        "hf_config": hf_config,
+        "hf_split": hf_split,
+        "max_samples": max_samples,
+        "max_chars": max_chars,
+    }
+    corpus = CorpusLoadResult(
+        text=text,
+        source_label="dialogue_pairs",
+        text_path=None,
+        sample_count=len(pairs),
+        file_count=len(paths),
+        char_count=len(text),
+        truncated=False,
+        metadata=metadata,
+    )
+    return pairs, corpus
+
+
+def split_dialogue_pairs(
+    pairs: Sequence[DialoguePairText],
+    *,
+    train_fraction: float = 0.9,
+) -> tuple[list[DialoguePairText], list[DialoguePairText]]:
+    split_index = int(len(pairs) * train_fraction)
+    split_index = max(1, min(split_index, len(pairs) - 1)) if len(pairs) > 1 else len(pairs)
+    return list(pairs[:split_index]), list(pairs[split_index:] or pairs[:split_index])
+
+
+def encode_dialogue_pairs(
+    pairs: Sequence[DialoguePairText],
+    *,
+    vocab: object,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    return [(vocab.encode(pair.prefix), vocab.encode(pair.response)) for pair in pairs]
+
+
+def require_subword_special_ids(vocab: object) -> dict[str, int]:
+    if not isinstance(vocab, SubwordVocab):
+        raise ValueError("prefix_response currently requires --tokenizer subword.")
+    return {
+        "user": vocab.token_id(USER_TOKEN),
+        "assistant": vocab.token_id(ASSISTANT_TOKEN),
+        "eos": vocab.token_id(EOS_TOKEN),
+        "pad": vocab.token_id(PAD_TOKEN),
+    }
 
 
 @torch.no_grad()
@@ -287,6 +531,53 @@ def generate_next_tokens_with_sampling(
     if was_training:
         model.train()
     return generated
+
+
+@torch.no_grad()
+def generate_prefix_response_with_sampling(
+    model: torch.nn.Module,
+    prefix: torch.Tensor,
+    *,
+    response_len: int,
+    bos_token_id: int,
+    eos_token_id: int,
+    device: torch.device | str,
+    temperature: float | None,
+    sample_topk: int | None,
+) -> torch.Tensor:
+    if temperature is not None and temperature <= 0.0:
+        raise ValueError("temperature must be positive when sampling is enabled.")
+    if sample_topk is not None and sample_topk <= 0:
+        raise ValueError("sample-topk must be positive.")
+    was_training = model.training
+    model.eval()
+    prefix = prefix.to(device).unsqueeze(0)
+    decoder_input = torch.tensor([[bos_token_id]], dtype=torch.long, device=device)
+    generated: list[torch.Tensor] = []
+    for _ in range(response_len):
+        logits = model.forward_response(prefix, decoder_input)[:, -1, :]
+        if temperature is None:
+            next_token = torch.argmax(logits, dim=-1)
+        else:
+            scaled_logits = logits / temperature
+            if sample_topk is not None:
+                k = min(sample_topk, scaled_logits.shape[-1])
+                topk_logits, topk_indices = torch.topk(scaled_logits, k=k, dim=-1)
+                probs = torch.softmax(topk_logits, dim=-1)
+                sampled_offset = torch.multinomial(probs, num_samples=1)
+                next_token = topk_indices.gather(-1, sampled_offset).reshape(-1)
+            else:
+                probs = torch.softmax(scaled_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1).reshape(-1)
+        generated.append(next_token.detach().cpu())
+        decoder_input = torch.cat((decoder_input, next_token.view(1, 1)), dim=-1)
+        if int(next_token.item()) == eos_token_id:
+            break
+    if was_training:
+        model.train()
+    if not generated:
+        return torch.empty(0, dtype=torch.long)
+    return torch.cat(generated, dim=0)
 
 
 def resolve_effective_model_config(
@@ -539,6 +830,9 @@ def run_single_experiment(
     device: torch.device | str,
     teacher_forcing: bool,
     full_sequence_causal: bool,
+    train_response_pairs: Sequence[tuple[torch.Tensor, torch.Tensor]] | None = None,
+    val_response_pairs: Sequence[tuple[torch.Tensor, torch.Tensor]] | None = None,
+    special_token_ids: dict[str, int] | None = None,
     trial: Any | None = None,
 ) -> dict[str, Any]:
     effective_config = resolve_effective_model_config(args, experiment_name)
@@ -551,11 +845,19 @@ def run_single_experiment(
     if grad_accum_steps <= 0:
         raise ValueError("grad-accum-steps must be positive.")
     effective_batch_size = args.batch_size * grad_accum_steps
-    steps_per_epoch = estimate_steps_per_epoch(
-        token_count=int(train_tokens.numel()),
-        seq_len=args.seq_len,
-        batch_size=effective_batch_size,
-    )
+    prefix_response = args.training_objective == "prefix_response"
+    if prefix_response:
+        if train_response_pairs is None or val_response_pairs is None or special_token_ids is None:
+            raise ValueError("prefix_response requires encoded dialogue pairs and special ids.")
+        if args.response_len <= 0:
+            raise ValueError("response-len must be positive.")
+        steps_per_epoch = max(1, math.ceil(len(train_response_pairs) / effective_batch_size))
+    else:
+        steps_per_epoch = estimate_steps_per_epoch(
+            token_count=int(train_tokens.numel()),
+            seq_len=args.seq_len,
+            batch_size=effective_batch_size,
+        )
     if args.steps <= 0:
         raise ValueError("steps must be positive.")
     if args.epochs is not None:
@@ -653,7 +955,8 @@ def run_single_experiment(
         f"schedule_steps={train_steps:,} | approx_epochs={requested_epochs:.3f} | "
         f"steps_per_epoch={steps_per_epoch:,} | batch_size={args.batch_size} | "
         f"grad_accum_steps={grad_accum_steps} | effective_batch_size={effective_batch_size} | "
-        f"objective={args.training_objective} | data_workers={args.data_workers} | "
+        f"objective={args.training_objective} | response_len={args.response_len} | "
+        f"data_workers={args.data_workers} | "
         f"prefetch_factor={args.prefetch_factor}"
     )
 
@@ -689,15 +992,31 @@ def run_single_experiment(
             writer.add_scalar("eval/val_loss", val_loss, step)
             writer.add_scalar("eval/train_ppl", perplexity_from_loss(train_loss), step)
             writer.add_scalar("eval/val_ppl", perplexity_from_loss(val_loss), step)
-            stats_batch = sample_next_token_batch(
-                train_tokens,
-                seq_len=args.seq_len,
-                batch_size=1,
-                device=device,
-                teacher_forcing=teacher_forcing,
-                full_sequence_causal=full_sequence_causal,
-            )
-            runtime_stats = model.collect_runtime_stats(stats_batch.context[:1])
+            if prefix_response:
+                assert train_response_pairs is not None
+                assert special_token_ids is not None
+                stats_batch = sample_prefix_response_batch(
+                    train_response_pairs,
+                    seq_len=args.seq_len,
+                    response_len=args.response_len,
+                    batch_size=1,
+                    bos_token_id=special_token_ids["assistant"],
+                    eos_token_id=special_token_ids["eos"],
+                    pad_token_id=special_token_ids["pad"],
+                    device=device,
+                )
+                stats_context = stats_batch.context[:1]
+            else:
+                stats_batch = sample_next_token_batch(
+                    train_tokens,
+                    seq_len=args.seq_len,
+                    batch_size=1,
+                    device=device,
+                    teacher_forcing=teacher_forcing,
+                    full_sequence_causal=full_sequence_causal,
+                )
+                stats_context = stats_batch.context[:1]
+            runtime_stats = model.collect_runtime_stats(stats_context)
             for key, value in sorted(runtime_stats.items()):
                 writer.add_scalar(key, value, step)
             writer.flush()
@@ -718,31 +1037,62 @@ def run_single_experiment(
         )
 
     try:
-        history = train_next_token_model(
-            model,
-            train_tokens,
-            val_tokens,
-            seq_len=args.seq_len,
-            batch_size=args.batch_size,
-            device=device,
-            steps=train_steps,
-            eval_interval=args.eval_interval,
-            eval_steps=args.eval_steps,
-            learning_rate=args.learning_rate,
-            weight_decay=args.weight_decay,
-            grad_accum_steps=grad_accum_steps,
-            teacher_forcing=teacher_forcing,
-            full_sequence_causal=full_sequence_causal,
-            teacher_forcing_chunk_size=args.teacher_forcing_chunk_size,
-            data_workers=args.data_workers,
-            prefetch_factor=args.prefetch_factor,
-            step_setup_callback=step_setup_callback,
-            progress_callback=progress_callback,
-            step_callback=step_tensorboard_callback,
-            eval_callback=eval_tensorboard_callback,
-            autocast_device_type=autocast_device_type,
-            autocast_dtype=autocast_dtype,
-        )
+        if prefix_response:
+            assert train_response_pairs is not None
+            assert val_response_pairs is not None
+            assert special_token_ids is not None
+            history = train_prefix_response_model(
+                model,
+                train_response_pairs,
+                val_response_pairs,
+                seq_len=args.seq_len,
+                response_len=args.response_len,
+                batch_size=args.batch_size,
+                bos_token_id=special_token_ids["assistant"],
+                eos_token_id=special_token_ids["eos"],
+                pad_token_id=special_token_ids["pad"],
+                device=device,
+                steps=train_steps,
+                eval_interval=args.eval_interval,
+                eval_steps=args.eval_steps,
+                learning_rate=args.learning_rate,
+                weight_decay=args.weight_decay,
+                grad_accum_steps=grad_accum_steps,
+                data_workers=args.data_workers,
+                prefetch_factor=args.prefetch_factor,
+                step_setup_callback=step_setup_callback,
+                progress_callback=progress_callback,
+                step_callback=step_tensorboard_callback,
+                eval_callback=eval_tensorboard_callback,
+                autocast_device_type=autocast_device_type,
+                autocast_dtype=autocast_dtype,
+            )
+        else:
+            history = train_next_token_model(
+                model,
+                train_tokens,
+                val_tokens,
+                seq_len=args.seq_len,
+                batch_size=args.batch_size,
+                device=device,
+                steps=train_steps,
+                eval_interval=args.eval_interval,
+                eval_steps=args.eval_steps,
+                learning_rate=args.learning_rate,
+                weight_decay=args.weight_decay,
+                grad_accum_steps=grad_accum_steps,
+                teacher_forcing=teacher_forcing,
+                full_sequence_causal=full_sequence_causal,
+                teacher_forcing_chunk_size=args.teacher_forcing_chunk_size,
+                data_workers=args.data_workers,
+                prefetch_factor=args.prefetch_factor,
+                step_setup_callback=step_setup_callback,
+                progress_callback=progress_callback,
+                step_callback=step_tensorboard_callback,
+                eval_callback=eval_tensorboard_callback,
+                autocast_device_type=autocast_device_type,
+                autocast_dtype=autocast_dtype,
+            )
     except Exception:
         if writer is not None:
             writer.flush()
@@ -752,17 +1102,32 @@ def run_single_experiment(
     print_eval_table(history, steps_per_epoch=steps_per_epoch)
 
     prompt_ids, prompt_text = select_prompt_tokens(args=args, vocab=vocab, train_tokens=train_tokens)
-    generated = generate_next_tokens_with_sampling(
-        model,
-        prompt_ids,
-        max_new_tokens=args.sample_tokens,
-        seq_len=args.seq_len,
-        device=device,
-        temperature=args.temperature,
-        sample_topk=args.sample_topk,
-        training_objective=args.training_objective,
-    )
-    generated_text = vocab.decode(generated.tolist())
+    if prefix_response:
+        assert special_token_ids is not None
+        response_ids = generate_prefix_response_with_sampling(
+            model,
+            prompt_ids[-args.seq_len :],
+            response_len=args.response_len,
+            bos_token_id=special_token_ids["assistant"],
+            eos_token_id=special_token_ids["eos"],
+            device=device,
+            temperature=args.temperature,
+            sample_topk=args.sample_topk,
+        )
+        generated_text = vocab.decode(response_ids.tolist())
+        generated = torch.cat((prompt_ids, response_ids), dim=0)
+    else:
+        generated = generate_next_tokens_with_sampling(
+            model,
+            prompt_ids,
+            max_new_tokens=args.sample_tokens,
+            seq_len=args.seq_len,
+            device=device,
+            temperature=args.temperature,
+            sample_topk=args.sample_topk,
+            training_objective=args.training_objective,
+        )
+        generated_text = vocab.decode(generated.tolist())
 
     best_index = min(range(len(history.val_losses)), key=history.val_losses.__getitem__)
     best_val_loss = history.val_losses[best_index]
@@ -779,6 +1144,7 @@ def run_single_experiment(
         "subword_vocab_size": args.subword_vocab_size if args.tokenizer == "subword" else None,
         "tokenizer_model_path": tokenizer_model_path,
         "seq_len": args.seq_len,
+        "response_len": args.response_len,
         "batch_size": args.batch_size,
         "grad_accum_steps": grad_accum_steps,
         "effective_batch_size": effective_batch_size,
@@ -843,6 +1209,7 @@ def run_single_experiment(
         "corpus_sample_count": corpus.sample_count,
         "corpus_file_count": corpus.file_count,
         "corpus_truncated": corpus.truncated,
+        "special_token_ids": special_token_ids or {},
         "run_dir": run_dir,
         "tensorboard_dir": tensorboard_dir if args.tensorboard else None,
         "final_runtime_stats": model.collect_runtime_stats(
@@ -979,7 +1346,7 @@ def main() -> None:
     parser.add_argument("--corpus-separator", default="\n\n")
     parser.add_argument(
         "--training-objective",
-        choices=("last_token", "teacher_forcing", "full_sequence_causal"),
+        choices=("last_token", "teacher_forcing", "full_sequence_causal", "prefix_response"),
         default="last_token",
     )
     parser.add_argument(
@@ -1004,6 +1371,7 @@ def main() -> None:
     parser.add_argument("--data-workers", type=int, default=0)
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--seq-len", type=int, default=32)
+    parser.add_argument("--response-len", type=int, default=64)
     parser.add_argument(
         "--model-preset",
         choices=preset_choices,
@@ -1140,6 +1508,7 @@ def main() -> None:
 
     teacher_forcing = args.training_objective == "teacher_forcing"
     full_sequence_causal = args.training_objective == "full_sequence_causal"
+    prefix_response = args.training_objective == "prefix_response"
     if args.teacher_forcing_chunk_size is not None and args.teacher_forcing_chunk_size <= 0:
         raise ValueError("teacher-forcing-chunk-size must be positive.")
     if args.teacher_forcing_chunk_size is not None and not teacher_forcing:
@@ -1155,6 +1524,8 @@ def main() -> None:
         raise ValueError("data-workers must be non-negative.")
     if args.prefetch_factor <= 0:
         raise ValueError("prefetch-factor must be positive.")
+    if args.response_len <= 0:
+        raise ValueError("response-len must be positive.")
     for name in (
         "edge_dropout_p",
         "usage_dropout_base",
@@ -1167,21 +1538,33 @@ def main() -> None:
     if not 0.0 <= args.usage_ema_decay < 1.0:
         raise ValueError("usage-ema-decay must be in [0, 1).")
 
-    corpus = load_text_corpus(
-        default_text=DEFAULT_TEXT,
-        text_file=args.text_file,
-        text_sources=args.text_source,
-        jsonl_sources=args.jsonl_source,
-        jsonl_text_keys=tuple(dict.fromkeys(args.jsonl_text_key)),
-        hf_dataset=args.hf_dataset,
-        hf_config=args.hf_config,
-        hf_split=args.hf_split,
-        hf_text_key=args.hf_text_key,
-        hf_streaming=args.hf_streaming,
-        max_samples=args.corpus_max_samples,
-        max_chars=args.corpus_max_chars,
-        separator=args.corpus_separator,
-    )
+    dialogue_pairs: list[DialoguePairText] | None = None
+    if prefix_response:
+        dialogue_pairs, corpus = load_dialogue_pairs(
+            jsonl_sources=args.jsonl_source,
+            hf_dataset=args.hf_dataset,
+            hf_config=args.hf_config,
+            hf_split=args.hf_split,
+            hf_streaming=args.hf_streaming,
+            max_samples=args.corpus_max_samples,
+            max_chars=args.corpus_max_chars,
+        )
+    else:
+        corpus = load_text_corpus(
+            default_text=DEFAULT_TEXT,
+            text_file=args.text_file,
+            text_sources=args.text_source,
+            jsonl_sources=args.jsonl_source,
+            jsonl_text_keys=tuple(dict.fromkeys(args.jsonl_text_key)),
+            hf_dataset=args.hf_dataset,
+            hf_config=args.hf_config,
+            hf_split=args.hf_split,
+            hf_text_key=args.hf_text_key,
+            hf_streaming=args.hf_streaming,
+            max_samples=args.corpus_max_samples,
+            max_chars=args.corpus_max_chars,
+            separator=args.corpus_separator,
+        )
     print(
         f"corpus={corpus.source_label} | chars={corpus.char_count:,} | "
         f"samples={corpus.sample_count:,} | files={corpus.file_count:,} | "
@@ -1197,15 +1580,30 @@ def main() -> None:
         subword_model_type=args.subword_model_type,
         tokenizer_prefix=args.tokenizer_prefix,
         subword_character_coverage=args.subword_character_coverage,
+        user_defined_symbols=DIALOGUE_SPECIAL_TOKENS if prefix_response else (),
     )
+    special_token_ids = require_subword_special_ids(vocab) if prefix_response else None
     tokens = vocab.encode(corpus.text)
-    if tokens.numel() <= args.seq_len + 1:
+    if not prefix_response and tokens.numel() <= args.seq_len + 1:
         raise ValueError("The tokenized corpus must be longer than seq_len + 1.")
     train_tokens, val_tokens = split_train_val(tokens, train_fraction=0.9)
+    train_response_pairs = None
+    val_response_pairs = None
+    if prefix_response:
+        assert dialogue_pairs is not None
+        train_pair_texts, val_pair_texts = split_dialogue_pairs(dialogue_pairs)
+        train_response_pairs = encode_dialogue_pairs(train_pair_texts, vocab=vocab)
+        val_response_pairs = encode_dialogue_pairs(val_pair_texts, vocab=vocab)
     print(
         f"tokenizer={tokenizer_label} | tokenizer_vocab={vocab.size:,} | "
         f"train_tokens={train_tokens.numel():,} | val_tokens={val_tokens.numel():,}"
     )
+    if prefix_response:
+        print(
+            f"dialogue_pairs={len(dialogue_pairs or ()):,} | "
+            f"train_pairs={len(train_response_pairs or ()):,} | "
+            f"val_pairs={len(val_response_pairs or ()):,} | response_len={args.response_len}"
+        )
     if tokenizer_model_path is not None:
         print(f"tokenizer_model={tokenizer_model_path}")
 
@@ -1237,6 +1635,9 @@ def main() -> None:
             device=device,
             teacher_forcing=teacher_forcing,
             full_sequence_causal=full_sequence_causal,
+            train_response_pairs=train_response_pairs,
+            val_response_pairs=val_response_pairs,
+            special_token_ids=special_token_ids,
         )
         summaries.append(summary)
         append_jsonl(session_dir / "experiments.jsonl", summary)

@@ -887,6 +887,17 @@ class ProgressiveBExampleLM(nn.Module):
         )
         self.readout_norm = _make_value_norm(dim, value_norm_kind)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
+        self.response_decoder = nn.GRU(
+            input_size=dim,
+            hidden_size=dim,
+            batch_first=True,
+        )
+        self.response_head_norm = _make_value_norm(dim, value_norm_kind)
+        self.response_head = nn.Sequential(
+            nn.Linear(dim, 4 * dim),
+            nn.GELU(),
+            nn.Linear(4 * dim, vocab_size),
+        )
 
     def set_b_schedule_scale(self, scale: float) -> None:
         for block in self.joint_blocks:
@@ -1019,8 +1030,68 @@ class ProgressiveBExampleLM(nn.Module):
         gathered = flat_val[batch_index, flat_indices]
         return gathered.reshape(*indices.shape, self.dim)
 
+    def read_response_slots(self, s_layer: Layer, response_len: int) -> Tensor:
+        if response_len <= 0:
+            raise ValueError("response_len must be positive.")
+        values = self.readout_norm(s_layer.val)
+        if response_len <= s_layer.num_nodes:
+            return values[..., -response_len:, :]
+        extra = values[..., -1:, :].expand(*values.shape[:-2], response_len - s_layer.num_nodes, self.dim)
+        return torch.cat((values, extra), dim=-2)
+
     def _apply_sequence_mask(self, s_layer: Layer, slot_mask: Tensor) -> Layer:
         return _apply_layer_slot_mask(s_layer, slot_mask)
+
+    def encode_prefix(self, token_ids: Tensor) -> tuple[Layer, Layer | None]:
+        s_layer = self.initialize_sequence_layer(token_ids)
+        compressed_b: Layer | None = None
+
+        for op in self.s_warmup:
+            delta = op.compute_delta(self._prepare_sequence_input(s_layer))
+            s_layer = self._apply_sequence_delta(s_layer, delta, scale=0.25)
+            s_layer = self._finalize_sequence_layer(s_layer)
+        for block in self.joint_blocks:
+            s_layer, compressed_b = block(s_layer, compressed_b)
+        for op in self.s_refine:
+            delta = op.compute_delta(self._prepare_sequence_input(s_layer))
+            s_layer = self._apply_sequence_delta(s_layer, delta, scale=0.25)
+            s_layer = self._finalize_sequence_layer(s_layer)
+
+        if self.track_stats:
+            stats = {}
+            stats.update(self._collect_layer_stats("s", s_layer))
+            stats.update(self._collect_layer_stats("b", compressed_b))
+            block_stats = [block.last_runtime_stats for block in self.joint_blocks if block.last_runtime_stats]
+            if block_stats:
+                keys = sorted({key for item in block_stats for key in item})
+                for key in keys:
+                    values = [item[key] for item in block_stats if key in item]
+                    if values:
+                        stats[f"blocks/{key}_mean"] = float(sum(values) / len(values))
+            self.last_runtime_stats = stats
+        return s_layer, compressed_b
+
+    def forward_response(
+        self,
+        prefix_token_ids: Tensor,
+        decoder_input_ids: Tensor,
+        *,
+        return_layers: bool = False,
+    ) -> Tensor | tuple[Tensor, Layer, Layer | None]:
+        if decoder_input_ids.ndim != prefix_token_ids.ndim:
+            raise ValueError("decoder_input_ids must have the same rank as prefix_token_ids.")
+        if tuple(decoder_input_ids.shape[:-1]) != tuple(prefix_token_ids.shape[:-1]):
+            raise ValueError("decoder_input_ids batch shape must match prefix_token_ids.")
+        response_len = decoder_input_ids.shape[-1]
+        s_layer, compressed_b = self.encode_prefix(prefix_token_ids)
+        read_slots = self.read_response_slots(s_layer, response_len)
+        decoder_inputs = self.token_embedding(decoder_input_ids) + read_slots
+        initial_hidden = self.readout_norm(s_layer.val[..., -1, :]).unsqueeze(0)
+        decoded, _ = self.response_decoder(decoder_inputs, initial_hidden)
+        logits = self.response_head(self.response_head_norm(decoded + read_slots))
+        if return_layers:
+            return logits, s_layer, compressed_b
+        return logits
 
     def forward_full_sequence_causal(
         self, token_ids: Tensor, *, return_layers: bool = False
@@ -1166,32 +1237,7 @@ class ProgressiveBExampleLM(nn.Module):
                 return_layers=return_layers,
                 teacher_forcing_chunk_size=teacher_forcing_chunk_size,
             )
-        s_layer = self.initialize_sequence_layer(token_ids)
-        compressed_b: Layer | None = None
-
-        for op in self.s_warmup:
-            delta = op.compute_delta(self._prepare_sequence_input(s_layer))
-            s_layer = self._apply_sequence_delta(s_layer, delta, scale=0.25)
-            s_layer = self._finalize_sequence_layer(s_layer)
-        for block in self.joint_blocks:
-            s_layer, compressed_b = block(s_layer, compressed_b)
-        for op in self.s_refine:
-            delta = op.compute_delta(self._prepare_sequence_input(s_layer))
-            s_layer = self._apply_sequence_delta(s_layer, delta, scale=0.25)
-            s_layer = self._finalize_sequence_layer(s_layer)
-
-        if self.track_stats:
-            stats = {}
-            stats.update(self._collect_layer_stats("s", s_layer))
-            stats.update(self._collect_layer_stats("b", compressed_b))
-            block_stats = [block.last_runtime_stats for block in self.joint_blocks if block.last_runtime_stats]
-            if block_stats:
-                keys = sorted({key for item in block_stats for key in item})
-                for key in keys:
-                    values = [item[key] for item in block_stats if key in item]
-                    if values:
-                        stats[f"blocks/{key}_mean"] = float(sum(values) / len(values))
-            self.last_runtime_stats = stats
+        s_layer, compressed_b = self.encode_prefix(token_ids)
 
         prediction_slot = self.readout_norm(self.read_prediction_slot(s_layer))
         logits = self.lm_head(prediction_slot)
@@ -1220,6 +1266,14 @@ class CharVocab:
 class NextTokenBatch:
     context: Tensor
     target: Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class PrefixResponseBatch:
+    context: Tensor
+    decoder_input: Tensor
+    target: Tensor
+    loss_mask: Tensor
 
 
 @dataclass(frozen=True, slots=True)
@@ -1293,6 +1347,123 @@ class NextTokenBatchDataset(IterableDataset[tuple[Tensor, Tensor]]):
             yield batch.context, batch.target
 
 
+def _pad_or_trim_prefix(token_ids: Tensor, *, seq_len: int, pad_token_id: int) -> Tensor:
+    token_ids = token_ids.detach().cpu().to(dtype=torch.long)
+    if token_ids.numel() >= seq_len:
+        return token_ids[-seq_len:].contiguous()
+    padding = torch.full((seq_len - token_ids.numel(),), pad_token_id, dtype=torch.long)
+    return torch.cat((padding, token_ids), dim=0)
+
+
+def _make_response_targets(
+    response_ids: Tensor,
+    *,
+    response_len: int,
+    bos_token_id: int,
+    eos_token_id: int,
+    pad_token_id: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    response_ids = response_ids.detach().cpu().to(dtype=torch.long)
+    target = torch.full((response_len,), pad_token_id, dtype=torch.long)
+    loss_mask = torch.zeros(response_len, dtype=torch.float32)
+    content_budget = max(0, response_len - 1)
+    content = response_ids[:content_budget]
+    used = int(content.numel())
+    if used > 0:
+        target[:used] = content
+        loss_mask[:used] = 1.0
+    if used < response_len:
+        target[used] = eos_token_id
+        loss_mask[used] = 1.0
+    decoder_input = torch.full((response_len,), pad_token_id, dtype=torch.long)
+    decoder_input[0] = bos_token_id
+    if response_len > 1:
+        decoder_input[1:] = target[:-1]
+    return decoder_input, target, loss_mask
+
+
+def sample_prefix_response_batch(
+    pairs: Sequence[tuple[Tensor, Tensor]],
+    *,
+    seq_len: int,
+    response_len: int,
+    batch_size: int,
+    bos_token_id: int,
+    eos_token_id: int,
+    pad_token_id: int,
+    device: torch.device | str,
+) -> PrefixResponseBatch:
+    if not pairs:
+        raise ValueError("pairs must not be empty.")
+    if response_len <= 0:
+        raise ValueError("response_len must be positive.")
+    indices = torch.randint(0, len(pairs), (batch_size,))
+    contexts: list[Tensor] = []
+    decoder_inputs: list[Tensor] = []
+    targets: list[Tensor] = []
+    masks: list[Tensor] = []
+    for index in indices.tolist():
+        prefix_ids, response_ids = pairs[index]
+        contexts.append(
+            _pad_or_trim_prefix(prefix_ids, seq_len=seq_len, pad_token_id=pad_token_id)
+        )
+        decoder_input, target, loss_mask = _make_response_targets(
+            response_ids,
+            response_len=response_len,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+        )
+        decoder_inputs.append(decoder_input)
+        targets.append(target)
+        masks.append(loss_mask)
+    target_device = torch.device(device)
+    return PrefixResponseBatch(
+        context=torch.stack(contexts, dim=0).to(target_device),
+        decoder_input=torch.stack(decoder_inputs, dim=0).to(target_device),
+        target=torch.stack(targets, dim=0).to(target_device),
+        loss_mask=torch.stack(masks, dim=0).to(target_device),
+    )
+
+
+class PrefixResponseBatchDataset(
+    IterableDataset[tuple[Tensor, Tensor, Tensor, Tensor]]
+):
+    def __init__(
+        self,
+        pairs: Sequence[tuple[Tensor, Tensor]],
+        *,
+        seq_len: int,
+        response_len: int,
+        batch_size: int,
+        bos_token_id: int,
+        eos_token_id: int,
+        pad_token_id: int,
+    ) -> None:
+        super().__init__()
+        self.pairs = tuple((prefix.detach().cpu(), response.detach().cpu()) for prefix, response in pairs)
+        self.seq_len = seq_len
+        self.response_len = response_len
+        self.batch_size = batch_size
+        self.bos_token_id = bos_token_id
+        self.eos_token_id = eos_token_id
+        self.pad_token_id = pad_token_id
+
+    def __iter__(self):
+        while True:
+            batch = sample_prefix_response_batch(
+                self.pairs,
+                seq_len=self.seq_len,
+                response_len=self.response_len,
+                batch_size=self.batch_size,
+                bos_token_id=self.bos_token_id,
+                eos_token_id=self.eos_token_id,
+                pad_token_id=self.pad_token_id,
+                device="cpu",
+            )
+            yield batch.context, batch.decoder_input, batch.target, batch.loss_mask
+
+
 def _make_train_batch_iterator(
     tokens: Tensor,
     *,
@@ -1338,6 +1509,59 @@ def _make_train_batch_iterator(
             )
 
 
+def _make_prefix_response_batch_iterator(
+    pairs: Sequence[tuple[Tensor, Tensor]],
+    *,
+    seq_len: int,
+    response_len: int,
+    batch_size: int,
+    bos_token_id: int,
+    eos_token_id: int,
+    pad_token_id: int,
+    device: torch.device | str,
+    data_workers: int,
+    prefetch_factor: int,
+):
+    target_device = torch.device(device)
+    if data_workers <= 0:
+        while True:
+            yield sample_prefix_response_batch(
+                pairs,
+                seq_len=seq_len,
+                response_len=response_len,
+                batch_size=batch_size,
+                bos_token_id=bos_token_id,
+                eos_token_id=eos_token_id,
+                pad_token_id=pad_token_id,
+                device=target_device,
+            )
+    else:
+        dataset = PrefixResponseBatchDataset(
+            pairs,
+            seq_len=seq_len,
+            response_len=response_len,
+            batch_size=batch_size,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=None,
+            num_workers=data_workers,
+            pin_memory=target_device.type == "cuda",
+            persistent_workers=True,
+            prefetch_factor=max(1, prefetch_factor),
+        )
+        for context, decoder_input, target, loss_mask in loader:
+            yield PrefixResponseBatch(
+                context=context.to(target_device, non_blocking=True),
+                decoder_input=decoder_input.to(target_device, non_blocking=True),
+                target=target.to(target_device, non_blocking=True),
+                loss_mask=loss_mask.to(target_device, non_blocking=True),
+            )
+
+
 def compute_next_token_loss(
     model: nn.Module,
     batch: NextTokenBatch,
@@ -1366,6 +1590,30 @@ def compute_next_token_loss(
             logits.reshape(-1, logits.shape[-1]),
             batch.target.reshape(-1),
         )
+    return loss, logits
+
+
+def compute_prefix_response_loss(
+    model: nn.Module,
+    batch: PrefixResponseBatch,
+    *,
+    autocast_device_type: str | None = None,
+    autocast_dtype: torch.dtype | None = None,
+) -> tuple[Tensor, Tensor]:
+    use_autocast = autocast_device_type is not None and autocast_dtype is not None
+    with torch.autocast(
+        device_type=autocast_device_type or "cpu",
+        dtype=autocast_dtype,
+        enabled=use_autocast,
+    ):
+        logits = model.forward_response(batch.context, batch.decoder_input)
+        token_losses = F.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]),
+            batch.target.reshape(-1),
+            reduction="none",
+        ).reshape_as(batch.target)
+        mask = batch.loss_mask.to(dtype=token_losses.dtype)
+        loss = (token_losses * mask).sum() / mask.sum().clamp_min(1.0)
     return loss, logits
 
 
@@ -1402,6 +1650,48 @@ def estimate_next_token_loss(
             teacher_forcing=teacher_forcing,
             full_sequence_causal=full_sequence_causal,
             teacher_forcing_chunk_size=teacher_forcing_chunk_size,
+            autocast_device_type=autocast_device_type,
+            autocast_dtype=autocast_dtype,
+        )
+        losses.append(float(loss.item()))
+    if was_training:
+        model.train()
+    return sum(losses) / len(losses)
+
+
+@torch.no_grad()
+def estimate_prefix_response_loss(
+    model: nn.Module,
+    pairs: Sequence[tuple[Tensor, Tensor]],
+    *,
+    seq_len: int,
+    response_len: int,
+    batch_size: int,
+    bos_token_id: int,
+    eos_token_id: int,
+    pad_token_id: int,
+    device: torch.device | str,
+    eval_steps: int,
+    autocast_device_type: str | None = None,
+    autocast_dtype: torch.dtype | None = None,
+) -> float:
+    was_training = model.training
+    model.eval()
+    losses: list[float] = []
+    for _ in range(eval_steps):
+        batch = sample_prefix_response_batch(
+            pairs,
+            seq_len=seq_len,
+            response_len=response_len,
+            batch_size=batch_size,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            device=device,
+        )
+        loss, _ = compute_prefix_response_loss(
+            model,
+            batch,
             autocast_device_type=autocast_device_type,
             autocast_dtype=autocast_dtype,
         )
@@ -1528,6 +1818,142 @@ def train_next_token_model(
                 teacher_forcing=teacher_forcing,
                 full_sequence_causal=full_sequence_causal,
                 teacher_forcing_chunk_size=teacher_forcing_chunk_size,
+                autocast_device_type=autocast_device_type,
+                autocast_dtype=autocast_dtype,
+            )
+            train_losses.append(train_eval)
+            val_losses.append(val_eval)
+            if eval_callback is not None:
+                eval_callback(step, train_eval, val_eval)
+
+    return TrainingHistory(
+        eval_steps=tuple(eval_steps_seen),
+        train_step_losses=tuple(train_step_losses),
+        grad_norms=tuple(grad_norms),
+        train_losses=tuple(train_losses),
+        val_losses=tuple(val_losses),
+    )
+
+
+def train_prefix_response_model(
+    model: nn.Module,
+    train_pairs: Sequence[tuple[Tensor, Tensor]],
+    val_pairs: Sequence[tuple[Tensor, Tensor]],
+    *,
+    seq_len: int,
+    response_len: int,
+    batch_size: int,
+    bos_token_id: int,
+    eos_token_id: int,
+    pad_token_id: int,
+    device: torch.device | str,
+    steps: int,
+    eval_interval: int,
+    eval_steps: int,
+    learning_rate: float,
+    weight_decay: float = 0.0,
+    grad_clip: float | None = 1.0,
+    grad_accum_steps: int = 1,
+    data_workers: int = 0,
+    prefetch_factor: int = 2,
+    step_setup_callback: Callable[[int, int], None] | None = None,
+    progress_callback: Callable[[int, int, float], None] | None = None,
+    step_callback: Callable[[int, float, float], None] | None = None,
+    eval_callback: Callable[[int, float, float], None] | None = None,
+    autocast_device_type: str | None = None,
+    autocast_dtype: torch.dtype | None = None,
+) -> TrainingHistory:
+    if grad_accum_steps <= 0:
+        raise ValueError("grad_accum_steps must be positive.")
+    model.to(device)
+    model.train()
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=learning_rate,
+        weight_decay=weight_decay,
+    )
+    eval_steps_seen: list[int] = []
+    train_step_losses: list[float] = []
+    grad_norms: list[float] = []
+    train_losses: list[float] = []
+    val_losses: list[float] = []
+    batch_iter = _make_prefix_response_batch_iterator(
+        train_pairs,
+        seq_len=seq_len,
+        response_len=response_len,
+        batch_size=batch_size,
+        bos_token_id=bos_token_id,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        device=device,
+        data_workers=data_workers,
+        prefetch_factor=prefetch_factor,
+    )
+
+    for step in range(1, steps + 1):
+        if step_setup_callback is not None:
+            step_setup_callback(step, steps)
+        optimizer.zero_grad(set_to_none=True)
+        accumulated_loss = 0.0
+        for _ in range(grad_accum_steps):
+            batch = next(batch_iter)
+            loss, _ = compute_prefix_response_loss(
+                model,
+                batch,
+                autocast_device_type=autocast_device_type,
+                autocast_dtype=autocast_dtype,
+            )
+            if not torch.isfinite(loss).item():
+                raise FloatingPointError(f"Non-finite loss at step {step}: {loss.item()}")
+            accumulated_loss += float(loss.item())
+            (loss / grad_accum_steps).backward()
+        grad_norm = 0.0
+        if grad_clip is not None:
+            grad_norm = float(
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip).item()
+            )
+        else:
+            grads = [parameter.grad.norm() for parameter in model.parameters() if parameter.grad is not None]
+            if grads:
+                grad_norm = float(torch.stack(grads).norm().item())
+        if not math.isfinite(grad_norm):
+            raise FloatingPointError(f"Non-finite grad norm at step {step}: {grad_norm}")
+        optimizer.step()
+        step_loss = accumulated_loss / grad_accum_steps
+        train_step_losses.append(step_loss)
+        grad_norms.append(grad_norm)
+        if progress_callback is not None:
+            progress_callback(step, steps, step_loss)
+        if step_callback is not None:
+            step_callback(step, step_loss, grad_norm)
+
+        if step % eval_interval == 0 or step == 1 or step == steps:
+            eval_steps_seen.append(step)
+            train_eval = estimate_prefix_response_loss(
+                model,
+                train_pairs,
+                seq_len=seq_len,
+                response_len=response_len,
+                batch_size=batch_size,
+                bos_token_id=bos_token_id,
+                eos_token_id=eos_token_id,
+                pad_token_id=pad_token_id,
+                device=device,
+                eval_steps=eval_steps,
+                autocast_device_type=autocast_device_type,
+                autocast_dtype=autocast_dtype,
+            )
+            val_eval = estimate_prefix_response_loss(
+                model,
+                val_pairs,
+                seq_len=seq_len,
+                response_len=response_len,
+                batch_size=batch_size,
+                bos_token_id=bos_token_id,
+                eos_token_id=eos_token_id,
+                pad_token_id=pad_token_id,
+                device=device,
+                eval_steps=eval_steps,
                 autocast_device_type=autocast_device_type,
                 autocast_dtype=autocast_dtype,
             )
