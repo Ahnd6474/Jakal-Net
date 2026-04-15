@@ -737,6 +737,7 @@ def generate_next_tokens_with_sampling(
     temperature: float | None,
     sample_topk: int | None,
     training_objective: str = "last_token",
+    eos_token_id: int | None = None,
 ) -> torch.Tensor:
     if temperature is not None and temperature <= 0.0:
         raise ValueError("temperature must be positive when sampling is enabled.")
@@ -750,6 +751,8 @@ def generate_next_tokens_with_sampling(
         context = generated[-seq_len:].unsqueeze(0)
         if training_objective == "full_sequence_causal":
             logits = model(context, full_sequence_causal=True)[..., -1, :]
+        elif training_objective == "query_next_token":
+            logits = model.forward_query_next_token(context)
         else:
             logits = model(context)
         if temperature is None:
@@ -766,6 +769,8 @@ def generate_next_tokens_with_sampling(
                 probs = torch.softmax(scaled_logits, dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1).reshape(-1)
         generated = torch.cat((generated, next_token), dim=0)
+        if eos_token_id is not None and int(next_token.item()) == eos_token_id:
+            break
     if was_training:
         model.train()
     return generated
@@ -1101,6 +1106,7 @@ def run_single_experiment(
     device: torch.device | str,
     teacher_forcing: bool,
     full_sequence_causal: bool,
+    query_next_token: bool,
     train_response_pairs: Sequence[tuple[torch.Tensor, torch.Tensor]] | None = None,
     val_response_pairs: Sequence[tuple[torch.Tensor, torch.Tensor]] | None = None,
     special_token_ids: dict[str, int] | None = None,
@@ -1201,6 +1207,7 @@ def run_single_experiment(
         state_init_mode=args.state_init_mode,
         pairwise_kind=args.pairwise_kind,
         pairwise_hidden_dim=args.pairwise_hidden_dim,
+        query_topk=args.query_topk or int(effective_config["route_topk"]),
         edge_dropout_p=args.edge_dropout_p,
         usage_dropout_base=args.usage_dropout_base,
         usage_dropout_scale=args.usage_dropout_scale,
@@ -1224,6 +1231,7 @@ def run_single_experiment(
         f"stages={effective_config['lite_layers']}/{effective_config['mid_layers']}/{effective_config['full_layers']} | "
         f"refine={effective_config['final_refine_layers']} | route_mode={args.route_mode} | "
         f"route_topk={effective_config['route_topk']} | route_kind={args.route_kind} | "
+        f"query_topk={args.query_topk or int(effective_config['route_topk'])} | "
         f"edge_dropout={args.edge_dropout_p:.3f} | "
         f"usage_dropout={args.usage_dropout_base:.3f}/{args.usage_dropout_scale:.3f}/{args.usage_dropout_max:.3f}"
     )
@@ -1282,6 +1290,7 @@ def run_single_experiment(
                 "norm_position": args.norm_position,
                 "propagation_residual": not args.disable_propagation_residual,
                 "route_mode": args.route_mode,
+                "query_topk": args.query_topk or int(effective_config["route_topk"]),
                 "sequence_propagation": args.sequence_propagation,
                 "expanded_propagation": args.expanded_propagation,
                 "compressed_propagation": args.compressed_propagation,
@@ -1428,6 +1437,11 @@ def run_single_experiment(
             temperature=args.temperature,
             sample_topk=args.sample_topk,
             training_objective=args.training_objective,
+            eos_token_id=(
+                vocab.token_id(EOS_TOKEN)
+                if args.training_objective == "query_next_token" and isinstance(vocab, SubwordVocab)
+                else None
+            ),
         )
         return prompt_text, vocab.decode(generated.tolist())
 
@@ -1583,6 +1597,7 @@ def run_single_experiment(
                 grad_accum_steps=grad_accum_steps,
                 teacher_forcing=teacher_forcing,
                 full_sequence_causal=full_sequence_causal,
+                query_next_token=query_next_token,
                 teacher_forcing_chunk_size=args.teacher_forcing_chunk_size,
                 data_workers=args.data_workers,
                 prefetch_factor=args.prefetch_factor,
@@ -1638,6 +1653,11 @@ def run_single_experiment(
             temperature=args.temperature,
             sample_topk=args.sample_topk,
             training_objective=args.training_objective,
+            eos_token_id=(
+                vocab.token_id(EOS_TOKEN)
+                if args.training_objective == "query_next_token" and isinstance(vocab, SubwordVocab)
+                else None
+            ),
         )
         generated_text = vocab.decode(generated.tolist())
 
@@ -1672,6 +1692,7 @@ def run_single_experiment(
         "mid_layers": effective_config["mid_layers"],
         "full_layers": effective_config["full_layers"],
         "route_topk": effective_config["route_topk"],
+        "query_topk": args.query_topk or int(effective_config["route_topk"]),
         "value_norm_kind": value_norm_kind,
         "norm_position": args.norm_position,
         "propagation_residual": not args.disable_propagation_residual,
@@ -1832,6 +1853,7 @@ def main() -> None:
             "last_token",
             "teacher_forcing",
             "full_sequence_causal",
+            "query_next_token",
             "prefix_response",
             "next_sentence_response",
         ),
@@ -1928,6 +1950,11 @@ def main() -> None:
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--route-topk", type=int, default=4)
+    parser.add_argument(
+        "--query-topk",
+        type=int,
+        help="Top-k source slots used by query_next_token query-conditioned propagation. Defaults to route-topk.",
+    )
     parser.add_argument(
         "--value-norm-kind",
         choices=("layernorm", "rmsnorm"),
@@ -2031,6 +2058,7 @@ def main() -> None:
 
     teacher_forcing = args.training_objective == "teacher_forcing"
     full_sequence_causal = args.training_objective == "full_sequence_causal"
+    query_next_token = args.training_objective == "query_next_token"
     prefix_response = args.training_objective == "prefix_response"
     next_sentence_response = args.training_objective == "next_sentence_response"
     response_objective = prefix_response or next_sentence_response
@@ -2045,6 +2073,8 @@ def main() -> None:
         raise ValueError("s-window must be positive.")
     if args.route_temperature <= 0.0:
         raise ValueError("route-temperature must be positive.")
+    if args.query_topk is not None and args.query_topk <= 0:
+        raise ValueError("query-topk must be positive.")
     if args.data_workers < 0:
         raise ValueError("data-workers must be non-negative.")
     if args.pretokenize_workers < 0:
@@ -2135,7 +2165,7 @@ def main() -> None:
         subword_character_coverage=args.subword_character_coverage,
         subword_input_sentence_size=args.subword_input_sentence_size,
         subword_num_threads=args.subword_num_threads,
-        user_defined_symbols=DIALOGUE_SPECIAL_TOKENS if response_objective else (),
+        user_defined_symbols=DIALOGUE_SPECIAL_TOKENS if response_objective or query_next_token else (),
     )
     special_token_ids = require_subword_special_ids(vocab) if response_objective else None
     if response_objective:
@@ -2214,6 +2244,7 @@ def main() -> None:
             device=device,
             teacher_forcing=teacher_forcing,
             full_sequence_causal=full_sequence_causal,
+            query_next_token=query_next_token,
             train_response_pairs=train_response_pairs,
             val_response_pairs=val_response_pairs,
             special_token_ids=special_token_ids,

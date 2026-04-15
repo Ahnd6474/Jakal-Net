@@ -25,7 +25,19 @@ from jakal_net import (
     SourceTargetHadamardMLPRoute,
     Transition,
 )
-from jakal_net.kernel_common import apply_slot_mask_to_state, apply_slot_mask_to_val
+from jakal_net.kernel_common import (
+    apply_slot_mask_to_state,
+    apply_slot_mask_to_val,
+    gather_state_by_indices,
+    gather_val_by_indices,
+    select_topk,
+    supports_pairwise_kernel,
+)
+from jakal_net.native_backend import (
+    native_supports,
+    native_supports_device,
+    propagation_query_topk_native,
+)
 
 
 class RMSNorm(nn.Module):
@@ -160,6 +172,131 @@ def _make_sparse_or_dense_propagation(
             residual=residual,
         )
     raise ValueError(f"Unsupported sparse_type: {sparse_type!r}.")
+
+
+class QueryTopKPropagation(nn.Module):
+    def __init__(
+        self,
+        pairwise_fn: nn.Module,
+        *,
+        topk: int,
+        implementation: str,
+        query_block_size: int | None = 128,
+        source_block_size: int | None = 128,
+        edge_compress_fn: Callable[[Tensor], Tensor] = F.softsign,
+    ) -> None:
+        super().__init__()
+        if topk <= 0:
+            raise ValueError("query topk must be positive.")
+        self.pairwise_fn = pairwise_fn
+        self.topk = topk
+        self.implementation = implementation
+        self.query_block_size = query_block_size
+        self.source_block_size = source_block_size
+        self.edge_compress_fn = edge_compress_fn
+
+    def _native_edge_compress_name(self) -> str | None:
+        name = getattr(self.edge_compress_fn, "__name__", "")
+        if self.edge_compress_fn is F.softsign or name == "softsign":
+            return "softsign"
+        return None
+
+    def _compute_delta_streaming(self, query_layer: Layer, source_layer: Layer) -> LayerDelta:
+        projected_state = source_layer.state
+        projected_val = source_layer.val
+        query_nodes = query_layer.num_nodes
+        source_nodes = source_layer.num_nodes
+        k = min(self.topk, source_nodes)
+        delta_state = torch.zeros(
+            *query_layer.batch_shape,
+            query_nodes,
+            device=query_layer.state.device,
+            dtype=projected_state.dtype,
+        )
+        delta_val = torch.zeros(
+            *query_layer.batch_shape,
+            query_nodes,
+            query_layer.dim,
+            device=query_layer.val.device,
+            dtype=projected_val.dtype,
+        )
+
+        for query_start in range(0, query_nodes, self.query_block_size or query_nodes):
+            query_end = min(query_nodes, query_start + (self.query_block_size or query_nodes))
+            query_val = query_layer.val[..., query_start:query_end, :]
+            best_scores: Tensor | None = None
+            best_indices: Tensor | None = None
+            for source_start in range(0, source_nodes, self.source_block_size or source_nodes):
+                source_end = min(source_nodes, source_start + (self.source_block_size or source_nodes))
+                source_val = source_layer.val[..., source_start:source_end, :]
+                scores = self.pairwise_fn(query_val, source_val)
+                if best_scores is None or best_indices is None:
+                    best_scores = torch.full(
+                        (*scores.shape[:-1], k),
+                        fill_value=torch.finfo(scores.dtype).min,
+                        device=scores.device,
+                        dtype=scores.dtype,
+                    )
+                    best_indices = torch.zeros(
+                        (*scores.shape[:-1], k),
+                        device=scores.device,
+                        dtype=torch.long,
+                    )
+                source_indices = torch.arange(
+                    source_start,
+                    source_end,
+                    device=scores.device,
+                    dtype=torch.long,
+                )
+                source_indices = source_indices.view(
+                    (1,) * (scores.ndim - 1) + (source_end - source_start,)
+                ).expand_as(scores)
+                candidate_scores = torch.cat((best_scores, scores), dim=-1)
+                candidate_indices = torch.cat((best_indices, source_indices), dim=-1)
+                selected = select_topk(candidate_scores, k, dim=-1)
+                best_scores = selected.values
+                best_indices = torch.take_along_dim(
+                    candidate_indices,
+                    selected.indices,
+                    dim=-1,
+                )
+
+            if best_scores is None or best_indices is None:
+                continue
+            edges = self.edge_compress_fn(best_scores)
+            selected_state = gather_state_by_indices(projected_state, best_indices)
+            selected_val = gather_val_by_indices(projected_val, best_indices)
+            delta_state[..., query_start:query_end] = (
+                edges.to(projected_state.dtype) * selected_state.to(projected_state.dtype)
+            ).sum(dim=-1)
+            delta_val[..., query_start:query_end, :] = (
+                edges.to(projected_val.dtype).unsqueeze(-1)
+                * selected_val.to(projected_val.dtype)
+            ).sum(dim=-2)
+
+        return LayerDelta(delta_state=delta_state, delta_val=delta_val)
+
+    def compute_delta(self, query_layer: Layer, source_layer: Layer) -> LayerDelta:
+        edge_compress_name = self._native_edge_compress_name()
+        if (
+            self.implementation == "native"
+            and edge_compress_name is not None
+            and supports_pairwise_kernel(self.pairwise_fn)
+            and native_supports("propagation_query_topk")
+            and native_supports_device(query_layer.val.device.type)
+        ):
+            return propagation_query_topk_native(
+                pairwise_fn=self.pairwise_fn,
+                edge_compress_name=edge_compress_name,
+                query_val=query_layer.val,
+                source_val=source_layer.val,
+                projected_state=source_layer.state,
+                projected_val=source_layer.val,
+                topk=min(self.topk, source_layer.num_nodes),
+                query_block_size=self.query_block_size or query_layer.num_nodes,
+                source_block_size=self.source_block_size or source_layer.num_nodes,
+            )
+        return self._compute_delta_streaming(query_layer, source_layer)
 
 
 def _make_transition(
@@ -748,6 +885,7 @@ class ProgressiveBExampleLM(nn.Module):
         pairwise_kind: str = "diagonal_bilinear",
         pairwise_hidden_dim: int | None = None,
         prediction_slot_index: int = -1,
+        query_topk: int | None = None,
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
@@ -778,6 +916,9 @@ class ProgressiveBExampleLM(nn.Module):
         self.state_init_mode = state_init_mode
         self.pairwise_kind = pairwise_kind
         self.pairwise_hidden_dim = pairwise_hidden_dim
+        self.query_topk = query_topk or route_topk
+        if self.query_topk <= 0:
+            raise ValueError("query_topk must be positive.")
         self.stage_specs = tuple(stage_specs or build_progressive_b_stage_specs(seq_nodes))
         self.track_stats = False
         self.last_runtime_stats: dict[str, float] | None = None
@@ -811,6 +952,27 @@ class ProgressiveBExampleLM(nn.Module):
         shared_s_pairwise = pairwise_factory()
         shared_expanded_pairwise = pairwise_factory()
         shared_compressed_pairwise = pairwise_factory()
+        query_pairwise = pairwise_factory()
+        self.query_val_norm = _make_value_norm(dim, value_norm_kind)
+        self.query_transition = _make_transition(
+            dim=dim,
+            route_topk=self.query_topk,
+            route_mode=route_mode,
+            route_kind=route_kind,
+            route_hidden_dim=route_hidden_dim,
+            route_temperature=route_temperature,
+            implementation=implementation,
+            edge_dropout_p=edge_dropout_p,
+            usage_dropout_base=usage_dropout_base,
+            usage_dropout_scale=usage_dropout_scale,
+            usage_dropout_max=usage_dropout_max,
+            usage_ema_decay=usage_ema_decay,
+        )
+        self.query_propagation = QueryTopKPropagation(
+            query_pairwise,
+            topk=self.query_topk,
+            implementation=implementation,
+        )
         self.s_warmup = nn.ModuleList(
             [
                 _make_sparse_or_dense_propagation(
@@ -894,6 +1056,12 @@ class ProgressiveBExampleLM(nn.Module):
         )
         self.response_head_norm = _make_value_norm(dim, value_norm_kind)
         self.response_head = nn.Sequential(
+            nn.Linear(dim, 4 * dim),
+            nn.GELU(),
+            nn.Linear(4 * dim, vocab_size),
+        )
+        self.query_head_norm = _make_value_norm(dim, value_norm_kind)
+        self.query_head = nn.Sequential(
             nn.Linear(dim, 4 * dim),
             nn.GELU(),
             nn.Linear(4 * dim, vocab_size),
@@ -1070,6 +1238,78 @@ class ProgressiveBExampleLM(nn.Module):
                         stats[f"blocks/{key}_mean"] = float(sum(values) / len(values))
             self.last_runtime_stats = stats
         return s_layer, compressed_b
+
+    def initialize_query_layer(self, reference: Layer) -> Layer:
+        batch_shape = tuple(reference.batch_shape)
+        query_position = self.position_encoding(
+            reference.num_nodes + 1,
+            device=reference.val.device,
+            dtype=reference.val.dtype,
+        )[-1:, :]
+        query_val = _expand_position_encoding(query_position, batch_shape)
+        query_state = self.state_init(query_val).squeeze(-1)
+        query_layer = Layer(
+            dim=self.dim,
+            num_nodes=1,
+            state=query_state,
+            val=query_val,
+        )
+        return _stabilize_layer(
+            query_layer,
+            self.query_val_norm,
+            apply_value_norm=self.norm_position == "post",
+        )
+
+    def _prepare_query_input(self, query_layer: Layer) -> Layer:
+        if self.norm_position != "pre":
+            return query_layer
+        return _normalize_layer_values(query_layer, self.query_val_norm)
+
+    def _finalize_query_layer(self, query_layer: Layer) -> Layer:
+        return _stabilize_layer(
+            query_layer,
+            self.query_val_norm,
+            apply_value_norm=self.norm_position == "post",
+        )
+
+    def update_query_slot(self, s_layer: Layer) -> Layer:
+        query_layer = self.initialize_query_layer(s_layer)
+        transition_delta = self.query_transition.compute_delta(
+            self._prepare_sequence_input(s_layer),
+            self._prepare_query_input(query_layer),
+        )
+        query_layer = _apply_scaled_delta(
+            query_layer,
+            transition_delta,
+            state_scale=self.cross_delta_scale * self.state_residual_scale,
+            val_scale=self.cross_delta_scale * self.value_residual_scale,
+        )
+        query_layer = self._finalize_query_layer(query_layer)
+        propagation_delta = self.query_propagation.compute_delta(
+            self._prepare_query_input(query_layer),
+            self._prepare_sequence_input(s_layer),
+        )
+        query_layer = _apply_scaled_delta(
+            query_layer,
+            propagation_delta,
+            state_scale=self.s_delta_scale * self.state_residual_scale,
+            val_scale=self.s_delta_scale * self.value_residual_scale,
+        )
+        return self._finalize_query_layer(query_layer)
+
+    def forward_query_next_token(
+        self,
+        token_ids: Tensor,
+        *,
+        return_layers: bool = False,
+    ) -> Tensor | tuple[Tensor, Layer, Layer | None]:
+        s_layer, compressed_b = self.encode_prefix(token_ids)
+        query_layer = self.update_query_slot(s_layer)
+        query_slot = self.query_head_norm(query_layer.val[..., 0, :])
+        logits = self.query_head(query_slot)
+        if return_layers:
+            return logits, s_layer, compressed_b
+        return logits
 
     def forward_response(
         self,
@@ -1568,24 +1808,30 @@ def compute_next_token_loss(
     *,
     teacher_forcing: bool = False,
     full_sequence_causal: bool = False,
+    query_next_token: bool = False,
     teacher_forcing_chunk_size: int | None = None,
     autocast_device_type: str | None = None,
     autocast_dtype: torch.dtype | None = None,
 ) -> tuple[Tensor, Tensor]:
     if teacher_forcing and full_sequence_causal:
         raise ValueError("teacher_forcing and full_sequence_causal cannot both be enabled.")
+    if query_next_token and (teacher_forcing or full_sequence_causal):
+        raise ValueError("query_next_token cannot be combined with teacher forcing modes.")
     use_autocast = autocast_device_type is not None and autocast_dtype is not None
     with torch.autocast(
         device_type=autocast_device_type or "cpu",
         dtype=autocast_dtype,
         enabled=use_autocast,
     ):
-        logits = model(
-            batch.context,
-            teacher_forcing=teacher_forcing,
-            full_sequence_causal=full_sequence_causal,
-            teacher_forcing_chunk_size=teacher_forcing_chunk_size,
-        )
+        if query_next_token:
+            logits = model.forward_query_next_token(batch.context)
+        else:
+            logits = model(
+                batch.context,
+                teacher_forcing=teacher_forcing,
+                full_sequence_causal=full_sequence_causal,
+                teacher_forcing_chunk_size=teacher_forcing_chunk_size,
+            )
         loss = F.cross_entropy(
             logits.reshape(-1, logits.shape[-1]),
             batch.target.reshape(-1),
@@ -1628,6 +1874,7 @@ def estimate_next_token_loss(
     eval_steps: int,
     teacher_forcing: bool = False,
     full_sequence_causal: bool = False,
+    query_next_token: bool = False,
     teacher_forcing_chunk_size: int | None = None,
     autocast_device_type: str | None = None,
     autocast_dtype: torch.dtype | None = None,
@@ -1649,6 +1896,7 @@ def estimate_next_token_loss(
             batch,
             teacher_forcing=teacher_forcing,
             full_sequence_causal=full_sequence_causal,
+            query_next_token=query_next_token,
             teacher_forcing_chunk_size=teacher_forcing_chunk_size,
             autocast_device_type=autocast_device_type,
             autocast_dtype=autocast_dtype,
@@ -1718,6 +1966,7 @@ def train_next_token_model(
     grad_accum_steps: int = 1,
     teacher_forcing: bool = False,
     full_sequence_causal: bool = False,
+    query_next_token: bool = False,
     teacher_forcing_chunk_size: int | None = None,
     data_workers: int = 0,
     prefetch_factor: int = 2,
@@ -1767,6 +2016,7 @@ def train_next_token_model(
                 batch,
                 teacher_forcing=teacher_forcing,
                 full_sequence_causal=full_sequence_causal,
+                query_next_token=query_next_token,
                 teacher_forcing_chunk_size=teacher_forcing_chunk_size,
                 autocast_device_type=autocast_device_type,
                 autocast_dtype=autocast_dtype,
@@ -1806,6 +2056,7 @@ def train_next_token_model(
                 eval_steps=eval_steps,
                 teacher_forcing=teacher_forcing,
                 full_sequence_causal=full_sequence_causal,
+                query_next_token=query_next_token,
                 teacher_forcing_chunk_size=teacher_forcing_chunk_size,
                 autocast_device_type=autocast_device_type,
                 autocast_dtype=autocast_dtype,
@@ -1819,6 +2070,7 @@ def train_next_token_model(
                 eval_steps=eval_steps,
                 teacher_forcing=teacher_forcing,
                 full_sequence_causal=full_sequence_causal,
+                query_next_token=query_next_token,
                 teacher_forcing_chunk_size=teacher_forcing_chunk_size,
                 autocast_device_type=autocast_device_type,
                 autocast_dtype=autocast_dtype,
