@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import tempfile
 import time
 from dataclasses import asdict, dataclass
@@ -205,6 +206,8 @@ def build_subword_vocab(
     model_type: str,
     tokenizer_prefix: str | None,
     character_coverage: float,
+    input_sentence_size: int = 0,
+    num_threads: int = 0,
     user_defined_symbols: Sequence[str] = (),
 ) -> SubwordVocab:
     if spm is None:
@@ -214,6 +217,10 @@ def build_subword_vocab(
         )
     if vocab_size <= 0:
         raise ValueError("subword-vocab-size must be positive.")
+    if input_sentence_size < 0:
+        raise ValueError("subword-input-sentence-size must be non-negative.")
+    if num_threads < 0:
+        raise ValueError("subword-num-threads must be non-negative.")
 
     prefix_path = resolve_tokenizer_prefix(
         text=text,
@@ -231,19 +238,24 @@ def build_subword_vocab(
             text_path=text_path,
             tokenizer_prefix=prefix_path,
         )
-        spm.SentencePieceTrainer.train(
-            input=str(training_text_path),
-            model_prefix=str(prefix_path),
-            model_type=model_type,
-            vocab_size=vocab_size,
-            character_coverage=character_coverage,
-            user_defined_symbols=list(user_defined_symbols),
-            bos_id=-1,
-            eos_id=-1,
-            pad_id=-1,
-            hard_vocab_limit=False,
-            split_digits=True,
-        )
+        trainer_kwargs: dict[str, Any] = {
+            "input": str(training_text_path),
+            "model_prefix": str(prefix_path),
+            "model_type": model_type,
+            "vocab_size": vocab_size,
+            "character_coverage": character_coverage,
+            "user_defined_symbols": list(user_defined_symbols),
+            "bos_id": -1,
+            "eos_id": -1,
+            "pad_id": -1,
+            "hard_vocab_limit": False,
+            "split_digits": True,
+            "num_threads": num_threads or (os.cpu_count() or 16),
+        }
+        if input_sentence_size > 0:
+            trainer_kwargs["input_sentence_size"] = input_sentence_size
+            trainer_kwargs["shuffle_input_sentence"] = True
+        spm.SentencePieceTrainer.train(**trainer_kwargs)
 
     processor = spm.SentencePieceProcessor(model_file=str(model_path))
     return SubwordVocab(
@@ -262,6 +274,8 @@ def build_tokenizer(
     subword_model_type: str,
     tokenizer_prefix: str | None,
     subword_character_coverage: float,
+    subword_input_sentence_size: int = 0,
+    subword_num_threads: int = 0,
     user_defined_symbols: Sequence[str] = (),
 ) -> tuple[object, str, Path | None]:
     if tokenizer == "char":
@@ -274,6 +288,8 @@ def build_tokenizer(
             model_type=subword_model_type,
             tokenizer_prefix=tokenizer_prefix,
             character_coverage=subword_character_coverage,
+            input_sentence_size=subword_input_sentence_size,
+            num_threads=subword_num_threads,
             user_defined_symbols=user_defined_symbols,
         )
         return (
@@ -1443,6 +1459,18 @@ def main() -> None:
     parser.add_argument("--subword-vocab-size", type=int, default=256)
     parser.add_argument("--subword-character-coverage", type=float, default=0.9995)
     parser.add_argument(
+        "--subword-input-sentence-size",
+        type=int,
+        default=0,
+        help="Randomly sample this many sentences for SentencePiece training. 0 uses all sentences.",
+    )
+    parser.add_argument(
+        "--subword-num-threads",
+        type=int,
+        default=0,
+        help="SentencePiece worker threads. 0 uses os.cpu_count().",
+    )
+    parser.add_argument(
         "--subword-model-type",
         choices=("bpe", "unigram"),
         default="bpe",
@@ -1612,6 +1640,10 @@ def main() -> None:
         raise ValueError("prefetch-factor must be positive.")
     if args.response_len <= 0:
         raise ValueError("response-len must be positive.")
+    if args.subword_input_sentence_size < 0:
+        raise ValueError("subword-input-sentence-size must be non-negative.")
+    if args.subword_num_threads < 0:
+        raise ValueError("subword-num-threads must be non-negative.")
     for name in (
         "edge_dropout_p",
         "usage_dropout_base",
@@ -1666,6 +1698,8 @@ def main() -> None:
         subword_model_type=args.subword_model_type,
         tokenizer_prefix=args.tokenizer_prefix,
         subword_character_coverage=args.subword_character_coverage,
+        subword_input_sentence_size=args.subword_input_sentence_size,
+        subword_num_threads=args.subword_num_threads,
         user_defined_symbols=DIALOGUE_SPECIAL_TOKENS if prefix_response else (),
     )
     special_token_ids = require_subword_special_ids(vocab) if prefix_response else None
