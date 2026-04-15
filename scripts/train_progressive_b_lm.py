@@ -767,6 +767,39 @@ def select_prompt_tokens(
     return prompt_ids, vocab.decode(prompt_ids.tolist())
 
 
+def select_prefix_response_prompt_tokens(
+    *,
+    args: argparse.Namespace,
+    vocab: object,
+    train_response_pairs: Sequence[tuple[torch.Tensor, torch.Tensor]],
+) -> tuple[torch.Tensor, str]:
+    if args.prompt_text:
+        prompt = args.prompt_text
+        if USER_TOKEN not in prompt and ASSISTANT_TOKEN not in prompt:
+            prompt = f"{USER_TOKEN}\n{prompt}\n{ASSISTANT_TOKEN}\n"
+        prompt_ids = vocab.encode(prompt)
+        if prompt_ids.numel() == 0:
+            raise ValueError("--prompt-text must encode to at least one token.")
+        return prompt_ids, prompt
+    if not train_response_pairs:
+        raise ValueError("prefix_response prompt selection requires at least one train pair.")
+    prompt_ids = train_response_pairs[0][0]
+    return prompt_ids, vocab.decode(prompt_ids.tolist())
+
+
+def format_tensorboard_sample(
+    *,
+    prompt_text: str,
+    generated_text: str,
+) -> str:
+    return (
+        "### Prompt\n\n"
+        f"```\n{prompt_text}\n```\n\n"
+        "### Generated\n\n"
+        f"```\n{generated_text}\n```"
+    )
+
+
 def save_run_artifacts(
     *,
     run_dir: Path,
@@ -963,6 +996,39 @@ def run_single_experiment(
     start_time = time.perf_counter()
     writer = maybe_create_summary_writer(enabled=args.tensorboard, tensorboard_dir=tensorboard_dir)
 
+    def make_eval_sample() -> tuple[str, str]:
+        if prefix_response:
+            assert train_response_pairs is not None
+            assert special_token_ids is not None
+            prompt_ids, prompt_text = select_prefix_response_prompt_tokens(
+                args=args,
+                vocab=vocab,
+                train_response_pairs=train_response_pairs,
+            )
+            response_ids = generate_prefix_response_with_sampling(
+                model,
+                prompt_ids[-args.seq_len :],
+                response_len=max(1, min(args.response_len, args.sample_tokens)),
+                bos_token_id=special_token_ids["assistant"],
+                eos_token_id=special_token_ids["eos"],
+                device=device,
+                temperature=args.temperature,
+                sample_topk=args.sample_topk,
+            )
+            return prompt_text, vocab.decode(response_ids.tolist())
+        prompt_ids, prompt_text = select_prompt_tokens(args=args, vocab=vocab, train_tokens=train_tokens)
+        generated = generate_next_tokens_with_sampling(
+            model,
+            prompt_ids,
+            max_new_tokens=args.sample_tokens,
+            seq_len=args.seq_len,
+            device=device,
+            temperature=args.temperature,
+            sample_topk=args.sample_topk,
+            training_objective=args.training_objective,
+        )
+        return prompt_text, vocab.decode(generated.tolist())
+
     def progress_callback(step: int, total_steps: int, minibatch_loss: float) -> None:
         if args.log_interval <= 0:
             return
@@ -1019,6 +1085,20 @@ def run_single_experiment(
             runtime_stats = model.collect_runtime_stats(stats_context)
             for key, value in sorted(runtime_stats.items()):
                 writer.add_scalar(key, value, step)
+            sample_prompt, sample_generated = make_eval_sample()
+            writer.add_text(
+                "eval/sample",
+                format_tensorboard_sample(
+                    prompt_text=sample_prompt,
+                    generated_text=sample_generated,
+                ),
+                step,
+            )
+            print(
+                f"eval_sample | step={step}\n"
+                f"--- prompt ---\n{sample_prompt}\n\n"
+                f"--- sample ---\n{sample_generated}"
+            )
             writer.flush()
         if trial is not None:
             trial.report(val_loss, step)
@@ -1101,9 +1181,14 @@ def run_single_experiment(
     runtime_seconds = time.perf_counter() - start_time
     print_eval_table(history, steps_per_epoch=steps_per_epoch)
 
-    prompt_ids, prompt_text = select_prompt_tokens(args=args, vocab=vocab, train_tokens=train_tokens)
     if prefix_response:
         assert special_token_ids is not None
+        assert train_response_pairs is not None
+        prompt_ids, prompt_text = select_prefix_response_prompt_tokens(
+            args=args,
+            vocab=vocab,
+            train_response_pairs=train_response_pairs,
+        )
         response_ids = generate_prefix_response_with_sampling(
             model,
             prompt_ids[-args.seq_len :],
@@ -1117,6 +1202,7 @@ def run_single_experiment(
         generated_text = vocab.decode(response_ids.tolist())
         generated = torch.cat((prompt_ids, response_ids), dim=0)
     else:
+        prompt_ids, prompt_text = select_prompt_tokens(args=args, vocab=vocab, train_tokens=train_tokens)
         generated = generate_next_tokens_with_sampling(
             model,
             prompt_ids,
@@ -1583,10 +1669,15 @@ def main() -> None:
         user_defined_symbols=DIALOGUE_SPECIAL_TOKENS if prefix_response else (),
     )
     special_token_ids = require_subword_special_ids(vocab) if prefix_response else None
-    tokens = vocab.encode(corpus.text)
-    if not prefix_response and tokens.numel() <= args.seq_len + 1:
-        raise ValueError("The tokenized corpus must be longer than seq_len + 1.")
-    train_tokens, val_tokens = split_train_val(tokens, train_fraction=0.9)
+    if prefix_response:
+        tokens = torch.empty(0, dtype=torch.long)
+        train_tokens = tokens
+        val_tokens = tokens
+    else:
+        tokens = vocab.encode(corpus.text)
+        if tokens.numel() <= args.seq_len + 1:
+            raise ValueError("The tokenized corpus must be longer than seq_len + 1.")
+        train_tokens, val_tokens = split_train_val(tokens, train_fraction=0.9)
     train_response_pairs = None
     val_response_pairs = None
     if prefix_response:
