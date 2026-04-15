@@ -12,3 +12,41 @@ std::tuple<torch::Tensor, torch::Tensor> jakal_net_query_topk_reduce_cuda(
     const torch::Tensor& indices,
     const torch::Tensor& projected_state,
     const torch::Tensor& projected_val);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> jakal_net_query_topk_reduce_backward_cuda(
+    const torch::Tensor& edges,
+    const torch::Tensor& indices,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    const torch::Tensor& grad_delta_state,
+    const torch::Tensor& grad_delta_val);
+
+torch::Tensor jakal_net_softsign_backward_cuda(
+    const torch::Tensor& scores,
+    const torch::Tensor& grad_edges);
+
+torch::Tensor jakal_net_softmax_backward_cuda(
+    const torch::Tensor& routes,
+    const torch::Tensor& grad_routes);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+jakal_net_diagonal_pairwise_topk_backward_cuda(
+    const torch::Tensor& query_val,
+    const torch::Tensor& source_val,
+    const torch::Tensor& weight,
+    const torch::Tensor& indices,
+    const torch::Tensor& grad_scores,
+    double temperature);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+jakal_net_low_rank_pairwise_topk_backward_cuda(
+    const torch::Tensor& query_val,
+    const torch::Tensor& source_val,
+    const torch::Tensor& source_weight,
+    const torch::Tensor& target_weight,
+    const torch::Tensor& core_weight,
+    const torch::Tensor& projected_query,
+    const torch::Tensor& projected_source,
+    const torch::Tensor& indices,
+    const torch::Tensor& grad_scores,
+    double temperature);

@@ -7,7 +7,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import torch
 from torch import Tensor
+from torch.autograd import Function
 
 from jakal_net.core import LayerDelta
 from jakal_net.kernel_common import (
@@ -17,6 +19,12 @@ from jakal_net.kernel_common import (
     supports_pairwise_kernel,
     supports_pairwise_route_kernel,
     supports_route_kernel,
+)
+from jakal_net.modules import (
+    DiagonalBilinearPairwise,
+    DiagonalBilinearRoute,
+    LowRankBilinearPairwise,
+    LowRankBilinearRoute,
 )
 
 DEFAULT_NATIVE_MODULE = "jakal_net_native"
@@ -176,6 +184,496 @@ def _to_layer_delta(result: Any) -> LayerDelta:
     raise TypeError("Native backend must return LayerDelta or (delta_state, delta_val).")
 
 
+def _cuda_float_tensor(tensor: Tensor | None) -> bool:
+    return (
+        tensor is not None
+        and tensor.device.type == "cuda"
+        and tensor.dtype in {torch.float32, torch.float64}
+    )
+
+
+def _query_backward_ops_available() -> bool:
+    return all(
+        native_supports(name)
+        for name in (
+            "query_topk_reduce_backward_cuda",
+            "softsign_backward_cuda",
+            "softmax_backward_cuda",
+        )
+    )
+
+
+def _flatten_query_tensors(
+    query_val: Tensor,
+    source_val: Tensor,
+    projected_state: Tensor,
+    projected_val: Tensor,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, tuple[int, ...], int, int, int]:
+    batch_shape = tuple(query_val.shape[:-2])
+    query_nodes = query_val.shape[-2]
+    source_nodes = source_val.shape[-2]
+    out_dim = projected_val.shape[-1]
+    return (
+        query_val.reshape(-1, query_nodes, query_val.shape[-1]).contiguous(),
+        source_val.reshape(-1, source_nodes, source_val.shape[-1]).contiguous(),
+        projected_state.reshape(-1, source_nodes).contiguous(),
+        projected_val.reshape(-1, source_nodes, out_dim).contiguous(),
+        batch_shape,
+        query_nodes,
+        source_nodes,
+        out_dim,
+    )
+
+
+class _DiagonalPropagationQueryTopK(Function):
+    @staticmethod
+    def forward(
+        ctx: Any,
+        query_val: Tensor,
+        source_val: Tensor,
+        projected_state: Tensor,
+        projected_val: Tensor,
+        weight: Tensor,
+        bias: Tensor | None,
+        topk: int,
+        query_block_size: int,
+        source_block_size: int,
+    ) -> tuple[Tensor, Tensor]:
+        result = _native_module().propagation_query_topk_select(
+            "diagonal_bilinear",
+            weight,
+            bias,
+            "softsign",
+            query_val,
+            source_val,
+            projected_state,
+            projected_val,
+            topk,
+            query_block_size,
+            source_block_size,
+            True,
+        )
+        delta_state, delta_val, scores, indices = result
+        ctx.has_bias = bias is not None
+        ctx.save_for_backward(query_val, source_val, projected_state, projected_val, weight, scores, indices)
+        return delta_state, delta_val
+
+    @staticmethod
+    def backward(ctx: Any, grad_delta_state: Tensor, grad_delta_val: Tensor) -> tuple[Any, ...]:
+        query_val, source_val, projected_state, projected_val, weight, scores, indices = ctx.saved_tensors
+        (
+            flat_query,
+            flat_source,
+            flat_projected_state,
+            flat_projected_val,
+            _batch_shape,
+            query_nodes,
+            source_nodes,
+            out_dim,
+        ) = _flatten_query_tensors(query_val, source_val, projected_state, projected_val)
+        flat_scores = scores.reshape(-1, query_nodes, scores.shape[-1]).contiguous()
+        flat_indices = indices.reshape(-1, query_nodes, indices.shape[-1]).contiguous()
+        flat_edges = torch.nn.functional.softsign(flat_scores).contiguous()
+        flat_grad_state = grad_delta_state.reshape(-1, query_nodes).contiguous()
+        flat_grad_val = grad_delta_val.reshape(-1, query_nodes, out_dim).contiguous()
+        module = _native_module()
+        grad_edges, grad_projected_state, grad_projected_val = module.query_topk_reduce_backward_cuda(
+            flat_edges,
+            flat_indices,
+            flat_projected_state,
+            flat_projected_val,
+            flat_grad_state,
+            flat_grad_val,
+        )
+        grad_scores = module.softsign_backward_cuda(flat_scores, grad_edges.contiguous())
+        grad_query, grad_source, grad_weight, grad_bias = module.diagonal_pairwise_topk_backward_cuda(
+            flat_query,
+            flat_source,
+            weight.contiguous(),
+            flat_indices,
+            grad_scores.contiguous(),
+            1.0,
+        )
+        return (
+            grad_query.reshape_as(query_val),
+            grad_source.reshape_as(source_val),
+            grad_projected_state.reshape_as(projected_state),
+            grad_projected_val.reshape_as(projected_val),
+            grad_weight,
+            grad_bias if ctx.has_bias else None,
+            None,
+            None,
+            None,
+        )
+
+
+class _LowRankPropagationQueryTopK(Function):
+    @staticmethod
+    def forward(
+        ctx: Any,
+        query_val: Tensor,
+        source_val: Tensor,
+        projected_state: Tensor,
+        projected_val: Tensor,
+        full_weight: Tensor,
+        source_weight: Tensor,
+        target_weight: Tensor,
+        core_weight: Tensor,
+        bias: Tensor | None,
+        topk: int,
+        query_block_size: int,
+        source_block_size: int,
+    ) -> tuple[Tensor, Tensor]:
+        result = _native_module().propagation_query_topk_select(
+            "bilinear",
+            full_weight,
+            bias,
+            "softsign",
+            query_val,
+            source_val,
+            projected_state,
+            projected_val,
+            topk,
+            query_block_size,
+            source_block_size,
+            True,
+        )
+        delta_state, delta_val, scores, indices = result
+        ctx.has_bias = bias is not None
+        ctx.save_for_backward(
+            query_val,
+            source_val,
+            projected_state,
+            projected_val,
+            source_weight,
+            target_weight,
+            core_weight,
+            scores,
+            indices,
+        )
+        return delta_state, delta_val
+
+    @staticmethod
+    def backward(ctx: Any, grad_delta_state: Tensor, grad_delta_val: Tensor) -> tuple[Any, ...]:
+        (
+            query_val,
+            source_val,
+            projected_state,
+            projected_val,
+            source_weight,
+            target_weight,
+            core_weight,
+            scores,
+            indices,
+        ) = ctx.saved_tensors
+        (
+            flat_query,
+            flat_source,
+            flat_projected_state,
+            flat_projected_val,
+            _batch_shape,
+            query_nodes,
+            _source_nodes,
+            out_dim,
+        ) = _flatten_query_tensors(query_val, source_val, projected_state, projected_val)
+        flat_scores = scores.reshape(-1, query_nodes, scores.shape[-1]).contiguous()
+        flat_indices = indices.reshape(-1, query_nodes, indices.shape[-1]).contiguous()
+        flat_edges = torch.nn.functional.softsign(flat_scores).contiguous()
+        flat_grad_state = grad_delta_state.reshape(-1, query_nodes).contiguous()
+        flat_grad_val = grad_delta_val.reshape(-1, query_nodes, out_dim).contiguous()
+        module = _native_module()
+        grad_edges, grad_projected_state, grad_projected_val = module.query_topk_reduce_backward_cuda(
+            flat_edges,
+            flat_indices,
+            flat_projected_state,
+            flat_projected_val,
+            flat_grad_state,
+            flat_grad_val,
+        )
+        grad_scores = module.softsign_backward_cuda(flat_scores, grad_edges.contiguous())
+        projected_query = torch.matmul(flat_query, target_weight.t()).contiguous()
+        projected_source = torch.matmul(flat_source, source_weight.t()).contiguous()
+        (
+            grad_query,
+            grad_source,
+            grad_source_weight,
+            grad_target_weight,
+            grad_core_weight,
+            grad_bias,
+        ) = module.low_rank_pairwise_topk_backward_cuda(
+            flat_query,
+            flat_source,
+            source_weight.contiguous(),
+            target_weight.contiguous(),
+            core_weight.contiguous(),
+            projected_query,
+            projected_source,
+            flat_indices,
+            grad_scores.contiguous(),
+            1.0,
+        )
+        return (
+            grad_query.reshape_as(query_val),
+            grad_source.reshape_as(source_val),
+            grad_projected_state.reshape_as(projected_state),
+            grad_projected_val.reshape_as(projected_val),
+            None,
+            grad_source_weight,
+            grad_target_weight,
+            grad_core_weight,
+            grad_bias if ctx.has_bias else None,
+            None,
+            None,
+            None,
+        )
+
+
+class _DiagonalTransitionQueryTopK(Function):
+    @staticmethod
+    def forward(
+        ctx: Any,
+        sender_strength: Tensor,
+        src_val: Tensor,
+        query_val: Tensor,
+        projected_state: Tensor,
+        projected_val: Tensor,
+        weight: Tensor,
+        bias: Tensor | None,
+        temperature: float,
+        topk: int,
+        query_block_size: int,
+        source_block_size: int,
+    ) -> tuple[Tensor, Tensor]:
+        result = _native_module().transition_query_topk_select(
+            "diagonal_bilinear_route",
+            None,
+            None,
+            weight,
+            bias,
+            float(temperature),
+            sender_strength,
+            src_val,
+            query_val,
+            projected_state,
+            projected_val,
+            topk,
+            query_block_size,
+            source_block_size,
+            True,
+        )
+        delta_state, delta_val, scores, indices = result
+        routes = torch.softmax(scores, dim=-1)
+        ctx.has_bias = bias is not None
+        ctx.temperature = float(temperature)
+        ctx.save_for_backward(
+            sender_strength,
+            src_val,
+            query_val,
+            projected_state,
+            projected_val,
+            weight,
+            routes,
+            indices,
+        )
+        return delta_state, delta_val
+
+    @staticmethod
+    def backward(ctx: Any, grad_delta_state: Tensor, grad_delta_val: Tensor) -> tuple[Any, ...]:
+        sender_strength, src_val, query_val, projected_state, projected_val, weight, routes, indices = ctx.saved_tensors
+        (
+            flat_query,
+            flat_source,
+            flat_projected_state,
+            flat_projected_val,
+            _batch_shape,
+            query_nodes,
+            source_nodes,
+            out_dim,
+        ) = _flatten_query_tensors(query_val, src_val, projected_state, projected_val)
+        flat_sender = sender_strength.reshape(-1, source_nodes).contiguous()
+        weighted_state = (flat_sender * flat_projected_state).contiguous()
+        weighted_val = (flat_sender.unsqueeze(-1) * flat_projected_val).contiguous()
+        flat_routes = routes.reshape(-1, query_nodes, routes.shape[-1]).contiguous()
+        flat_indices = indices.reshape(-1, query_nodes, indices.shape[-1]).contiguous()
+        flat_grad_state = grad_delta_state.reshape(-1, query_nodes).contiguous()
+        flat_grad_val = grad_delta_val.reshape(-1, query_nodes, out_dim).contiguous()
+        module = _native_module()
+        grad_routes, grad_weighted_state, grad_weighted_val = module.query_topk_reduce_backward_cuda(
+            flat_routes,
+            flat_indices,
+            weighted_state,
+            weighted_val,
+            flat_grad_state,
+            flat_grad_val,
+        )
+        grad_scores = module.softmax_backward_cuda(flat_routes, grad_routes.contiguous())
+        grad_query, grad_source, grad_weight, grad_bias = module.diagonal_pairwise_topk_backward_cuda(
+            flat_query,
+            flat_source,
+            weight.contiguous(),
+            flat_indices,
+            grad_scores.contiguous(),
+            ctx.temperature,
+        )
+        grad_sender = (
+            grad_weighted_state * flat_projected_state
+            + (grad_weighted_val * flat_projected_val).sum(dim=-1)
+        )
+        grad_projected_state = grad_weighted_state * flat_sender
+        grad_projected_val = grad_weighted_val * flat_sender.unsqueeze(-1)
+        return (
+            grad_sender.reshape_as(sender_strength),
+            grad_source.reshape_as(src_val),
+            grad_query.reshape_as(query_val),
+            grad_projected_state.reshape_as(projected_state),
+            grad_projected_val.reshape_as(projected_val),
+            grad_weight,
+            grad_bias if ctx.has_bias else None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+class _LowRankTransitionQueryTopK(Function):
+    @staticmethod
+    def forward(
+        ctx: Any,
+        sender_strength: Tensor,
+        src_val: Tensor,
+        query_val: Tensor,
+        projected_state: Tensor,
+        projected_val: Tensor,
+        source_weight: Tensor,
+        target_weight: Tensor,
+        core_weight: Tensor,
+        bias: Tensor | None,
+        temperature: float,
+        topk: int,
+        query_block_size: int,
+        source_block_size: int,
+    ) -> tuple[Tensor, Tensor]:
+        result = _native_module().transition_query_topk_select(
+            "low_rank_bilinear_route",
+            source_weight,
+            target_weight,
+            core_weight,
+            bias,
+            float(temperature),
+            sender_strength,
+            src_val,
+            query_val,
+            projected_state,
+            projected_val,
+            topk,
+            query_block_size,
+            source_block_size,
+            True,
+        )
+        delta_state, delta_val, scores, indices = result
+        routes = torch.softmax(scores, dim=-1)
+        ctx.has_bias = bias is not None
+        ctx.temperature = float(temperature)
+        ctx.save_for_backward(
+            sender_strength,
+            src_val,
+            query_val,
+            projected_state,
+            projected_val,
+            source_weight,
+            target_weight,
+            core_weight,
+            routes,
+            indices,
+        )
+        return delta_state, delta_val
+
+    @staticmethod
+    def backward(ctx: Any, grad_delta_state: Tensor, grad_delta_val: Tensor) -> tuple[Any, ...]:
+        (
+            sender_strength,
+            src_val,
+            query_val,
+            projected_state,
+            projected_val,
+            source_weight,
+            target_weight,
+            core_weight,
+            routes,
+            indices,
+        ) = ctx.saved_tensors
+        (
+            flat_query,
+            flat_source,
+            flat_projected_state,
+            flat_projected_val,
+            _batch_shape,
+            query_nodes,
+            source_nodes,
+            out_dim,
+        ) = _flatten_query_tensors(query_val, src_val, projected_state, projected_val)
+        flat_sender = sender_strength.reshape(-1, source_nodes).contiguous()
+        weighted_state = (flat_sender * flat_projected_state).contiguous()
+        weighted_val = (flat_sender.unsqueeze(-1) * flat_projected_val).contiguous()
+        flat_routes = routes.reshape(-1, query_nodes, routes.shape[-1]).contiguous()
+        flat_indices = indices.reshape(-1, query_nodes, indices.shape[-1]).contiguous()
+        flat_grad_state = grad_delta_state.reshape(-1, query_nodes).contiguous()
+        flat_grad_val = grad_delta_val.reshape(-1, query_nodes, out_dim).contiguous()
+        module = _native_module()
+        grad_routes, grad_weighted_state, grad_weighted_val = module.query_topk_reduce_backward_cuda(
+            flat_routes,
+            flat_indices,
+            weighted_state,
+            weighted_val,
+            flat_grad_state,
+            flat_grad_val,
+        )
+        grad_scores = module.softmax_backward_cuda(flat_routes, grad_routes.contiguous())
+        projected_query = torch.matmul(flat_query, target_weight.t()).contiguous()
+        projected_source = torch.matmul(flat_source, source_weight.t()).contiguous()
+        (
+            grad_query,
+            grad_source,
+            grad_source_weight,
+            grad_target_weight,
+            grad_core_weight,
+            grad_bias,
+        ) = module.low_rank_pairwise_topk_backward_cuda(
+            flat_query,
+            flat_source,
+            source_weight.contiguous(),
+            target_weight.contiguous(),
+            core_weight.contiguous(),
+            projected_query,
+            projected_source,
+            flat_indices,
+            grad_scores.contiguous(),
+            ctx.temperature,
+        )
+        grad_sender = (
+            grad_weighted_state * flat_projected_state
+            + (grad_weighted_val * flat_projected_val).sum(dim=-1)
+        )
+        grad_projected_state = grad_weighted_state * flat_sender
+        grad_projected_val = grad_weighted_val * flat_sender.unsqueeze(-1)
+        return (
+            grad_sender.reshape_as(sender_strength),
+            grad_source.reshape_as(src_val),
+            grad_query.reshape_as(query_val),
+            grad_projected_state.reshape_as(projected_state),
+            grad_projected_val.reshape_as(projected_val),
+            grad_source_weight,
+            grad_target_weight,
+            grad_core_weight,
+            grad_bias if ctx.has_bias else None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
 def propagation_dense_native(
     *,
     pairwise_fn: object,
@@ -273,6 +771,45 @@ def propagation_query_topk_native(
 ) -> Any:
     if not supports_pairwise_kernel(pairwise_fn):
         raise TypeError("Unsupported pairwise_fn for native query propagation.")
+    use_cuda_autograd = (
+        _query_backward_ops_available()
+        and native_supports("propagation_query_topk_select")
+        and native_supports("diagonal_pairwise_topk_backward_cuda")
+        and native_supports("low_rank_pairwise_topk_backward_cuda")
+        and _cuda_float_tensor(query_val)
+        and _cuda_float_tensor(source_val)
+        and _cuda_float_tensor(projected_state)
+        and _cuda_float_tensor(projected_val)
+    )
+    if use_cuda_autograd and isinstance(pairwise_fn, DiagonalBilinearPairwise):
+        delta_state, delta_val = _DiagonalPropagationQueryTopK.apply(
+            query_val,
+            source_val,
+            projected_state,
+            projected_val,
+            pairwise_fn.weight,
+            pairwise_fn.bias,
+            topk,
+            query_block_size,
+            source_block_size,
+        )
+        return LayerDelta(delta_state=delta_state, delta_val=delta_val)
+    if use_cuda_autograd and isinstance(pairwise_fn, LowRankBilinearPairwise):
+        delta_state, delta_val = _LowRankPropagationQueryTopK.apply(
+            query_val,
+            source_val,
+            projected_state,
+            projected_val,
+            pairwise_fn.effective_weight(),
+            pairwise_fn.source_proj.weight,
+            pairwise_fn.target_proj.weight,
+            pairwise_fn.weight,
+            pairwise_fn.bias,
+            topk,
+            query_block_size,
+            source_block_size,
+        )
+        return LayerDelta(delta_state=delta_state, delta_val=delta_val)
     spec = pairwise_kernel_spec(pairwise_fn)
     return _to_layer_delta(_native_module().propagation_query_topk(
         spec.kind,
@@ -367,6 +904,51 @@ def transition_query_topk_native(
 ) -> Any:
     if not supports_pairwise_route_kernel(route_fn):
         raise TypeError("Unsupported pairwise route_fn for native query transition.")
+    inner = getattr(route_fn, "route_fn", route_fn)
+    temperature = float(getattr(route_fn, "temperature", 1.0))
+    use_cuda_autograd = (
+        _query_backward_ops_available()
+        and native_supports("transition_query_topk_select")
+        and native_supports("diagonal_pairwise_topk_backward_cuda")
+        and native_supports("low_rank_pairwise_topk_backward_cuda")
+        and _cuda_float_tensor(sender_strength)
+        and _cuda_float_tensor(src_val)
+        and _cuda_float_tensor(query_val)
+        and _cuda_float_tensor(projected_state)
+        and _cuda_float_tensor(projected_val)
+    )
+    if use_cuda_autograd and isinstance(inner, DiagonalBilinearRoute):
+        delta_state, delta_val = _DiagonalTransitionQueryTopK.apply(
+            sender_strength,
+            src_val,
+            query_val,
+            projected_state,
+            projected_val,
+            inner.weight,
+            inner.bias,
+            temperature,
+            topk,
+            query_block_size,
+            source_block_size,
+        )
+        return LayerDelta(delta_state=delta_state, delta_val=delta_val)
+    if use_cuda_autograd and isinstance(inner, LowRankBilinearRoute):
+        delta_state, delta_val = _LowRankTransitionQueryTopK.apply(
+            sender_strength,
+            src_val,
+            query_val,
+            projected_state,
+            projected_val,
+            inner.source_proj.weight,
+            inner.target_proj.weight,
+            inner.weight,
+            inner.bias,
+            temperature,
+            topk,
+            query_block_size,
+            source_block_size,
+        )
+        return LayerDelta(delta_state=delta_state, delta_val=delta_val)
     spec = pairwise_route_kernel_spec(route_fn)
     return _to_layer_delta(_native_module().transition_query_topk(
         spec.kind,

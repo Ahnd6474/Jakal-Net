@@ -12,6 +12,7 @@ from jakal_net import (
     Layer,
     LayerDelta,
     LinearRoute,
+    LowRankBilinearPairwise,
     LowRankBilinearRoute,
     MLPRoute,
     Propagation,
@@ -515,8 +516,8 @@ class CudaNativeBackendTests(unittest.TestCase):
         module = native_backend._native_module()
         with mock.patch.object(
             module,
-            "propagation_query_topk",
-            wraps=module.propagation_query_topk,
+            "propagation_query_topk_select",
+            wraps=module.propagation_query_topk_select,
         ) as wrapped:
             actual_propagation = propagation_query_topk_native(
                 pairwise_fn=pairwise,
@@ -548,8 +549,8 @@ class CudaNativeBackendTests(unittest.TestCase):
 
         with mock.patch.object(
             module,
-            "transition_query_topk",
-            wraps=module.transition_query_topk,
+            "transition_query_topk_select",
+            wraps=module.transition_query_topk_select,
         ) as wrapped:
             actual_transition = transition_query_topk_native(
                 route_fn=route_fn,
@@ -564,6 +565,147 @@ class CudaNativeBackendTests(unittest.TestCase):
             )
         self.assertGreater(wrapped.call_count, 0)
         self.assert_delta_close(expected_transition, actual_transition)
+
+    def test_query_only_native_propagation_backward_matches_reference_on_cuda(self) -> None:
+        module = native_backend._native_module()
+        required = {
+            "propagation_query_topk_select",
+            "query_topk_reduce_backward_cuda",
+            "softsign_backward_cuda",
+            "diagonal_pairwise_topk_backward_cuda",
+            "low_rank_pairwise_topk_backward_cuda",
+        }
+        if not required.issubset(set(module.supported_ops())):
+            self.skipTest("Native query propagation backward kernels are unavailable.")
+
+        for pairwise_fn in (
+            DiagonalBilinearPairwise(dim=4).to(self.device),
+            LowRankBilinearPairwise(dim=4, rank=2).to(self.device),
+        ):
+            torch.manual_seed(37)
+            query_val = torch.randn(2, 3, 4, device=self.device, requires_grad=True)
+            source_val = torch.randn(2, 5, 4, device=self.device, requires_grad=True)
+            projected_state = torch.randn(2, 5, device=self.device, requires_grad=True)
+            projected_val = torch.randn(2, 5, 4, device=self.device, requires_grad=True)
+            reference_pairwise = (
+                LowRankBilinearPairwise(dim=4, rank=2).to(self.device)
+                if isinstance(pairwise_fn, LowRankBilinearPairwise)
+                else DiagonalBilinearPairwise(dim=4).to(self.device)
+            )
+            reference_pairwise.load_state_dict(pairwise_fn.state_dict())
+
+            ref_query = query_val.detach().clone().requires_grad_()
+            ref_source = source_val.detach().clone().requires_grad_()
+            ref_projected_state = projected_state.detach().clone().requires_grad_()
+            ref_projected_val = projected_val.detach().clone().requires_grad_()
+
+            actual = propagation_query_topk_native(
+                pairwise_fn=pairwise_fn,
+                edge_compress_name="softsign",
+                query_val=query_val,
+                source_val=source_val,
+                projected_state=projected_state,
+                projected_val=projected_val,
+                topk=3,
+                query_block_size=2,
+                source_block_size=0,
+            )
+            actual_loss = actual.delta_state.square().sum() + actual.delta_val.square().sum()
+            actual_loss.backward()
+
+            scores = reference_pairwise(ref_query, ref_source)
+            selected = torch.topk(scores, k=3, dim=-1)
+            edges = torch.nn.functional.softsign(selected.values)
+            ref_state = (edges * _gather_state(ref_projected_state, selected.indices)).sum(dim=-1)
+            ref_val = (
+                edges.unsqueeze(-1) * _gather_val(ref_projected_val, selected.indices)
+            ).sum(dim=-2)
+            reference_loss = ref_state.square().sum() + ref_val.square().sum()
+            reference_loss.backward()
+
+            for actual_grad, expected_grad in (
+                (query_val.grad, ref_query.grad),
+                (source_val.grad, ref_source.grad),
+                (projected_state.grad, ref_projected_state.grad),
+                (projected_val.grad, ref_projected_val.grad),
+            ):
+                self.assertTrue(torch.allclose(actual_grad, expected_grad, atol=2e-5, rtol=2e-5))
+            for name, parameter in pairwise_fn.named_parameters():
+                expected = dict(reference_pairwise.named_parameters())[name].grad
+                self.assertTrue(torch.allclose(parameter.grad, expected, atol=2e-5, rtol=2e-5))
+
+    def test_query_only_native_transition_backward_matches_reference_on_cuda(self) -> None:
+        module = native_backend._native_module()
+        required = {
+            "transition_query_topk_select",
+            "query_topk_reduce_backward_cuda",
+            "softmax_backward_cuda",
+            "diagonal_pairwise_topk_backward_cuda",
+            "low_rank_pairwise_topk_backward_cuda",
+        }
+        if not required.issubset(set(module.supported_ops())):
+            self.skipTest("Native query transition backward kernels are unavailable.")
+
+        for route_fn in (
+            DiagonalBilinearRoute(src_dim=4, dst_dim=4).to(self.device),
+            LowRankBilinearRoute(src_dim=4, dst_dim=4, rank=2).to(self.device),
+        ):
+            torch.manual_seed(38)
+            src_val = torch.randn(2, 5, 4, device=self.device, requires_grad=True)
+            query_val = torch.randn(2, 3, 4, device=self.device, requires_grad=True)
+            sender_strength = (torch.rand(2, 5, device=self.device) + 0.2).requires_grad_()
+            projected_state = torch.randn(2, 5, device=self.device, requires_grad=True)
+            projected_val = torch.randn(2, 5, 4, device=self.device, requires_grad=True)
+            reference_route = (
+                LowRankBilinearRoute(src_dim=4, dst_dim=4, rank=2).to(self.device)
+                if isinstance(route_fn, LowRankBilinearRoute)
+                else DiagonalBilinearRoute(src_dim=4, dst_dim=4).to(self.device)
+            )
+            reference_route.load_state_dict(route_fn.state_dict())
+
+            ref_src = src_val.detach().clone().requires_grad_()
+            ref_query = query_val.detach().clone().requires_grad_()
+            ref_sender = sender_strength.detach().clone().requires_grad_()
+            ref_projected_state = projected_state.detach().clone().requires_grad_()
+            ref_projected_val = projected_val.detach().clone().requires_grad_()
+
+            actual = transition_query_topk_native(
+                route_fn=route_fn,
+                sender_strength=sender_strength,
+                src_val=src_val,
+                query_val=query_val,
+                projected_state=projected_state,
+                projected_val=projected_val,
+                topk=3,
+                query_block_size=2,
+                source_block_size=0,
+            )
+            actual_loss = actual.delta_state.square().sum() + actual.delta_val.square().sum()
+            actual_loss.backward()
+
+            logits = reference_route(ref_src, ref_query).transpose(-1, -2)
+            selected = torch.topk(logits, k=3, dim=-1)
+            routes = torch.softmax(selected.values, dim=-1)
+            weighted_state = ref_sender * ref_projected_state
+            weighted_val = ref_sender.unsqueeze(-1) * ref_projected_val
+            ref_state = (routes * _gather_state(weighted_state, selected.indices)).sum(dim=-1)
+            ref_val = (
+                routes.unsqueeze(-1) * _gather_val(weighted_val, selected.indices)
+            ).sum(dim=-2)
+            reference_loss = ref_state.square().sum() + ref_val.square().sum()
+            reference_loss.backward()
+
+            for actual_grad, expected_grad in (
+                (src_val.grad, ref_src.grad),
+                (query_val.grad, ref_query.grad),
+                (sender_strength.grad, ref_sender.grad),
+                (projected_state.grad, ref_projected_state.grad),
+                (projected_val.grad, ref_projected_val.grad),
+            ):
+                self.assertTrue(torch.allclose(actual_grad, expected_grad, atol=2e-5, rtol=2e-5))
+            for name, parameter in route_fn.named_parameters():
+                expected = dict(reference_route.named_parameters())[name].grad
+                self.assertTrue(torch.allclose(parameter.grad, expected, atol=2e-5, rtol=2e-5))
 
 
 if __name__ == "__main__":
