@@ -44,6 +44,13 @@ from progressive_b_example import (
     train_next_token_model,
 )
 
+
+def rng_state_payload() -> dict[str, Any]:
+    payload: dict[str, Any] = {"torch": torch.get_rng_state()}
+    if torch.cuda.is_available():
+        payload["cuda"] = torch.cuda.get_rng_state_all()
+    return payload
+
 try:
     import sentencepiece as spm
 except ImportError:
@@ -1195,6 +1202,7 @@ def run_single_experiment(
 
     run_dir = session_dir / slugify_run_name(experiment_name)
     run_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = run_dir / "checkpoints"
     tensorboard_dir = (
         Path(args.tensorboard_dir) / session_dir.name / slugify_run_name(experiment_name)
         if args.tensorboard_dir
@@ -1221,6 +1229,145 @@ def run_single_experiment(
 
     start_time = time.perf_counter()
     writer = maybe_create_summary_writer(enabled=args.tensorboard, tensorboard_dir=tensorboard_dir)
+    best_checkpoint_val_loss = math.inf
+
+    def make_checkpoint_payload(
+        *,
+        step: int,
+        train_loss: float | None,
+        val_loss: float | None,
+        checkpoint_model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer | None,
+        checkpoint_kind: str,
+    ) -> dict[str, Any]:
+        return {
+            "checkpoint_kind": checkpoint_kind,
+            "step": step,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "model_state_dict": checkpoint_model.state_dict(),
+            "optimizer_state_dict": None if optimizer is None else optimizer.state_dict(),
+            "rng_state": rng_state_payload(),
+            "config": {
+                "vocab_size": vocab.size,
+                "tokenizer": tokenizer_label,
+                "tokenizer_model_path": None if tokenizer_model_path is None else str(tokenizer_model_path),
+                "training_objective": args.training_objective,
+                "seq_nodes": args.seq_len,
+                "response_len": args.response_len,
+                "implementation": args.implementation,
+                "precision": args.precision,
+                "value_norm_kind": value_norm_kind,
+                "norm_position": args.norm_position,
+                "propagation_residual": not args.disable_propagation_residual,
+                "route_mode": args.route_mode,
+                "sequence_propagation": args.sequence_propagation,
+                "expanded_propagation": args.expanded_propagation,
+                "compressed_propagation": args.compressed_propagation,
+                "value_residual_scale": args.value_residual_scale,
+                "state_residual_scale": args.state_residual_scale,
+                "route_temperature": args.route_temperature,
+                "route_kind": args.route_kind,
+                "route_hidden_dim": args.route_hidden_dim,
+                "state_init_mode": args.state_init_mode,
+                "pairwise_kind": args.pairwise_kind,
+                "pairwise_hidden_dim": args.pairwise_hidden_dim,
+                "edge_dropout_p": args.edge_dropout_p,
+                "usage_dropout_base": args.usage_dropout_base,
+                "usage_dropout_scale": args.usage_dropout_scale,
+                "usage_dropout_max": args.usage_dropout_max,
+                "usage_ema_decay": args.usage_ema_decay,
+                "alpha_scale": args.alpha_scale,
+                "beta_s_to_b_scale": args.beta_s_to_b_scale,
+                "beta_b_to_s_scale": args.beta_b_to_s_scale,
+                "s_delta_scale": args.s_delta_scale,
+                "b_delta_scale": args.b_delta_scale,
+                "cross_delta_scale": args.cross_delta_scale,
+                "b_schedule": args.b_schedule,
+                "b_schedule_min": args.b_schedule_min,
+                "b_schedule_max": args.b_schedule_max,
+                "stage_specs": [asdict(spec) for spec in stage_specs],
+                **{key: int(value) if isinstance(value, int) else value for key, value in effective_config.items()},
+            },
+            "metadata": {
+                "experiment": experiment_name,
+                "parameter_count": parameter_count,
+                "corpus_source_label": corpus.source_label,
+                "corpus_char_count": corpus.char_count,
+                "corpus_sample_count": corpus.sample_count,
+                "steps_per_epoch": steps_per_epoch,
+                "train_steps": train_steps,
+            },
+        }
+
+    def save_checkpoint(
+        *,
+        step: int,
+        train_loss: float | None,
+        val_loss: float | None,
+        checkpoint_model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer | None,
+        checkpoint_kind: str,
+        filename: str,
+    ) -> Path:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        path = checkpoint_dir / filename
+        torch.save(
+            make_checkpoint_payload(
+                step=step,
+                train_loss=train_loss,
+                val_loss=val_loss,
+                checkpoint_model=checkpoint_model,
+                optimizer=optimizer,
+                checkpoint_kind=checkpoint_kind,
+            ),
+            path,
+        )
+        write_json(
+            checkpoint_dir / f"{path.stem}.json",
+            {
+                "path": str(path),
+                "checkpoint_kind": checkpoint_kind,
+                "step": step,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+            },
+        )
+        return path
+
+    def training_checkpoint_callback(
+        step: int,
+        train_loss: float,
+        val_loss: float,
+        checkpoint_model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+    ) -> None:
+        nonlocal best_checkpoint_val_loss
+        if not args.save_checkpoint:
+            return
+        last_path = save_checkpoint(
+            step=step,
+            train_loss=train_loss,
+            val_loss=val_loss,
+            checkpoint_model=checkpoint_model,
+            optimizer=optimizer,
+            checkpoint_kind="last",
+            filename="last.pt",
+        )
+        if val_loss < best_checkpoint_val_loss:
+            best_checkpoint_val_loss = val_loss
+            best_path = save_checkpoint(
+                step=step,
+                train_loss=train_loss,
+                val_loss=val_loss,
+                checkpoint_model=checkpoint_model,
+                optimizer=optimizer,
+                checkpoint_kind="best",
+                filename="best.pt",
+            )
+            print(f"checkpoint | step={step} | best_val_loss={val_loss:.4f} | path={best_path}")
+        else:
+            print(f"checkpoint | step={step} | val_loss={val_loss:.4f} | path={last_path}")
 
     def make_eval_sample() -> tuple[str, str]:
         if response_objective:
@@ -1370,6 +1517,7 @@ def run_single_experiment(
                 progress_callback=progress_callback,
                 step_callback=step_tensorboard_callback,
                 eval_callback=eval_tensorboard_callback,
+                checkpoint_callback=training_checkpoint_callback,
                 autocast_device_type=autocast_device_type,
                 autocast_dtype=autocast_dtype,
             )
@@ -1396,6 +1544,7 @@ def run_single_experiment(
                 progress_callback=progress_callback,
                 step_callback=step_tensorboard_callback,
                 eval_callback=eval_tensorboard_callback,
+                checkpoint_callback=training_checkpoint_callback,
                 autocast_device_type=autocast_device_type,
                 autocast_dtype=autocast_dtype,
             )
@@ -1533,57 +1682,24 @@ def run_single_experiment(
     }
     metrics_rows = build_metrics_rows(history, steps_per_epoch=steps_per_epoch)
 
-    checkpoint_payload = None
+    final_checkpoint_payload = None
     if args.save_checkpoint:
-        checkpoint_payload = {
-            "model_state_dict": model.state_dict(),
-            "config": {
-                "vocab_size": vocab.size,
-                "tokenizer": tokenizer_label,
-                "tokenizer_model_path": None if tokenizer_model_path is None else str(tokenizer_model_path),
-                "seq_nodes": args.seq_len,
-                "implementation": args.implementation,
-                "value_norm_kind": value_norm_kind,
-                "norm_position": args.norm_position,
-                "propagation_residual": not args.disable_propagation_residual,
-                "route_mode": args.route_mode,
-                "sequence_propagation": args.sequence_propagation,
-                "expanded_propagation": args.expanded_propagation,
-                "compressed_propagation": args.compressed_propagation,
-                "value_residual_scale": args.value_residual_scale,
-                "state_residual_scale": args.state_residual_scale,
-                "route_temperature": args.route_temperature,
-                "route_kind": args.route_kind,
-                "route_hidden_dim": args.route_hidden_dim,
-                "state_init_mode": args.state_init_mode,
-                "pairwise_kind": args.pairwise_kind,
-                "pairwise_hidden_dim": args.pairwise_hidden_dim,
-                "edge_dropout_p": args.edge_dropout_p,
-                "usage_dropout_base": args.usage_dropout_base,
-                "usage_dropout_scale": args.usage_dropout_scale,
-                "usage_dropout_max": args.usage_dropout_max,
-                "usage_ema_decay": args.usage_ema_decay,
-                "alpha_scale": args.alpha_scale,
-                "beta_s_to_b_scale": args.beta_s_to_b_scale,
-                "beta_b_to_s_scale": args.beta_b_to_s_scale,
-                "s_delta_scale": args.s_delta_scale,
-                "b_delta_scale": args.b_delta_scale,
-                "cross_delta_scale": args.cross_delta_scale,
-                "b_schedule": args.b_schedule,
-                "b_schedule_min": args.b_schedule_min,
-                "b_schedule_max": args.b_schedule_max,
-                "stage_specs": [asdict(spec) for spec in stage_specs],
-                **{key: int(value) if isinstance(value, int) else value for key, value in effective_config.items()},
-            },
-            "history": {
-                "eval_steps": history.eval_steps,
-                "train_step_losses": history.train_step_losses,
-                "train_losses": history.train_losses,
-                "val_losses": history.val_losses,
-            },
-            "summary": summary,
-            "corpus": to_jsonable(corpus),
+        final_checkpoint_payload = make_checkpoint_payload(
+            step=train_steps,
+            train_loss=final_train_loss,
+            val_loss=final_val_loss,
+            checkpoint_model=model,
+            optimizer=None,
+            checkpoint_kind="final",
+        )
+        final_checkpoint_payload["history"] = {
+            "eval_steps": history.eval_steps,
+            "train_step_losses": history.train_step_losses,
+            "train_losses": history.train_losses,
+            "val_losses": history.val_losses,
         }
+        final_checkpoint_payload["summary"] = summary
+        final_checkpoint_payload["corpus"] = to_jsonable(corpus)
 
     save_run_artifacts(
         run_dir=run_dir,
@@ -1599,7 +1715,7 @@ def run_single_experiment(
         prompt_text=prompt_text,
         generated_text=generated_text,
         summary=summary,
-        checkpoint_payload=checkpoint_payload,
+        checkpoint_payload=final_checkpoint_payload,
     )
 
     try:

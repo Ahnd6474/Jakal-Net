@@ -1725,6 +1725,7 @@ def train_next_token_model(
     progress_callback: Callable[[int, int, float], None] | None = None,
     step_callback: Callable[[int, float, float], None] | None = None,
     eval_callback: Callable[[int, float, float], None] | None = None,
+    checkpoint_callback: Callable[[int, float, float, nn.Module, torch.optim.Optimizer], None] | None = None,
     autocast_device_type: str | None = None,
     autocast_dtype: torch.dtype | None = None,
 ) -> TrainingHistory:
@@ -1823,6 +1824,8 @@ def train_next_token_model(
             )
             train_losses.append(train_eval)
             val_losses.append(val_eval)
+            if checkpoint_callback is not None:
+                checkpoint_callback(step, train_eval, val_eval, model, optimizer)
             if eval_callback is not None:
                 eval_callback(step, train_eval, val_eval)
 
@@ -1860,6 +1863,7 @@ def train_prefix_response_model(
     progress_callback: Callable[[int, int, float], None] | None = None,
     step_callback: Callable[[int, float, float], None] | None = None,
     eval_callback: Callable[[int, float, float], None] | None = None,
+    checkpoint_callback: Callable[[int, float, float, nn.Module, torch.optim.Optimizer], None] | None = None,
     autocast_device_type: str | None = None,
     autocast_dtype: torch.dtype | None = None,
 ) -> TrainingHistory:
@@ -1959,6 +1963,8 @@ def train_prefix_response_model(
             )
             train_losses.append(train_eval)
             val_losses.append(val_eval)
+            if checkpoint_callback is not None:
+                checkpoint_callback(step, train_eval, val_eval, model, optimizer)
             if eval_callback is not None:
                 eval_callback(step, train_eval, val_eval)
 
