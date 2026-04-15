@@ -1726,6 +1726,7 @@ def train_next_token_model(
     step_callback: Callable[[int, float, float], None] | None = None,
     eval_callback: Callable[[int, float, float], None] | None = None,
     checkpoint_callback: Callable[[int, float, float, nn.Module, torch.optim.Optimizer], None] | None = None,
+    eval_on_first_step: bool = True,
     autocast_device_type: str | None = None,
     autocast_dtype: torch.dtype | None = None,
 ) -> TrainingHistory:
@@ -1794,7 +1795,7 @@ def train_next_token_model(
         if step_callback is not None:
             step_callback(step, step_loss, grad_norm)
 
-        if step % eval_interval == 0 or step == 1 or step == steps:
+        if step % eval_interval == 0 or (eval_on_first_step and step == 1) or step == steps:
             eval_steps_seen.append(step)
             train_eval = estimate_next_token_loss(
                 model,
@@ -1864,6 +1865,7 @@ def train_prefix_response_model(
     step_callback: Callable[[int, float, float], None] | None = None,
     eval_callback: Callable[[int, float, float], None] | None = None,
     checkpoint_callback: Callable[[int, float, float, nn.Module, torch.optim.Optimizer], None] | None = None,
+    eval_on_first_step: bool = True,
     autocast_device_type: str | None = None,
     autocast_dtype: torch.dtype | None = None,
 ) -> TrainingHistory:
@@ -1931,7 +1933,7 @@ def train_prefix_response_model(
         if step_callback is not None:
             step_callback(step, step_loss, grad_norm)
 
-        if step % eval_interval == 0 or step == 1 or step == steps:
+        if step % eval_interval == 0 or (eval_on_first_step and step == 1) or step == steps:
             eval_steps_seen.append(step)
             train_eval = estimate_prefix_response_loss(
                 model,

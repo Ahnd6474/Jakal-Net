@@ -15,6 +15,11 @@ from typing import Any, Sequence
 
 import torch
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
+
 from jakal_net import describe_device, resolve_device
 from lm_experiment_utils import (
     MODEL_SIZE_PRESETS,
@@ -1134,6 +1139,10 @@ def run_single_experiment(
     else:
         train_steps = args.steps
         requested_epochs = train_steps / steps_per_epoch
+    effective_eval_interval = steps_per_epoch if args.eval_every_epoch else args.eval_interval
+    if effective_eval_interval <= 0:
+        raise ValueError("eval interval must be positive.")
+    eval_on_first_step = not args.eval_every_epoch
 
     stage_specs = build_progressive_b_stage_specs(
         seq_nodes=args.seq_len,
@@ -1223,6 +1232,7 @@ def run_single_experiment(
         f"steps_per_epoch={steps_per_epoch:,} | batch_size={args.batch_size} | "
         f"grad_accum_steps={grad_accum_steps} | effective_batch_size={effective_batch_size} | "
         f"objective={args.training_objective} | response_len={args.response_len} | "
+        f"eval_interval={effective_eval_interval:,} | eval_every_epoch={args.eval_every_epoch} | "
         f"data_workers={args.data_workers} | "
         f"prefetch_factor={args.prefetch_factor}"
     )
@@ -1230,6 +1240,17 @@ def run_single_experiment(
     start_time = time.perf_counter()
     writer = maybe_create_summary_writer(enabled=args.tensorboard, tensorboard_dir=tensorboard_dir)
     best_checkpoint_val_loss = math.inf
+    progress_bar: Any | None = None
+    last_progress_step = 0
+    if args.tqdm:
+        if tqdm is None:
+            raise ImportError("tqdm is required when --tqdm is set.")
+        progress_bar = tqdm(
+            total=requested_epochs,
+            unit="epoch",
+            dynamic_ncols=True,
+            desc=experiment_name,
+        )
 
     def make_checkpoint_payload(
         *,
@@ -1365,9 +1386,17 @@ def run_single_experiment(
                 checkpoint_kind="best",
                 filename="best.pt",
             )
-            print(f"checkpoint | step={step} | best_val_loss={val_loss:.4f} | path={best_path}")
+            checkpoint_message = (
+                f"checkpoint | step={step} | best_val_loss={val_loss:.4f} | path={best_path}"
+            )
         else:
-            print(f"checkpoint | step={step} | val_loss={val_loss:.4f} | path={last_path}")
+            checkpoint_message = (
+                f"checkpoint | step={step} | val_loss={val_loss:.4f} | path={last_path}"
+            )
+        if progress_bar is not None:
+            progress_bar.write(checkpoint_message)
+        else:
+            print(checkpoint_message)
 
     def make_eval_sample() -> tuple[str, str]:
         if response_objective:
@@ -1403,16 +1432,28 @@ def run_single_experiment(
         return prompt_text, vocab.decode(generated.tolist())
 
     def progress_callback(step: int, total_steps: int, minibatch_loss: float) -> None:
+        nonlocal last_progress_step
+        if progress_bar is not None:
+            progress_bar.update((step - last_progress_step) / steps_per_epoch)
+            last_progress_step = step
+            progress_bar.set_postfix(
+                step=f"{step}/{total_steps}",
+                loss=f"{minibatch_loss:.4f}",
+            )
         if args.log_interval <= 0:
             return
         if step != 1 and step != total_steps and step % args.log_interval != 0:
             return
         elapsed = time.perf_counter() - start_time
-        print(
+        progress_message = (
             f"progress | experiment={experiment_name} | step={step:>5d}/{total_steps:<5d} | "
             f"epoch={step / steps_per_epoch:.3f} | {100.0 * step / total_steps:5.1f}% | "
             f"minibatch_loss={minibatch_loss:.4f} | elapsed={elapsed:.1f}s"
         )
+        if progress_bar is not None:
+            progress_bar.write(progress_message)
+        else:
+            print(progress_message)
 
     def step_tensorboard_callback(step: int, minibatch_loss: float, grad_norm: float) -> None:
         if writer is None:
@@ -1467,11 +1508,15 @@ def run_single_experiment(
                 ),
                 step,
             )
-            print(
+            sample_message = (
                 f"eval_sample | step={step}\n"
                 f"--- prompt ---\n{sample_prompt}\n\n"
                 f"--- sample ---\n{sample_generated}"
             )
+            if progress_bar is not None:
+                progress_bar.write(sample_message)
+            else:
+                print(sample_message)
             writer.flush()
         if trial is not None:
             trial.report(val_loss, step)
@@ -1506,7 +1551,7 @@ def run_single_experiment(
                 pad_token_id=special_token_ids["pad"],
                 device=device,
                 steps=train_steps,
-                eval_interval=args.eval_interval,
+                eval_interval=effective_eval_interval,
                 eval_steps=args.eval_steps,
                 learning_rate=args.learning_rate,
                 weight_decay=args.weight_decay,
@@ -1518,6 +1563,7 @@ def run_single_experiment(
                 step_callback=step_tensorboard_callback,
                 eval_callback=eval_tensorboard_callback,
                 checkpoint_callback=training_checkpoint_callback,
+                eval_on_first_step=eval_on_first_step,
                 autocast_device_type=autocast_device_type,
                 autocast_dtype=autocast_dtype,
             )
@@ -1530,7 +1576,7 @@ def run_single_experiment(
                 batch_size=args.batch_size,
                 device=device,
                 steps=train_steps,
-                eval_interval=args.eval_interval,
+                eval_interval=effective_eval_interval,
                 eval_steps=args.eval_steps,
                 learning_rate=args.learning_rate,
                 weight_decay=args.weight_decay,
@@ -1545,14 +1591,19 @@ def run_single_experiment(
                 step_callback=step_tensorboard_callback,
                 eval_callback=eval_tensorboard_callback,
                 checkpoint_callback=training_checkpoint_callback,
+                eval_on_first_step=eval_on_first_step,
                 autocast_device_type=autocast_device_type,
                 autocast_dtype=autocast_dtype,
             )
     except Exception:
+        if progress_bar is not None:
+            progress_bar.close()
         if writer is not None:
             writer.flush()
             writer.close()
         raise
+    if progress_bar is not None:
+        progress_bar.close()
     runtime_seconds = time.perf_counter() - start_time
     print_eval_table(history, steps_per_epoch=steps_per_epoch)
 
@@ -1814,8 +1865,18 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--epochs", type=float)
     parser.add_argument("--eval-interval", type=int, default=20)
+    parser.add_argument(
+        "--eval-every-epoch",
+        action="store_true",
+        help="Run eval, TensorBoard sample logging, and eval-tied checkpoints once per epoch.",
+    )
     parser.add_argument("--eval-steps", type=int, default=10)
     parser.add_argument("--log-interval", type=int, default=25)
+    parser.add_argument(
+        "--tqdm",
+        action="store_true",
+        help="Show tqdm progress with epoch progress and ETA.",
+    )
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--data-workers", type=int, default=0)
     parser.add_argument("--prefetch-factor", type=int, default=2)
