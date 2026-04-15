@@ -62,6 +62,11 @@ except ImportError:
     spm = None
 
 try:
+    from tokenizers import ByteLevelBPETokenizer
+except ImportError:
+    ByteLevelBPETokenizer = None
+
+try:
     from torch.utils.tensorboard import SummaryWriter
 except ImportError:
     SummaryWriter = None
@@ -132,6 +137,32 @@ class SubwordVocab:
                 f"Tokenizer {self.model_path} does not contain required piece {piece!r}."
             )
         return idx
+
+
+@dataclass(frozen=True, slots=True)
+class ByteBPEVocab:
+    tokenizer: object
+    vocab_path: Path
+    merges_path: Path
+
+    @property
+    def size(self) -> int:
+        return int(self.tokenizer.get_vocab_size())
+
+    def encode(self, text: str) -> torch.Tensor:
+        token_ids = self.tokenizer.encode(text).ids
+        return torch.tensor(token_ids, dtype=torch.long)
+
+    def decode(self, token_ids: Sequence[int]) -> str:
+        return str(self.tokenizer.decode(list(map(int, token_ids))))
+
+    def token_id(self, piece: str) -> int:
+        idx = self.tokenizer.token_to_id(piece)
+        if idx is None:
+            raise ValueError(
+                f"Tokenizer {self.vocab_path} does not contain required token {piece!r}."
+            )
+        return int(idx)
 
 
 def count_parameters(model: torch.nn.Module) -> int:
@@ -282,6 +313,57 @@ def build_subword_vocab(
     )
 
 
+def build_byte_bpe_vocab(
+    text: str,
+    *,
+    text_path: str | None,
+    vocab_size: int,
+    tokenizer_prefix: str | None,
+    input_sentence_size: int = 0,
+    num_threads: int = 0,
+    user_defined_symbols: Sequence[str] = (),
+) -> ByteBPEVocab:
+    if ByteLevelBPETokenizer is None:
+        raise ImportError(
+            "tokenizers is required for --tokenizer byte_bpe. "
+            "Install dependencies from requirements-base.txt first."
+        )
+    if vocab_size <= 0:
+        raise ValueError("subword-vocab-size must be positive.")
+    if input_sentence_size < 0:
+        raise ValueError("subword-input-sentence-size must be non-negative.")
+    if num_threads < 0:
+        raise ValueError("subword-num-threads must be non-negative.")
+
+    prefix_path = resolve_tokenizer_prefix(
+        text=text,
+        tokenizer="byte_bpe",
+        model_type="byte_level",
+        vocab_size=vocab_size,
+        prefix=tokenizer_prefix,
+    )
+    vocab_path = prefix_path.parent / f"{prefix_path.name}-vocab.json"
+    merges_path = prefix_path.parent / f"{prefix_path.name}-merges.txt"
+
+    if not vocab_path.exists() or not merges_path.exists():
+        training_text_path = ensure_tokenizer_training_text(
+            text=text,
+            text_path=text_path,
+            tokenizer_prefix=prefix_path,
+        )
+        tokenizer = ByteLevelBPETokenizer()
+        tokenizer.train(
+            files=[str(training_text_path)],
+            vocab_size=vocab_size,
+            min_frequency=2,
+            special_tokens=list(user_defined_symbols),
+        )
+        tokenizer.save_model(str(prefix_path.parent), prefix_path.name)
+
+    tokenizer = ByteLevelBPETokenizer(str(vocab_path), str(merges_path))
+    return ByteBPEVocab(tokenizer=tokenizer, vocab_path=vocab_path, merges_path=merges_path)
+
+
 def build_tokenizer(
     text: str,
     *,
@@ -314,6 +396,17 @@ def build_tokenizer(
             f"subword/{subword_vocab.model_type}",
             subword_vocab.model_path,
         )
+    if tokenizer == "byte_bpe":
+        byte_bpe_vocab = build_byte_bpe_vocab(
+            text,
+            text_path=text_path,
+            vocab_size=subword_vocab_size,
+            tokenizer_prefix=tokenizer_prefix,
+            input_sentence_size=subword_input_sentence_size,
+            num_threads=subword_num_threads,
+            user_defined_symbols=user_defined_symbols,
+        )
+        return byte_bpe_vocab, "byte_bpe", byte_bpe_vocab.vocab_path
     raise ValueError(f"Unsupported tokenizer: {tokenizer!r}.")
 
 
@@ -387,6 +480,195 @@ def _pairs_from_record(record: Any) -> list[DialoguePairText]:
             )
         ]
     return []
+
+
+def _chat_transcript_from_messages(messages: Sequence[dict[str, Any]]) -> str | None:
+    parts: list[str] = []
+    has_assistant = False
+    for message in messages:
+        role = _message_role(message)
+        content = _message_content(message)
+        if not content:
+            continue
+        if role == "user":
+            parts.append(f"{USER_TOKEN}\n{content}")
+        elif role == "assistant":
+            parts.append(f"{ASSISTANT_TOKEN}\n{content}")
+            has_assistant = True
+    if not parts or not has_assistant:
+        return None
+    return "\n".join(parts)
+
+
+def _text_from_record_keys(record: Any, text_keys: Sequence[str]) -> str | None:
+    if isinstance(record, str):
+        return record.strip() or None
+    if not isinstance(record, dict):
+        return None
+    for key in text_keys:
+        value = record.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _chat_stream_from_record(record: Any) -> str | None:
+    if not isinstance(record, dict):
+        return None
+    prefix = record.get("prefix")
+    response = record.get("response")
+    if isinstance(prefix, str) and prefix.strip() and isinstance(response, str) and response.strip():
+        separator = "" if prefix.endswith(("\n", " ", "\t")) else "\n"
+        return f"{prefix}{separator}{response.strip()}"
+    messages = record.get("messages") or record.get("conversations")
+    if isinstance(messages, list):
+        normalized = [message for message in messages if isinstance(message, dict)]
+        transcript = _chat_transcript_from_messages(normalized)
+        if transcript is not None:
+            return transcript
+    prompt = None
+    for key in ("prompt", "instruction", "question", "input"):
+        value = record.get(key)
+        if isinstance(value, str) and value.strip():
+            prompt = value.strip()
+            break
+    response = None
+    for key in ("response", "output", "answer", "completion"):
+        value = record.get(key)
+        if isinstance(value, str) and value.strip():
+            response = value.strip()
+            break
+    if prompt and response:
+        return f"{USER_TOKEN}\n{prompt}\n{ASSISTANT_TOKEN}\n{response}"
+    return None
+
+
+def load_token_stream_corpus(
+    *,
+    default_text: str,
+    text_file: str | None,
+    text_sources: Sequence[str],
+    jsonl_sources: Sequence[str],
+    jsonl_text_keys: Sequence[str],
+    hf_dataset: str | None,
+    hf_config: str | None,
+    hf_split: str,
+    hf_text_key: str,
+    hf_streaming: bool,
+    max_samples: int | None,
+    max_chars: int | None,
+    separator: str,
+) -> CorpusLoadResult:
+    from lm_experiment_utils import _expand_sources, _truncate_texts
+
+    sources = [text_file] if text_file is not None else []
+    sources.extend(text_sources)
+    text_paths = _expand_sources(sources, directory_suffixes=(".txt", ".text", ".md"))
+    jsonl_paths = _expand_sources(jsonl_sources, directory_suffixes=(".jsonl", ".json"))
+    eos_separator = f"\n{EOS_TOKEN}\n"
+
+    pieces: list[str] = []
+    chat_record_count = 0
+    text_record_count = 0
+    for path in text_paths:
+        text = path.read_text(encoding="utf-8")
+        if not text.strip():
+            raise ValueError(f"Input text file must not be empty: {path}")
+        pieces.append(text.strip())
+    for path in jsonl_paths:
+        with path.open("r", encoding="utf-8") as handle:
+            for line_number, raw_line in enumerate(handle, start=1):
+                line = raw_line.strip().lstrip("\ufeff")
+                if not line:
+                    continue
+                record = json.loads(line)
+                stream = _chat_stream_from_record(record)
+                if stream is not None:
+                    pieces.append(stream.strip())
+                    chat_record_count += 1
+                else:
+                    text = _text_from_record_keys(record, jsonl_text_keys)
+                    if text is None:
+                        raise ValueError(
+                            f"Could not find chat or text in {path} line {line_number}. "
+                            f"Tried text keys: {', '.join(jsonl_text_keys)}."
+                        )
+                    pieces.append(text)
+                    text_record_count += 1
+                if max_samples is not None and len(pieces) >= max_samples:
+                    break
+        if max_samples is not None and len(pieces) >= max_samples:
+            break
+    if hf_dataset is not None and (max_samples is None or len(pieces) < max_samples):
+        hf_corpus = load_text_corpus(
+            default_text="",
+            text_file=None,
+            text_sources=(),
+            jsonl_sources=(),
+            jsonl_text_keys=jsonl_text_keys,
+            hf_dataset=hf_dataset,
+            hf_config=hf_config,
+            hf_split=hf_split,
+            hf_text_key=hf_text_key,
+            hf_streaming=hf_streaming,
+            max_samples=None if pieces else max_samples,
+            max_chars=None,
+            separator=separator,
+        )
+        if hf_corpus.text.strip():
+            pieces.append(hf_corpus.text.strip())
+            text_record_count += hf_corpus.sample_count
+    if not pieces:
+        pieces.append(default_text.strip())
+        text_record_count += 1
+
+    combined_text, sample_count, truncated = _truncate_texts(
+        pieces,
+        separator=eos_separator,
+        max_samples=max_samples,
+        max_chars=max_chars,
+    )
+    combined_text = combined_text.rstrip()
+    if not combined_text.endswith(EOS_TOKEN):
+        combined_text = f"{combined_text}{eos_separator}"
+    else:
+        combined_text = f"{combined_text}\n"
+
+    source_parts: list[str] = []
+    if text_paths:
+        source_parts.append(f"text_files={len(text_paths)}")
+    if jsonl_paths:
+        source_parts.append(f"jsonl_files={len(jsonl_paths)}")
+    if hf_dataset is not None:
+        source_parts.append(f"hf_dataset={hf_dataset}:{hf_split}")
+    if not source_parts:
+        source_parts.append("default_text")
+
+    return CorpusLoadResult(
+        text=combined_text,
+        source_label=f"token_stream,{', '.join(source_parts)}",
+        text_path=None,
+        sample_count=sample_count,
+        file_count=len(text_paths) + len(jsonl_paths),
+        char_count=len(combined_text),
+        truncated=truncated,
+        metadata={
+            "source_kind": "token_stream",
+            "text_paths": [str(path) for path in text_paths],
+            "jsonl_paths": [str(path) for path in jsonl_paths],
+            "hf_dataset": hf_dataset,
+            "hf_config": hf_config,
+            "hf_split": hf_split,
+            "hf_text_key": hf_text_key,
+            "hf_streaming": hf_streaming,
+            "max_samples": max_samples,
+            "max_chars": max_chars,
+            "chat_record_count": chat_record_count,
+            "text_record_count": text_record_count,
+            "eos_at_document_boundaries": True,
+            "document_separator": EOS_TOKEN,
+        },
+    )
 
 
 def split_prediction_units(text: str, *, min_chars: int = 8) -> list[str]:
@@ -715,15 +997,40 @@ def encode_dialogue_pairs(
     return encoded
 
 
-def require_subword_special_ids(vocab: object) -> dict[str, int]:
-    if not isinstance(vocab, SubwordVocab):
-        raise ValueError("prefix_response currently requires --tokenizer subword.")
+def require_special_token_ids(vocab: object) -> dict[str, int]:
+    if not hasattr(vocab, "token_id"):
+        raise ValueError(
+            "This objective requires a tokenizer with explicit special-token ids "
+            "(use --tokenizer subword or --tokenizer byte_bpe)."
+        )
     return {
         "user": vocab.token_id(USER_TOKEN),
         "assistant": vocab.token_id(ASSISTANT_TOKEN),
         "eos": vocab.token_id(EOS_TOKEN),
         "pad": vocab.token_id(PAD_TOKEN),
     }
+
+
+def append_eos_markers_to_corpus(corpus: CorpusLoadResult, *, separator: str) -> CorpusLoadResult:
+    eos_marker = f"\n{EOS_TOKEN}\n"
+    text = corpus.text
+    if separator and separator in text:
+        text = text.replace(separator, eos_marker)
+    text = text.rstrip()
+    if not text.endswith(EOS_TOKEN):
+        text = f"{text}{eos_marker}"
+    else:
+        text = f"{text}\n"
+    return CorpusLoadResult(
+        text=text,
+        source_label=f"{corpus.source_label}+eos",
+        text_path=None,
+        sample_count=corpus.sample_count,
+        file_count=corpus.file_count,
+        char_count=len(text),
+        truncated=corpus.truncated,
+        metadata={**corpus.metadata, "eos_markers_inserted": True},
+    )
 
 
 @torch.no_grad()
@@ -738,6 +1045,7 @@ def generate_next_tokens_with_sampling(
     sample_topk: int | None,
     training_objective: str = "last_token",
     eos_token_id: int | None = None,
+    target_len: int = 1,
 ) -> torch.Tensor:
     if temperature is not None and temperature <= 0.0:
         raise ValueError("temperature must be positive when sampling is enabled.")
@@ -747,30 +1055,42 @@ def generate_next_tokens_with_sampling(
     was_training = model.training
     model.eval()
     generated = prompt.to(device).clone()
-    for _ in range(max_new_tokens):
+    tokens_remaining = max_new_tokens
+    while tokens_remaining > 0:
         context = generated[-seq_len:].unsqueeze(0)
         if training_objective == "full_sequence_causal":
             logits = model(context, full_sequence_causal=True)[..., -1, :]
+        elif training_objective == "query_block":
+            block_len = min(max(1, target_len), tokens_remaining)
+            logits = model.forward_query_block(context, target_len=block_len)
         elif training_objective == "query_next_token":
             logits = model.forward_query_next_token(context)
         else:
             logits = model(context)
-        if temperature is None:
-            next_token = torch.argmax(logits, dim=-1)
-        else:
-            scaled_logits = logits / temperature
-            if sample_topk is not None:
-                k = min(sample_topk, scaled_logits.shape[-1])
-                topk_logits, topk_indices = torch.topk(scaled_logits, k=k, dim=-1)
-                probs = torch.softmax(topk_logits, dim=-1)
-                sampled_offset = torch.multinomial(probs, num_samples=1)
-                next_token = topk_indices.gather(-1, sampled_offset).reshape(-1)
+        if logits.ndim == 2:
+            logits = logits.unsqueeze(1)
+        sampled_tokens: list[torch.Tensor] = []
+        for offset in range(logits.shape[1]):
+            step_logits = logits[:, offset, :]
+            if temperature is None:
+                next_token = torch.argmax(step_logits, dim=-1)
             else:
-                probs = torch.softmax(scaled_logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1).reshape(-1)
-        generated = torch.cat((generated, next_token), dim=0)
-        if eos_token_id is not None and int(next_token.item()) == eos_token_id:
-            break
+                scaled_logits = step_logits / temperature
+                if sample_topk is not None:
+                    k = min(sample_topk, scaled_logits.shape[-1])
+                    topk_logits, topk_indices = torch.topk(scaled_logits, k=k, dim=-1)
+                    probs = torch.softmax(topk_logits, dim=-1)
+                    sampled_offset = torch.multinomial(probs, num_samples=1)
+                    next_token = topk_indices.gather(-1, sampled_offset).reshape(-1)
+                else:
+                    probs = torch.softmax(scaled_logits, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1).reshape(-1)
+            sampled_tokens.append(next_token)
+            tokens_remaining -= 1
+            if eos_token_id is not None and int(next_token.item()) == eos_token_id:
+                tokens_remaining = 0
+                break
+        generated = torch.cat((generated, torch.cat(sampled_tokens, dim=0)), dim=0)
     if was_training:
         model.train()
     return generated
@@ -1107,6 +1427,7 @@ def run_single_experiment(
     teacher_forcing: bool,
     full_sequence_causal: bool,
     query_next_token: bool,
+    query_block: bool,
     train_response_pairs: Sequence[tuple[torch.Tensor, torch.Tensor]] | None = None,
     val_response_pairs: Sequence[tuple[torch.Tensor, torch.Tensor]] | None = None,
     special_token_ids: dict[str, int] | None = None,
@@ -1239,7 +1560,8 @@ def run_single_experiment(
         f"schedule_steps={train_steps:,} | approx_epochs={requested_epochs:.3f} | "
         f"steps_per_epoch={steps_per_epoch:,} | batch_size={args.batch_size} | "
         f"grad_accum_steps={grad_accum_steps} | effective_batch_size={effective_batch_size} | "
-        f"objective={args.training_objective} | response_len={args.response_len} | "
+        f"objective={args.training_objective} | target_len={args.target_len} | "
+        f"response_len={args.response_len} | "
         f"eval_interval={effective_eval_interval:,} | eval_every_epoch={args.eval_every_epoch} | "
         f"data_workers={args.data_workers} | "
         f"prefetch_factor={args.prefetch_factor}"
@@ -1283,6 +1605,7 @@ def run_single_experiment(
                 "tokenizer_model_path": None if tokenizer_model_path is None else str(tokenizer_model_path),
                 "training_objective": args.training_objective,
                 "seq_nodes": args.seq_len,
+                "target_len": args.target_len,
                 "response_len": args.response_len,
                 "implementation": args.implementation,
                 "precision": args.precision,
@@ -1437,9 +1760,11 @@ def run_single_experiment(
             temperature=args.temperature,
             sample_topk=args.sample_topk,
             training_objective=args.training_objective,
+            target_len=args.target_len,
             eos_token_id=(
                 vocab.token_id(EOS_TOKEN)
-                if args.training_objective == "query_next_token" and isinstance(vocab, SubwordVocab)
+                if args.training_objective in {"query_next_token", "query_block"}
+                and hasattr(vocab, "token_id")
                 else None
             ),
         )
@@ -1598,6 +1923,8 @@ def run_single_experiment(
                 teacher_forcing=teacher_forcing,
                 full_sequence_causal=full_sequence_causal,
                 query_next_token=query_next_token,
+                query_block=query_block,
+                target_len=args.target_len if query_block else 1,
                 teacher_forcing_chunk_size=args.teacher_forcing_chunk_size,
                 data_workers=args.data_workers,
                 prefetch_factor=args.prefetch_factor,
@@ -1653,9 +1980,11 @@ def run_single_experiment(
             temperature=args.temperature,
             sample_topk=args.sample_topk,
             training_objective=args.training_objective,
+            target_len=args.target_len,
             eos_token_id=(
                 vocab.token_id(EOS_TOKEN)
-                if args.training_objective == "query_next_token" and isinstance(vocab, SubwordVocab)
+                if args.training_objective in {"query_next_token", "query_block"}
+                and hasattr(vocab, "token_id")
                 else None
             ),
         )
@@ -1673,9 +2002,10 @@ def run_single_experiment(
         "model_preset": effective_config["model_preset"],
         "tokenizer": tokenizer_label,
         "tokenizer_vocab_size": vocab.size,
-        "subword_vocab_size": args.subword_vocab_size if args.tokenizer == "subword" else None,
+        "subword_vocab_size": args.subword_vocab_size if args.tokenizer in {"subword", "byte_bpe"} else None,
         "tokenizer_model_path": tokenizer_model_path,
         "seq_len": args.seq_len,
+        "target_len": args.target_len,
         "response_len": args.response_len,
         "sentence_prefix_count": args.sentence_prefix_count,
         "sentence_min_chars": args.sentence_min_chars,
@@ -1854,6 +2184,7 @@ def main() -> None:
             "teacher_forcing",
             "full_sequence_causal",
             "query_next_token",
+            "query_block",
             "prefix_response",
             "next_sentence_response",
         ),
@@ -1861,7 +2192,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--tokenizer",
-        choices=("char", "subword"),
+        choices=("char", "subword", "byte_bpe"),
         default="char",
     )
     parser.add_argument("--subword-vocab-size", type=int, default=256)
@@ -1904,6 +2235,12 @@ def main() -> None:
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--pretokenize-workers", type=int, default=0)
     parser.add_argument("--seq-len", type=int, default=32)
+    parser.add_argument(
+        "--target-len",
+        type=int,
+        default=1,
+        help="Number of future tokens predicted by query_block in one causal query-slot block.",
+    )
     parser.add_argument("--response-len", type=int, default=64)
     parser.add_argument(
         "--sentence-prefix-count",
@@ -2059,6 +2396,7 @@ def main() -> None:
     teacher_forcing = args.training_objective == "teacher_forcing"
     full_sequence_causal = args.training_objective == "full_sequence_causal"
     query_next_token = args.training_objective == "query_next_token"
+    query_block = args.training_objective == "query_block"
     prefix_response = args.training_objective == "prefix_response"
     next_sentence_response = args.training_objective == "next_sentence_response"
     response_objective = prefix_response or next_sentence_response
@@ -2083,6 +2421,8 @@ def main() -> None:
         raise ValueError("prefetch-factor must be positive.")
     if args.response_len <= 0:
         raise ValueError("response-len must be positive.")
+    if args.target_len <= 0:
+        raise ValueError("target-len must be positive.")
     if args.sentence_prefix_count <= 0:
         raise ValueError("sentence-prefix-count must be positive.")
     if args.sentence_min_chars <= 0:
@@ -2132,6 +2472,22 @@ def main() -> None:
             prefix_sentences=args.sentence_prefix_count,
             min_chars=args.sentence_min_chars,
         )
+    elif query_next_token or query_block:
+        corpus = load_token_stream_corpus(
+            default_text=DEFAULT_TEXT,
+            text_file=args.text_file,
+            text_sources=args.text_source,
+            jsonl_sources=args.jsonl_source,
+            jsonl_text_keys=tuple(dict.fromkeys(args.jsonl_text_key)),
+            hf_dataset=args.hf_dataset,
+            hf_config=args.hf_config,
+            hf_split=args.hf_split,
+            hf_text_key=args.hf_text_key,
+            hf_streaming=args.hf_streaming,
+            max_samples=args.corpus_max_samples,
+            max_chars=args.corpus_max_chars,
+            separator=args.corpus_separator,
+        )
     else:
         corpus = load_text_corpus(
             default_text=DEFAULT_TEXT,
@@ -2148,6 +2504,8 @@ def main() -> None:
             max_chars=args.corpus_max_chars,
             separator=args.corpus_separator,
         )
+    if (query_next_token or query_block) and not corpus.metadata.get("eos_at_document_boundaries"):
+        corpus = append_eos_markers_to_corpus(corpus, separator=args.corpus_separator)
     print(
         f"corpus={corpus.source_label} | chars={corpus.char_count:,} | "
         f"samples={corpus.sample_count:,} | files={corpus.file_count:,} | "
@@ -2165,17 +2523,18 @@ def main() -> None:
         subword_character_coverage=args.subword_character_coverage,
         subword_input_sentence_size=args.subword_input_sentence_size,
         subword_num_threads=args.subword_num_threads,
-        user_defined_symbols=DIALOGUE_SPECIAL_TOKENS if response_objective or query_next_token else (),
+        user_defined_symbols=DIALOGUE_SPECIAL_TOKENS if response_objective or query_next_token or query_block else (),
     )
-    special_token_ids = require_subword_special_ids(vocab) if response_objective else None
+    special_token_ids = require_special_token_ids(vocab) if response_objective else None
     if response_objective:
         tokens = torch.empty(0, dtype=torch.long)
         train_tokens = tokens
         val_tokens = tokens
     else:
         tokens = vocab.encode(corpus.text)
-        if tokens.numel() <= args.seq_len + 1:
-            raise ValueError("The tokenized corpus must be longer than seq_len + 1.")
+        required_future_tokens = args.target_len if query_block else 1
+        if tokens.numel() <= args.seq_len + required_future_tokens:
+            raise ValueError("The tokenized corpus must be longer than seq_len + target_len.")
         train_tokens, val_tokens = split_train_val(tokens, train_fraction=0.9)
     train_response_pairs = None
     val_response_pairs = None
@@ -2245,6 +2604,7 @@ def main() -> None:
             teacher_forcing=teacher_forcing,
             full_sequence_causal=full_sequence_causal,
             query_next_token=query_next_token,
+            query_block=query_block,
             train_response_pairs=train_response_pairs,
             val_response_pairs=val_response_pairs,
             special_token_ids=special_token_ids,

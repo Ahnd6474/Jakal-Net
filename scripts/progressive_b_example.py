@@ -1239,18 +1239,29 @@ class ProgressiveBExampleLM(nn.Module):
             self.last_runtime_stats = stats
         return s_layer, compressed_b
 
-    def initialize_query_layer(self, reference: Layer) -> Layer:
+    @staticmethod
+    def _concat_layers(first: Layer, second: Layer) -> Layer:
+        return Layer(
+            dim=first.dim,
+            num_nodes=first.num_nodes + second.num_nodes,
+            state=torch.cat((first.state, second.state), dim=-1),
+            val=torch.cat((first.val, second.val), dim=-2),
+        )
+
+    def initialize_query_layer(self, reference: Layer, *, query_nodes: int = 1) -> Layer:
+        if query_nodes <= 0:
+            raise ValueError("query_nodes must be positive.")
         batch_shape = tuple(reference.batch_shape)
         query_position = self.position_encoding(
-            reference.num_nodes + 1,
+            reference.num_nodes + query_nodes,
             device=reference.val.device,
             dtype=reference.val.dtype,
-        )[-1:, :]
+        )[-query_nodes:, :]
         query_val = _expand_position_encoding(query_position, batch_shape)
         query_state = self.state_init(query_val).squeeze(-1)
         query_layer = Layer(
             dim=self.dim,
-            num_nodes=1,
+            num_nodes=query_nodes,
             state=query_state,
             val=query_val,
         )
@@ -1272,10 +1283,11 @@ class ProgressiveBExampleLM(nn.Module):
             apply_value_norm=self.norm_position == "post",
         )
 
-    def update_query_slot(self, s_layer: Layer) -> Layer:
-        query_layer = self.initialize_query_layer(s_layer)
+    def update_query_slot(self, source_layer: Layer, query_layer: Layer | None = None) -> Layer:
+        if query_layer is None:
+            query_layer = self.initialize_query_layer(source_layer)
         transition_delta = self.query_transition.compute_delta(
-            self._prepare_sequence_input(s_layer),
+            self._prepare_sequence_input(source_layer),
             self._prepare_query_input(query_layer),
         )
         query_layer = _apply_scaled_delta(
@@ -1287,7 +1299,7 @@ class ProgressiveBExampleLM(nn.Module):
         query_layer = self._finalize_query_layer(query_layer)
         propagation_delta = self.query_propagation.compute_delta(
             self._prepare_query_input(query_layer),
-            self._prepare_sequence_input(s_layer),
+            self._prepare_sequence_input(source_layer),
         )
         query_layer = _apply_scaled_delta(
             query_layer,
@@ -1296,6 +1308,43 @@ class ProgressiveBExampleLM(nn.Module):
             val_scale=self.s_delta_scale * self.value_residual_scale,
         )
         return self._finalize_query_layer(query_layer)
+
+    def forward_query_block(
+        self,
+        token_ids: Tensor,
+        *,
+        target_len: int,
+        return_layers: bool = False,
+    ) -> Tensor | tuple[Tensor, Layer, Layer | None]:
+        if target_len <= 0:
+            raise ValueError("target_len must be positive.")
+        s_layer, compressed_b = self.encode_prefix(token_ids)
+        query_template = self.initialize_query_layer(s_layer, query_nodes=target_len)
+        updated_queries: list[Layer] = []
+        updated_prefix: Layer | None = None
+        for index in range(target_len):
+            query_slot = Layer(
+                dim=self.dim,
+                num_nodes=1,
+                state=query_template.state[..., index : index + 1],
+                val=query_template.val[..., index : index + 1, :],
+            )
+            source_layer = s_layer
+            if updated_prefix is not None:
+                source_layer = self._concat_layers(s_layer, updated_prefix)
+            query_slot = self.update_query_slot(source_layer, query_slot)
+            updated_queries.append(query_slot)
+            updated_prefix = (
+                query_slot
+                if updated_prefix is None
+                else self._concat_layers(updated_prefix, query_slot)
+            )
+        assert updated_prefix is not None
+        query_slots = self.query_head_norm(updated_prefix.val)
+        logits = self.query_head(query_slots)
+        if return_layers:
+            return logits, s_layer, compressed_b
+        return logits
 
     def forward_query_next_token(
         self,
@@ -1544,14 +1593,25 @@ def sample_next_token_batch(
     device: torch.device | str,
     teacher_forcing: bool = False,
     full_sequence_causal: bool = False,
+    target_len: int = 1,
 ) -> NextTokenBatch:
     if teacher_forcing and full_sequence_causal:
         raise ValueError("teacher_forcing and full_sequence_causal cannot both be enabled.")
-    max_start = tokens.numel() - seq_len - 1
+    if target_len <= 0:
+        raise ValueError("target_len must be positive.")
+    forecast_len = 1 if teacher_forcing or full_sequence_causal else target_len
+    max_start = tokens.numel() - seq_len - forecast_len
+    if max_start < 0:
+        raise ValueError("The tokenized corpus must be longer than seq_len + target_len.")
     starts = torch.randint(0, max_start + 1, (batch_size,))
     context = torch.stack([tokens[start : start + seq_len] for start in starts], dim=0)
     if teacher_forcing or full_sequence_causal:
         target = torch.stack([tokens[start + 1 : start + seq_len + 1] for start in starts], dim=0)
+    elif target_len > 1:
+        target = torch.stack(
+            [tokens[start + seq_len : start + seq_len + target_len] for start in starts],
+            dim=0,
+        )
     else:
         target = torch.stack([tokens[start + seq_len] for start in starts], dim=0)
     return NextTokenBatch(context=context.to(device), target=target.to(device))
@@ -1566,6 +1626,7 @@ class NextTokenBatchDataset(IterableDataset[tuple[Tensor, Tensor]]):
         batch_size: int,
         teacher_forcing: bool = False,
         full_sequence_causal: bool = False,
+        target_len: int = 1,
     ) -> None:
         super().__init__()
         self.tokens = tokens.detach().cpu().contiguous()
@@ -1573,6 +1634,7 @@ class NextTokenBatchDataset(IterableDataset[tuple[Tensor, Tensor]]):
         self.batch_size = batch_size
         self.teacher_forcing = teacher_forcing
         self.full_sequence_causal = full_sequence_causal
+        self.target_len = target_len
 
     def __iter__(self):
         while True:
@@ -1583,6 +1645,7 @@ class NextTokenBatchDataset(IterableDataset[tuple[Tensor, Tensor]]):
                 device="cpu",
                 teacher_forcing=self.teacher_forcing,
                 full_sequence_causal=self.full_sequence_causal,
+                target_len=self.target_len,
             )
             yield batch.context, batch.target
 
@@ -1714,6 +1777,7 @@ def _make_train_batch_iterator(
     full_sequence_causal: bool,
     data_workers: int,
     prefetch_factor: int,
+    target_len: int = 1,
 ):
     target_device = torch.device(device)
     if data_workers <= 0:
@@ -1725,6 +1789,7 @@ def _make_train_batch_iterator(
                 device=target_device,
                 teacher_forcing=teacher_forcing,
                 full_sequence_causal=full_sequence_causal,
+                target_len=target_len,
             )
     else:
         dataset = NextTokenBatchDataset(
@@ -1733,6 +1798,7 @@ def _make_train_batch_iterator(
             batch_size=batch_size,
             teacher_forcing=teacher_forcing,
             full_sequence_causal=full_sequence_causal,
+            target_len=target_len,
         )
         loader = DataLoader(
             dataset,
@@ -1809,21 +1875,27 @@ def compute_next_token_loss(
     teacher_forcing: bool = False,
     full_sequence_causal: bool = False,
     query_next_token: bool = False,
+    query_block: bool = False,
     teacher_forcing_chunk_size: int | None = None,
     autocast_device_type: str | None = None,
     autocast_dtype: torch.dtype | None = None,
 ) -> tuple[Tensor, Tensor]:
     if teacher_forcing and full_sequence_causal:
         raise ValueError("teacher_forcing and full_sequence_causal cannot both be enabled.")
-    if query_next_token and (teacher_forcing or full_sequence_causal):
-        raise ValueError("query_next_token cannot be combined with teacher forcing modes.")
+    if query_next_token and query_block:
+        raise ValueError("query_next_token and query_block cannot both be enabled.")
+    if (query_next_token or query_block) and (teacher_forcing or full_sequence_causal):
+        raise ValueError("query objectives cannot be combined with teacher forcing modes.")
     use_autocast = autocast_device_type is not None and autocast_dtype is not None
     with torch.autocast(
         device_type=autocast_device_type or "cpu",
         dtype=autocast_dtype,
         enabled=use_autocast,
     ):
-        if query_next_token:
+        if query_block:
+            target_len = batch.target.shape[-1] if batch.target.ndim > 1 else 1
+            logits = model.forward_query_block(batch.context, target_len=target_len)
+        elif query_next_token:
             logits = model.forward_query_next_token(batch.context)
         else:
             logits = model(
@@ -1875,6 +1947,8 @@ def estimate_next_token_loss(
     teacher_forcing: bool = False,
     full_sequence_causal: bool = False,
     query_next_token: bool = False,
+    query_block: bool = False,
+    target_len: int = 1,
     teacher_forcing_chunk_size: int | None = None,
     autocast_device_type: str | None = None,
     autocast_dtype: torch.dtype | None = None,
@@ -1890,6 +1964,7 @@ def estimate_next_token_loss(
             device=device,
             teacher_forcing=teacher_forcing,
             full_sequence_causal=full_sequence_causal,
+            target_len=target_len,
         )
         loss, _ = compute_next_token_loss(
             model,
@@ -1897,6 +1972,7 @@ def estimate_next_token_loss(
             teacher_forcing=teacher_forcing,
             full_sequence_causal=full_sequence_causal,
             query_next_token=query_next_token,
+            query_block=query_block,
             teacher_forcing_chunk_size=teacher_forcing_chunk_size,
             autocast_device_type=autocast_device_type,
             autocast_dtype=autocast_dtype,
@@ -1967,6 +2043,8 @@ def train_next_token_model(
     teacher_forcing: bool = False,
     full_sequence_causal: bool = False,
     query_next_token: bool = False,
+    query_block: bool = False,
+    target_len: int = 1,
     teacher_forcing_chunk_size: int | None = None,
     data_workers: int = 0,
     prefetch_factor: int = 2,
@@ -2002,6 +2080,7 @@ def train_next_token_model(
         full_sequence_causal=full_sequence_causal,
         data_workers=data_workers,
         prefetch_factor=prefetch_factor,
+        target_len=target_len,
     )
 
     for step in range(1, steps + 1):
@@ -2017,6 +2096,7 @@ def train_next_token_model(
                 teacher_forcing=teacher_forcing,
                 full_sequence_causal=full_sequence_causal,
                 query_next_token=query_next_token,
+                query_block=query_block,
                 teacher_forcing_chunk_size=teacher_forcing_chunk_size,
                 autocast_device_type=autocast_device_type,
                 autocast_dtype=autocast_dtype,
@@ -2057,6 +2137,8 @@ def train_next_token_model(
                 teacher_forcing=teacher_forcing,
                 full_sequence_causal=full_sequence_causal,
                 query_next_token=query_next_token,
+                query_block=query_block,
+                target_len=target_len,
                 teacher_forcing_chunk_size=teacher_forcing_chunk_size,
                 autocast_device_type=autocast_device_type,
                 autocast_dtype=autocast_dtype,
@@ -2071,6 +2153,8 @@ def train_next_token_model(
                 teacher_forcing=teacher_forcing,
                 full_sequence_causal=full_sequence_causal,
                 query_next_token=query_next_token,
+                query_block=query_block,
+                target_len=target_len,
                 teacher_forcing_chunk_size=teacher_forcing_chunk_size,
                 autocast_device_type=autocast_device_type,
                 autocast_dtype=autocast_dtype,

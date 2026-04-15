@@ -1,5 +1,6 @@
 numpy==2.4.4
 sentencepiece==0.2.1
+tokenizers>=0.20,<1
 tqdm==4.67.1
 matplotlib==3.10.7
 ipykernel==6.30.1
