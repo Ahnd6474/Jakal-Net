@@ -1,0 +1,114 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="840" viewBox="0 0 1280 840" role="img" aria-labelledby="title desc">
+  <title id="title">Jakal-Net Progressive-B Architecture</title>
+  <desc id="desc">A diagram showing corpus tokenization, the Progressive-B S and B latent workspaces, response decoding, training losses, and native backends.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f7f3ea; }
+      .panel { fill: #fffaf0; stroke: #1f2933; stroke-width: 2; rx: 18; }
+      .box { fill: #ffffff; stroke: #1f2933; stroke-width: 2; rx: 14; }
+      .box2 { fill: #e8f4f1; stroke: #1f2933; stroke-width: 2; rx: 14; }
+      .box3 { fill: #ffe9d2; stroke: #1f2933; stroke-width: 2; rx: 14; }
+      .box4 { fill: #e9eef8; stroke: #1f2933; stroke-width: 2; rx: 14; }
+      .small { font: 500 15px Verdana, sans-serif; fill: #334155; }
+      .label { font: 700 18px Verdana, sans-serif; fill: #111827; }
+      .title { font: 800 28px Verdana, sans-serif; fill: #111827; }
+      .subtitle { font: 500 16px Verdana, sans-serif; fill: #475569; }
+      .mono { font: 600 14px Consolas, monospace; fill: #263238; }
+      .arrow { stroke: #1f2933; stroke-width: 2.5; fill: none; marker-end: url(#arrow); }
+      .softarrow { stroke: #64748b; stroke-width: 2; fill: none; stroke-dasharray: 7 6; marker-end: url(#arrowSoft); }
+      .accent { fill: #d97706; }
+      .teal { fill: #0f766e; }
+      .blue { fill: #3659a8; }
+      .note { fill: #fff7d6; stroke: #b45309; stroke-width: 1.5; rx: 12; }
+    </style>
+    <marker id="arrow" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto">
+      <path d="M0,0 L10,5.5 L0,11 Z" fill="#1f2933"/>
+    </marker>
+    <marker id="arrowSoft" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto">
+      <path d="M0,0 L10,5.5 L0,11 Z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1280" height="840"/>
+  <text class="title" x="48" y="55">Jakal-Net Progressive-B LM</text>
+  <text class="subtitle" x="48" y="82">Latent node propagation, sparse routing, and prefix-response decoding</text>
+
+  <rect class="panel" x="42" y="118" width="280" height="205"/>
+  <text class="label" x="66" y="152">Data and tokenizer</text>
+  <rect class="box" x="66" y="172" width="232" height="48"/>
+  <text class="small" x="84" y="202">JSONL / text / HF datasets</text>
+  <rect class="box" x="66" y="238" width="232" height="48"/>
+  <text class="small" x="84" y="268">SentencePiece subword vocab</text>
+  <text class="mono" x="82" y="306">prefix ids + response ids</text>
+
+  <rect class="panel" x="374" y="118" width="560" height="522"/>
+  <text class="label" x="400" y="152">Progressive-B encoder</text>
+  <text class="subtitle" x="400" y="177">S is the sequence workspace; B is the bottleneck workspace.</text>
+
+  <rect class="box2" x="414" y="210" width="200" height="70"/>
+  <text class="label" x="438" y="240">S init</text>
+  <text class="small" x="438" y="264">embedding + position</text>
+
+  <rect class="box2" x="668" y="210" width="210" height="70"/>
+  <text class="label" x="692" y="240">S warmup</text>
+  <text class="small" x="692" y="264">window sparse propagation</text>
+
+  <rect class="box3" x="414" y="330" width="464" height="210"/>
+  <text class="label" x="438" y="362">Progressive-B joint blocks</text>
+  <text class="small" x="438" y="389">repeated lite / mid / full stages</text>
+
+  <rect class="box" x="438" y="416" width="142" height="48"/>
+  <text class="small" x="460" y="446">S propagation</text>
+  <rect class="box" x="616" y="416" width="220" height="48"/>
+  <text class="small" x="636" y="446">compressed B memory</text>
+  <rect class="box" x="438" y="482" width="142" height="40"/>
+  <text class="mono" x="460" y="507">S -&gt; B</text>
+  <rect class="box" x="616" y="482" width="220" height="40"/>
+  <text class="mono" x="636" y="507">expand -&gt; topk prop -&gt; compress</text>
+
+  <rect class="box2" x="514" y="570" width="270" height="52"/>
+  <text class="label" x="545" y="603">Final S refinement</text>
+
+  <path class="arrow" d="M322 220 C352 220 370 220 414 245"/>
+  <path class="arrow" d="M614 245 L668 245"/>
+  <path class="arrow" d="M773 280 C773 315 704 320 646 330"/>
+  <path class="arrow" d="M646 540 C646 552 646 560 646 570"/>
+  <path class="softarrow" d="M580 440 C600 430 600 430 616 440"/>
+  <path class="softarrow" d="M616 502 C600 512 600 512 580 502"/>
+
+  <rect class="panel" x="984" y="118" width="250" height="340"/>
+  <text class="label" x="1010" y="152">Readout paths</text>
+  <rect class="box4" x="1010" y="190" width="194" height="58"/>
+  <text class="label" x="1030" y="220">LM head</text>
+  <text class="small" x="1030" y="240">next-token logits</text>
+  <rect class="box4" x="1010" y="286" width="194" height="70"/>
+  <text class="label" x="1030" y="316">GRU decoder</text>
+  <text class="small" x="1030" y="340">response slots + ids</text>
+  <rect class="box4" x="1010" y="388" width="194" height="48"/>
+  <text class="small" x="1030" y="418">MLP response head</text>
+
+  <path class="arrow" d="M784 596 C900 596 950 220 1010 220"/>
+  <path class="arrow" d="M784 596 C900 596 942 322 1010 322"/>
+  <path class="arrow" d="M1107 356 L1107 388"/>
+
+  <rect class="panel" x="984" y="500" width="250" height="140"/>
+  <text class="label" x="1010" y="534">Training</text>
+  <rect class="box" x="1010" y="556" width="194" height="48"/>
+  <text class="small" x="1030" y="586">masked cross-entropy</text>
+  <text class="mono" x="1012" y="625">best / last / final ckpt</text>
+  <path class="arrow" d="M1107 436 L1107 556"/>
+
+  <rect class="panel" x="84" y="390" width="240" height="250"/>
+  <text class="label" x="110" y="424">Operator backends</text>
+  <rect class="box" x="110" y="456" width="188" height="42"/>
+  <text class="small" x="132" y="483">reference</text>
+  <rect class="box" x="110" y="512" width="188" height="42"/>
+  <text class="small" x="132" y="539">streaming</text>
+  <rect class="box" x="110" y="568" width="188" height="42"/>
+  <text class="small" x="132" y="595">kernel / native CUDA</text>
+  <path class="softarrow" d="M324 516 C354 486 370 450 414 430"/>
+
+  <rect class="note" x="146" y="700" width="988" height="82"/>
+  <text class="label" x="174" y="734">Key idea</text>
+  <text class="small" x="174" y="762">Propagation updates nodes inside a layer. Transition routes information between layers. Progressive-B composes those two primitives into a reusable latent workspace encoder.</text>
+</svg>

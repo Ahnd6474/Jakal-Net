@@ -1,602 +1,273 @@
 # Jakal-Net
 
-A PyTorch playground for latent-node propagation and routing.
+Jakal-Net is a PyTorch research playground for latent-node propagation,
+sparse routing, and the Progressive-B language-model experiments built on top
+of those operators.
 
-This repository currently holds the core data structures and reference operators. The code is intentionally plain right now. The goal is to lock down module boundaries before the implementation gets faster or more specialized.
+The current codebase has two layers:
 
-## Table of contents
+- `src/jakal_net/`: reusable operator primitives (`Layer`, propagation,
+  transition, sparse routing, native backend dispatch).
+- `scripts/`: experiment code, including the Progressive-B example LM,
+  corpus builders, training loops, checkpointing, TensorBoard logging, and
+  native extension build helpers.
 
-- [Installation](#installation)
-- [Notebook setup](#notebook-setup)
-- [Quick start](#quick-start)
-- [What is Jakal-Net?](#what-is-jakal-net)
-- [Why this shape?](#why-this-shape)
-- [API](#api)
-  - [`Layer`](#layer)
-  - [`LayerDelta`](#layerdelta)
-  - [`Propagation`](#propagation)
-  - [`SparsePropagation`](#sparsepropagation)
-  - [`Transition`](#transition)
-  - [`SparseTransition`](#sparsetransition)
-  - [Helper modules](#helper-modules)
-- [Examples](#examples)
-- [Further reading](#further-reading)
-- [License](#license)
-- [Contributing](#contributing)
+## Architecture
+
+![Jakal-Net Progressive-B architecture](docs/architecture.svg)
+
+At a high level, the example LM encodes a fixed-length prefix into an `S`
+sequence workspace, repeatedly exchanges information with a compressed/expanded
+`B` bottleneck workspace, then reads from the final `S` state.
+
+For response training, the final `S` slots condition a small GRU response
+decoder:
+
+```text
+prefix ids -> S/B encoder -> response slots -> GRU decoder -> MLP head -> token logits
+```
+
+For classic next-token training, the final prediction slot goes directly to
+the LM head.
+
+## Current Capabilities
+
+- Same-layer node message passing with `Propagation` and `SparsePropagation`.
+- Cross-layer information movement with `Transition` and `SparseTransition`.
+- Dense, window, top-k, and query-top-k execution paths.
+- Reference, streaming, kernel, and native backend implementations.
+- Native C++/CUDA extension support for selected propagation and transition
+  kernels.
+- Progressive-B example LM with warmup `S` propagation, lite/mid/full B stages,
+  final `S` refinement, and optional prefix-response decoding.
+- Training objectives:
+  `last_token`, `teacher_forcing`, `full_sequence_causal`,
+  `prefix_response`, and `next_sentence_response`.
+- Subword tokenization through SentencePiece with dialogue special tokens for
+  response objectives.
+- TensorBoard logging, epoch-based eval, resumable-style checkpoint payloads,
+  and best/last/final checkpoint artifacts.
+
+## Repository Layout
+
+| Path | Purpose |
+| --- | --- |
+| `src/jakal_net/core.py` | `Layer`, `LayerDelta`, block helpers, validation |
+| `src/jakal_net/propagation.py` | Dense and sparse same-layer propagation |
+| `src/jakal_net/transition.py` | Dense and sparse cross-layer routing |
+| `src/jakal_net/modules.py` | Pairwise scorers, route modules, position encoding |
+| `src/jakal_net/native_backend.py` | Native extension discovery and dispatch |
+| `native/` | C++/CUDA extension source |
+| `scripts/progressive_b_example.py` | Progressive-B model and training utilities |
+| `scripts/train_progressive_b_lm.py` | CLI training entry point |
+| `scripts/build_mixed_next_sentence_corpus.py` | Mixed dialogue/science/wiki/code pair corpus builder |
+| `tests/` | Unit tests and native backend checks |
+| `docs/architecture.svg` | Architecture diagram used by this README |
 
 ## Installation
 
-Clone the repository, create a virtual environment, and install the pinned dependencies.
+Create a virtual environment and install dependencies.
 
-### PowerShell
-
-```powershell
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-```
-
-### Bash
+### Linux or macOS
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-```
-
-`requirements.txt` currently installs the CPU build of PyTorch. If you want a CUDA build, install the matching `torch` wheel first and then install the rest of the dependencies around it.
-
-For NVIDIA GPUs on Windows, use a separate CUDA environment:
-
-```powershell
-.\scripts\setup_cuda_env.ps1
-```
-
-That script creates `.venv-cuda`, installs the shared Python dependencies from `requirements-base.txt`, and then installs the CUDA-enabled PyTorch wheel that matches this repository's current torch pin.
-
-If you prefer the manual path:
-
-```powershell
-py -m venv .venv-cuda
-.\.venv-cuda\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements-base.txt
-python -m pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cu124
-```
-
-If you plan to build native CUDA kernels later, install the NVIDIA CUDA Toolkit separately. The setup script can do that too:
-
-```powershell
-.\scripts\setup_cuda_env.ps1 -InstallToolkit
-```
-
-That toolkit step requires an elevated PowerShell session because the NVIDIA installer triggers UAC.
-
-Visual Studio Build Tools 2022 are also required for native extension builds on Windows.
-
-For DirectML on Windows, use a separate environment:
-
-```powershell
-py -m venv .venv-dml
-.\.venv-dml\Scripts\Activate.ps1
-python -m pip install torch-directml numpy
-```
-
-This repository now accepts `--device directml` in the smoke test and benchmark scripts.
-
-This project is not packaged as an installable wheel yet, so examples and scripts expect:
-
-```powershell
-$env:PYTHONPATH = "src"
-```
-
-Or in bash:
-
-```bash
 export PYTHONPATH=src
 ```
 
-## Notebook setup
-
-`notebooks/ar_teacher_forced_training.ipynb` expects the shared dependencies from `requirements-base.txt` plus PyTorch. Installing `requirements.txt` now includes the notebook extras needed for a normal Jupyter workflow:
-
-- `ipykernel` for the notebook kernel
-- `tqdm` for progress bars
-- `matplotlib` for training curves
-- `tensorboard` for event logging
-
-From the repository root:
+### Windows PowerShell
 
 ```powershell
+py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-python -m ipykernel install --user --name jakal-net --display-name "Jakal-Net"
-```
-
-The notebook finds `src/` and `scripts/` automatically as long as you launch it from somewhere inside this repository tree.
-
-For corpus loading, set `TEXT_FILE` in the notebook to either:
-
-- an absolute path, or
-- a repository-relative path such as `artifacts\data\sample.txt`
-
-If `TEXT_FILE` is left empty, the notebook falls back to the built-in `DEFAULT_TEXT` sample corpus.
-
-## Quick start
-
-If you just want to check that the environment is wired correctly, run the smoke test from the repository root.
-
-### PowerShell
-
-```powershell
 $env:PYTHONPATH = "src"
-.\.venv\Scripts\python.exe scripts\smoke_test.py
 ```
 
-You should see:
+For CUDA, install the matching PyTorch CUDA wheel for the target system before
+running GPU experiments. The native extension build requires a working compiler
+toolchain and CUDA toolkit when CUDA kernels are enabled.
 
-```text
-using device: cpu
-smoke test passed
+## Quick Checks
+
+Run the smoke test:
+
+```bash
+PYTHONPATH=src python scripts/smoke_test.py --device cpu
 ```
 
-To try the Intel GPU through DirectML:
+Run unit tests:
 
-```powershell
-$env:PYTHONPATH = "src"
-.\.venv-dml\Scripts\python.exe scripts\smoke_test.py --device directml
+```bash
+PYTHONPATH=src python -m unittest discover -s tests
 ```
 
-To use an NVIDIA GPU through CUDA:
+Build the native extension:
 
-```powershell
-$env:PYTHONPATH = "src"
-.\.venv-cuda\Scripts\python.exe scripts\smoke_test.py --device cuda
+```bash
+PYTHONPATH=src python scripts/build_native_extension.py
 ```
 
-You should see:
+Inspect native backend support:
 
-```text
-using device: cuda
-smoke test passed
+```bash
+PYTHONPATH=src python - <<'PY'
+from jakal_net.native_backend import native_status
+print(native_status())
+PY
 ```
 
-Current state of the backend split:
+## Training Examples
 
-- `device="cuda"` already works through the PyTorch `kernel` path.
-- `implementation="native"` is still a CPU C++ backend today.
-- Native CUDA kernels will require the CUDA Toolkit and additional `.cu` sources; the environment above prepares for that direction without changing the current operator behavior.
+Small next-token smoke run:
 
-To run the progressive B example through an actual next-token training loop:
-
-```powershell
-$env:PYTHONPATH = "src"
-.\.venv\Scripts\python.exe scripts\train_progressive_b_lm.py --steps 100 --seq-len 32 --dim 48
+```bash
+PYTHONPATH=src python scripts/train_progressive_b_lm.py \
+  --device cuda \
+  --tokenizer subword \
+  --subword-vocab-size 1024 \
+  --seq-len 128 \
+  --steps 100 \
+  --batch-size 16 \
+  --dim 128 \
+  --tensorboard \
+  --run-name smoke_next_token
 ```
 
-The training script uses a small built-in character corpus by default. It can now also load larger external corpora from:
+Prefix/response dialogue-style run:
 
-- a single UTF-8 file with `--text-file`
-- multiple files, directories, or globs with `--text-source`
-- JSONL corpora with `--jsonl-source --jsonl-text-key text`
-- Hugging Face datasets with `--hf-dataset --hf-split train --hf-text-key text`
-
-You can compare multiple model sizes in one session with `--sweep-presets tiny,small,base,medium`, and the script writes per-run artifacts under `artifacts/training_runs/`:
-
-- `summary.json` and `session_summary.json`
-- `metrics.jsonl` and `metrics.csv`
-- `sample_prompt.txt` and `sample_generated.txt`
-- TensorBoard event files under each run's `tensorboard/` directory when `--tensorboard` is enabled
-
-Example sweep over a local text corpus with TensorBoard logging:
-
-```powershell
-$env:PYTHONPATH = "src"
-.\.venv\Scripts\python.exe scripts\train_progressive_b_lm.py `
-  --text-file artifacts\data\sample.txt `
-  --training-objective teacher_forcing `
-  --teacher-forcing-chunk-size 8 `
-  --seq-len 32 `
-  --batch-size 8 `
-  --steps 50 `
-  --sweep-presets tiny,small,base `
-  --tensorboard `
-  --run-name sample_sweep
+```bash
+PYTHONPATH=src python scripts/train_progressive_b_lm.py \
+  --device cuda \
+  --training-objective next_sentence_response \
+  --jsonl-source artifacts/data/mixed_next_sentence_dialogue_science_wiki_code.jsonl \
+  --tokenizer subword \
+  --tokenizer-prefix artifacts/tokenizers/en_dialogue_subword_4096 \
+  --subword-vocab-size 4096 \
+  --seq-len 512 \
+  --response-len 128 \
+  --epochs 5 \
+  --eval-every-epoch \
+  --batch-size 64 \
+  --dim 384 \
+  --warmup-layers 2 \
+  --lite-layers 5 \
+  --mid-layers 5 \
+  --full-layers 0 \
+  --final-refine-layers 3 \
+  --route-topk 32 \
+  --route-mode topk \
+  --route-kind low_rank_bilinear \
+  --route-hidden-dim 64 \
+  --pairwise-kind low_rank_bilinear \
+  --pairwise-hidden-dim 64 \
+  --sequence-propagation window \
+  --expanded-propagation topk \
+  --compressed-propagation topk \
+  --s-window 64 \
+  --value-norm-kind layernorm \
+  --norm-position pre \
+  --edge-dropout-p 0.1 \
+  --learning-rate 0.0002 \
+  --weight-decay 0.01 \
+  --precision bf16 \
+  --implementation native \
+  --tensorboard \
+  --save-checkpoint
 ```
 
-Then launch TensorBoard from the generated session directory:
+The training script writes:
 
-```powershell
-.\.venv\Scripts\python.exe -m tensorboard.main --logdir artifacts\training_runs
+- TensorBoard events under `artifacts/tensorboard/`.
+- Run summaries, metrics, samples, and checkpoints under
+  `artifacts/training_runs/`.
+- Best and last checkpoints under `custom/checkpoints/` when
+  `--save-checkpoint` is enabled.
+
+Launch TensorBoard against the current artifact root:
+
+```bash
+tensorboard --logdir artifacts/tensorboard
 ```
 
-There is also a companion notebook for running these sweeps interactively: `notebooks/ar_model_sweep_experiments.ipynb`.
+## Operator Model
 
-Here is the smallest useful Python example:
-
-```python
-import torch
-
-from jakal_net import DiagonalBilinearPairwise, Layer, Propagation
-
-layer = Layer.zeros(dim=8, num_nodes=16, batch_shape=(2,))
-layer = layer.with_tensors(
-    state=torch.randn_like(layer.state),
-    val=torch.randn_like(layer.val),
-)
-
-propagation = Propagation(pairwise_fn=DiagonalBilinearPairwise(dim=8))
-delta = propagation(layer)
-
-print(delta.delta_state.shape)
-print(delta.delta_val.shape)
-```
-
-Expected output:
-
-```text
-torch.Size([2, 16])
-torch.Size([2, 16, 8])
-```
-
-## What is Jakal-Net?
-
-Jakal-Net is a small PyTorch codebase for experimenting with node-based latent workspaces. Each layer stores a scalar `state` per node and a vector `val` per node. Same-layer propagation and cross-layer transition are separate modules on purpose.
-
-Right now the repository focuses on these low-level operators:
-
-- `Layer` and `LayerDelta` for storage and updates
-- `Propagation` and `SparsePropagation` for same-layer message passing
-- `Transition` and `SparseTransition` for cross-layer routing
-- A few lightweight scorer and router modules for wiring experiments together
-
-What is not here yet:
-
-- Flash kernels
-- Encoders or decoders
-- Real tokenizer integrations
-- Production-scale dataset pipelines
-
-## Why this shape?
-
-The main split in this codebase is between propagation and transition.
-
-Propagation is for same-layer message passing. It uses pairwise relations, compresses only the edge scores, and does not apply an activation to `state` before transport.
-
-Transition is for moving information from one layer to another. It builds routing logits, applies a softmax over destination nodes, and then uses an activation over source `state` to scale outgoing transport. The default activation is `softplus`.
-
-That distinction is not cosmetic. It keeps the dense reference path and the future optimized path aligned:
-
-- Propagation can later become a flash-style tiled reduce without storing a full edge matrix.
-- Transition can later become a fused routing-and-transport kernel without storing a full routing matrix.
-- Sparse variants already share the same public surface area as the dense ones.
-
-In short, the APIs are meant to stay stable while the kernels underneath get faster.
-
-## API
-
-### `Layer`
-
-`Layer` is the storage unit. It does not perform computation by itself.
+`Layer` is the base storage object:
 
 | Field | Shape | Meaning |
 | --- | --- | --- |
-| `state` | `[..., num_nodes]` | Scalar node state |
+| `state` | `[..., num_nodes]` | Scalar node activation/state |
 | `val` | `[..., num_nodes, dim]` | Vector node value |
 
-The leading `...` dimensions are free. You can use them for batch, groups, heads, or any other fixed layout.
+`LayerDelta` stores matching updates:
 
-Useful methods:
-
-- `Layer.zeros(dim, num_nodes, batch_shape=(), device=None, dtype=None)` creates a zero-initialized layer.
-- `clone()` returns a deep copy.
-- `with_tensors(state=None, val=None)` returns a new `Layer` with replaced tensors.
-- `apply_delta(delta, merge_mode="add")` applies a `LayerDelta` by addition or replacement.
-
-### `LayerDelta`
-
-`LayerDelta` holds the update tensors that match a target layer:
-
-- `delta_state`: `[..., num_nodes]`
-- `delta_val`: `[..., num_nodes, dim]`
-
-Use `LayerDelta.zeros_like(layer)` when you need an empty accumulator.
-
-### `Propagation`
-
-```python
-Propagation(
-    pairwise_fn,
-    edge_compress_fn=torch.nn.functional.softsign,
-    val_proj_fn=None,
-    state_proj_fn=None,
-    norm_fn=None,
-    residual=True,
-    return_delta=True,
-)
-```
-
-`Propagation` performs same-layer message passing.
-
-Behavior:
-
-- Calls `pairwise_fn(layer.val, layer.val)` to produce pairwise scores shaped `[..., num_nodes, num_nodes]`
-- Applies `edge_compress_fn` to those scores
-- Projects `state` and `val` separately
-- Reduces messages into a `LayerDelta`
-- Returns that delta by default
-
-Important detail: propagation does not apply an activation to `layer.state` before transport.
-
-Implementation notes:
-
-- `implementation="reference"` materializes the full pairwise relation for debugging and regression checks.
-- `implementation="kernel"` uses vectorized fast paths for supported scorer types such as `DiagonalBilinearPairwise` and `BilinearPairwise`.
-- `implementation="streaming"` processes target and source blocks incrementally to avoid storing the full edge matrix.
-- `target_block_size` and `source_block_size` control the block shape in streaming mode.
-- `accumulator_dtype` lets you keep accumulation in a wider dtype such as `torch.float32`.
-
-On DirectML, supported scorer combinations automatically fall back to the kernel path when the generic streaming path is not a good fit.
-
-If you set `return_delta=False`, the module applies the update to the input layer and returns a `Layer`. With `residual=True`, it adds the delta. With `residual=False`, it replaces the stored tensors.
-
-### `SparsePropagation`
-
-```python
-SparsePropagation(
-    pairwise_fn,
-    sparse_type,
-    edge_compress_fn=torch.nn.functional.softsign,
-    topk=None,
-    window=None,
-    val_proj_fn=None,
-    state_proj_fn=None,
-    norm_fn=None,
-    residual=True,
-    return_delta=True,
-)
-```
-
-`SparsePropagation` is the restricted version of `Propagation`.
-
-Supported sparse modes:
-
-- `sparse_type="window"` keeps a causal window `i - window <= j <= i`
-- `sparse_type="topk"` keeps the highest-scoring source nodes per target
-
-The return behavior matches `Propagation`.
-
-- In `implementation="kernel"`, the `window` path uses an unfold-based fused fast path for supported pairwise scorers.
-- In `implementation="streaming"`, the `window` path only evaluates the necessary neighborhood.
-- In `implementation="kernel"`, the `topk` path uses a specialized vectorized score-and-top-k path for supported pairwise scorers.
-- In `implementation="streaming"`, the `topk` path keeps a running top-k set per target block.
-
-### `Transition`
-
-```python
-Transition(
-    route_fn,
-    norm_fn=None,
-    state_activation_fn=torch.nn.functional.softplus,
-    val_proj_fn=None,
-    state_proj_fn=None,
-    merge_mode="add",
-)
-```
-
-`Transition` moves information from a source layer to a destination layer.
-
-Behavior:
-
-- Calls `route_fn(src_layer.val)` to produce routing logits shaped `[..., src_nodes, dst_nodes]`
-- Applies `softmax` over the destination axis
-- Applies `state_activation_fn(src_layer.state)` to scale outgoing transport
-- Projects source `state` and `val`
-- Accumulates into the destination layer
-
-`Transition.forward(src_layer, dst_layer)` returns the updated destination `Layer`.
-
-Notes:
-
-- `merge_mode="add"` accumulates into the existing destination tensors
-- `merge_mode="replace"` overwrites them with the transported result
-- `val_proj_fn` must return `[..., src_nodes, dst_dim]`
-- `implementation="kernel"` uses a dense vectorized transport path and currently works best with lightweight route functions such as `LinearRoute`
-- `implementation="streaming"` processes source blocks incrementally so the full routing matrix is never stored
-- `src_block_size` controls how many source nodes are routed per block in streaming mode
-- `accumulator_dtype` controls the internal accumulation dtype
-
-On DirectML, `SparseTransition` uses a compatibility fallback that avoids unsupported scatter patterns.
-
-### `SparseTransition`
-
-```python
-SparseTransition(
-    route_fn,
-    topk,
-    norm_fn=None,
-    state_activation_fn=torch.nn.functional.softplus,
-    val_proj_fn=None,
-    state_proj_fn=None,
-    merge_mode="add",
-)
-```
-
-`SparseTransition` keeps only the highest-scoring destination nodes per source before the softmax step.
-
-That gives you:
-
-- dense routing semantics on the kept destinations
-- fixed `topk` sparsity for larger cross-layer moves
-- the same update behavior as `Transition`
-- a vectorized `implementation="kernel"` path for dense-logit top-k routing
-- scatter-based destination accumulation in streaming mode instead of a materialized dense routing matrix
-
-### Helper modules
-
-These helpers are exported from `jakal_net` and are meant to make experiments less repetitive.
-
-| Export | Purpose |
+| Field | Shape |
 | --- | --- |
-| `ScalarAffine` | Scalar projection for `state` tensors |
-| `DiagonalBilinearPairwise` | Cheap diagonal bilinear scorer |
-| `BilinearPairwise` | Full bilinear scorer |
-| `HadamardMLPPairwise` | Hadamard interaction followed by a small MLP |
-| `LinearRoute` | One-layer router from source value to destination logits |
-| `MLPRoute` | Two-layer router for richer routing logits |
+| `delta_state` | `[..., num_nodes]` |
+| `delta_val` | `[..., num_nodes, dim]` |
 
-## Examples
+`Propagation` performs same-layer message passing. It scores node pairs,
+compresses edge scores, transports state/value projections, and returns a
+`LayerDelta` or updated `Layer`.
 
-### Dense propagation
+`SparsePropagation` restricts same-layer message passing to a causal window or
+top-k source set.
 
-```python
-import torch
+`Transition` moves information from a source layer to a destination layer by
+building route logits and reducing transported source values into destination
+nodes.
 
-from jakal_net import DiagonalBilinearPairwise, Layer, Propagation, ScalarAffine
+`SparseTransition` keeps only top-k destination routes per source before
+transport. It supports edge dropout and usage-aware dropout in the experimental
+paths used by Progressive-B.
 
-layer = Layer.zeros(dim=8, num_nodes=16, batch_shape=(2,))
-layer = layer.with_tensors(
-    state=torch.randn_like(layer.state),
-    val=torch.randn_like(layer.val),
-)
+## Progressive-B Example LM
 
-op = Propagation(
-    pairwise_fn=DiagonalBilinearPairwise(dim=8),
-    state_proj_fn=ScalarAffine(),
-)
+The example LM in `scripts/progressive_b_example.py` is intentionally kept
+outside the package surface. It composes the public operators into a staged
+encoder:
 
-delta = op(layer)
-updated = layer.apply_delta(delta)
-```
+1. Token embedding plus learned position encoding initializes the `S` layer.
+2. `S` warmup applies window sparse propagation.
+3. Each Progressive-B joint block updates `S`, expands compressed `B` memory,
+   propagates through expanded `B`, sends information back to `S`, recompresses
+   `B`, and optionally lets `S` update compressed `B`.
+4. Final `S` refinement prepares readout slots.
+5. The LM head reads the prediction slot for next-token objectives.
+6. The response path reads multiple `S` slots, adds decoder-token embeddings,
+   runs a GRU decoder, then projects through an MLP response head.
 
-### Window sparse propagation
+The default large response configuration uses low-rank bilinear pairwise
+scorers and routers with `route_topk=32`, `seq_len=512`, and `response_len=128`.
 
-```python
-import torch
+## Corpus Paths
 
-from jakal_net import DiagonalBilinearPairwise, Layer, SparsePropagation
+The training CLI can read:
 
-layer = Layer.zeros(dim=8, num_nodes=32, batch_shape=(1,))
-layer = layer.with_tensors(
-    state=torch.randn_like(layer.state),
-    val=torch.randn_like(layer.val),
-)
+- Plain text files with `--text-file`.
+- Repeated text files, directories, or globs with `--text-source`.
+- JSONL text records with `--jsonl-source --jsonl-text-key`.
+- Hugging Face datasets with `--hf-dataset`.
+- Explicit dialogue/prefix-response records with `prefix` and `response`
+  fields.
 
-op = SparsePropagation(
-    pairwise_fn=DiagonalBilinearPairwise(dim=8),
-    sparse_type="window",
-    window=3,
-)
+`next_sentence_response` first converts source text or explicit JSONL records
+into prefix/response pairs, then trains the response decoder with masked
+cross-entropy over the response tokens.
 
-delta = op(layer)
-```
+## Development Notes
 
-### Top-k transition between layers
-
-```python
-import torch
-
-from jakal_net import Layer, LinearRoute, SparseTransition
-
-src = Layer.zeros(dim=16, num_nodes=32, batch_shape=(4,))
-src = src.with_tensors(
-    state=torch.randn_like(src.state),
-    val=torch.randn_like(src.val),
-)
-
-dst = Layer.zeros(dim=16, num_nodes=8, batch_shape=(4,))
-
-op = SparseTransition(
-    route_fn=LinearRoute(src_dim=16, dst_nodes=8),
-    topk=2,
-)
-
-updated_dst = op(src, dst)
-```
-
-### Progressive B example LM
-
-The progressive B model is kept as example code in [`scripts/progressive_b_example.py`](./scripts/progressive_b_example.py), not as part of the public `jakal_net` package surface.
-
-That example follows this flow:
-
-- `Embedding + position -> init(s, v)`
-- `S warmup` with window sparse propagation
-- `joint blocks` that expand, compress, and progressively gate the B path
-- `final S refine`
-- `prediction slot -> LM head`
-
-The B path is still built entirely from the existing public modules:
-
-- `SparsePropagation` for the S path
-- `Transition` or `SparseTransition` for B expansion, compression, and S/B exchange
-- `DiagonalBilinearPairwise` and `LinearRoute` as the default scorers and routers
-
-If you want to train the example instead of only running a forward pass, the helper code also lives in [`scripts/progressive_b_example.py`](./scripts/progressive_b_example.py):
-
-- `build_char_vocab`
-- `sample_next_token_batch`
-- `train_next_token_model`
-- `generate_next_tokens`
-
-## Further reading
-
-If you want to inspect the reference implementation directly, start here:
-
-- [`src/jakal_net/core.py`](./src/jakal_net/core.py)
-- [`src/jakal_net/propagation.py`](./src/jakal_net/propagation.py)
-- [`src/jakal_net/transition.py`](./src/jakal_net/transition.py)
-- [`tests/test_jakal_net.py`](./tests/test_jakal_net.py)
-
-The tests are small, but they are a good map of the intended behavior.
-
-For timing and memory checks, run:
-
-```powershell
-$env:PYTHONPATH = "src"
-.\.venv\Scripts\python.exe scripts\benchmark_operators.py --warmup 1 --iterations 5
-```
-
-That script compares `reference`, `kernel`, and `streaming` implementations for:
-
-- dense propagation
-- window sparse propagation
-- top-k sparse propagation
-- dense transition
-- top-k sparse transition
-
-You can run the same benchmark on DirectML like this:
-
-```powershell
-$env:PYTHONPATH = "src"
-.\.venv-dml\Scripts\python.exe scripts\benchmark_operators.py --device directml --warmup 1 --iterations 5
-```
+- Keep generated artifacts out of commits unless the artifact is intentionally
+  part of a regression fixture.
+- Prefer `artifacts/tensorboard/<run-name>` for TensorBoard runs and archive old
+  runs outside the active logdir when the UI gets noisy.
+- Run smoke tests and unit tests before pushing operator changes.
+- If native backend behavior changes, update both `native/` and
+  `tests/test_native_backend.py`.
 
 ## License
 
-MIT-style usage terms do not apply here. This repository is distributed under Apache 2.0. See [LICENSE](./LICENSE) for the full text.
-
-## Contributing
-
-If you change the core operators, run the checks before you push anything:
-
-### PowerShell
-
-```powershell
-$env:PYTHONPATH = "src"
-.\.venv\Scripts\python.exe scripts\smoke_test.py
-.\.venv\Scripts\python.exe -m unittest discover -s tests
-```
-
-Expected output:
-
-```text
-smoke test passed
-..............
-----------------------------------------------------------------------
-Ran 14 tests in 0.128s
-
-OK
-```
-
-There is no formatter or linter wired into this repository yet, so for now the test suite is the main safety check.
+This repository is distributed under Apache 2.0. See [LICENSE](./LICENSE) for
+the full text.
