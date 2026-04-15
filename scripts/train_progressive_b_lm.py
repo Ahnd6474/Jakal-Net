@@ -7,6 +7,7 @@ import math
 import os
 import tempfile
 import time
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -51,6 +52,8 @@ try:
     from torch.utils.tensorboard import SummaryWriter
 except ImportError:
     SummaryWriter = None
+
+_SUBWORD_WORKER_PROCESSOR: Any | None = None
 
 
 DEFAULT_TEXT = """
@@ -485,12 +488,54 @@ def split_dialogue_pairs(
     return list(pairs[:split_index]), list(pairs[split_index:] or pairs[:split_index])
 
 
+def _init_subword_encode_worker(model_path: str) -> None:
+    global _SUBWORD_WORKER_PROCESSOR
+    if spm is None:
+        raise ImportError("sentencepiece is required for parallel subword encoding.")
+    _SUBWORD_WORKER_PROCESSOR = spm.SentencePieceProcessor(model_file=model_path)
+
+
+def _encode_subword_dialogue_pair_worker(pair: tuple[str, str]) -> tuple[list[int], list[int]]:
+    if _SUBWORD_WORKER_PROCESSOR is None:
+        raise RuntimeError("Subword worker was not initialized.")
+    prefix, response = pair
+    return (
+        list(map(int, _SUBWORD_WORKER_PROCESSOR.encode(prefix, out_type=int))),
+        list(map(int, _SUBWORD_WORKER_PROCESSOR.encode(response, out_type=int))),
+    )
+
+
 def encode_dialogue_pairs(
     pairs: Sequence[DialoguePairText],
     *,
     vocab: object,
+    workers: int = 0,
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    return [(vocab.encode(pair.prefix), vocab.encode(pair.response)) for pair in pairs]
+    if workers <= 1 or not isinstance(vocab, SubwordVocab):
+        return [(vocab.encode(pair.prefix), vocab.encode(pair.response)) for pair in pairs]
+    if vocab.model_path is None:
+        raise ValueError("Parallel subword encoding requires a tokenizer model path.")
+    pair_count = len(pairs)
+    chunksize = max(1, pair_count // (workers * 16)) if pair_count else 1
+    text_pairs = ((pair.prefix, pair.response) for pair in pairs)
+    encoded: list[tuple[torch.Tensor, torch.Tensor]] = []
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        initializer=_init_subword_encode_worker,
+        initargs=(str(vocab.model_path),),
+    ) as executor:
+        for prefix_ids, response_ids in executor.map(
+            _encode_subword_dialogue_pair_worker,
+            text_pairs,
+            chunksize=chunksize,
+        ):
+            encoded.append(
+                (
+                    torch.tensor(prefix_ids, dtype=torch.long),
+                    torch.tensor(response_ids, dtype=torch.long),
+                )
+            )
+    return encoded
 
 
 def require_subword_special_ids(vocab: object) -> dict[str, int]:
@@ -1252,6 +1297,7 @@ def run_single_experiment(
         "effective_batch_size": effective_batch_size,
         "data_workers": args.data_workers,
         "prefetch_factor": args.prefetch_factor,
+        "pretokenize_workers": args.pretokenize_workers,
         "dim": effective_config["dim"],
         "warmup_layers": effective_config["warmup_layers"],
         "final_refine_layers": effective_config["final_refine_layers"],
@@ -1484,6 +1530,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--data-workers", type=int, default=0)
     parser.add_argument("--prefetch-factor", type=int, default=2)
+    parser.add_argument("--pretokenize-workers", type=int, default=0)
     parser.add_argument("--seq-len", type=int, default=32)
     parser.add_argument("--response-len", type=int, default=64)
     parser.add_argument(
@@ -1636,6 +1683,8 @@ def main() -> None:
         raise ValueError("route-temperature must be positive.")
     if args.data_workers < 0:
         raise ValueError("data-workers must be non-negative.")
+    if args.pretokenize_workers < 0:
+        raise ValueError("pretokenize-workers must be non-negative.")
     if args.prefetch_factor <= 0:
         raise ValueError("prefetch-factor must be positive.")
     if args.response_len <= 0:
@@ -1717,8 +1766,27 @@ def main() -> None:
     if prefix_response:
         assert dialogue_pairs is not None
         train_pair_texts, val_pair_texts = split_dialogue_pairs(dialogue_pairs)
-        train_response_pairs = encode_dialogue_pairs(train_pair_texts, vocab=vocab)
-        val_response_pairs = encode_dialogue_pairs(val_pair_texts, vocab=vocab)
+        effective_pretokenize_workers = min(args.pretokenize_workers, os.cpu_count() or 1)
+        print(
+            "encoding_dialogue_pairs | "
+            f"train={len(train_pair_texts):,} | val={len(val_pair_texts):,} | "
+            f"pretokenize_workers={effective_pretokenize_workers}"
+        )
+        encode_start = time.perf_counter()
+        train_response_pairs = encode_dialogue_pairs(
+            train_pair_texts,
+            vocab=vocab,
+            workers=effective_pretokenize_workers,
+        )
+        val_response_pairs = encode_dialogue_pairs(
+            val_pair_texts,
+            vocab=vocab,
+            workers=effective_pretokenize_workers,
+        )
+        print(
+            "encoded_dialogue_pairs | "
+            f"elapsed={time.perf_counter() - encode_start:.1f}s"
+        )
     print(
         f"tokenizer={tokenizer_label} | tokenizer_vocab={vocab.size:,} | "
         f"train_tokens={train_tokens.numel():,} | val_tokens={val_tokens.numel():,}"
