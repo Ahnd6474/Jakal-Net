@@ -18,17 +18,16 @@ The current codebase has two layers:
 
 At a high level, the example LM encodes a fixed-length prefix into an `S`
 sequence workspace, repeatedly exchanges information with a compressed/expanded
-`B` bottleneck workspace, then reads from the final `S` state.
-
-For response training, the final `S` slots condition a small GRU response
-decoder:
+`B` bottleneck workspace, then decodes future tokens through query slots. The
+query path is the only prediction path in the current model:
 
 ```text
-prefix ids -> S/B encoder -> response slots -> GRU decoder -> MLP head -> token logits
+prefix ids -> S/B encoder -> query transition -> query propagation -> query head -> token logits
 ```
 
-For classic next-token training, the final prediction slot goes directly to
-the LM head.
+There is no legacy LM head and no GRU response decoder. The vocabulary
+projection is owned by the query head so the trainable parameters match the
+query-block objective.
 
 ## Current Capabilities
 
@@ -39,14 +38,15 @@ the LM head.
 - Native C++/CUDA extension support for selected propagation and transition
   kernels.
 - Progressive-B example LM with warmup `S` propagation, lite/mid/full B stages,
-  final `S` refinement, and optional prefix-response decoding.
-- Training objectives:
-  `last_token`, `teacher_forcing`, `full_sequence_causal`,
-  `prefix_response`, and `next_sentence_response`.
-- Subword tokenization through SentencePiece with dialogue special tokens for
-  response objectives.
-- TensorBoard logging, epoch-based eval, resumable-style checkpoint payloads,
-  and best/last/final checkpoint artifacts.
+  final `S` refinement, query transition, query propagation, and query-only
+  vocab prediction.
+- Training objectives: `query_next_token` and `query_block`.
+- Byte-level BPE tokenization, including larger vocabularies for code and
+  LaTeX-heavy corpora.
+- TensorBoard logging focused on total minibatch loss and four overlaid
+  distance-bucket minibatch perplexity curves.
+- Resumable-style checkpoint payloads plus best/last/final checkpoint
+  artifacts.
 
 ## Repository Layout
 
@@ -121,14 +121,16 @@ PY
 
 ## Training Examples
 
-Small next-token smoke run:
+Small query-block smoke run:
 
 ```bash
 PYTHONPATH=src python scripts/train_progressive_b_lm.py \
   --device cuda \
+  --training-objective query_block \
   --tokenizer byte_bpe \
-  --subword-vocab-size 1024 \
+  --subword-vocab-size 4096 \
   --seq-len 128 \
+  --target-len 32 \
   --steps 100 \
   --batch-size 16 \
   --dim 128 \
@@ -136,20 +138,22 @@ PYTHONPATH=src python scripts/train_progressive_b_lm.py \
   --run-name smoke_next_token
 ```
 
-Prefix/response dialogue-style run:
+Mixed corpus query-block run with a larger byte BPE vocabulary:
 
 ```bash
 PYTHONPATH=src python scripts/train_progressive_b_lm.py \
   --device cuda \
-  --training-objective next_sentence_response \
+  --training-objective query_block \
   --jsonl-source artifacts/data/mixed_next_sentence_dialogue_science_wiki_code.jsonl \
   --tokenizer byte_bpe \
-  --tokenizer-prefix artifacts/tokenizers/en_dialogue_byte_bpe_4096 \
-  --subword-vocab-size 4096 \
+  --tokenizer-prefix artifacts/tokenizers/mixed_next_sentence_byte_bpe_16384 \
+  --subword-vocab-size 16384 \
   --seq-len 512 \
-  --response-len 128 \
-  --epochs 5 \
-  --eval-every-epoch \
+  --target-len 128 \
+  --steps 100000 \
+  --eval-interval 1000 \
+  --eval-steps 16 \
+  --checkpoint-interval 1000 \
   --batch-size 64 \
   --dim 384 \
   --warmup-layers 2 \
@@ -163,15 +167,17 @@ PYTHONPATH=src python scripts/train_progressive_b_lm.py \
   --route-hidden-dim 64 \
   --pairwise-kind low_rank_bilinear \
   --pairwise-hidden-dim 64 \
-  --sequence-propagation window \
-  --expanded-propagation topk \
-  --compressed-propagation topk \
-  --s-window 64 \
-  --value-norm-kind layernorm \
   --norm-position pre \
   --edge-dropout-p 0.1 \
-  --learning-rate 0.0002 \
-  --weight-decay 0.01 \
+  --balance-batch-by-source \
+  --data-workers 8 \
+  --prefetch-factor 4 \
+  --pretokenize-workers 32 \
+  --b-diversity-loss-weight 0.02 \
+  --b-cosine-margin 0.20 \
+  --route-concentration-loss-weight 0.05 \
+  --route-load-cap 0.20 \
+  --edge-prob-cap 0.55 \
   --precision bf16 \
   --implementation native \
   --tensorboard \
@@ -180,7 +186,10 @@ PYTHONPATH=src python scripts/train_progressive_b_lm.py \
 
 The training script writes:
 
-- TensorBoard events under `artifacts/tensorboard/`.
+- TensorBoard events under each run directory. The current scalar layout is
+  intentionally small: `train/minibatch_loss` plus
+  `train/minibatch_ppl_by_distance` overlaid for token ranges `000_015`,
+  `016_031`, `032_063`, and `064_127`.
 - Run summaries, metrics, samples, and checkpoints under
   `artifacts/training_runs/`.
 - Best and last checkpoints under `custom/checkpoints/` when
@@ -189,8 +198,29 @@ The training script writes:
 Launch TensorBoard against the current artifact root:
 
 ```bash
-tensorboard --logdir artifacts/tensorboard
+tensorboard --logdir artifacts/training_runs
 ```
+
+## Losses and Prediction Head
+
+`query_block` predicts a block of future tokens from a prefix. It first builds
+query slots from the encoded `S` workspace, lets those slots receive routed
+information from `S`, then updates query slots left-to-right through query
+propagation. The query head maps the final query slot values to vocabulary
+logits.
+
+The main objective is cross entropy over the query block. For monitoring, the
+same logits are also split into four distance buckets so TensorBoard can show
+short-, mid-, and long-distance perplexity on one plot.
+
+Two auxiliary losses can be enabled:
+
+- `--b-diversity-loss-weight` penalizes compressed `B` nodes whose cosine
+  similarity exceeds `--b-cosine-margin`.
+- `--route-concentration-loss-weight` penalizes route or edge concentration
+  only when destination load or single-edge probability exceeds the configured
+  caps. It is not a uniform-routing loss; it specifically discourages collapse
+  onto one node.
 
 ## Operator Model
 
@@ -234,13 +264,16 @@ encoder:
 3. Each Progressive-B joint block updates `S`, expands compressed `B` memory,
    propagates through expanded `B`, sends information back to `S`, recompresses
    `B`, and optionally lets `S` update compressed `B`.
-4. Final `S` refinement prepares readout slots.
-5. The LM head reads the prediction slot for next-token objectives.
-6. The response path reads multiple `S` slots, adds decoder-token embeddings,
-   runs a GRU decoder, then projects through an MLP response head.
+4. Final `S` refinement prepares the encoded prefix state.
+5. Query slots are initialized for future-token positions.
+6. Query transition routes `S` information into those slots.
+7. Query propagation updates the slots left-to-right.
+8. The query head projects query slot values to vocabulary logits.
 
-The default large response configuration uses low-rank bilinear pairwise
-scorers and routers with `route_topk=32`, `seq_len=512`, and `response_len=128`.
+The current large query-block configuration uses low-rank bilinear pairwise
+scorers and routers with `route_topk=32`, `seq_len=512`, `target_len=128`, and
+a byte BPE vocabulary sized for mixed dialogue, science, wiki, code, and LaTeX
+text.
 
 ## Corpus Paths
 

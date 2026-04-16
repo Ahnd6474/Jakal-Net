@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import math
 import os
@@ -42,10 +43,8 @@ from progressive_b_example import (
     build_char_vocab,
     build_progressive_b_stage_specs,
     perplexity_from_loss,
-    sample_prefix_response_batch,
     sample_next_token_batch,
     split_train_val,
-    train_prefix_response_model,
     train_next_token_model,
 )
 
@@ -55,6 +54,17 @@ def rng_state_payload() -> dict[str, Any]:
     if torch.cuda.is_available():
         payload["cuda"] = torch.cuda.get_rng_state_all()
     return payload
+
+
+def restore_rng_state(payload: object) -> None:
+    if not isinstance(payload, dict):
+        return
+    torch_state = payload.get("torch")
+    if isinstance(torch_state, torch.Tensor):
+        torch.set_rng_state(torch_state.cpu())
+    cuda_state = payload.get("cuda")
+    if torch.cuda.is_available() and isinstance(cuda_state, list):
+        torch.cuda.set_rng_state_all(cuda_state)
 
 try:
     import sentencepiece as spm
@@ -72,6 +82,7 @@ except ImportError:
     SummaryWriter = None
 
 _SUBWORD_WORKER_PROCESSOR: Any | None = None
+_BYTE_BPE_WORKER_TOKENIZER: Any | None = None
 
 
 DEFAULT_TEXT = """
@@ -111,6 +122,7 @@ class TrialPrunedError(RuntimeError):
 class DialoguePairText:
     prefix: str
     response: str
+    source: str = "unknown"
 
 
 @dataclass(frozen=True, slots=True)
@@ -442,7 +454,7 @@ def _pairs_from_messages(messages: Sequence[dict[str, Any]]) -> list[DialoguePai
             history.append(f"{USER_TOKEN}\n{content}\n")
         elif role == "assistant" and history:
             prefix = "".join(history) + f"{ASSISTANT_TOKEN}\n"
-            pairs.append(DialoguePairText(prefix=prefix, response=content))
+            pairs.append(DialoguePairText(prefix=prefix, response=content, source="messages"))
             history.append(f"{ASSISTANT_TOKEN}\n{content}\n{EOS_TOKEN}\n")
     return pairs
 
@@ -453,7 +465,9 @@ def _pairs_from_record(record: Any) -> list[DialoguePairText]:
     prefix = record.get("prefix")
     response = record.get("response")
     if isinstance(prefix, str) and prefix.strip() and isinstance(response, str) and response.strip():
-        return [DialoguePairText(prefix=prefix.strip(), response=response.strip())]
+        source = record.get("source")
+        source_label = source.strip() if isinstance(source, str) and source.strip() else "unknown"
+        return [DialoguePairText(prefix=prefix.strip(), response=response.strip(), source=source_label)]
     messages = record.get("messages") or record.get("conversations")
     if isinstance(messages, list):
         normalized = [message for message in messages if isinstance(message, dict)]
@@ -669,6 +683,140 @@ def load_token_stream_corpus(
             "document_separator": EOS_TOKEN,
         },
     )
+
+
+def _source_label_from_record(record: Any, *, default: str = "unknown") -> str:
+    raw_source = record.get("source") if isinstance(record, dict) else None
+    if isinstance(raw_source, str) and raw_source.strip():
+        label = raw_source.strip().split(":", 1)[0]
+    else:
+        label = default
+    label = re.sub(r"\s+", "_", label.strip().lower())
+    return label or "unknown"
+
+
+def load_token_stream_source_texts(
+    *,
+    jsonl_sources: Sequence[str],
+    jsonl_text_keys: Sequence[str],
+    max_samples: int | None,
+    max_chars: int | None,
+) -> dict[str, str]:
+    from lm_experiment_utils import _expand_sources
+
+    jsonl_paths = _expand_sources(jsonl_sources, directory_suffixes=(".jsonl", ".json"))
+    eos_separator = f"\n{EOS_TOKEN}\n"
+    source_pieces: dict[str, list[str]] = {}
+    sample_count = 0
+    char_count = 0
+    exhausted = False
+    for path in jsonl_paths:
+        with path.open("r", encoding="utf-8") as handle:
+            for line_number, raw_line in enumerate(handle, start=1):
+                if max_samples is not None and sample_count >= max_samples:
+                    exhausted = True
+                    break
+                line = raw_line.strip().lstrip("\ufeff")
+                if not line:
+                    continue
+                record = json.loads(line)
+                stream = _chat_stream_from_record(record)
+                if stream is None:
+                    text = _text_from_record_keys(record, jsonl_text_keys)
+                    if text is None:
+                        raise ValueError(
+                            f"Could not find chat or text in {path} line {line_number}. "
+                            f"Tried text keys: {', '.join(jsonl_text_keys)}."
+                        )
+                    stream = text
+                piece = stream.strip()
+                if not piece:
+                    continue
+                if max_chars is not None:
+                    remaining_chars = max_chars - char_count
+                    if remaining_chars <= 0:
+                        exhausted = True
+                        break
+                    if len(piece) > remaining_chars:
+                        piece = piece[:remaining_chars].rstrip()
+                if not piece:
+                    exhausted = True
+                    break
+                label = _source_label_from_record(record, default=path.stem)
+                source_pieces.setdefault(label, []).append(piece)
+                sample_count += 1
+                char_count += len(piece)
+                if max_chars is not None and char_count >= max_chars:
+                    exhausted = True
+                    break
+        if exhausted:
+            break
+
+    source_texts: dict[str, str] = {}
+    for source, pieces in source_pieces.items():
+        combined = eos_separator.join(piece.strip() for piece in pieces if piece.strip()).rstrip()
+        if not combined:
+            continue
+        if not combined.endswith(EOS_TOKEN):
+            combined = f"{combined}{eos_separator}"
+        else:
+            combined = f"{combined}\n"
+        source_texts[source] = combined
+    return source_texts
+
+
+def _iter_nonempty_text_chunks(text: str, *, chunk_chars: int) -> Iterable[str]:
+    for start in range(0, len(text), chunk_chars):
+        chunk = text[start : start + chunk_chars]
+        if chunk.strip():
+            yield chunk
+
+
+def _init_byte_bpe_encode_worker(vocab_path: str, merges_path: str) -> None:
+    global _BYTE_BPE_WORKER_TOKENIZER
+    if ByteLevelBPETokenizer is None:
+        raise ImportError("tokenizers is required for parallel byte BPE encoding.")
+    _BYTE_BPE_WORKER_TOKENIZER = ByteLevelBPETokenizer(vocab_path, merges_path)
+
+
+def _encode_byte_bpe_text_worker(text: str) -> list[int]:
+    if _BYTE_BPE_WORKER_TOKENIZER is None:
+        raise RuntimeError("Byte BPE worker was not initialized.")
+    return list(map(int, _BYTE_BPE_WORKER_TOKENIZER.encode(text).ids))
+
+
+def encode_text_in_chunks(
+    vocab: object,
+    text: str,
+    *,
+    chunk_chars: int = 8_000_000,
+    workers: int = 0,
+) -> torch.Tensor:
+    if chunk_chars <= 0:
+        raise ValueError("chunk_chars must be positive.")
+    if workers > 1 and isinstance(vocab, ByteBPEVocab):
+        token_parts: list[torch.Tensor] = []
+        chunks = _iter_nonempty_text_chunks(text, chunk_chars=chunk_chars)
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            initializer=_init_byte_bpe_encode_worker,
+            initargs=(str(vocab.vocab_path), str(vocab.merges_path)),
+        ) as executor:
+            for token_ids in executor.map(_encode_byte_bpe_text_worker, chunks, chunksize=1):
+                if token_ids:
+                    token_parts.append(torch.tensor(token_ids, dtype=torch.long))
+        if not token_parts:
+            return torch.empty(0, dtype=torch.long)
+        return torch.cat(token_parts)
+
+    token_parts: list[torch.Tensor] = []
+    for chunk in _iter_nonempty_text_chunks(text, chunk_chars=chunk_chars):
+        encoded = vocab.encode(chunk)
+        if encoded.numel() > 0:
+            token_parts.append(encoded)
+    if not token_parts:
+        return torch.empty(0, dtype=torch.long)
+    return torch.cat(token_parts)
 
 
 def split_prediction_units(text: str, *, min_chars: int = 8) -> list[str]:
@@ -947,6 +1095,49 @@ def split_dialogue_pairs(
     return list(pairs[:split_index]), list(pairs[split_index:] or pairs[:split_index])
 
 
+def build_source_balanced_index_groups(
+    pairs: Sequence[DialoguePairText],
+) -> tuple[tuple[int, ...], ...]:
+    buckets: dict[str, list[int]] = {}
+    for index, pair in enumerate(pairs):
+        source = pair.source.split(":", 1)[0] if pair.source else "unknown"
+        buckets.setdefault(source, []).append(index)
+    return tuple(tuple(indices) for _, indices in sorted(buckets.items()))
+
+
+def summarize_source_groups(
+    pairs: Sequence[DialoguePairText],
+    groups: Sequence[Sequence[int]],
+) -> dict[str, int]:
+    summary: dict[str, int] = {}
+    for group in groups:
+        if not group:
+            continue
+        source = pairs[int(group[0])].source.split(":", 1)[0] if pairs[int(group[0])].source else "unknown"
+        summary[source] = len(group)
+    return summary
+
+
+def split_dialogue_pairs_by_source(
+    pairs: Sequence[DialoguePairText],
+    *,
+    train_fraction: float = 0.9,
+) -> tuple[list[DialoguePairText], list[DialoguePairText]]:
+    buckets: dict[str, list[DialoguePairText]] = {}
+    for pair in pairs:
+        source = pair.source.split(":", 1)[0] if pair.source else "unknown"
+        buckets.setdefault(source, []).append(pair)
+    train: list[DialoguePairText] = []
+    val: list[DialoguePairText] = []
+    for source in sorted(buckets):
+        bucket = buckets[source]
+        split_index = int(len(bucket) * train_fraction)
+        split_index = max(1, min(split_index, len(bucket) - 1)) if len(bucket) > 1 else len(bucket)
+        train.extend(bucket[:split_index])
+        val.extend(bucket[split_index:] or bucket[:split_index])
+    return train, val
+
+
 def _init_subword_encode_worker(model_path: str) -> None:
     global _SUBWORD_WORKER_PROCESSOR
     if spm is None:
@@ -1043,7 +1234,7 @@ def generate_next_tokens_with_sampling(
     device: torch.device | str,
     temperature: float | None,
     sample_topk: int | None,
-    training_objective: str = "last_token",
+    training_objective: str = "query_block",
     eos_token_id: int | None = None,
     target_len: int = 1,
 ) -> torch.Tensor:
@@ -1058,15 +1249,13 @@ def generate_next_tokens_with_sampling(
     tokens_remaining = max_new_tokens
     while tokens_remaining > 0:
         context = generated[-seq_len:].unsqueeze(0)
-        if training_objective == "full_sequence_causal":
-            logits = model(context, full_sequence_causal=True)[..., -1, :]
-        elif training_objective == "query_block":
+        if training_objective == "query_block":
             block_len = min(max(1, target_len), tokens_remaining)
             logits = model.forward_query_block(context, target_len=block_len)
         elif training_objective == "query_next_token":
             logits = model.forward_query_next_token(context)
         else:
-            logits = model(context)
+            raise ValueError(f"Unsupported query generation objective: {training_objective!r}.")
         if logits.ndim == 2:
             logits = logits.unsqueeze(1)
         sampled_tokens: list[torch.Tensor] = []
@@ -1108,39 +1297,7 @@ def generate_prefix_response_with_sampling(
     temperature: float | None,
     sample_topk: int | None,
 ) -> torch.Tensor:
-    if temperature is not None and temperature <= 0.0:
-        raise ValueError("temperature must be positive when sampling is enabled.")
-    if sample_topk is not None and sample_topk <= 0:
-        raise ValueError("sample-topk must be positive.")
-    was_training = model.training
-    model.eval()
-    prefix = prefix.to(device).unsqueeze(0)
-    decoder_input = torch.tensor([[bos_token_id]], dtype=torch.long, device=device)
-    generated: list[torch.Tensor] = []
-    for _ in range(response_len):
-        logits = model.forward_response(prefix, decoder_input)[:, -1, :]
-        if temperature is None:
-            next_token = torch.argmax(logits, dim=-1)
-        else:
-            scaled_logits = logits / temperature
-            if sample_topk is not None:
-                k = min(sample_topk, scaled_logits.shape[-1])
-                topk_logits, topk_indices = torch.topk(scaled_logits, k=k, dim=-1)
-                probs = torch.softmax(topk_logits, dim=-1)
-                sampled_offset = torch.multinomial(probs, num_samples=1)
-                next_token = topk_indices.gather(-1, sampled_offset).reshape(-1)
-            else:
-                probs = torch.softmax(scaled_logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1).reshape(-1)
-        generated.append(next_token.detach().cpu())
-        decoder_input = torch.cat((decoder_input, next_token.view(1, 1)), dim=-1)
-        if int(next_token.item()) == eos_token_id:
-            break
-    if was_training:
-        model.train()
-    if not generated:
-        return torch.empty(0, dtype=torch.long)
-    return torch.cat(generated, dim=0)
+    raise RuntimeError("Prefix-response generation was removed; use query objectives.")
 
 
 def resolve_effective_model_config(
@@ -1350,6 +1507,11 @@ def select_prefix_response_prompt_tokens(
     return prompt_ids, vocab.decode(prompt_ids.tolist())
 
 
+def format_tensorboard_text(text: str) -> str:
+    escaped = html.escape(text)
+    return escaped.replace("\n", "<br/>\n")
+
+
 def format_tensorboard_sample(
     *,
     prompt_text: str,
@@ -1357,9 +1519,9 @@ def format_tensorboard_sample(
 ) -> str:
     return (
         "### Prompt\n\n"
-        f"```\n{prompt_text}\n```\n\n"
+        f"<div>{format_tensorboard_text(prompt_text)}</div>\n\n"
         "### Generated\n\n"
-        f"```\n{generated_text}\n```"
+        f"<div>{format_tensorboard_text(generated_text)}</div>"
     )
 
 
@@ -1423,6 +1585,9 @@ def run_single_experiment(
     tokenizer_model_path: Path | None,
     train_tokens: torch.Tensor,
     val_tokens: torch.Tensor,
+    train_balanced_index_groups: Sequence[Sequence[int]] | None,
+    train_balanced_token_groups: Sequence[torch.Tensor] | None,
+    val_balanced_token_groups: Sequence[torch.Tensor] | None,
     device: torch.device | str,
     teacher_forcing: bool,
     full_sequence_causal: bool,
@@ -1443,7 +1608,7 @@ def run_single_experiment(
     if grad_accum_steps <= 0:
         raise ValueError("grad-accum-steps must be positive.")
     effective_batch_size = args.batch_size * grad_accum_steps
-    response_objective = args.training_objective in {"prefix_response", "next_sentence_response"}
+    response_objective = False
     if response_objective:
         if train_response_pairs is None or val_response_pairs is None or special_token_ids is None:
             raise ValueError("response objectives require encoded pairs and special ids.")
@@ -1534,6 +1699,7 @@ def run_single_experiment(
         usage_dropout_scale=args.usage_dropout_scale,
         usage_dropout_max=args.usage_dropout_max,
         usage_ema_decay=args.usage_ema_decay,
+        include_query_head=query_next_token or query_block,
     )
     parameter_count = count_parameters(model)
 
@@ -1566,17 +1732,51 @@ def run_single_experiment(
         f"data_workers={args.data_workers} | "
         f"prefetch_factor={args.prefetch_factor}"
     )
+    if args.b_diversity_loss_weight > 0.0 or args.route_concentration_loss_weight > 0.0:
+        print(
+            "aux_losses | "
+            f"b_diversity_weight={args.b_diversity_loss_weight:.6g} | "
+            f"b_cosine_margin={args.b_cosine_margin:.3f} | "
+            f"route_concentration_weight={args.route_concentration_loss_weight:.6g} | "
+            f"route_load_cap={args.route_load_cap:.3f} | "
+            f"edge_prob_cap={args.edge_prob_cap:.3f}"
+        )
 
     start_time = time.perf_counter()
     writer = maybe_create_summary_writer(enabled=args.tensorboard, tensorboard_dir=tensorboard_dir)
+    resume_checkpoint: dict[str, Any] | None = None
+    resume_step = 0
+    optimizer_state_dict: dict[str, object] | None = None
+    if args.resume_checkpoint:
+        resume_checkpoint = torch.load(args.resume_checkpoint, map_location="cpu")
+        resume_step = int(resume_checkpoint.get("step") or 0)
+        load_result = model.load_state_dict(resume_checkpoint["model_state_dict"], strict=False)
+        if load_result.missing_keys or load_result.unexpected_keys:
+            print(
+                "resume_state_dict_load | "
+                f"missing={list(load_result.missing_keys)} | "
+                f"unexpected={list(load_result.unexpected_keys)}"
+            )
+        raw_optimizer_state = resume_checkpoint.get("optimizer_state_dict")
+        optimizer_state_dict = raw_optimizer_state if isinstance(raw_optimizer_state, dict) else None
+        restore_rng_state(resume_checkpoint.get("rng_state"))
+        if resume_step >= train_steps:
+            raise ValueError(
+                f"Resume checkpoint step {resume_step} is already >= requested train_steps {train_steps}."
+            )
+        print(f"resume_checkpoint={args.resume_checkpoint} | resume_step={resume_step:,}")
+
     best_checkpoint_val_loss = math.inf
+    if resume_checkpoint is not None and resume_checkpoint.get("val_loss") is not None:
+        best_checkpoint_val_loss = float(resume_checkpoint["val_loss"])
     progress_bar: Any | None = None
-    last_progress_step = 0
+    last_progress_step = resume_step
     if args.tqdm:
         if tqdm is None:
             raise ImportError("tqdm is required when --tqdm is set.")
         progress_bar = tqdm(
             total=requested_epochs,
+            initial=resume_step / steps_per_epoch,
             unit="epoch",
             dynamic_ncols=True,
             desc=experiment_name,
@@ -1707,7 +1907,27 @@ def run_single_experiment(
             checkpoint_kind="last",
             filename="last.pt",
         )
-        if val_loss < best_checkpoint_val_loss:
+        if val_loss is None:
+            interval_path = save_checkpoint(
+                step=step,
+                train_loss=train_loss,
+                val_loss=None,
+                checkpoint_model=checkpoint_model,
+                optimizer=optimizer,
+                checkpoint_kind="interval",
+                filename=f"step_{step:06d}.pt",
+            )
+            save_checkpoint(
+                step=step,
+                train_loss=train_loss,
+                val_loss=None,
+                checkpoint_model=checkpoint_model,
+                optimizer=optimizer,
+                checkpoint_kind="last",
+                filename="last.pt",
+            )
+            checkpoint_message = f"checkpoint | step={step} | interval | path={interval_path}"
+        elif val_loss < best_checkpoint_val_loss:
             best_checkpoint_val_loss = val_loss
             best_path = save_checkpoint(
                 step=step,
@@ -1798,64 +2018,24 @@ def run_single_experiment(
         if writer is None:
             return
         writer.add_scalar("train/minibatch_loss", minibatch_loss, step)
-        writer.add_scalar("train/epoch", step / steps_per_epoch, step)
-        writer.add_scalar("train/grad_norm", grad_norm, step)
+        if step == 1 or step == train_steps or (args.log_interval > 0 and step % args.log_interval == 0):
+            writer.flush()
+
+    def loss_stats_tensorboard_callback(step: int, stats: dict[str, float]) -> None:
+        if writer is None:
+            return
+        bucket_ppl = {
+            key.removeprefix("query_block_pos_loss/"): perplexity_from_loss(value)
+            for key, value in sorted(stats.items())
+            if key.startswith("query_block_pos_loss/")
+        }
+        if bucket_ppl:
+            writer.add_scalars("train/minibatch_ppl_by_distance", bucket_ppl, step)
         if step == 1 or step == train_steps or (args.log_interval > 0 and step % args.log_interval == 0):
             writer.flush()
 
     def eval_tensorboard_callback(step: int, train_loss: float, val_loss: float) -> None:
-        if writer is None:
-            runtime_stats = None
-        else:
-            writer.add_scalar("eval/train_loss", train_loss, step)
-            writer.add_scalar("eval/val_loss", val_loss, step)
-            writer.add_scalar("eval/train_ppl", perplexity_from_loss(train_loss), step)
-            writer.add_scalar("eval/val_ppl", perplexity_from_loss(val_loss), step)
-            if response_objective:
-                assert train_response_pairs is not None
-                assert special_token_ids is not None
-                stats_batch = sample_prefix_response_batch(
-                    train_response_pairs,
-                    seq_len=args.seq_len,
-                    response_len=args.response_len,
-                    batch_size=1,
-                    bos_token_id=special_token_ids["assistant"],
-                    eos_token_id=special_token_ids["eos"],
-                    pad_token_id=special_token_ids["pad"],
-                    device=device,
-                )
-                stats_context = stats_batch.context[:1]
-            else:
-                stats_batch = sample_next_token_batch(
-                    train_tokens,
-                    seq_len=args.seq_len,
-                    batch_size=1,
-                    device=device,
-                    teacher_forcing=teacher_forcing,
-                    full_sequence_causal=full_sequence_causal,
-                )
-                stats_context = stats_batch.context[:1]
-            runtime_stats = model.collect_runtime_stats(stats_context)
-            for key, value in sorted(runtime_stats.items()):
-                writer.add_scalar(key, value, step)
-            sample_prompt, sample_generated = make_eval_sample()
-            writer.add_text(
-                "eval/sample",
-                format_tensorboard_sample(
-                    prompt_text=sample_prompt,
-                    generated_text=sample_generated,
-                ),
-                step,
-            )
-            sample_message = (
-                f"eval_sample | step={step}\n"
-                f"--- prompt ---\n{sample_prompt}\n\n"
-                f"--- sample ---\n{sample_generated}"
-            )
-            if progress_bar is not None:
-                progress_bar.write(sample_message)
-            else:
-                print(sample_message)
+        if writer is not None:
             writer.flush()
         if trial is not None:
             trial.report(val_loss, step)
@@ -1889,7 +2069,7 @@ def run_single_experiment(
                 eos_token_id=special_token_ids["eos"],
                 pad_token_id=special_token_ids["pad"],
                 device=device,
-                steps=train_steps,
+                steps=train_steps - resume_step,
                 eval_interval=effective_eval_interval,
                 eval_steps=args.eval_steps,
                 learning_rate=args.learning_rate,
@@ -1897,6 +2077,11 @@ def run_single_experiment(
                 grad_accum_steps=grad_accum_steps,
                 data_workers=args.data_workers,
                 prefetch_factor=args.prefetch_factor,
+                balanced_index_groups=train_balanced_index_groups,
+                start_step=resume_step,
+                total_steps=train_steps,
+                optimizer_state_dict=optimizer_state_dict,
+                checkpoint_interval=args.checkpoint_interval,
                 step_setup_callback=step_setup_callback,
                 progress_callback=progress_callback,
                 step_callback=step_tensorboard_callback,
@@ -1914,7 +2099,7 @@ def run_single_experiment(
                 seq_len=args.seq_len,
                 batch_size=args.batch_size,
                 device=device,
-                steps=train_steps,
+                steps=train_steps - resume_step,
                 eval_interval=effective_eval_interval,
                 eval_steps=args.eval_steps,
                 learning_rate=args.learning_rate,
@@ -1931,11 +2116,23 @@ def run_single_experiment(
                 step_setup_callback=step_setup_callback,
                 progress_callback=progress_callback,
                 step_callback=step_tensorboard_callback,
+                loss_stats_callback=loss_stats_tensorboard_callback,
                 eval_callback=eval_tensorboard_callback,
                 checkpoint_callback=training_checkpoint_callback,
                 eval_on_first_step=eval_on_first_step,
                 autocast_device_type=autocast_device_type,
                 autocast_dtype=autocast_dtype,
+                balanced_token_groups=train_balanced_token_groups,
+                val_balanced_token_groups=val_balanced_token_groups,
+                start_step=resume_step,
+                total_steps=train_steps,
+                optimizer_state_dict=optimizer_state_dict,
+                checkpoint_interval=args.checkpoint_interval,
+                b_diversity_loss_weight=args.b_diversity_loss_weight,
+                b_cosine_margin=args.b_cosine_margin,
+                route_concentration_loss_weight=args.route_concentration_loss_weight,
+                route_load_cap=args.route_load_cap,
+                edge_prob_cap=args.edge_prob_cap,
             )
     except Exception:
         if progress_bar is not None:
@@ -2180,15 +2377,10 @@ def main() -> None:
     parser.add_argument(
         "--training-objective",
         choices=(
-            "last_token",
-            "teacher_forcing",
-            "full_sequence_causal",
             "query_next_token",
             "query_block",
-            "prefix_response",
-            "next_sentence_response",
         ),
-        default="last_token",
+        default="query_block",
     )
     parser.add_argument(
         "--tokenizer",
@@ -2224,6 +2416,13 @@ def main() -> None:
         help="Run eval, TensorBoard sample logging, and eval-tied checkpoints once per epoch.",
     )
     parser.add_argument("--eval-steps", type=int, default=10)
+    parser.add_argument("--checkpoint-interval", type=int, default=0)
+    parser.add_argument("--resume-checkpoint")
+    parser.add_argument(
+        "--balance-batch-by-source",
+        action="store_true",
+        help="For response objectives, sample each batch evenly across source buckets.",
+    )
     parser.add_argument("--log-interval", type=int, default=25)
     parser.add_argument(
         "--tqdm",
@@ -2240,6 +2439,36 @@ def main() -> None:
         type=int,
         default=1,
         help="Number of future tokens predicted by query_block in one causal query-slot block.",
+    )
+    parser.add_argument(
+        "--b-diversity-loss-weight",
+        type=float,
+        default=0.0,
+        help="Auxiliary weight for reducing high cosine similarity between compressed B nodes.",
+    )
+    parser.add_argument(
+        "--b-cosine-margin",
+        type=float,
+        default=0.20,
+        help="Compressed B node cosine similarity above this margin is penalized.",
+    )
+    parser.add_argument(
+        "--route-concentration-loss-weight",
+        type=float,
+        default=0.0,
+        help="Auxiliary weight for penalizing route/edge concentration onto a single node.",
+    )
+    parser.add_argument(
+        "--route-load-cap",
+        type=float,
+        default=0.25,
+        help="Maximum allowed normalized destination route load before concentration loss applies.",
+    )
+    parser.add_argument(
+        "--edge-prob-cap",
+        type=float,
+        default=0.55,
+        help="Maximum allowed single-edge probability before concentration loss applies.",
     )
     parser.add_argument("--response-len", type=int, default=64)
     parser.add_argument(
@@ -2393,13 +2622,13 @@ def main() -> None:
     device = resolve_device(args.device)
     print(f"using device: {describe_device(args.device)}")
 
-    teacher_forcing = args.training_objective == "teacher_forcing"
-    full_sequence_causal = args.training_objective == "full_sequence_causal"
+    teacher_forcing = False
+    full_sequence_causal = False
     query_next_token = args.training_objective == "query_next_token"
     query_block = args.training_objective == "query_block"
-    prefix_response = args.training_objective == "prefix_response"
-    next_sentence_response = args.training_objective == "next_sentence_response"
-    response_objective = prefix_response or next_sentence_response
+    prefix_response = False
+    next_sentence_response = False
+    response_objective = False
     if args.teacher_forcing_chunk_size is not None and args.teacher_forcing_chunk_size <= 0:
         raise ValueError("teacher-forcing-chunk-size must be positive.")
     if args.teacher_forcing_chunk_size is not None and not teacher_forcing:
@@ -2419,10 +2648,22 @@ def main() -> None:
         raise ValueError("pretokenize-workers must be non-negative.")
     if args.prefetch_factor <= 0:
         raise ValueError("prefetch-factor must be positive.")
+    if args.checkpoint_interval < 0:
+        raise ValueError("checkpoint-interval must be non-negative.")
     if args.response_len <= 0:
         raise ValueError("response-len must be positive.")
     if args.target_len <= 0:
         raise ValueError("target-len must be positive.")
+    if args.b_diversity_loss_weight < 0.0:
+        raise ValueError("b-diversity-loss-weight must be non-negative.")
+    if args.route_concentration_loss_weight < 0.0:
+        raise ValueError("route-concentration-loss-weight must be non-negative.")
+    if not 0.0 <= args.b_cosine_margin < 1.0:
+        raise ValueError("b-cosine-margin must be in [0, 1).")
+    if not 0.0 < args.route_load_cap <= 1.0:
+        raise ValueError("route-load-cap must be in (0, 1].")
+    if not 0.0 < args.edge_prob_cap <= 1.0:
+        raise ValueError("edge-prob-cap must be in (0, 1].")
     if args.sentence_prefix_count <= 0:
         raise ValueError("sentence-prefix-count must be positive.")
     if args.sentence_min_chars <= 0:
@@ -2526,22 +2767,105 @@ def main() -> None:
         user_defined_symbols=DIALOGUE_SPECIAL_TOKENS if response_objective or query_next_token or query_block else (),
     )
     special_token_ids = require_special_token_ids(vocab) if response_objective else None
+    effective_pretokenize_workers = min(args.pretokenize_workers, os.cpu_count() or 1)
+    if not response_objective and effective_pretokenize_workers > 1 and isinstance(vocab, ByteBPEVocab):
+        print(f"parallel_byte_bpe_encoding | workers={effective_pretokenize_workers}", flush=True)
     if response_objective:
         tokens = torch.empty(0, dtype=torch.long)
         train_tokens = tokens
         val_tokens = tokens
     else:
-        tokens = vocab.encode(corpus.text)
         required_future_tokens = args.target_len if query_block else 1
-        if tokens.numel() <= args.seq_len + required_future_tokens:
-            raise ValueError("The tokenized corpus must be longer than seq_len + target_len.")
-        train_tokens, val_tokens = split_train_val(tokens, train_fraction=0.9)
+        if (query_next_token or query_block) and args.balance_batch_by_source and args.jsonl_source:
+            source_texts = load_token_stream_source_texts(
+                jsonl_sources=args.jsonl_source,
+                jsonl_text_keys=tuple(dict.fromkeys(args.jsonl_text_key)),
+                max_samples=args.corpus_max_samples,
+                max_chars=args.corpus_max_chars,
+            )
+            source_train_parts: list[torch.Tensor] = []
+            source_val_parts: list[torch.Tensor] = []
+            source_val_counts: dict[str, int] = {}
+            source_counts: dict[str, int] = {}
+            skipped_sources: dict[str, int] = {}
+            min_tokens = args.seq_len + required_future_tokens
+            for source, source_text in sorted(source_texts.items()):
+                source_tokens = encode_text_in_chunks(
+                    vocab,
+                    source_text,
+                    workers=effective_pretokenize_workers,
+                )
+                if source_tokens.numel() <= min_tokens:
+                    skipped_sources[source] = int(source_tokens.numel())
+                    continue
+                source_train, source_val = split_train_val(source_tokens, train_fraction=0.9)
+                if source_train.numel() <= min_tokens:
+                    skipped_sources[source] = int(source_train.numel())
+                    continue
+                source_counts[source] = int(source_train.numel())
+                source_train_parts.append(source_train)
+                if source_val.numel() > min_tokens:
+                    source_val_counts[source] = int(source_val.numel())
+                    source_val_parts.append(source_val)
+            if not source_train_parts:
+                raise ValueError("No source group has enough tokens for balanced query/block batches.")
+            train_tokens = torch.cat(source_train_parts)
+            source_views: list[torch.Tensor] = []
+            offset = 0
+            for source_train in source_train_parts:
+                next_offset = offset + source_train.numel()
+                source_views.append(train_tokens[offset:next_offset])
+                offset = next_offset
+            train_balanced_token_groups = tuple(source_views)
+            val_tokens = torch.cat(source_val_parts) if source_val_parts else train_tokens
+            val_balanced_token_groups = None
+            if source_val_parts:
+                val_views: list[torch.Tensor] = []
+                offset = 0
+                for source_val in source_val_parts:
+                    next_offset = offset + source_val.numel()
+                    val_views.append(val_tokens[offset:next_offset])
+                    offset = next_offset
+                val_balanced_token_groups = tuple(val_views)
+            print(
+                "balanced_token_batches | "
+                f"train_groups={len(train_balanced_token_groups)} | "
+                f"val_groups={len(val_balanced_token_groups or ())} | "
+                f"train_token_counts={source_counts} | "
+                f"val_token_counts={source_val_counts}"
+                + (f" | skipped={skipped_sources}" if skipped_sources else "")
+            )
+        else:
+            tokens = encode_text_in_chunks(
+                vocab,
+                corpus.text,
+                workers=effective_pretokenize_workers,
+            )
+            if tokens.numel() <= args.seq_len + required_future_tokens:
+                raise ValueError("The tokenized corpus must be longer than seq_len + target_len.")
+            train_tokens, val_tokens = split_train_val(tokens, train_fraction=0.9)
     train_response_pairs = None
     val_response_pairs = None
+    train_balanced_index_groups = None
+    if 'val_balanced_token_groups' not in locals():
+        val_balanced_token_groups = None
+    if response_objective or not (
+        (query_next_token or query_block) and args.balance_batch_by_source and args.jsonl_source
+    ):
+        train_balanced_token_groups = None
     if response_objective:
         assert dialogue_pairs is not None
-        train_pair_texts, val_pair_texts = split_dialogue_pairs(dialogue_pairs)
-        effective_pretokenize_workers = min(args.pretokenize_workers, os.cpu_count() or 1)
+        if args.balance_batch_by_source:
+            train_pair_texts, val_pair_texts = split_dialogue_pairs_by_source(dialogue_pairs)
+        else:
+            train_pair_texts, val_pair_texts = split_dialogue_pairs(dialogue_pairs)
+        if args.balance_batch_by_source:
+            train_balanced_index_groups = build_source_balanced_index_groups(train_pair_texts)
+            print(
+                "balanced_source_batches | "
+                f"groups={len(train_balanced_index_groups)} | "
+                f"counts={summarize_source_groups(train_pair_texts, train_balanced_index_groups)}"
+            )
         print(
             "encoding_response_pairs | "
             f"train={len(train_pair_texts):,} | val={len(val_pair_texts):,} | "
@@ -2600,6 +2924,9 @@ def main() -> None:
             tokenizer_model_path=tokenizer_model_path,
             train_tokens=train_tokens,
             val_tokens=val_tokens,
+            train_balanced_index_groups=train_balanced_index_groups,
+            train_balanced_token_groups=train_balanced_token_groups,
+            val_balanced_token_groups=val_balanced_token_groups,
             device=device,
             teacher_forcing=teacher_forcing,
             full_sequence_causal=full_sequence_causal,
