@@ -36,6 +36,7 @@ from jakal_net.kernel_common import (
 from jakal_net.native_backend import (
     native_supports,
     native_supports_device,
+    propagation_query_dense_native,
     propagation_query_topk_native,
 )
 
@@ -148,9 +149,91 @@ def _layer_cosine_duplicate_loss(
     cosine = torch.matmul(values, values.transpose(-1, -2))
     off_diagonal_mask = ~torch.eye(layer.num_nodes, device=cosine.device, dtype=torch.bool)
     off_diagonal = cosine[..., off_diagonal_mask]
-    loss = (off_diagonal - margin).clamp_min(0.0).square().mean()
-    mean_high_cosine = (off_diagonal - margin).clamp_min(0.0).mean()
+    over_margin = (off_diagonal - margin).clamp_min(0.0)
+    loss = over_margin.mean()
+    mean_high_cosine = over_margin.mean()
     return loss, mean_high_cosine
+
+
+def _set_optimizer_hyperparams(
+    optimizer: torch.optim.Optimizer,
+    *,
+    learning_rate: float,
+    weight_decay: float | None = None,
+) -> None:
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = learning_rate
+        if weight_decay is not None:
+            param_group["weight_decay"] = weight_decay
+
+
+def _resolve_scheduled_learning_rate(
+    *,
+    base_learning_rate: float,
+    schedule: str,
+    warmup_steps: int,
+    step: int,
+    start_step: int,
+    total_steps: int,
+) -> float:
+    if schedule == "none":
+        return base_learning_rate
+    if schedule != "cosine":
+        raise ValueError(f"Unsupported learning-rate schedule: {schedule!r}.")
+    relative_step = max(1, step - start_step)
+    if warmup_steps > 0 and relative_step <= warmup_steps:
+        return base_learning_rate * (relative_step / warmup_steps)
+    decay_steps = max(1, total_steps - start_step - warmup_steps)
+    decay_progress = min(1.0, max(0.0, (relative_step - warmup_steps) / decay_steps))
+    cosine_scale = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
+    return base_learning_rate * cosine_scale
+
+
+def _grad_group_keys(parameter_name: str) -> tuple[str, ...]:
+    groups: list[str] = []
+    if parameter_name.startswith("joint_blocks."):
+        parts = parameter_name.split(".")
+        if len(parts) >= 3:
+            block_index = parts[1]
+            component = parts[2]
+            groups.append(f"grad/joint_blocks/{block_index}/total")
+            groups.append(f"grad/joint_blocks/{block_index}/{component}")
+        return tuple(groups)
+    direct_prefixes = (
+        "token_embedding",
+        "position_encoding",
+        "state_init",
+        "query_transition",
+        "query_propagation",
+        "query_head",
+        "query_head_norm",
+        "sequence_val_norm",
+        "query_val_norm",
+    )
+    for prefix in direct_prefixes:
+        if parameter_name.startswith(prefix):
+            return (f"grad/{prefix}",)
+    if parameter_name.startswith("s_warmup."):
+        return ("grad/s_warmup",)
+    if parameter_name.startswith("s_refine."):
+        return ("grad/s_refine",)
+    return ("grad/other",)
+
+
+def _collect_grad_group_norms(model: nn.Module) -> dict[str, float]:
+    grad_square_sums: dict[str, float] = {}
+    for name, parameter in model.named_parameters():
+        if parameter.grad is None:
+            continue
+        grad = parameter.grad.detach().float()
+        square_sum = float(grad.square().sum().item())
+        for group in _grad_group_keys(name):
+            grad_square_sums[group] = grad_square_sums.get(group, 0.0) + square_sum
+    return {
+        key: math.sqrt(value)
+        for key, value in sorted(grad_square_sums.items())
+        if value > 0.0
+    }
 
 
 def _make_value_norm(dim: int, norm_kind: str) -> nn.Module:
@@ -184,6 +267,51 @@ def _apply_layer_slot_mask(layer: Layer, slot_mask: Tensor) -> Layer:
     return layer.with_tensors(
         state=apply_slot_mask_to_state(layer.state, slot_mask),
         val=apply_slot_mask_to_val(layer.val, slot_mask),
+    )
+
+
+def _sample_slot_keep_mask(layer: Layer, *, dropout_p: float) -> Tensor | None:
+    if dropout_p <= 0.0 or dropout_p >= 1.0 or layer.num_nodes <= 1:
+        return None
+    mask = (
+        torch.rand(
+            *layer.batch_shape,
+            layer.num_nodes,
+            device=layer.val.device,
+        )
+        >= dropout_p
+    )
+    flat_mask = mask.reshape(-1, layer.num_nodes)
+    empty_rows = ~flat_mask.any(dim=-1)
+    if empty_rows.any():
+        random_indices = torch.randint(
+            0,
+            layer.num_nodes,
+            (int(empty_rows.sum().item()),),
+            device=layer.val.device,
+        )
+        flat_mask[empty_rows, random_indices] = True
+    return flat_mask.reshape(*layer.batch_shape, layer.num_nodes)
+
+
+def _apply_scaled_slot_mask(layer: Layer, slot_mask: Tensor, *, keep_prob: float) -> Layer:
+    scale = slot_mask.to(dtype=layer.val.dtype) / keep_prob
+    return layer.with_tensors(
+        state=layer.state * scale.to(dtype=layer.state.dtype),
+        val=layer.val * scale.unsqueeze(-1),
+    )
+
+
+def _apply_scaled_delta_slot_mask(
+    delta: LayerDelta,
+    slot_mask: Tensor,
+    *,
+    keep_prob: float,
+) -> LayerDelta:
+    scale = slot_mask.to(dtype=delta.delta_val.dtype) / keep_prob
+    return LayerDelta(
+        delta_state=delta.delta_state * scale.to(dtype=delta.delta_state.dtype),
+        delta_val=delta.delta_val * scale.unsqueeze(-1),
     )
 
 
@@ -267,7 +395,6 @@ class QueryTopKPropagation(nn.Module):
         projected_val = source_layer.val
         query_nodes = query_layer.num_nodes
         source_nodes = source_layer.num_nodes
-        k = min(self.topk, source_nodes)
         delta_state = torch.zeros(
             *query_layer.batch_shape,
             query_nodes,
@@ -285,60 +412,59 @@ class QueryTopKPropagation(nn.Module):
         for query_start in range(0, query_nodes, self.query_block_size or query_nodes):
             query_end = min(query_nodes, query_start + (self.query_block_size or query_nodes))
             query_val = query_layer.val[..., query_start:query_end, :]
-            best_scores: Tensor | None = None
-            best_indices: Tensor | None = None
+            query_state_acc = torch.zeros(
+                *query_layer.batch_shape,
+                query_end - query_start,
+                device=query_layer.state.device,
+                dtype=projected_state.dtype,
+            )
+            query_val_acc = torch.zeros(
+                *query_layer.batch_shape,
+                query_end - query_start,
+                query_layer.dim,
+                device=query_layer.val.device,
+                dtype=projected_val.dtype,
+            )
             for source_start in range(0, source_nodes, self.source_block_size or source_nodes):
                 source_end = min(source_nodes, source_start + (self.source_block_size or source_nodes))
                 source_val = source_layer.val[..., source_start:source_end, :]
                 scores = self.pairwise_fn(query_val, source_val)
-                if best_scores is None or best_indices is None:
-                    best_scores = torch.full(
-                        (*scores.shape[:-1], k),
-                        fill_value=torch.finfo(scores.dtype).min,
-                        device=scores.device,
-                        dtype=scores.dtype,
-                    )
-                    best_indices = torch.zeros(
-                        (*scores.shape[:-1], k),
-                        device=scores.device,
-                        dtype=torch.long,
-                    )
-                source_indices = torch.arange(
-                    source_start,
-                    source_end,
-                    device=scores.device,
-                    dtype=torch.long,
+                edges = self.edge_compress_fn(scores)
+                query_state_acc += torch.einsum(
+                    "...ij,...j->...i",
+                    edges.to(projected_state.dtype),
+                    projected_state[..., source_start:source_end].to(projected_state.dtype),
                 )
-                source_indices = source_indices.view(
-                    (1,) * (scores.ndim - 1) + (source_end - source_start,)
-                ).expand_as(scores)
-                candidate_scores = torch.cat((best_scores, scores), dim=-1)
-                candidate_indices = torch.cat((best_indices, source_indices), dim=-1)
-                selected = select_topk(candidate_scores, k, dim=-1)
-                best_scores = selected.values
-                best_indices = torch.take_along_dim(
-                    candidate_indices,
-                    selected.indices,
-                    dim=-1,
+                query_val_acc += torch.einsum(
+                    "...ij,...jd->...id",
+                    edges.to(projected_val.dtype),
+                    projected_val[..., source_start:source_end, :].to(projected_val.dtype),
                 )
 
-            if best_scores is None or best_indices is None:
-                continue
-            edges = self.edge_compress_fn(best_scores)
-            selected_state = gather_state_by_indices(projected_state, best_indices)
-            selected_val = gather_val_by_indices(projected_val, best_indices)
-            delta_state[..., query_start:query_end] = (
-                edges.to(projected_state.dtype) * selected_state.to(projected_state.dtype)
-            ).sum(dim=-1)
-            delta_val[..., query_start:query_end, :] = (
-                edges.to(projected_val.dtype).unsqueeze(-1)
-                * selected_val.to(projected_val.dtype)
-            ).sum(dim=-2)
+            delta_state[..., query_start:query_end] = query_state_acc
+            delta_val[..., query_start:query_end, :] = query_val_acc
 
         return LayerDelta(delta_state=delta_state, delta_val=delta_val)
 
     def compute_delta(self, query_layer: Layer, source_layer: Layer) -> LayerDelta:
         edge_compress_name = self._native_edge_compress_name()
+        if (
+            self.implementation == "native"
+            and edge_compress_name is not None
+            and supports_pairwise_kernel(self.pairwise_fn)
+            and native_supports("propagation_query_dense")
+            and native_supports_device(query_layer.val.device.type)
+        ):
+            return propagation_query_dense_native(
+                pairwise_fn=self.pairwise_fn,
+                edge_compress_name=edge_compress_name,
+                query_val=query_layer.val,
+                source_val=source_layer.val,
+                projected_state=source_layer.state,
+                projected_val=source_layer.val,
+                query_block_size=self.query_block_size or query_layer.num_nodes,
+                source_block_size=self.source_block_size or source_layer.num_nodes,
+            )
         if (
             self.implementation == "native"
             and edge_compress_name is not None
@@ -405,11 +531,6 @@ def _make_transition(
         topk=route_topk,
         implementation=implementation,
         merge_mode=merge_mode,
-        edge_dropout_p=edge_dropout_p,
-        usage_dropout_base=usage_dropout_base,
-        usage_dropout_scale=usage_dropout_scale,
-        usage_dropout_max=usage_dropout_max,
-        usage_ema_decay=usage_ema_decay,
     )
 
 
@@ -544,6 +665,9 @@ class ProgressiveBJointBlock(nn.Module):
         usage_dropout_scale: float = 0.0,
         usage_dropout_max: float = 0.0,
         usage_ema_decay: float = 0.99,
+        b_slot_dropout_p: float = 0.0,
+        s_to_b_slot_dropout_p: float = 0.0,
+        b_to_s_slot_dropout_p: float = 0.0,
         s_pairwise_fn: nn.Module | None = None,
         expanded_pairwise_fn: nn.Module | None = None,
         compressed_pairwise_fn: nn.Module | None = None,
@@ -579,6 +703,9 @@ class ProgressiveBJointBlock(nn.Module):
         self.usage_dropout_scale = usage_dropout_scale
         self.usage_dropout_max = usage_dropout_max
         self.usage_ema_decay = usage_ema_decay
+        self.b_slot_dropout_p = b_slot_dropout_p
+        self.s_to_b_slot_dropout_p = s_to_b_slot_dropout_p
+        self.b_to_s_slot_dropout_p = b_to_s_slot_dropout_p
         self.track_stats = False
         self.last_runtime_stats: dict[str, float] | None = None
         self.collect_aux_losses = False
@@ -843,6 +970,17 @@ class ProgressiveBJointBlock(nn.Module):
             compressed_nodes,
         )
         compressed_b = self._finalize_layer(compressed_b, self.compressed_val_norm)
+        if self.training and self.b_slot_dropout_p > 0.0:
+            compressed_slot_mask = _sample_slot_keep_mask(
+                compressed_b,
+                dropout_p=self.b_slot_dropout_p,
+            )
+            assert compressed_slot_mask is not None
+            compressed_b = _apply_scaled_slot_mask(
+                compressed_b,
+                compressed_slot_mask,
+                keep_prob=1.0 - self.b_slot_dropout_p,
+            )
 
         expanded_b = self._make_b_layer(
             s_layer,
@@ -870,14 +1008,43 @@ class ProgressiveBJointBlock(nn.Module):
             path_scale=alpha_b * self.b_delta_scale,
         )
         expanded_b = self._finalize_layer(expanded_b, self.expanded_val_norm)
+        if self.training and self.b_slot_dropout_p > 0.0:
+            expanded_slot_mask = _sample_slot_keep_mask(
+                expanded_b,
+                dropout_p=self.b_slot_dropout_p,
+            )
+            assert expanded_slot_mask is not None
+            expanded_b = _apply_scaled_slot_mask(
+                expanded_b,
+                expanded_slot_mask,
+                keep_prob=1.0 - self.b_slot_dropout_p,
+            )
 
         b_to_s_src = self._prepare_operator_input(expanded_b, self.expanded_val_norm)
         b_to_s_dst = self._prepare_operator_input(s_layer, self.s_val_norm)
+        b_to_s_slot_mask = None
+        if self.training and self.b_to_s_slot_dropout_p > 0.0:
+            b_to_s_slot_mask = _sample_slot_keep_mask(
+                b_to_s_dst,
+                dropout_p=self.b_to_s_slot_dropout_p,
+            )
+            assert b_to_s_slot_mask is not None
+            b_to_s_dst = _apply_scaled_slot_mask(
+                b_to_s_dst,
+                b_to_s_slot_mask,
+                keep_prob=1.0 - self.b_to_s_slot_dropout_p,
+            )
         add_route_concentration("b_to_s", self.b_to_s, b_to_s_src, b_to_s_dst)
         b_to_s_delta = self.b_to_s.compute_delta(
             b_to_s_src,
             b_to_s_dst,
         )
+        if b_to_s_slot_mask is not None:
+            b_to_s_delta = _apply_scaled_delta_slot_mask(
+                b_to_s_delta,
+                b_to_s_slot_mask,
+                keep_prob=1.0 - self.b_to_s_slot_dropout_p,
+            )
         s_layer = self._scaled_apply(
             s_layer,
             b_to_s_delta,
@@ -900,11 +1067,29 @@ class ProgressiveBJointBlock(nn.Module):
         )
         s_to_b_src = self._prepare_operator_input(s_layer, self.s_val_norm)
         s_to_b_dst = self._prepare_operator_input(next_compressed, self.compressed_val_norm)
+        s_to_b_slot_mask = None
+        if self.training and self.s_to_b_slot_dropout_p > 0.0:
+            s_to_b_slot_mask = _sample_slot_keep_mask(
+                s_to_b_dst,
+                dropout_p=self.s_to_b_slot_dropout_p,
+            )
+            assert s_to_b_slot_mask is not None
+            s_to_b_dst = _apply_scaled_slot_mask(
+                s_to_b_dst,
+                s_to_b_slot_mask,
+                keep_prob=1.0 - self.s_to_b_slot_dropout_p,
+            )
         add_route_concentration("s_to_b", self.s_to_b, s_to_b_src, s_to_b_dst)
         s_to_b_delta = self.s_to_b.compute_delta(
             s_to_b_src,
             s_to_b_dst,
         )
+        if s_to_b_slot_mask is not None:
+            s_to_b_delta = _apply_scaled_delta_slot_mask(
+                s_to_b_delta,
+                s_to_b_slot_mask,
+                keep_prob=1.0 - self.s_to_b_slot_dropout_p,
+            )
         next_compressed = self._scaled_apply(
             next_compressed,
             s_to_b_delta,
@@ -919,6 +1104,17 @@ class ProgressiveBJointBlock(nn.Module):
             path_scale=alpha_b * self.b_delta_scale,
         )
         next_compressed = self._finalize_layer(next_compressed, self.compressed_val_norm)
+        if self.training and self.b_slot_dropout_p > 0.0:
+            next_compressed_slot_mask = _sample_slot_keep_mask(
+                next_compressed,
+                dropout_p=self.b_slot_dropout_p,
+            )
+            assert next_compressed_slot_mask is not None
+            next_compressed = _apply_scaled_slot_mask(
+                next_compressed,
+                next_compressed_slot_mask,
+                keep_prob=1.0 - self.b_slot_dropout_p,
+            )
         if self.track_stats:
             for prefix, transition in (
                 ("expand", self.expand_transition),
@@ -986,6 +1182,9 @@ class ProgressiveBExampleLM(nn.Module):
         usage_dropout_scale: float = 0.0,
         usage_dropout_max: float = 0.0,
         usage_ema_decay: float = 0.99,
+        b_slot_dropout_p: float = 0.0,
+        s_to_b_slot_dropout_p: float = 0.0,
+        b_to_s_slot_dropout_p: float = 0.0,
         state_init_mode: str = "zero",
         pairwise_kind: str = "diagonal_bilinear",
         pairwise_hidden_dim: int | None = None,
@@ -1019,6 +1218,9 @@ class ProgressiveBExampleLM(nn.Module):
         self.usage_dropout_scale = usage_dropout_scale
         self.usage_dropout_max = usage_dropout_max
         self.usage_ema_decay = usage_ema_decay
+        self.b_slot_dropout_p = b_slot_dropout_p
+        self.s_to_b_slot_dropout_p = s_to_b_slot_dropout_p
+        self.b_to_s_slot_dropout_p = b_to_s_slot_dropout_p
         self.state_init_mode = state_init_mode
         self.pairwise_kind = pairwise_kind
         self.pairwise_hidden_dim = pairwise_hidden_dim
@@ -1034,6 +1236,11 @@ class ProgressiveBExampleLM(nn.Module):
         self.edge_prob_cap = 0.55
         self.last_aux_losses: dict[str, Tensor] | None = None
         self.last_aux_stats: dict[str, float] | None = None
+        self.collect_b_diversity_losses = False
+        self.b_diversity_early_margin = 0.35
+        self.b_diversity_final_margin = 0.20
+        self.last_b_diversity_losses: dict[str, Tensor] | None = None
+        self.last_b_diversity_stats: dict[str, float] | None = None
 
         self.token_embedding = nn.Embedding(vocab_size, dim)
         self.position_encoding = LearnedPositionEncoding(dim)
@@ -1139,6 +1346,9 @@ class ProgressiveBExampleLM(nn.Module):
                     usage_dropout_scale=usage_dropout_scale,
                     usage_dropout_max=usage_dropout_max,
                     usage_ema_decay=usage_ema_decay,
+                    b_slot_dropout_p=b_slot_dropout_p,
+                    s_to_b_slot_dropout_p=s_to_b_slot_dropout_p,
+                    b_to_s_slot_dropout_p=b_to_s_slot_dropout_p,
                     s_pairwise_fn=shared_s_pairwise,
                     expanded_pairwise_fn=shared_expanded_pairwise,
                     compressed_pairwise_fn=shared_compressed_pairwise,
@@ -1192,6 +1402,28 @@ class ProgressiveBExampleLM(nn.Module):
         self.last_aux_stats = None
         for block in self.joint_blocks:
             block.set_aux_loss_collection(enabled, route_load_cap=route_load_cap)
+
+    def set_b_diversity_collection(
+        self,
+        enabled: bool,
+        *,
+        early_margin: float,
+        final_margin: float,
+    ) -> None:
+        self.collect_b_diversity_losses = enabled
+        self.b_diversity_early_margin = early_margin
+        self.b_diversity_final_margin = final_margin
+        self.last_b_diversity_losses = None
+        self.last_b_diversity_stats = None
+
+    def _resolve_b_diversity_margin(self, block_index: int) -> float:
+        total_blocks = len(self.joint_blocks)
+        if total_blocks <= 1:
+            return self.b_diversity_final_margin
+        progress = block_index / (total_blocks - 1)
+        return self.b_diversity_early_margin + (
+            self.b_diversity_final_margin - self.b_diversity_early_margin
+        ) * progress
 
     def initialize_sequence_layer(
         self,
@@ -1323,17 +1555,35 @@ class ProgressiveBExampleLM(nn.Module):
     def encode_prefix(self, token_ids: Tensor) -> tuple[Layer, Layer | None]:
         s_layer = self.initialize_sequence_layer(token_ids)
         compressed_b: Layer | None = None
+        b_diversity_losses: dict[str, Tensor] = {}
+        b_diversity_stats: dict[str, float] = {}
 
         for op in self.s_warmup:
             delta = op.compute_delta(self._prepare_sequence_input(s_layer))
             s_layer = self._apply_sequence_delta(s_layer, delta, scale=0.25)
             s_layer = self._finalize_sequence_layer(s_layer)
-        for block in self.joint_blocks:
+        for block_index, block in enumerate(self.joint_blocks):
             s_layer, compressed_b = block(s_layer, compressed_b)
+            if self.collect_b_diversity_losses and compressed_b is not None:
+                margin = self._resolve_b_diversity_margin(block_index)
+                block_loss, block_high_cosine = _layer_cosine_duplicate_loss(
+                    compressed_b,
+                    margin=margin,
+                    reference=s_layer.val,
+                )
+                key = f"b_diversity/block_{block_index:02d}"
+                b_diversity_losses[key] = block_loss
+                b_diversity_stats[f"{key}_margin"] = margin
+                b_diversity_stats[f"{key}_over_margin_mean"] = float(
+                    block_high_cosine.detach().item()
+                )
         for op in self.s_refine:
             delta = op.compute_delta(self._prepare_sequence_input(s_layer))
             s_layer = self._apply_sequence_delta(s_layer, delta, scale=0.25)
             s_layer = self._finalize_sequence_layer(s_layer)
+
+        self.last_b_diversity_losses = b_diversity_losses if b_diversity_losses else None
+        self.last_b_diversity_stats = b_diversity_stats if b_diversity_stats else None
 
         if self.track_stats:
             stats = {}
@@ -1556,10 +1806,12 @@ class ProgressiveBExampleLM(nn.Module):
         full_sequence_causal: bool = False,
         teacher_forcing_chunk_size: int | None = None,
     ) -> Tensor | tuple[Tensor, Layer, Layer | None]:
-        raise RuntimeError(
-            "ProgressiveBExampleLM is query-head only. Use forward_query_next_token "
-            "or forward_query_block."
-        )
+        if teacher_forcing or full_sequence_causal or teacher_forcing_chunk_size is not None:
+            raise RuntimeError(
+                "ProgressiveBExampleLM is query-head only. Use forward_query_next_token "
+                "or forward_query_block for non-legacy training objectives."
+            )
+        return self.forward_query_next_token(token_ids, return_layers=return_layers)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1981,7 +2233,10 @@ def compute_next_token_loss(
     autocast_device_type: str | None = None,
     autocast_dtype: torch.dtype | None = None,
     b_diversity_loss_weight: float = 0.0,
+    b_diversity_unweighted_per_layer: bool = False,
+    b_diversity_per_layer_weight: float = 1.0,
     b_cosine_margin: float = 0.20,
+    b_cosine_early_margin: float = 0.35,
     route_concentration_loss_weight: float = 0.0,
     route_load_cap: float = 0.25,
     edge_prob_cap: float = 0.55,
@@ -1998,6 +2253,11 @@ def compute_next_token_loss(
         model,
         "set_aux_loss_collection",
     )
+    collect_b_diversity_losses = (
+        query_block
+        and b_diversity_unweighted_per_layer
+        and hasattr(model, "set_b_diversity_collection")
+    )
     if hasattr(model, "last_loss_stats"):
         model.last_loss_stats = {}
     if collect_aux_losses:
@@ -2005,6 +2265,12 @@ def compute_next_token_loss(
             True,
             route_load_cap=route_load_cap,
             edge_prob_cap=edge_prob_cap,
+        )
+    if collect_b_diversity_losses:
+        model.set_b_diversity_collection(
+            True,
+            early_margin=b_cosine_early_margin,
+            final_margin=b_cosine_margin,
         )
     with torch.autocast(
         device_type=autocast_device_type or "cpu",
@@ -2057,6 +2323,22 @@ def compute_next_token_loss(
             loss = loss + b_diversity_loss_weight * b_loss
             loss_stats["aux/b_cosine_duplicate_loss"] = float(b_loss.detach().item())
             loss_stats["aux/b_cosine_over_margin_mean"] = float(b_high_cosine.detach().item())
+        if collect_b_diversity_losses:
+            b_losses = getattr(model, "last_b_diversity_losses", None)
+            b_stats = getattr(model, "last_b_diversity_stats", None)
+            if b_losses:
+                per_layer_b_loss = torch.stack(list(b_losses.values())).mean()
+                weighted_per_layer_b_loss = b_diversity_per_layer_weight * per_layer_b_loss
+                loss = loss + weighted_per_layer_b_loss
+                loss_stats["aux/b_cosine_per_layer_loss"] = float(per_layer_b_loss.detach().item())
+                loss_stats["aux/b_cosine_per_layer_weighted_loss"] = float(
+                    weighted_per_layer_b_loss.detach().item()
+                )
+                for key, value in sorted(b_losses.items()):
+                    loss_stats[f"aux/{key}_loss"] = float(value.detach().item())
+            if b_stats:
+                for key, value in sorted(b_stats.items()):
+                    loss_stats[f"aux/{key}"] = value
         if route_concentration_loss_weight > 0.0:
             aux_losses = getattr(model, "last_aux_losses", None)
             aux_stats = getattr(model, "last_aux_stats", None)
@@ -2072,6 +2354,12 @@ def compute_next_token_loss(
         loss_stats["loss/total"] = float(loss.detach().item())
     if collect_aux_losses:
         model.set_aux_loss_collection(False)
+    if collect_b_diversity_losses:
+        model.set_b_diversity_collection(
+            False,
+            early_margin=b_cosine_early_margin,
+            final_margin=b_cosine_margin,
+        )
     if hasattr(model, "__dict__"):
         model.last_loss_stats = loss_stats
     return loss, logits
@@ -2206,6 +2494,7 @@ def train_next_token_model(
     progress_callback: Callable[[int, int, float], None] | None = None,
     step_callback: Callable[[int, float, float], None] | None = None,
     loss_stats_callback: Callable[[int, dict[str, float]], None] | None = None,
+    grad_stats_callback: Callable[[int, dict[str, float]], None] | None = None,
     eval_callback: Callable[[int, float, float], None] | None = None,
     checkpoint_callback: Callable[[int, float, float, nn.Module, torch.optim.Optimizer], None] | None = None,
     eval_on_first_step: bool = True,
@@ -2218,10 +2507,16 @@ def train_next_token_model(
     optimizer_state_dict: dict[str, object] | None = None,
     checkpoint_interval: int | None = None,
     b_diversity_loss_weight: float = 0.0,
+    b_diversity_unweighted_per_layer: bool = False,
+    b_diversity_per_layer_weight: float = 1.0,
     b_cosine_margin: float = 0.20,
+    b_cosine_early_margin: float = 0.35,
     route_concentration_loss_weight: float = 0.0,
     route_load_cap: float = 0.25,
     edge_prob_cap: float = 0.55,
+    learning_rate_schedule: str = "none",
+    learning_rate_warmup_steps: int = 0,
+    grad_breakdown_start_step: int | None = None,
 ) -> TrainingHistory:
     if grad_accum_steps <= 0:
         raise ValueError("grad_accum_steps must be positive.")
@@ -2237,6 +2532,11 @@ def train_next_token_model(
             optimizer.load_state_dict(optimizer_state_dict)
         except ValueError as exc:
             print(f"optimizer_state_load_skipped | reason={exc}")
+    _set_optimizer_hyperparams(
+        optimizer,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+    )
     eval_steps_seen: list[int] = []
     train_step_losses: list[float] = []
     grad_norms: list[float] = []
@@ -2260,6 +2560,18 @@ def train_next_token_model(
         step = start_step + relative_step
         if step_setup_callback is not None:
             step_setup_callback(step, schedule_total_steps)
+        current_learning_rate = _resolve_scheduled_learning_rate(
+            base_learning_rate=learning_rate,
+            schedule=learning_rate_schedule,
+            warmup_steps=learning_rate_warmup_steps,
+            step=step,
+            start_step=start_step,
+            total_steps=schedule_total_steps,
+        )
+        _set_optimizer_hyperparams(
+            optimizer,
+            learning_rate=current_learning_rate,
+        )
         optimizer.zero_grad(set_to_none=True)
         accumulated_loss = 0.0
         accumulated_loss_stats: dict[str, list[float]] = {}
@@ -2276,7 +2588,10 @@ def train_next_token_model(
                 autocast_device_type=autocast_device_type,
                 autocast_dtype=autocast_dtype,
                 b_diversity_loss_weight=b_diversity_loss_weight,
+                b_diversity_unweighted_per_layer=b_diversity_unweighted_per_layer,
+                b_diversity_per_layer_weight=b_diversity_per_layer_weight,
                 b_cosine_margin=b_cosine_margin,
+                b_cosine_early_margin=b_cosine_early_margin,
                 route_concentration_loss_weight=route_concentration_loss_weight,
                 route_load_cap=route_load_cap,
                 edge_prob_cap=edge_prob_cap,
@@ -2300,6 +2615,11 @@ def train_next_token_model(
                 grad_norm = float(torch.stack(grads).norm().item())
         if not math.isfinite(grad_norm):
             raise FloatingPointError(f"Non-finite grad norm at step {step}: {grad_norm}")
+        if (
+            grad_stats_callback is not None
+            and (grad_breakdown_start_step is None or step >= grad_breakdown_start_step)
+        ):
+            grad_stats_callback(step, _collect_grad_group_norms(model))
         optimizer.step()
         step_loss = accumulated_loss / grad_accum_steps
         train_step_losses.append(step_loss)
@@ -2411,6 +2731,8 @@ def train_prefix_response_model(
     total_steps: int | None = None,
     optimizer_state_dict: dict[str, object] | None = None,
     checkpoint_interval: int | None = None,
+    learning_rate_schedule: str = "none",
+    learning_rate_warmup_steps: int = 0,
 ) -> TrainingHistory:
     if grad_accum_steps <= 0:
         raise ValueError("grad_accum_steps must be positive.")
@@ -2426,6 +2748,11 @@ def train_prefix_response_model(
             optimizer.load_state_dict(optimizer_state_dict)
         except ValueError as exc:
             print(f"optimizer_state_load_skipped | reason={exc}")
+    _set_optimizer_hyperparams(
+        optimizer,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+    )
     eval_steps_seen: list[int] = []
     train_step_losses: list[float] = []
     grad_norms: list[float] = []
@@ -2450,6 +2777,18 @@ def train_prefix_response_model(
         step = start_step + relative_step
         if step_setup_callback is not None:
             step_setup_callback(step, schedule_total_steps)
+        current_learning_rate = _resolve_scheduled_learning_rate(
+            base_learning_rate=learning_rate,
+            schedule=learning_rate_schedule,
+            warmup_steps=learning_rate_warmup_steps,
+            step=step,
+            start_step=start_step,
+            total_steps=schedule_total_steps,
+        )
+        _set_optimizer_hyperparams(
+            optimizer,
+            learning_rate=current_learning_rate,
+        )
         optimizer.zero_grad(set_to_none=True)
         accumulated_loss = 0.0
         for _ in range(grad_accum_steps):

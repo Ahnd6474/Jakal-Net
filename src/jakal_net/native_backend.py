@@ -779,6 +779,34 @@ def propagation_dense_native(
     ))
 
 
+def propagation_query_dense_native(
+    *,
+    pairwise_fn: object,
+    edge_compress_name: str,
+    query_val: Tensor,
+    source_val: Tensor,
+    projected_state: Tensor,
+    projected_val: Tensor,
+    query_block_size: int,
+    source_block_size: int,
+) -> Any:
+    if not supports_pairwise_kernel(pairwise_fn):
+        raise TypeError("Unsupported pairwise_fn for native dense query propagation.")
+    spec = pairwise_kernel_spec(pairwise_fn)
+    return _to_layer_delta(_native_module().propagation_query_dense(
+        spec.kind,
+        spec.weight,
+        spec.bias,
+        edge_compress_name,
+        query_val,
+        source_val,
+        projected_state,
+        projected_val,
+        query_block_size,
+        source_block_size,
+    ))
+
+
 def propagation_window_native(
     *,
     pairwise_fn: object,
@@ -931,6 +959,37 @@ def transition_dense_native(
         projected_state,
         projected_val,
         dst_nodes,
+        src_block_size,
+        dst_block_size,
+    ))
+
+
+def transition_pairwise_dense_native(
+    *,
+    route_fn: object,
+    sender_strength: Tensor,
+    src_val: Tensor,
+    dst_val: Tensor,
+    projected_state: Tensor,
+    projected_val: Tensor,
+    src_block_size: int,
+    dst_block_size: int,
+) -> Any:
+    if not supports_pairwise_route_kernel(route_fn):
+        raise TypeError("Unsupported pairwise route_fn for native dense transition.")
+    spec = pairwise_route_kernel_spec(route_fn)
+    return _to_layer_delta(_native_module().transition_pairwise_dense(
+        spec.kind,
+        spec.source_weight,
+        spec.target_weight,
+        spec.core_weight,
+        spec.bias,
+        spec.temperature,
+        sender_strength,
+        src_val,
+        dst_val,
+        projected_state,
+        projected_val,
         src_block_size,
         dst_block_size,
     ))
