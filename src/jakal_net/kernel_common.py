@@ -11,11 +11,13 @@ from jakal_net.modules import (
     BilinearPairwise,
     DiagonalBilinearPairwise,
     DiagonalBilinearRoute,
+    HadamardMLPPairwise,
     LinearRoute,
     LowRankBilinearPairwise,
     LowRankBilinearRoute,
     MLPRoute,
     BilinearPairwiseRoute,
+    SourceTargetHadamardMLPRoute,
 )
 
 
@@ -37,6 +39,10 @@ class PairwiseKernelSpec:
     kind: str
     weight: Tensor
     bias: Tensor | None
+    in_weight: Tensor | None = None
+    in_bias: Tensor | None = None
+    out_weight: Tensor | None = None
+    out_bias: Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,9 +58,15 @@ class RouteKernelSpec:
 class PairwiseRouteKernelSpec:
     kind: str
     source_weight: Tensor | None
+    source_bias: Tensor | None
     target_weight: Tensor | None
+    target_bias: Tensor | None
     core_weight: Tensor
     bias: Tensor | None
+    hidden_weight: Tensor | None = None
+    hidden_bias: Tensor | None = None
+    out_weight: Tensor | None = None
+    out_bias: Tensor | None = None
     temperature: float = 1.0
 
 
@@ -84,7 +96,12 @@ def reshape_val(
 def supports_pairwise_kernel(pairwise_fn: object) -> bool:
     return isinstance(
         pairwise_fn,
-        (DiagonalBilinearPairwise, BilinearPairwise, LowRankBilinearPairwise),
+        (
+            DiagonalBilinearPairwise,
+            BilinearPairwise,
+            LowRankBilinearPairwise,
+            HadamardMLPPairwise,
+        ),
     )
 
 
@@ -102,7 +119,12 @@ def supports_pairwise_route_kernel(route_fn: object) -> bool:
     inner, _ = _unwrap_temperature_scaled_route(route_fn)
     return isinstance(
         inner,
-        (DiagonalBilinearRoute, LowRankBilinearRoute, BilinearPairwiseRoute),
+        (
+            DiagonalBilinearRoute,
+            LowRankBilinearRoute,
+            BilinearPairwiseRoute,
+            SourceTargetHadamardMLPRoute,
+        ),
     )
 
 
@@ -124,6 +146,16 @@ def pairwise_kernel_spec(pairwise_fn: object) -> PairwiseKernelSpec:
             kind="bilinear",
             weight=pairwise_fn.weight,
             bias=pairwise_fn.bias,
+        )
+    if isinstance(pairwise_fn, HadamardMLPPairwise):
+        return PairwiseKernelSpec(
+            kind="hadamard_mlp",
+            weight=pairwise_fn.proj_in.weight,
+            bias=pairwise_fn.proj_out.bias,
+            in_weight=pairwise_fn.proj_in.weight,
+            in_bias=pairwise_fn.proj_in.bias,
+            out_weight=pairwise_fn.proj_out.weight,
+            out_bias=pairwise_fn.proj_out.bias,
         )
     raise TypeError("Unsupported pairwise_fn for native/kernel spec.")
 
@@ -154,7 +186,9 @@ def pairwise_route_kernel_spec(route_fn: object) -> PairwiseRouteKernelSpec:
         return PairwiseRouteKernelSpec(
             kind="diagonal_bilinear_route",
             source_weight=None,
+            source_bias=None,
             target_weight=None,
+            target_bias=None,
             core_weight=inner.weight,
             bias=inner.bias,
             temperature=temperature,
@@ -163,7 +197,9 @@ def pairwise_route_kernel_spec(route_fn: object) -> PairwiseRouteKernelSpec:
         return PairwiseRouteKernelSpec(
             kind="low_rank_bilinear_route",
             source_weight=inner.source_proj.weight,
+            source_bias=None,
             target_weight=inner.target_proj.weight,
+            target_bias=None,
             core_weight=inner.weight,
             bias=inner.bias,
             temperature=temperature,
@@ -172,9 +208,26 @@ def pairwise_route_kernel_spec(route_fn: object) -> PairwiseRouteKernelSpec:
         return PairwiseRouteKernelSpec(
             kind="full_bilinear_route",
             source_weight=inner.source_proj.weight,
+            source_bias=None,
             target_weight=inner.target_proj.weight,
+            target_bias=None,
             core_weight=inner.weight,
             bias=inner.bias,
+            temperature=temperature,
+        )
+    if isinstance(inner, SourceTargetHadamardMLPRoute):
+        return PairwiseRouteKernelSpec(
+            kind="source_target_hadamard_mlp_route",
+            source_weight=inner.source_proj.weight,
+            source_bias=inner.source_proj.bias,
+            target_weight=inner.target_proj.weight,
+            target_bias=inner.target_proj.bias,
+            core_weight=inner.proj_in.weight,
+            bias=None,
+            hidden_weight=inner.proj_in.weight,
+            hidden_bias=inner.proj_in.bias,
+            out_weight=inner.proj_out.weight,
+            out_bias=inner.proj_out.bias,
             temperature=temperature,
         )
     raise TypeError("Unsupported pairwise route_fn for native/kernel spec.")
@@ -204,6 +257,11 @@ def pairwise_scores_dense(
         if pairwise_fn.bias is not None:
             scores = scores + pairwise_fn.bias
         return scores
+
+    if isinstance(pairwise_fn, HadamardMLPPairwise):
+        interaction = target_val.unsqueeze(-2) * source_val.unsqueeze(-3)
+        hidden = pairwise_fn.activation(pairwise_fn.proj_in(interaction))
+        return pairwise_fn.proj_out(hidden).squeeze(-1)
 
     raise TypeError("Unsupported pairwise_fn for kernel path.")
 

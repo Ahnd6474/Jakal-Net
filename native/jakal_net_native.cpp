@@ -156,6 +156,17 @@ torch::Tensor linear3d(
   return output;
 }
 
+torch::Tensor linear4d(
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    const c10::optional<torch::Tensor>& bias) {
+  auto output = torch::matmul(input, weight.transpose(0, 1));
+  if (bias.has_value()) {
+    output = output + bias.value().view({1, 1, 1, -1});
+  }
+  return output;
+}
+
 c10::optional<torch::Tensor> slice_optional_tensor(
     const c10::optional<torch::Tensor>& tensor,
     int64_t start,
@@ -171,7 +182,11 @@ torch::Tensor pairwise_scores(
     const torch::Tensor& target_val,
     const torch::Tensor& source_val,
     const torch::Tensor& weight,
-    const c10::optional<torch::Tensor>& bias) {
+    const c10::optional<torch::Tensor>& bias,
+    const c10::optional<torch::Tensor>& in_weight,
+    const c10::optional<torch::Tensor>& in_bias,
+    const c10::optional<torch::Tensor>& out_weight,
+    const c10::optional<torch::Tensor>& out_bias) {
   if (pairwise_kind == "diagonal_bilinear") {
     auto target_proj = target_val * weight.view({1, 1, -1});
     auto scores = torch::bmm(target_proj, source_val.transpose(1, 2));
@@ -185,6 +200,22 @@ torch::Tensor pairwise_scores(
     auto target_proj = torch::matmul(target_val, weight);
     auto scores = torch::bmm(target_proj, source_val.transpose(1, 2));
     if (bias.has_value()) {
+      scores = scores + bias.value();
+    }
+    return scores;
+  }
+
+  if (pairwise_kind == "hadamard_mlp") {
+    if (!in_weight.has_value() || !out_weight.has_value()) {
+      throw std::runtime_error("Hadamard MLP pairwise kernel is missing MLP weights.");
+    }
+    auto interaction = target_val.unsqueeze(2) * source_val.unsqueeze(1);
+    auto hidden = linear4d(interaction, in_weight.value(), in_bias);
+    hidden = hidden * torch::sigmoid(hidden);
+    auto scores = torch::matmul(hidden, out_weight.value().transpose(0, 1)).squeeze(-1);
+    if (out_bias.has_value()) {
+      scores = scores + out_bias.value();
+    } else if (bias.has_value()) {
       scores = scores + bias.value();
     }
     return scores;
@@ -238,9 +269,15 @@ torch::Tensor pairwise_route_block_logits(
     const torch::Tensor& src_val,
     const torch::Tensor& dst_val,
     const c10::optional<torch::Tensor>& source_weight,
+    const c10::optional<torch::Tensor>& source_bias,
     const c10::optional<torch::Tensor>& target_weight,
+    const c10::optional<torch::Tensor>& target_bias,
     const torch::Tensor& core_weight,
     const c10::optional<torch::Tensor>& bias,
+    const c10::optional<torch::Tensor>& hidden_weight,
+    const c10::optional<torch::Tensor>& hidden_bias,
+    const c10::optional<torch::Tensor>& out_weight,
+    const c10::optional<torch::Tensor>& out_bias,
     double temperature) {
   if (temperature <= 0.0) {
     throw std::runtime_error("route temperature must be positive.");
@@ -267,6 +304,29 @@ torch::Tensor pairwise_route_block_logits(
     auto projected_target = torch::matmul(dst_val, target_weight.value().transpose(0, 1));
     auto weighted_source = torch::matmul(projected_source, core_weight);
     scores = torch::bmm(weighted_source, projected_target.transpose(1, 2));
+  } else if (route_kind == "source_target_hadamard_mlp_route") {
+    if (!source_weight.has_value() || !target_weight.has_value() ||
+        !hidden_weight.has_value() || !out_weight.has_value()) {
+      throw std::runtime_error("Hadamard MLP route kernel is missing projection weights.");
+    }
+    auto projected_source = linear3d(src_val, source_weight.value(), source_bias);
+    auto projected_target = linear3d(dst_val, target_weight.value(), target_bias);
+    auto source_features =
+        projected_source.unsqueeze(2).expand(
+            {projected_source.size(0), projected_source.size(1), projected_target.size(1),
+             projected_source.size(2)});
+    auto target_features =
+        projected_target.unsqueeze(1).expand(
+            {projected_target.size(0), projected_source.size(1), projected_target.size(1),
+             projected_target.size(2)});
+    auto interaction = source_features * target_features;
+    auto features = torch::cat({source_features, target_features, interaction}, -1);
+    auto hidden = linear4d(features, hidden_weight.value(), hidden_bias);
+    hidden = hidden * torch::sigmoid(hidden);
+    scores = torch::matmul(hidden, out_weight.value().transpose(0, 1)).squeeze(-1);
+    if (out_bias.has_value()) {
+      scores = scores + out_bias.value();
+    }
   } else {
     throw std::runtime_error("Unsupported pairwise route kernel kind: " + route_kind);
   }
@@ -379,6 +439,10 @@ std::tuple<torch::Tensor, torch::Tensor> propagation_dense(
     const std::string& pairwise_kind,
     const torch::Tensor& weight,
     const c10::optional<torch::Tensor>& bias,
+    const c10::optional<torch::Tensor>& in_weight,
+    const c10::optional<torch::Tensor>& in_bias,
+    const c10::optional<torch::Tensor>& out_weight,
+    const c10::optional<torch::Tensor>& out_bias,
     const std::string& edge_compress_name,
     const torch::Tensor& layer_val,
     const torch::Tensor& projected_state,
@@ -401,8 +465,10 @@ std::tuple<torch::Tensor, torch::Tensor> propagation_dense(
   const auto state_acc_dtype = accumulator_dtype(projected_state.scalar_type());
   const auto val_acc_dtype = accumulator_dtype(projected_val.scalar_type());
 
-  if (can_use_full_dense_logits(flat_val, batch_flat, num_nodes, num_nodes)) {
-    auto scores = pairwise_scores(pairwise_kind, flat_val, flat_val, weight, bias);
+  if (pairwise_kind != "hadamard_mlp" &&
+      can_use_full_dense_logits(flat_val, batch_flat, num_nodes, num_nodes)) {
+    auto scores = pairwise_scores(
+        pairwise_kind, flat_val, flat_val, weight, bias, in_weight, in_bias, out_weight, out_bias);
     auto edges = softsign(scores);
     auto delta_state =
         torch::bmm(
@@ -433,7 +499,8 @@ std::tuple<torch::Tensor, torch::Tensor> propagation_dense(
     for (int64_t source_start = 0; source_start < num_nodes; source_start += source_step) {
       const auto source_end = std::min(source_start + source_step, num_nodes);
       auto source_val = flat_val.slice(1, source_start, source_end);
-      auto scores = pairwise_scores(pairwise_kind, target_val, source_val, weight, bias);
+      auto scores = pairwise_scores(
+          pairwise_kind, target_val, source_val, weight, bias, in_weight, in_bias, out_weight, out_bias);
       auto edges = softsign(scores);
       auto state_edges = edges.to(state_acc_dtype);
       auto val_edges = edges.to(val_acc_dtype);
@@ -461,6 +528,10 @@ std::tuple<torch::Tensor, torch::Tensor> propagation_query_dense(
     const std::string& pairwise_kind,
     const torch::Tensor& weight,
     const c10::optional<torch::Tensor>& bias,
+    const c10::optional<torch::Tensor>& in_weight,
+    const c10::optional<torch::Tensor>& in_bias,
+    const c10::optional<torch::Tensor>& out_weight,
+    const c10::optional<torch::Tensor>& out_bias,
     const std::string& edge_compress_name,
     const torch::Tensor& query_val,
     const torch::Tensor& source_val,
@@ -488,8 +559,18 @@ std::tuple<torch::Tensor, torch::Tensor> propagation_query_dense(
   const auto state_acc_dtype = accumulator_dtype(projected_state.scalar_type());
   const auto val_acc_dtype = accumulator_dtype(projected_val.scalar_type());
 
-  if (can_use_full_dense_logits(flat_query_val, batch_flat, query_nodes, source_nodes)) {
-    auto scores = pairwise_scores(pairwise_kind, flat_query_val, flat_source_val, weight, bias);
+  if (pairwise_kind != "hadamard_mlp" &&
+      can_use_full_dense_logits(flat_query_val, batch_flat, query_nodes, source_nodes)) {
+    auto scores = pairwise_scores(
+        pairwise_kind,
+        flat_query_val,
+        flat_source_val,
+        weight,
+        bias,
+        in_weight,
+        in_bias,
+        out_weight,
+        out_bias);
     auto edges = softsign(scores);
     auto delta_state =
         torch::bmm(
@@ -521,7 +602,16 @@ std::tuple<torch::Tensor, torch::Tensor> propagation_query_dense(
     for (int64_t source_start = 0; source_start < source_nodes; source_start += source_step) {
       const auto source_end = std::min(source_start + source_step, source_nodes);
       auto source_block = flat_source_val.slice(1, source_start, source_end);
-      auto scores = pairwise_scores(pairwise_kind, query_block, source_block, weight, bias);
+      auto scores = pairwise_scores(
+          pairwise_kind,
+          query_block,
+          source_block,
+          weight,
+          bias,
+          in_weight,
+          in_bias,
+          out_weight,
+          out_bias);
       auto edges = softsign(scores);
       query_state_acc = query_state_acc +
                         torch::bmm(
@@ -550,6 +640,10 @@ std::tuple<torch::Tensor, torch::Tensor> propagation_window(
     const std::string& pairwise_kind,
     const torch::Tensor& weight,
     const c10::optional<torch::Tensor>& bias,
+    const c10::optional<torch::Tensor>& in_weight,
+    const c10::optional<torch::Tensor>& in_bias,
+    const c10::optional<torch::Tensor>& out_weight,
+    const c10::optional<torch::Tensor>& out_bias,
     const std::string& edge_compress_name,
     const torch::Tensor& layer_val,
     const torch::Tensor& projected_state,
@@ -594,7 +688,8 @@ std::tuple<torch::Tensor, torch::Tensor> propagation_window(
     for (int64_t source_start = source_floor; source_start < source_ceiling; source_start += source_step) {
       const auto source_end = std::min(source_start + source_step, source_ceiling);
       auto source_val = flat_val.slice(1, source_start, source_end);
-      auto scores = pairwise_scores(pairwise_kind, target_val, source_val, weight, bias);
+      auto scores = pairwise_scores(
+          pairwise_kind, target_val, source_val, weight, bias, in_weight, in_bias, out_weight, out_bias);
       auto mask = causal_window_mask(
                       target_start, target_end, source_start, source_end, window, layer_val.device())
                       .unsqueeze(0)
@@ -626,6 +721,10 @@ std::tuple<torch::Tensor, torch::Tensor> propagation_topk(
     const std::string& pairwise_kind,
     const torch::Tensor& weight,
     const c10::optional<torch::Tensor>& bias,
+    const c10::optional<torch::Tensor>& in_weight,
+    const c10::optional<torch::Tensor>& in_bias,
+    const c10::optional<torch::Tensor>& out_weight,
+    const c10::optional<torch::Tensor>& out_bias,
     const std::string& edge_compress_name,
     const torch::Tensor& layer_val,
     const torch::Tensor& projected_state,
@@ -655,6 +754,10 @@ std::tuple<torch::Tensor, torch::Tensor> propagation_topk(
         pairwise_kind,
         weight,
         bias,
+        in_weight,
+        in_bias,
+        out_weight,
+        out_bias,
         edge_compress_name,
         layer_val,
         projected_state,
@@ -686,7 +789,8 @@ std::tuple<torch::Tensor, torch::Tensor> propagation_topk(
     for (int64_t source_start = 0; source_start < num_nodes; source_start += source_step) {
       const auto source_end = std::min(source_start + source_step, num_nodes);
       auto source_val = flat_val.slice(1, source_start, source_end);
-      auto scores = pairwise_scores(pairwise_kind, target_val, source_val, weight, bias);
+      auto scores = pairwise_scores(
+          pairwise_kind, target_val, source_val, weight, bias, in_weight, in_bias, out_weight, out_bias);
       auto source_indices = torch::arange(
                                 source_start,
                                 source_end,
@@ -748,7 +852,8 @@ std::tuple<torch::Tensor, torch::Tensor> transition_dense(
   const auto state_acc_dtype = accumulator_dtype(projected_state.scalar_type());
   const auto val_acc_dtype = accumulator_dtype(projected_val.scalar_type());
 
-  if (can_use_full_dense_logits(flat_src_val, batch_flat, src_nodes, dst_nodes)) {
+  if (route_kind != "source_target_hadamard_mlp_route" &&
+      can_use_full_dense_logits(flat_src_val, batch_flat, src_nodes, dst_nodes)) {
     auto route_context = prepare_route_context(route_kind, flat_src_val, in_weight, in_bias);
     auto logits = route_block_logits(
         route_kind, route_context, in_weight, in_bias, out_weight, out_bias, 0, dst_nodes);
@@ -948,9 +1053,15 @@ std::tuple<torch::Tensor, torch::Tensor> transition_topk(
 std::tuple<torch::Tensor, torch::Tensor> transition_pairwise_dense(
     const std::string& route_kind,
     const c10::optional<torch::Tensor>& source_weight,
+    const c10::optional<torch::Tensor>& source_bias,
     const c10::optional<torch::Tensor>& target_weight,
+    const c10::optional<torch::Tensor>& target_bias,
     const torch::Tensor& core_weight,
     const c10::optional<torch::Tensor>& bias,
+    const c10::optional<torch::Tensor>& hidden_weight,
+    const c10::optional<torch::Tensor>& hidden_bias,
+    const c10::optional<torch::Tensor>& out_weight,
+    const c10::optional<torch::Tensor>& out_bias,
     double temperature,
     const torch::Tensor& sender_strength,
     const torch::Tensor& src_val,
@@ -985,9 +1096,15 @@ std::tuple<torch::Tensor, torch::Tensor> transition_pairwise_dense(
         flat_src_val,
         flat_dst_val,
         source_weight,
+        source_bias,
         target_weight,
+        target_bias,
         core_weight,
         bias,
+        hidden_weight,
+        hidden_bias,
+        out_weight,
+        out_bias,
         temperature);
     auto routes = torch::softmax(logits, -1);
     auto state_sender =
@@ -1029,9 +1146,15 @@ std::tuple<torch::Tensor, torch::Tensor> transition_pairwise_dense(
           src_block,
           dst_block,
           source_weight,
+          source_bias,
           target_weight,
+          target_bias,
           core_weight,
           bias,
+          hidden_weight,
+          hidden_bias,
+          out_weight,
+          out_bias,
           temperature);
       auto block_max = std::get<0>(logits.max(-1));
       auto block_exp = torch::exp(logits - block_max.unsqueeze(-1));
@@ -1065,9 +1188,15 @@ std::tuple<torch::Tensor, torch::Tensor> transition_pairwise_dense(
           src_block,
           dst_block,
           source_weight,
+          source_bias,
           target_weight,
+          target_bias,
           core_weight,
           bias,
+          hidden_weight,
+          hidden_bias,
+          out_weight,
+          out_bias,
           temperature);
       auto routes = torch::exp(logits - running_max.unsqueeze(-1)) / running_sum.unsqueeze(-1);
       auto transport = routes.transpose(1, 2).contiguous();
@@ -1089,9 +1218,15 @@ std::tuple<torch::Tensor, torch::Tensor> transition_pairwise_dense(
 std::tuple<torch::Tensor, torch::Tensor> transition_pairwise_topk(
     const std::string& route_kind,
     const c10::optional<torch::Tensor>& source_weight,
+    const c10::optional<torch::Tensor>& source_bias,
     const c10::optional<torch::Tensor>& target_weight,
+    const c10::optional<torch::Tensor>& target_bias,
     const torch::Tensor& core_weight,
     const c10::optional<torch::Tensor>& bias,
+    const c10::optional<torch::Tensor>& hidden_weight,
+    const c10::optional<torch::Tensor>& hidden_bias,
+    const c10::optional<torch::Tensor>& out_weight,
+    const c10::optional<torch::Tensor>& out_bias,
     double temperature,
     const torch::Tensor& sender_strength,
     const torch::Tensor& src_val,
@@ -1150,9 +1285,15 @@ std::tuple<torch::Tensor, torch::Tensor> transition_pairwise_topk(
           src_block,
           dst_block,
           source_weight,
+          source_bias,
           target_weight,
+          target_bias,
           core_weight,
           bias,
+          hidden_weight,
+          hidden_bias,
+          out_weight,
+          out_bias,
           temperature);
       auto block_indices = torch::arange(
                                dst_start,

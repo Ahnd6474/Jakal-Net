@@ -25,6 +25,7 @@ from jakal_net.kernel_common import (
     route_slot_mask,
     select_topk,
     supports_pairwise_kernel,
+    supports_pairwise_route_kernel,
     supports_route_kernel,
 )
 from jakal_net.modules import (
@@ -58,13 +59,15 @@ class KernelCommonTests(unittest.TestCase):
         target = torch.randn(2, 5, 4)
         source = torch.randn(2, 7, 4)
 
-        for module in (DiagonalBilinearPairwise(dim=4), BilinearPairwise(dim=4)):
+        for module in (
+            DiagonalBilinearPairwise(dim=4),
+            BilinearPairwise(dim=4),
+            HadamardMLPPairwise(dim=4, hidden_dim=6),
+        ):
             expected = module(target, source)
             actual = pairwise_scores_dense(module, target, source)
             self.assertTrue(torch.allclose(expected, actual))
             self.assertTrue(supports_pairwise_kernel(module))
-
-        self.assertFalse(supports_pairwise_kernel(HadamardMLPPairwise(dim=4)))
 
     def test_route_kernel_family_matches_linear_and_mlp(self) -> None:
         torch.manual_seed(1)
@@ -84,6 +87,11 @@ class KernelCommonTests(unittest.TestCase):
         )
         self.assertFalse(
             supports_route_kernel(SourceTargetHadamardMLPRoute(src_dim=5, dst_dim=5))
+        )
+        self.assertTrue(
+            supports_pairwise_route_kernel(
+                SourceTargetHadamardMLPRoute(src_dim=5, dst_dim=5)
+            )
         )
 
     def test_route_block_logits_match_full_route_logits(self) -> None:

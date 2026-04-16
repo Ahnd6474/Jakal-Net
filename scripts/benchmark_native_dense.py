@@ -9,12 +9,15 @@ from typing import Callable
 import torch
 
 from jakal_net import (
+    BilinearPairwiseRoute,
     DiagonalBilinearRoute,
     DiagonalBilinearPairwise,
+    HadamardMLPPairwise,
     Layer,
     LowRankBilinearRoute,
     MLPRoute,
     Propagation,
+    SourceTargetHadamardMLPRoute,
     Transition,
     native_status,
 )
@@ -79,6 +82,8 @@ def _propagation_case(
     batch_size: int,
     num_nodes: int,
     dim: int,
+    pairwise_kind: str,
+    hidden_dim: int,
     seed: int,
 ) -> tuple[dict[str, float], torch.nn.Module, Layer]:
     torch.manual_seed(seed)
@@ -88,8 +93,14 @@ def _propagation_case(
         state=torch.randn(batch_size, num_nodes, device=device, requires_grad=True),
         val=torch.randn(batch_size, num_nodes, dim, device=device, requires_grad=True),
     )
+    if pairwise_kind == "diagonal_bilinear":
+        pairwise_fn = DiagonalBilinearPairwise(dim=dim).to(device)
+    elif pairwise_kind == "hadamard_mlp":
+        pairwise_fn = HadamardMLPPairwise(dim=dim, hidden_dim=hidden_dim).to(device)
+    else:
+        raise ValueError(f"Unsupported propagation pairwise kind: {pairwise_kind!r}")
     module = Propagation(
-        pairwise_fn=DiagonalBilinearPairwise(dim=dim).to(device),
+        pairwise_fn=pairwise_fn,
         implementation=mode,
     ).to(device)
     delta = module.compute_delta(layer)
@@ -134,6 +145,19 @@ def _transition_case(
         if src_dim != dst_dim:
             raise ValueError("diagonal_bilinear route requires matching src/dst dims.")
         route_fn = DiagonalBilinearRoute(src_dim=src_dim, dst_dim=dst_dim).to(device)
+    elif route_kind == "bilinear":
+        route_fn = BilinearPairwiseRoute(
+            src_dim=src_dim,
+            dst_dim=dst_dim,
+            route_dim=hidden_dim,
+        ).to(device)
+    elif route_kind == "hadamard_mlp":
+        route_fn = SourceTargetHadamardMLPRoute(
+            src_dim=src_dim,
+            dst_dim=dst_dim,
+            route_dim=hidden_dim,
+            hidden_dim=hidden_dim,
+        ).to(device)
     else:
         raise ValueError(f"Unsupported transition route kind: {route_kind!r}")
     module = Transition(
@@ -159,11 +183,19 @@ def _time_propagation(
     batch_size: int,
     num_nodes: int,
     dim: int,
+    pairwise_kind: str,
+    hidden_dim: int,
     warmup: int,
     iters: int,
 ) -> dict[str, float]:
+    if pairwise_kind == "diagonal_bilinear":
+        pairwise_fn = DiagonalBilinearPairwise(dim=dim).to(device)
+    elif pairwise_kind == "hadamard_mlp":
+        pairwise_fn = HadamardMLPPairwise(dim=dim, hidden_dim=hidden_dim).to(device)
+    else:
+        raise ValueError(f"Unsupported propagation pairwise kind: {pairwise_kind!r}")
     module = Propagation(
-        pairwise_fn=DiagonalBilinearPairwise(dim=dim).to(device),
+        pairwise_fn=pairwise_fn,
         implementation=mode,
     ).to(device)
 
@@ -206,6 +238,19 @@ def _time_transition(
         if src_dim != dst_dim:
             raise ValueError("diagonal_bilinear route requires matching src/dst dims.")
         route_fn = DiagonalBilinearRoute(src_dim=src_dim, dst_dim=dst_dim).to(device)
+    elif route_kind == "bilinear":
+        route_fn = BilinearPairwiseRoute(
+            src_dim=src_dim,
+            dst_dim=dst_dim,
+            route_dim=hidden_dim,
+        ).to(device)
+    elif route_kind == "hadamard_mlp":
+        route_fn = SourceTargetHadamardMLPRoute(
+            src_dim=src_dim,
+            dst_dim=dst_dim,
+            route_dim=hidden_dim,
+            hidden_dim=hidden_dim,
+        ).to(device)
     else:
         raise ValueError(f"Unsupported transition route kind: {route_kind!r}")
     module = Transition(
@@ -236,6 +281,12 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--prop-nodes", type=int, default=256)
     parser.add_argument("--prop-dim", type=int, default=64)
+    parser.add_argument("--prop-hidden-dim", type=int, default=96)
+    parser.add_argument(
+        "--prop-pairwise-kind",
+        default="diagonal_bilinear",
+        choices=["diagonal_bilinear", "hadamard_mlp"],
+    )
     parser.add_argument("--trans-src-nodes", type=int, default=256)
     parser.add_argument("--trans-dst-nodes", type=int, default=256)
     parser.add_argument("--trans-src-dim", type=int, default=64)
@@ -244,7 +295,7 @@ def main() -> None:
     parser.add_argument(
         "--transition-route-kind",
         default="mlp",
-        choices=["mlp", "low_rank_bilinear", "diagonal_bilinear"],
+        choices=["mlp", "low_rank_bilinear", "diagonal_bilinear", "bilinear", "hadamard_mlp"],
     )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
@@ -284,6 +335,8 @@ def main() -> None:
             batch_size=args.batch_size,
             num_nodes=args.prop_nodes,
             dim=args.prop_dim,
+            pairwise_kind=args.prop_pairwise_kind,
+            hidden_dim=args.prop_hidden_dim,
             seed=101,
         )
         report["benchmark"] = report.get("benchmark", {})
@@ -409,6 +462,8 @@ def main() -> None:
             batch_size=args.batch_size,
             num_nodes=args.prop_nodes,
             dim=args.prop_dim,
+            pairwise_kind=args.prop_pairwise_kind,
+            hidden_dim=args.prop_hidden_dim,
             warmup=args.warmup,
             iters=args.iters,
         )
