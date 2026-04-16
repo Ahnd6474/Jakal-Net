@@ -23,6 +23,7 @@ from train_progressive_b_lm import (  # noqa: E402
     ASSISTANT_TOKEN,
     EOS_TOKEN,
     PAD_TOKEN,
+    QUERY_BLOCK_START_TOKEN,
     USER_TOKEN,
     build_tokenizer,
 )
@@ -32,6 +33,7 @@ class TrainingTests(unittest.TestCase):
         text = (
             f"{USER_TOKEN}\nhello\n{ASSISTANT_TOKEN}\nworld\n{EOS_TOKEN}\n"
             f"{USER_TOKEN}\nbyte bpe test\n{ASSISTANT_TOKEN}\nworks\n{PAD_TOKEN}\n"
+            f"{QUERY_BLOCK_START_TOKEN}\n"
         )
         with TemporaryDirectory() as tmpdir:
             vocab, tokenizer_label, tokenizer_model_path = build_tokenizer(
@@ -42,7 +44,13 @@ class TrainingTests(unittest.TestCase):
                 subword_model_type="bpe",
                 tokenizer_prefix=str(Path(tmpdir) / "byte_bpe_test"),
                 subword_character_coverage=0.9995,
-                user_defined_symbols=(USER_TOKEN, ASSISTANT_TOKEN, EOS_TOKEN, PAD_TOKEN),
+                user_defined_symbols=(
+                    USER_TOKEN,
+                    ASSISTANT_TOKEN,
+                    EOS_TOKEN,
+                    PAD_TOKEN,
+                    QUERY_BLOCK_START_TOKEN,
+                ),
             )
 
             self.assertEqual(tokenizer_label, "byte_bpe")
@@ -52,6 +60,7 @@ class TrainingTests(unittest.TestCase):
             encoded = vocab.encode(text)
             self.assertGreater(encoded.numel(), 0)
             self.assertGreaterEqual(vocab.token_id(USER_TOKEN), 0)
+            self.assertGreaterEqual(vocab.token_id(QUERY_BLOCK_START_TOKEN), 0)
             decoded = vocab.decode(encoded[:16].tolist())
             self.assertIsInstance(decoded, str)
 
@@ -70,6 +79,25 @@ class TrainingTests(unittest.TestCase):
 
         self.assertEqual(batch.context.shape, (4, 5))
         self.assertEqual(batch.target.shape, (4,))
+
+    def test_query_block_sampling_prepends_start_token(self) -> None:
+        tokens = torch.arange(40, dtype=torch.long)
+
+        batch = sample_next_token_batch(
+            tokens,
+            seq_len=5,
+            batch_size=4,
+            device="cpu",
+            target_len=4,
+            query_block_start_token_id=99,
+        )
+
+        self.assertEqual(batch.target.shape, (4, 5))
+        self.assertTrue(torch.equal(batch.target[:, 0], torch.full((4,), 99, dtype=torch.long)))
+        torch.testing.assert_close(batch.target[:, 1], batch.context[:, -1] + 1)
+        torch.testing.assert_close(batch.target[:, 2], batch.context[:, -1] + 2)
+        torch.testing.assert_close(batch.target[:, 3], batch.context[:, -1] + 3)
+        torch.testing.assert_close(batch.target[:, 4], batch.context[:, -1] + 4)
 
     def test_full_sequence_causal_sampling_and_loss(self) -> None:
         torch.manual_seed(7)

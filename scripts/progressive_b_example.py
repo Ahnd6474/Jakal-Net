@@ -1872,6 +1872,7 @@ def _sample_next_token_item(
     teacher_forcing: bool,
     full_sequence_causal: bool,
     target_len: int,
+    query_block_start_token_id: int | None = None,
 ) -> tuple[Tensor, Tensor]:
     max_start = tokens.numel() - seq_len - forecast_len
     if max_start < 0:
@@ -1880,10 +1881,15 @@ def _sample_next_token_item(
     context = tokens[start : start + seq_len]
     if teacher_forcing or full_sequence_causal:
         target = tokens[start + 1 : start + seq_len + 1]
-    elif target_len > 1:
-        target = tokens[start + seq_len : start + seq_len + target_len]
     else:
-        target = tokens[start + seq_len]
+        future_tokens = tokens[start + seq_len : start + seq_len + target_len]
+        if query_block_start_token_id is not None:
+            start_token = torch.tensor([query_block_start_token_id], dtype=torch.long)
+            target = torch.cat((start_token, future_tokens), dim=0)
+        elif target_len > 1:
+            target = future_tokens
+        else:
+            target = future_tokens[0]
     return context, target
 
 
@@ -1897,6 +1903,7 @@ def sample_next_token_batch(
     full_sequence_causal: bool = False,
     target_len: int = 1,
     balanced_token_groups: Sequence[Tensor] | None = None,
+    query_block_start_token_id: int | None = None,
 ) -> NextTokenBatch:
     if teacher_forcing and full_sequence_causal:
         raise ValueError("teacher_forcing and full_sequence_causal cannot both be enabled.")
@@ -1917,6 +1924,7 @@ def sample_next_token_batch(
                 teacher_forcing=teacher_forcing,
                 full_sequence_causal=full_sequence_causal,
                 target_len=target_len,
+                query_block_start_token_id=query_block_start_token_id,
             )
             contexts.append(context)
             targets.append(target)
@@ -1930,13 +1938,18 @@ def sample_next_token_batch(
     context = torch.stack([tokens[start : start + seq_len] for start in starts], dim=0)
     if teacher_forcing or full_sequence_causal:
         target = torch.stack([tokens[start + 1 : start + seq_len + 1] for start in starts], dim=0)
-    elif target_len > 1:
-        target = torch.stack(
+    else:
+        future_tokens = torch.stack(
             [tokens[start + seq_len : start + seq_len + target_len] for start in starts],
             dim=0,
         )
-    else:
-        target = torch.stack([tokens[start + seq_len] for start in starts], dim=0)
+        if query_block_start_token_id is not None:
+            start_tokens = torch.full((batch_size, 1), query_block_start_token_id, dtype=torch.long)
+            target = torch.cat((start_tokens, future_tokens), dim=1)
+        elif target_len > 1:
+            target = future_tokens
+        else:
+            target = future_tokens[:, 0]
     return NextTokenBatch(context=context.to(device), target=target.to(device))
 
 
@@ -1951,6 +1964,7 @@ class NextTokenBatchDataset(IterableDataset[tuple[Tensor, Tensor]]):
         full_sequence_causal: bool = False,
         target_len: int = 1,
         balanced_token_groups: Sequence[Tensor] | None = None,
+        query_block_start_token_id: int | None = None,
     ) -> None:
         super().__init__()
         self.tokens = tokens.detach().cpu().contiguous()
@@ -1962,6 +1976,7 @@ class NextTokenBatchDataset(IterableDataset[tuple[Tensor, Tensor]]):
         self.teacher_forcing = teacher_forcing
         self.full_sequence_causal = full_sequence_causal
         self.target_len = target_len
+        self.query_block_start_token_id = query_block_start_token_id
 
     def __iter__(self):
         while True:
@@ -1974,6 +1989,7 @@ class NextTokenBatchDataset(IterableDataset[tuple[Tensor, Tensor]]):
                 full_sequence_causal=self.full_sequence_causal,
                 target_len=self.target_len,
                 balanced_token_groups=self.balanced_token_groups,
+                query_block_start_token_id=self.query_block_start_token_id,
             )
             yield batch.context, batch.target
 
@@ -2126,6 +2142,7 @@ def _make_train_batch_iterator(
     prefetch_factor: int,
     target_len: int = 1,
     balanced_token_groups: Sequence[Tensor] | None = None,
+    query_block_start_token_id: int | None = None,
 ):
     target_device = torch.device(device)
     if data_workers <= 0:
@@ -2139,6 +2156,7 @@ def _make_train_batch_iterator(
                 full_sequence_causal=full_sequence_causal,
                 target_len=target_len,
                 balanced_token_groups=balanced_token_groups,
+                query_block_start_token_id=query_block_start_token_id,
             )
     else:
         dataset = NextTokenBatchDataset(
@@ -2149,6 +2167,7 @@ def _make_train_batch_iterator(
             full_sequence_causal=full_sequence_causal,
             target_len=target_len,
             balanced_token_groups=balanced_token_groups,
+            query_block_start_token_id=query_block_start_token_id,
         )
         loader = DataLoader(
             dataset,
@@ -2393,6 +2412,7 @@ def estimate_next_token_loss(
     autocast_device_type: str | None = None,
     autocast_dtype: torch.dtype | None = None,
     balanced_token_groups: Sequence[Tensor] | None = None,
+    query_block_start_token_id: int | None = None,
 ) -> float:
     was_training = model.training
     model.eval()
@@ -2407,6 +2427,7 @@ def estimate_next_token_loss(
             full_sequence_causal=full_sequence_causal,
             target_len=target_len,
             balanced_token_groups=balanced_token_groups,
+            query_block_start_token_id=query_block_start_token_id,
         )
         loss, _ = compute_next_token_loss(
             model,
@@ -2502,6 +2523,7 @@ def train_next_token_model(
     autocast_dtype: torch.dtype | None = None,
     balanced_token_groups: Sequence[Tensor] | None = None,
     val_balanced_token_groups: Sequence[Tensor] | None = None,
+    query_block_start_token_id: int | None = None,
     start_step: int = 0,
     total_steps: int | None = None,
     optimizer_state_dict: dict[str, object] | None = None,
@@ -2553,6 +2575,7 @@ def train_next_token_model(
         prefetch_factor=prefetch_factor,
         target_len=target_len,
         balanced_token_groups=balanced_token_groups,
+        query_block_start_token_id=query_block_start_token_id,
     )
 
     schedule_total_steps = total_steps if total_steps is not None else start_step + steps
@@ -2663,6 +2686,7 @@ def train_next_token_model(
                 autocast_device_type=autocast_device_type,
                 autocast_dtype=autocast_dtype,
                 balanced_token_groups=balanced_token_groups,
+                query_block_start_token_id=query_block_start_token_id,
             )
             val_eval = estimate_next_token_loss(
                 model,
@@ -2680,6 +2704,7 @@ def train_next_token_model(
                 autocast_device_type=autocast_device_type,
                 autocast_dtype=autocast_dtype,
                 balanced_token_groups=val_balanced_token_groups,
+                query_block_start_token_id=query_block_start_token_id,
             )
             train_losses.append(train_eval)
             val_losses.append(val_eval)

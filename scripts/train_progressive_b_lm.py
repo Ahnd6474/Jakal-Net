@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import html
 import json
 import math
 import os
@@ -96,7 +95,14 @@ USER_TOKEN = "<|user|>"
 ASSISTANT_TOKEN = "<|assistant|>"
 EOS_TOKEN = "<|eos|>"
 PAD_TOKEN = "<|pad|>"
-DIALOGUE_SPECIAL_TOKENS = (USER_TOKEN, ASSISTANT_TOKEN, EOS_TOKEN, PAD_TOKEN)
+QUERY_BLOCK_START_TOKEN = "<|query_block_start|>"
+DIALOGUE_SPECIAL_TOKENS = (
+    USER_TOKEN,
+    ASSISTANT_TOKEN,
+    EOS_TOKEN,
+    PAD_TOKEN,
+    QUERY_BLOCK_START_TOKEN,
+)
 SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+(?=[\"'(\[]?[A-Z0-9])")
 DEFAULT_DIALOGUE_MESSAGES = (
     (
@@ -1199,6 +1205,7 @@ def require_special_token_ids(vocab: object) -> dict[str, int]:
         "assistant": vocab.token_id(ASSISTANT_TOKEN),
         "eos": vocab.token_id(EOS_TOKEN),
         "pad": vocab.token_id(PAD_TOKEN),
+        "query_block_start": vocab.token_id(QUERY_BLOCK_START_TOKEN),
     }
 
 
@@ -1237,6 +1244,7 @@ def generate_next_tokens_with_sampling(
     training_objective: str = "query_block",
     eos_token_id: int | None = None,
     target_len: int = 1,
+    query_block_start_token_id: int | None = None,
 ) -> torch.Tensor:
     if temperature is not None and temperature <= 0.0:
         raise ValueError("temperature must be positive when sampling is enabled.")
@@ -1250,7 +1258,8 @@ def generate_next_tokens_with_sampling(
     while tokens_remaining > 0:
         context = generated[-seq_len:].unsqueeze(0)
         if training_objective == "query_block":
-            block_len = min(max(1, target_len), tokens_remaining)
+            block_len = max(1, target_len) + int(query_block_start_token_id is not None)
+            block_len = min(block_len, tokens_remaining)
             logits = model.forward_query_block(context, target_len=block_len)
         elif training_objective == "query_next_token":
             logits = model.forward_query_next_token(context)
@@ -1407,8 +1416,8 @@ def log_history_to_tensorboard(
             writer.add_scalar("eval/val_loss", val_loss, step)
             writer.add_scalar("eval/train_ppl", perplexity_from_loss(train_loss), step)
             writer.add_scalar("eval/val_ppl", perplexity_from_loss(val_loss), step)
-    writer.add_text("sample/prompt", prompt_text)
-    writer.add_text("sample/generated", generated_text)
+    writer.add_text("sample/prompt", format_tensorboard_text(prompt_text))
+    writer.add_text("sample/generated", format_tensorboard_text(generated_text))
     writer.add_hparams(
         {
             "seq_len": int(summary["seq_len"]),
@@ -1508,8 +1517,10 @@ def select_prefix_response_prompt_tokens(
 
 
 def format_tensorboard_text(text: str) -> str:
-    escaped = html.escape(text)
-    return escaped.replace("\n", "<br/>\n")
+    lines = text.splitlines() or [text]
+    if not lines:
+        lines = [""]
+    return "\n".join(f"    {line}" for line in lines)
 
 
 def format_tensorboard_sample(
@@ -1537,6 +1548,7 @@ def save_run_artifacts(
     steps_per_epoch: int,
     history: TrainingHistory,
     metrics_rows: Sequence[dict[str, Any]],
+    eval_runtime_rows: Sequence[dict[str, Any]],
     prompt_text: str,
     generated_text: str,
     summary: dict[str, Any],
@@ -1567,6 +1579,8 @@ def save_run_artifacts(
     )
     write_jsonl(run_dir / "metrics.jsonl", metrics_rows)
     write_csv_rows(run_dir / "metrics.csv", metrics_rows)
+    if eval_runtime_rows:
+        write_jsonl(run_dir / "eval_runtime_metrics.jsonl", eval_runtime_rows)
     write_json(run_dir / "summary.json", summary)
     (run_dir / "sample_prompt.txt").write_text(prompt_text, encoding="utf-8")
     (run_dir / "sample_generated.txt").write_text(generated_text, encoding="utf-8")
@@ -1609,6 +1623,7 @@ def run_single_experiment(
         raise ValueError("grad-accum-steps must be positive.")
     effective_batch_size = args.batch_size * grad_accum_steps
     response_objective = False
+    query_block_start_token_id: int | None = None
     if response_objective:
         if train_response_pairs is None or val_response_pairs is None or special_token_ids is None:
             raise ValueError("response objectives require encoded pairs and special ids.")
@@ -1699,6 +1714,9 @@ def run_single_experiment(
         usage_dropout_scale=args.usage_dropout_scale,
         usage_dropout_max=args.usage_dropout_max,
         usage_ema_decay=args.usage_ema_decay,
+        b_slot_dropout_p=args.b_slot_dropout_p,
+        s_to_b_slot_dropout_p=args.s_to_b_slot_dropout_p,
+        b_to_s_slot_dropout_p=args.b_to_s_slot_dropout_p,
         include_query_head=query_next_token or query_block,
     )
     parameter_count = count_parameters(model)
@@ -1720,7 +1738,9 @@ def run_single_experiment(
         f"route_topk={effective_config['route_topk']} | route_kind={args.route_kind} | "
         f"query_topk={args.query_topk or int(effective_config['route_topk'])} | "
         f"edge_dropout={args.edge_dropout_p:.3f} | "
-        f"usage_dropout={args.usage_dropout_base:.3f}/{args.usage_dropout_scale:.3f}/{args.usage_dropout_max:.3f}"
+        f"usage_dropout={args.usage_dropout_base:.3f}/{args.usage_dropout_scale:.3f}/{args.usage_dropout_max:.3f} | "
+        f"b_slot_dropout={args.b_slot_dropout_p:.3f} | "
+        f"slot_dropout(s_to_b/b_to_s)={args.s_to_b_slot_dropout_p:.3f}/{args.b_to_s_slot_dropout_p:.3f}"
     )
     print(
         f"schedule_steps={train_steps:,} | approx_epochs={requested_epochs:.3f} | "
@@ -1732,18 +1752,33 @@ def run_single_experiment(
         f"data_workers={args.data_workers} | "
         f"prefetch_factor={args.prefetch_factor}"
     )
-    if args.b_diversity_loss_weight > 0.0 or args.route_concentration_loss_weight > 0.0:
+    if (
+        args.b_diversity_loss_weight > 0.0
+        or args.b_diversity_unweighted_per_layer
+        or args.route_concentration_loss_weight > 0.0
+    ):
         print(
             "aux_losses | "
             f"b_diversity_weight={args.b_diversity_loss_weight:.6g} | "
+            f"b_diversity_per_layer_weight={args.b_diversity_per_layer_weight:.6g} | "
             f"b_cosine_margin={args.b_cosine_margin:.3f} | "
+            f"b_cosine_early_margin={args.b_cosine_early_margin:.3f} | "
+            f"b_diversity_unweighted_per_layer={args.b_diversity_unweighted_per_layer} | "
             f"route_concentration_weight={args.route_concentration_loss_weight:.6g} | "
             f"route_load_cap={args.route_load_cap:.3f} | "
             f"edge_prob_cap={args.edge_prob_cap:.3f}"
         )
+    print(
+        f"learning_rate={args.learning_rate:.6g} | "
+        f"lr_schedule={args.learning_rate_schedule} | "
+        f"lr_warmup_steps={args.learning_rate_warmup_steps} | "
+        f"grad_breakdown={args.grad_breakdown} | "
+        f"grad_breakdown_start_step={args.grad_breakdown_start_step}"
+    )
 
     start_time = time.perf_counter()
     writer = maybe_create_summary_writer(enabled=args.tensorboard, tensorboard_dir=tensorboard_dir)
+    eval_runtime_rows: list[dict[str, Any]] = []
     resume_checkpoint: dict[str, Any] | None = None
     resume_step = 0
     optimizer_state_dict: dict[str, object] | None = None
@@ -1830,6 +1865,14 @@ def run_single_experiment(
                 "usage_dropout_scale": args.usage_dropout_scale,
                 "usage_dropout_max": args.usage_dropout_max,
                 "usage_ema_decay": args.usage_ema_decay,
+                "b_slot_dropout_p": args.b_slot_dropout_p,
+                "s_to_b_slot_dropout_p": args.s_to_b_slot_dropout_p,
+                "b_to_s_slot_dropout_p": args.b_to_s_slot_dropout_p,
+                "b_diversity_unweighted_per_layer": args.b_diversity_unweighted_per_layer,
+                "b_diversity_per_layer_weight": args.b_diversity_per_layer_weight,
+                "b_cosine_early_margin": args.b_cosine_early_margin,
+                "learning_rate_schedule": args.learning_rate_schedule,
+                "learning_rate_warmup_steps": args.learning_rate_warmup_steps,
                 "alpha_scale": args.alpha_scale,
                 "beta_s_to_b_scale": args.beta_s_to_b_scale,
                 "beta_b_to_s_scale": args.beta_b_to_s_scale,
@@ -1987,6 +2030,7 @@ def run_single_experiment(
                 and hasattr(vocab, "token_id")
                 else None
             ),
+            query_block_start_token_id=query_block_start_token_id if query_block else None,
         )
         return prompt_text, vocab.decode(generated.tolist())
 
@@ -2018,12 +2062,18 @@ def run_single_experiment(
         if writer is None:
             return
         writer.add_scalar("train/minibatch_loss", minibatch_loss, step)
+        writer.add_scalar("train/epoch", step / steps_per_epoch, step)
+        writer.add_scalar("train/grad_norm", grad_norm, step)
         if step == 1 or step == train_steps or (args.log_interval > 0 and step % args.log_interval == 0):
             writer.flush()
 
     def loss_stats_tensorboard_callback(step: int, stats: dict[str, float]) -> None:
         if writer is None:
             return
+        for key, value in sorted(stats.items()):
+            if key.startswith("query_block_pos_loss/"):
+                continue
+            writer.add_scalar(key, value, step)
         bucket_ppl = {
             key.removeprefix("query_block_pos_loss/"): perplexity_from_loss(value)
             for key, value in sorted(stats.items())
@@ -2034,9 +2084,79 @@ def run_single_experiment(
         if step == 1 or step == train_steps or (args.log_interval > 0 and step % args.log_interval == 0):
             writer.flush()
 
-    def eval_tensorboard_callback(step: int, train_loss: float, val_loss: float) -> None:
-        if writer is not None:
+    def grad_stats_tensorboard_callback(step: int, stats: dict[str, float]) -> None:
+        if writer is None:
+            return
+        for key, value in sorted(stats.items()):
+            writer.add_scalar(key, value, step)
+        if step == 1 or step == train_steps or (args.log_interval > 0 and step % args.log_interval == 0):
             writer.flush()
+
+    def eval_tensorboard_callback(step: int, train_loss: float, val_loss: float) -> None:
+        runtime_stats: dict[str, float] | None = None
+        if writer is not None:
+            writer.add_scalar("eval/train_loss", train_loss, step)
+            writer.add_scalar("eval/val_loss", val_loss, step)
+            writer.add_scalar("eval/train_ppl", perplexity_from_loss(train_loss), step)
+            writer.add_scalar("eval/val_ppl", perplexity_from_loss(val_loss), step)
+            if response_objective:
+                assert special_token_ids is not None
+                stats_pairs = val_response_pairs or train_response_pairs
+                assert stats_pairs is not None
+                stats_batch = sample_prefix_response_batch(
+                    stats_pairs,
+                    seq_len=args.seq_len,
+                    response_len=args.response_len,
+                    batch_size=1,
+                    bos_token_id=special_token_ids["assistant"],
+                    eos_token_id=special_token_ids["eos"],
+                    pad_token_id=special_token_ids["pad"],
+                    device=device,
+                )
+                stats_context = stats_batch.context[:1]
+            else:
+                stats_batch = sample_next_token_batch(
+                    val_tokens,
+                    seq_len=args.seq_len,
+                    batch_size=1,
+                    device=device,
+                    teacher_forcing=teacher_forcing,
+                    full_sequence_causal=full_sequence_causal,
+                    target_len=args.target_len if query_block else 1,
+                    balanced_token_groups=val_balanced_token_groups,
+                    query_block_start_token_id=query_block_start_token_id if query_block else None,
+                )
+                stats_context = stats_batch.context[:1]
+            runtime_stats = model.collect_runtime_stats(stats_context)
+            eval_runtime_rows.append(
+                {
+                    "record_type": "eval_runtime",
+                    "step": step,
+                    "epoch": step / steps_per_epoch,
+                    **runtime_stats,
+                }
+            )
+            for key, value in sorted(runtime_stats.items()):
+                writer.add_scalar(f"eval/runtime/{key}", value, step)
+            sample_prompt, sample_generated = make_eval_sample()
+            writer.add_text(
+                "eval/sample",
+                format_tensorboard_sample(
+                    prompt_text=sample_prompt,
+                    generated_text=sample_generated,
+                ),
+                step,
+            )
+            writer.flush()
+            sample_message = (
+                f"eval_sample | step={step}\n"
+                f"--- prompt ---\n{sample_prompt}\n\n"
+                f"--- sample ---\n{sample_generated}"
+            )
+            if progress_bar is not None:
+                progress_bar.write(sample_message)
+            else:
+                print(sample_message)
         if trial is not None:
             trial.report(val_loss, step)
             if trial.should_prune():
@@ -2082,6 +2202,8 @@ def run_single_experiment(
                 total_steps=train_steps,
                 optimizer_state_dict=optimizer_state_dict,
                 checkpoint_interval=args.checkpoint_interval,
+                learning_rate_schedule=args.learning_rate_schedule,
+                learning_rate_warmup_steps=args.learning_rate_warmup_steps,
                 step_setup_callback=step_setup_callback,
                 progress_callback=progress_callback,
                 step_callback=step_tensorboard_callback,
@@ -2117,6 +2239,7 @@ def run_single_experiment(
                 progress_callback=progress_callback,
                 step_callback=step_tensorboard_callback,
                 loss_stats_callback=loss_stats_tensorboard_callback,
+                grad_stats_callback=grad_stats_tensorboard_callback if args.grad_breakdown else None,
                 eval_callback=eval_tensorboard_callback,
                 checkpoint_callback=training_checkpoint_callback,
                 eval_on_first_step=eval_on_first_step,
@@ -2124,15 +2247,22 @@ def run_single_experiment(
                 autocast_dtype=autocast_dtype,
                 balanced_token_groups=train_balanced_token_groups,
                 val_balanced_token_groups=val_balanced_token_groups,
+                query_block_start_token_id=query_block_start_token_id if query_block else None,
                 start_step=resume_step,
                 total_steps=train_steps,
                 optimizer_state_dict=optimizer_state_dict,
                 checkpoint_interval=args.checkpoint_interval,
                 b_diversity_loss_weight=args.b_diversity_loss_weight,
+                b_diversity_unweighted_per_layer=args.b_diversity_unweighted_per_layer,
+                b_diversity_per_layer_weight=args.b_diversity_per_layer_weight,
                 b_cosine_margin=args.b_cosine_margin,
+                b_cosine_early_margin=args.b_cosine_early_margin,
                 route_concentration_loss_weight=args.route_concentration_loss_weight,
                 route_load_cap=args.route_load_cap,
                 edge_prob_cap=args.edge_prob_cap,
+                learning_rate_schedule=args.learning_rate_schedule,
+                learning_rate_warmup_steps=args.learning_rate_warmup_steps,
+                grad_breakdown_start_step=args.grad_breakdown_start_step if args.grad_breakdown else None,
             )
     except Exception:
         if progress_bar is not None:
@@ -2184,6 +2314,7 @@ def run_single_experiment(
                 and hasattr(vocab, "token_id")
                 else None
             ),
+            query_block_start_token_id=query_block_start_token_id if query_block else None,
         )
         generated_text = vocab.decode(generated.tolist())
 
@@ -2240,6 +2371,12 @@ def run_single_experiment(
         "usage_dropout_scale": args.usage_dropout_scale,
         "usage_dropout_max": args.usage_dropout_max,
         "usage_ema_decay": args.usage_ema_decay,
+        "b_slot_dropout_p": args.b_slot_dropout_p,
+        "s_to_b_slot_dropout_p": args.s_to_b_slot_dropout_p,
+        "b_to_s_slot_dropout_p": args.b_to_s_slot_dropout_p,
+        "b_diversity_unweighted_per_layer": args.b_diversity_unweighted_per_layer,
+        "b_diversity_per_layer_weight": args.b_diversity_per_layer_weight,
+        "b_cosine_early_margin": args.b_cosine_early_margin,
         "alpha_scale": args.alpha_scale,
         "beta_s_to_b_scale": args.beta_s_to_b_scale,
         "beta_b_to_s_scale": args.beta_b_to_s_scale,
@@ -2250,6 +2387,8 @@ def run_single_experiment(
         "b_schedule_min": args.b_schedule_min,
         "b_schedule_max": args.b_schedule_max,
         "learning_rate": args.learning_rate,
+        "learning_rate_schedule": args.learning_rate_schedule,
+        "learning_rate_warmup_steps": args.learning_rate_warmup_steps,
         "weight_decay": args.weight_decay,
         "precision": args.precision,
         "s_window": args.s_window,
@@ -2311,6 +2450,7 @@ def run_single_experiment(
         steps_per_epoch=steps_per_epoch,
         history=history,
         metrics_rows=metrics_rows,
+        eval_runtime_rows=eval_runtime_rows,
         prompt_text=prompt_text,
         generated_text=generated_text,
         summary=summary,
@@ -2446,11 +2586,24 @@ def main() -> None:
         default=0.0,
         help="Auxiliary weight for reducing high cosine similarity between compressed B nodes.",
     )
+    parser.add_argument("--b-diversity-unweighted-per-layer", action="store_true")
+    parser.add_argument(
+        "--b-diversity-per-layer-weight",
+        type=float,
+        default=1.0,
+        help="Weight applied to the averaged per-layer B diversity penalty when enabled.",
+    )
     parser.add_argument(
         "--b-cosine-margin",
         type=float,
         default=0.20,
         help="Compressed B node cosine similarity above this margin is penalized.",
+    )
+    parser.add_argument(
+        "--b-cosine-early-margin",
+        type=float,
+        default=0.35,
+        help="Higher cosine margin used for earlier B layers when per-layer B diversity loss is enabled.",
     )
     parser.add_argument(
         "--route-concentration-loss-weight",
@@ -2514,6 +2667,14 @@ def main() -> None:
     parser.add_argument("--full-beta-s-to-b", type=float, default=0.9)
     parser.add_argument("--full-beta-b-to-s", type=float, default=0.8)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument(
+        "--learning-rate-schedule",
+        choices=("none", "cosine"),
+        default="none",
+    )
+    parser.add_argument("--learning-rate-warmup-steps", type=int, default=0)
+    parser.add_argument("--grad-breakdown", action="store_true")
+    parser.add_argument("--grad-breakdown-start-step", type=int, default=0)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--route-topk", type=int, default=4)
     parser.add_argument(
@@ -2557,6 +2718,9 @@ def main() -> None:
     parser.add_argument("--usage-dropout-scale", type=float, default=0.0)
     parser.add_argument("--usage-dropout-max", type=float, default=0.0)
     parser.add_argument("--usage-ema-decay", type=float, default=0.99)
+    parser.add_argument("--b-slot-dropout-p", type=float, default=0.0)
+    parser.add_argument("--s-to-b-slot-dropout-p", type=float, default=0.0)
+    parser.add_argument("--b-to-s-slot-dropout-p", type=float, default=0.0)
     parser.add_argument(
         "--precision",
         choices=("fp32", "bf16", "fp16"),
@@ -2656,10 +2820,18 @@ def main() -> None:
         raise ValueError("target-len must be positive.")
     if args.b_diversity_loss_weight < 0.0:
         raise ValueError("b-diversity-loss-weight must be non-negative.")
+    if args.b_diversity_per_layer_weight < 0.0:
+        raise ValueError("b-diversity-per-layer-weight must be non-negative.")
     if args.route_concentration_loss_weight < 0.0:
         raise ValueError("route-concentration-loss-weight must be non-negative.")
+    if args.learning_rate_warmup_steps < 0:
+        raise ValueError("learning-rate-warmup-steps must be non-negative.")
+    if args.grad_breakdown_start_step < 0:
+        raise ValueError("grad-breakdown-start-step must be non-negative.")
     if not 0.0 <= args.b_cosine_margin < 1.0:
         raise ValueError("b-cosine-margin must be in [0, 1).")
+    if not 0.0 <= args.b_cosine_early_margin < 1.0:
+        raise ValueError("b-cosine-early-margin must be in [0, 1).")
     if not 0.0 < args.route_load_cap <= 1.0:
         raise ValueError("route-load-cap must be in (0, 1].")
     if not 0.0 < args.edge_prob_cap <= 1.0:
@@ -2677,6 +2849,9 @@ def main() -> None:
         "usage_dropout_base",
         "usage_dropout_scale",
         "usage_dropout_max",
+        "b_slot_dropout_p",
+        "s_to_b_slot_dropout_p",
+        "b_to_s_slot_dropout_p",
     ):
         value = getattr(args, name)
         if not 0.0 <= value < 1.0:
@@ -2766,7 +2941,13 @@ def main() -> None:
         subword_num_threads=args.subword_num_threads,
         user_defined_symbols=DIALOGUE_SPECIAL_TOKENS if response_objective or query_next_token or query_block else (),
     )
-    special_token_ids = require_special_token_ids(vocab) if response_objective else None
+    if response_objective:
+        special_token_ids = require_special_token_ids(vocab)
+    elif query_block and hasattr(vocab, "token_id"):
+        special_token_ids = require_special_token_ids(vocab)
+        query_block_start_token_id = special_token_ids["query_block_start"]
+    else:
+        special_token_ids = None
     effective_pretokenize_workers = min(args.pretokenize_workers, os.cpu_count() or 1)
     if not response_objective and effective_pretokenize_workers > 1 and isinstance(vocab, ByteBPEVocab):
         print(f"parallel_byte_bpe_encoding | workers={effective_pretokenize_workers}", flush=True)
