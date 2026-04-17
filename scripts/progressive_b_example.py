@@ -10,6 +10,8 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, IterableDataset
 
 from jakal_net import (
+    AdditiveLowRankPairwise,
+    AdditiveLowRankRoute,
     BilinearPairwiseRoute,
     DiagonalBilinearPairwise,
     DiagonalBilinearRoute,
@@ -172,6 +174,7 @@ def _resolve_scheduled_learning_rate(
     base_learning_rate: float,
     schedule: str,
     warmup_steps: int,
+    warmup_start_learning_rate: float | None,
     step: int,
     start_step: int,
     total_steps: int,
@@ -182,6 +185,13 @@ def _resolve_scheduled_learning_rate(
         raise ValueError(f"Unsupported learning-rate schedule: {schedule!r}.")
     relative_step = max(1, step - start_step)
     if warmup_steps > 0 and relative_step <= warmup_steps:
+        if warmup_start_learning_rate is not None:
+            if warmup_steps == 1:
+                return base_learning_rate
+            warmup_progress = (relative_step - 1) / (warmup_steps - 1)
+            return warmup_start_learning_rate + (
+                base_learning_rate - warmup_start_learning_rate
+            ) * warmup_progress
         return base_learning_rate * (relative_step / warmup_steps)
     decay_steps = max(1, total_steps - start_step - warmup_steps)
     decay_progress = min(1.0, max(0.0, (relative_step - warmup_steps) / decay_steps))
@@ -323,6 +333,37 @@ def _expand_position_encoding(
     return position_encoding.view(view_shape).expand(*batch_shape, *position_encoding.shape)
 
 
+def _resize_slot_parameter(
+    parameter: Tensor,
+    *,
+    num_nodes: int,
+) -> Tensor:
+    if parameter.shape[0] == num_nodes:
+        return parameter
+    if parameter.ndim == 1:
+        resized = F.interpolate(
+            parameter.view(1, 1, -1),
+            size=num_nodes,
+            mode="linear",
+            align_corners=True,
+        )
+        return resized.view(num_nodes)
+    if parameter.ndim == 2:
+        resized = F.interpolate(
+            parameter.transpose(0, 1).unsqueeze(0),
+            size=num_nodes,
+            mode="linear",
+            align_corners=True,
+        )
+        return resized.squeeze(0).transpose(0, 1)
+    raise ValueError(f"Unsupported slot parameter rank: {parameter.ndim}.")
+
+
+def _expand_slot_template(slot_parameter: Tensor, batch_shape: tuple[int, ...]) -> Tensor:
+    view_shape = (1,) * len(batch_shape) + tuple(slot_parameter.shape)
+    return slot_parameter.view(view_shape).expand(*batch_shape, *slot_parameter.shape)
+
+
 def _make_sparse_or_dense_propagation(
     *,
     dim: int,
@@ -361,6 +402,70 @@ def _make_sparse_or_dense_propagation(
             residual=residual,
         )
     raise ValueError(f"Unsupported sparse_type: {sparse_type!r}.")
+
+
+def _dense_causal_block_mask(
+    *,
+    target_start: int,
+    target_end: int,
+    source_start: int,
+    source_end: int,
+    device: torch.device,
+    batch_shape: tuple[int, ...],
+) -> Tensor:
+    target_positions = torch.arange(target_start, target_end, device=device)
+    source_positions = torch.arange(source_start, source_end, device=device)
+    mask_2d = source_positions.unsqueeze(0) <= target_positions.unsqueeze(1)
+    return mask_2d.view((1,) * len(batch_shape) + mask_2d.shape)
+
+
+def _compute_dense_causal_propagation_delta(
+    propagation: Propagation,
+    layer: Layer,
+) -> LayerDelta:
+    projected_state, projected_val = propagation._project_inputs(layer)
+    delta_state, delta_val = propagation._allocate_delta_buffers(
+        layer, projected_state, projected_val
+    )
+    target_block_size = propagation.target_block_size or layer.num_nodes
+    source_block_size = propagation.source_block_size or layer.num_nodes
+    if isinstance(propagation.pairwise_fn, HadamardMLPPairwise):
+        target_block_size = min(target_block_size, 8)
+        source_block_size = min(source_block_size, 8)
+    state_acc_dtype = delta_state.dtype
+    val_acc_dtype = delta_val.dtype
+
+    for target_start in range(0, layer.num_nodes, target_block_size):
+        target_end = min(layer.num_nodes, target_start + target_block_size)
+        target_val = layer.val[..., target_start:target_end, :]
+
+        for source_start in range(0, target_end, source_block_size):
+            source_end = min(target_end, source_start + source_block_size)
+            source_val = layer.val[..., source_start:source_end, :]
+            scores = propagation.pairwise_fn(target_val, source_val)
+            edges = propagation.edge_compress_fn(scores) * _dense_causal_block_mask(
+                target_start=target_start,
+                target_end=target_end,
+                source_start=source_start,
+                source_end=source_end,
+                device=scores.device,
+                batch_shape=layer.batch_shape,
+            ).to(dtype=scores.dtype)
+            delta_state[..., target_start:target_end] += torch.einsum(
+                "...ij,...j->...i",
+                edges.to(dtype=state_acc_dtype),
+                projected_state[..., source_start:source_end].to(dtype=state_acc_dtype),
+            )
+            delta_val[..., target_start:target_end, :] += torch.einsum(
+                "...ij,...jd->...id",
+                edges.to(dtype=val_acc_dtype),
+                projected_val[..., source_start:source_end, :].to(dtype=val_acc_dtype),
+            )
+
+    return LayerDelta(
+        delta_state=delta_state.to(dtype=projected_state.dtype),
+        delta_val=delta_val.to(dtype=projected_val.dtype),
+    )
 
 
 class QueryTopKPropagation(nn.Module):
@@ -509,6 +614,12 @@ def _make_transition(
             src_dim=dim,
             dst_dim=dim,
             rank=route_hidden_dim or max(1, dim // 2),
+        )
+    elif route_kind == "additive_low_rank":
+        route_fn = AdditiveLowRankRoute(
+            src_dim=dim,
+            dst_dim=dim,
+            hidden_dim=route_hidden_dim or max(1, dim // 16),
         )
     elif route_kind == "hadamard_mlp":
         route_fn = SourceTargetHadamardMLPRoute(
@@ -715,8 +826,14 @@ class ProgressiveBJointBlock(nn.Module):
         self.s_val_norm = _make_value_norm(dim, value_norm_kind)
         self.expanded_val_norm = _make_value_norm(dim, value_norm_kind)
         self.compressed_val_norm = _make_value_norm(dim, value_norm_kind)
-        self.expanded_position_encoding = LearnedPositionEncoding(dim)
-        self.compressed_position_encoding = LearnedPositionEncoding(dim)
+        self.expanded_slot_state = nn.Parameter(torch.empty(expanded_nodes))
+        self.expanded_slot_val = nn.Parameter(torch.empty(expanded_nodes, dim))
+        self.compressed_slot_state = nn.Parameter(torch.empty(compressed_nodes))
+        self.compressed_slot_val = nn.Parameter(torch.empty(compressed_nodes, dim))
+        nn.init.normal_(self.expanded_slot_state, mean=0.0, std=0.02)
+        nn.init.normal_(self.expanded_slot_val, mean=0.0, std=0.02)
+        nn.init.normal_(self.compressed_slot_state, mean=0.0, std=0.02)
+        nn.init.normal_(self.compressed_slot_val, mean=0.0, std=0.02)
 
         self.s_propagation = _make_sparse_or_dense_propagation(
             dim=dim,
@@ -871,21 +988,27 @@ class ProgressiveBJointBlock(nn.Module):
         self,
         reference: Layer,
         num_nodes: int,
-        position_encoding: LearnedPositionEncoding,
+        *,
+        slot_state_template: Tensor,
+        slot_val_template: Tensor,
     ) -> Layer:
         batch_shape = tuple(reference.batch_shape)
-        state = torch.zeros(
-            *batch_shape,
-            num_nodes,
+        slot_state = _resize_slot_parameter(
+            slot_state_template,
+            num_nodes=num_nodes,
+        )
+        slot_val = _resize_slot_parameter(
+            slot_val_template,
+            num_nodes=num_nodes,
+        )
+        state = _expand_slot_template(slot_state, batch_shape).to(
             device=reference.state.device,
             dtype=reference.state.dtype,
         )
-        base_position = position_encoding(
-            num_nodes,
+        val = _expand_slot_template(slot_val, batch_shape).to(
             device=reference.val.device,
             dtype=reference.val.dtype,
         )
-        val = _expand_position_encoding(base_position, batch_shape)
         return Layer(
             dim=self.dim,
             num_nodes=num_nodes,
@@ -903,14 +1026,16 @@ class ProgressiveBJointBlock(nn.Module):
             return self._make_b_layer(
                 s_layer,
                 compressed_nodes,
-                self.compressed_position_encoding,
+                slot_state_template=self.compressed_slot_state,
+                slot_val_template=self.compressed_slot_val,
             )
         if compressed_b.num_nodes == compressed_nodes:
             return compressed_b
         adapted = self._make_b_layer(
             s_layer,
             compressed_nodes,
-            self.compressed_position_encoding,
+            slot_state_template=self.compressed_slot_state,
+            slot_val_template=self.compressed_slot_val,
         )
         return self.compressed_adapter(compressed_b, adapted)
 
@@ -985,7 +1110,8 @@ class ProgressiveBJointBlock(nn.Module):
         expanded_b = self._make_b_layer(
             s_layer,
             expanded_nodes,
-            self.expanded_position_encoding,
+            slot_state_template=self.expanded_slot_state,
+            slot_val_template=self.expanded_slot_val,
         )
         expand_src = self._prepare_operator_input(compressed_b, self.compressed_val_norm)
         expand_dst = self._prepare_operator_input(expanded_b, self.expanded_val_norm)
@@ -1152,6 +1278,7 @@ class ProgressiveBExampleLM(nn.Module):
         warmup_layers: int = 2,
         stage_specs: Sequence[ProgressiveBStageSpec] | None = None,
         final_refine_layers: int = 2,
+        query_refine_layers: int | None = None,
         s_window: int = 4,
         route_topk: int = 4,
         expanded_topk: int = 4,
@@ -1226,6 +1353,10 @@ class ProgressiveBExampleLM(nn.Module):
         self.pairwise_hidden_dim = pairwise_hidden_dim
         self.query_topk = query_topk or route_topk
         self.include_query_head = include_query_head
+        self.query_refine_layers = max(
+            1,
+            final_refine_layers if query_refine_layers is None else int(query_refine_layers),
+        )
         if self.query_topk <= 0:
             raise ValueError("query_topk must be positive.")
         self.stage_specs = tuple(stage_specs or build_progressive_b_stage_specs(seq_nodes))
@@ -1264,6 +1395,11 @@ class ProgressiveBExampleLM(nn.Module):
                 dim=dim,
                 rank=pairwise_hidden_dim or max(1, dim // 2),
             )
+        elif pairwise_kind == "additive_low_rank":
+            pairwise_factory = lambda: AdditiveLowRankPairwise(
+                dim=dim,
+                rank=pairwise_hidden_dim or max(1, dim // 16),
+            )
         elif pairwise_kind == "hadamard_mlp":
             pairwise_factory = lambda: HadamardMLPPairwise(dim=dim, hidden_dim=pairwise_hidden_dim)
         else:
@@ -1288,10 +1424,12 @@ class ProgressiveBExampleLM(nn.Module):
                 usage_dropout_max=usage_dropout_max,
                 usage_ema_decay=usage_ema_decay,
             )
-            self.query_propagation = QueryTopKPropagation(
-                query_pairwise,
-                topk=self.query_topk,
+            self.query_propagation = _make_sparse_or_dense_propagation(
+                dim=dim,
+                sparse_type="dense",
                 implementation=implementation,
+                pairwise_fn=query_pairwise,
+                residual=propagation_residual,
             )
         self.s_warmup = nn.ModuleList(
             [
@@ -1669,13 +1807,12 @@ class ProgressiveBExampleLM(nn.Module):
     def apply_query_propagation(
         self,
         query_layer: Layer,
-        propagation_source_layer: Layer | None = None,
     ) -> Layer:
         self._require_query_head()
-        source_layer = query_layer if propagation_source_layer is None else propagation_source_layer
-        propagation_delta = self.query_propagation.compute_delta(
-            self._prepare_query_input(query_layer),
-            self._prepare_query_input(source_layer),
+        prepared_query = self._prepare_query_input(query_layer)
+        propagation_delta = _compute_dense_causal_propagation_delta(
+            self.query_propagation,
+            prepared_query,
         )
         query_layer = _apply_scaled_delta(
             query_layer,
@@ -1685,6 +1822,18 @@ class ProgressiveBExampleLM(nn.Module):
         )
         return self._finalize_query_layer(query_layer)
 
+    def refine_query_layer(
+        self,
+        source_layer: Layer,
+        query_layer: Layer | None = None,
+    ) -> Layer:
+        if query_layer is None:
+            query_layer = self.initialize_query_layer(source_layer)
+        for _ in range(self.query_refine_layers):
+            query_layer = self.apply_query_transition(source_layer, query_layer)
+            query_layer = self.apply_query_propagation(query_layer)
+        return query_layer
+
     def update_query_slot(
         self,
         source_layer: Layer,
@@ -1692,10 +1841,8 @@ class ProgressiveBExampleLM(nn.Module):
         *,
         propagation_source_layer: Layer | None = None,
     ) -> Layer:
-        query_layer = self.apply_query_transition(source_layer, query_layer)
-        if propagation_source_layer is None:
-            propagation_source_layer = query_layer
-        return self.apply_query_propagation(query_layer, propagation_source_layer)
+        del propagation_source_layer
+        return self.refine_query_layer(source_layer, query_layer)
 
     def forward_query_block(
         self,
@@ -1724,58 +1871,29 @@ class ProgressiveBExampleLM(nn.Module):
             for key, values in block_stat_values.items():
                 if values:
                     aux_stats[f"blocks/{key}_mean"] = float(sum(values) / len(values))
-        query_template = self.initialize_query_layer(s_layer, query_nodes=target_len)
-        if self.collect_aux_losses:
-            query_transition_loss, query_transition_max_load = _transition_route_concentration_loss(
-                self.query_transition,
-                self._prepare_sequence_input(s_layer),
-                self._prepare_query_input(query_template),
-                load_cap=self.route_load_cap,
-            )
-            aux_losses["route_concentration/query_transition"] = query_transition_loss
-            aux_stats["route_concentration/query_transition_max_load"] = float(
-                query_transition_max_load.detach().item()
-            )
-        transitioned_queries = self.apply_query_transition(s_layer, query_template)
-        updated_prefix: Layer | None = None
-        query_edge_losses: list[Tensor] = []
-        query_edge_max_probs: list[Tensor] = []
-        for index in range(target_len):
-            query_slot = Layer(
-                dim=self.dim,
-                num_nodes=1,
-                state=transitioned_queries.state[..., index : index + 1],
-                val=transitioned_queries.val[..., index : index + 1, :],
-            )
-            propagation_source = query_slot
-            if updated_prefix is not None:
-                propagation_source = self._concat_layers(updated_prefix, query_slot)
+        query_layer = self.initialize_query_layer(s_layer, query_nodes=target_len)
+        query_transition_losses: list[Tensor] = []
+        query_transition_max_loads: list[Tensor] = []
+        for _ in range(self.query_refine_layers):
             if self.collect_aux_losses:
-                scores = self.query_propagation.pairwise_fn(
-                    self._prepare_query_input(query_slot).val,
-                    self._prepare_query_input(propagation_source).val,
+                query_transition_loss, query_transition_max_load = _transition_route_concentration_loss(
+                    self.query_transition,
+                    self._prepare_sequence_input(s_layer),
+                    self._prepare_query_input(query_layer),
+                    load_cap=self.route_load_cap,
                 )
-                edge_loss, edge_max_prob = _edge_probability_concentration_loss(
-                    scores,
-                    prob_cap=self.edge_prob_cap,
-                )
-                query_edge_losses.append(edge_loss)
-                query_edge_max_probs.append(edge_max_prob)
-            query_slot = self.apply_query_propagation(query_slot, propagation_source)
-            updated_prefix = (
-                query_slot
-                if updated_prefix is None
-                else self._concat_layers(updated_prefix, query_slot)
-            )
-        assert updated_prefix is not None
-        if self.collect_aux_losses and query_edge_losses:
-            aux_losses["edge_concentration/query_propagation"] = torch.stack(query_edge_losses).mean()
-            aux_stats["edge_concentration/query_propagation_max_prob"] = float(
-                torch.stack(query_edge_max_probs).mean().detach().item()
+                query_transition_losses.append(query_transition_loss)
+                query_transition_max_loads.append(query_transition_max_load)
+            query_layer = self.apply_query_transition(s_layer, query_layer)
+            query_layer = self.apply_query_propagation(query_layer)
+        if self.collect_aux_losses and query_transition_losses:
+            aux_losses["route_concentration/query_transition"] = torch.stack(query_transition_losses).mean()
+            aux_stats["route_concentration/query_transition_max_load"] = float(
+                torch.stack(query_transition_max_loads).mean().detach().item()
             )
         self.last_aux_losses = aux_losses if aux_losses else None
         self.last_aux_stats = aux_stats if aux_stats else None
-        query_slots = self.query_head_norm(updated_prefix.val)
+        query_slots = self.query_head_norm(query_layer.val)
         logits = self.query_head(query_slots)
         if return_layers:
             return logits, s_layer, compressed_b
@@ -1789,8 +1907,7 @@ class ProgressiveBExampleLM(nn.Module):
     ) -> Tensor | tuple[Tensor, Layer, Layer | None]:
         self._require_query_head()
         s_layer, compressed_b = self.encode_prefix(token_ids)
-        query_layer = self.apply_query_transition(s_layer)
-        query_layer = self.apply_query_propagation(query_layer)
+        query_layer = self.refine_query_layer(s_layer)
         query_slot = self.query_head_norm(query_layer.val[..., 0, :])
         logits = self.query_head(query_slot)
         if return_layers:
@@ -1834,6 +1951,7 @@ class CharVocab:
 class NextTokenBatch:
     context: Tensor
     target: Tensor
+    loss_mask: Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1930,7 +2048,11 @@ def sample_next_token_batch(
             targets.append(target)
         context_batch = torch.stack(contexts, dim=0)
         target_batch = torch.stack(targets, dim=0)
-        return NextTokenBatch(context=context_batch.to(device), target=target_batch.to(device))
+        return NextTokenBatch(
+            context=context_batch.to(device),
+            target=target_batch.to(device),
+            loss_mask=None,
+        )
     max_start = tokens.numel() - seq_len - forecast_len
     if max_start < 0:
         raise ValueError("The tokenized corpus must be longer than seq_len + target_len.")
@@ -1950,7 +2072,11 @@ def sample_next_token_batch(
             target = future_tokens
         else:
             target = future_tokens[:, 0]
-    return NextTokenBatch(context=context.to(device), target=target.to(device))
+    return NextTokenBatch(
+        context=context.to(device),
+        target=target.to(device),
+        loss_mask=None,
+    )
 
 
 class NextTokenBatchDataset(IterableDataset[tuple[Tensor, Tensor]]):
@@ -1991,7 +2117,7 @@ class NextTokenBatchDataset(IterableDataset[tuple[Tensor, Tensor]]):
                 balanced_token_groups=self.balanced_token_groups,
                 query_block_start_token_id=self.query_block_start_token_id,
             )
-            yield batch.context, batch.target
+            yield batch.context, batch.target, batch.loss_mask
 
 
 def _pad_or_trim_prefix(token_ids: Tensor, *, seq_len: int, pad_token_id: int) -> Tensor:
@@ -2027,6 +2153,128 @@ def _make_response_targets(
     if response_len > 1:
         decoder_input[1:] = target[:-1]
     return decoder_input, target, loss_mask
+
+
+def _make_query_block_targets(
+    response_ids: Tensor,
+    *,
+    target_len: int,
+    query_block_start_token_id: int,
+    eos_token_id: int,
+    pad_token_id: int,
+) -> tuple[Tensor, Tensor]:
+    if target_len <= 0:
+        raise ValueError('target_len must be positive.')
+    response_ids = response_ids.detach().cpu().to(dtype=torch.long)
+    total_len = target_len + 1
+    target = torch.full((total_len,), pad_token_id, dtype=torch.long)
+    loss_mask = torch.zeros(total_len, dtype=torch.float32)
+    # query_block_start is a structural buffer token, not a supervised content target.
+    target[0] = query_block_start_token_id
+    content = response_ids[:target_len]
+    used = int(content.numel())
+    if used > 0:
+        target[1 : 1 + used] = content
+        loss_mask[1 : 1 + used] = 1.0
+    if used < target_len:
+        target[1 + used] = eos_token_id
+        loss_mask[1 + used] = 1.0
+    return target, loss_mask
+
+
+def sample_query_block_pair_batch(
+    pairs: Sequence[tuple[Tensor, Tensor]],
+    *,
+    seq_len: int,
+    target_len: int,
+    batch_size: int,
+    query_block_start_token_id: int,
+    eos_token_id: int,
+    pad_token_id: int,
+    device: torch.device | str,
+    balanced_index_groups: Sequence[Sequence[int]] | None = None,
+) -> NextTokenBatch:
+    if not pairs:
+        raise ValueError('pairs must not be empty.')
+    if target_len <= 0:
+        raise ValueError('target_len must be positive.')
+    if balanced_index_groups:
+        groups = [tuple(int(index) for index in group) for group in balanced_index_groups if group]
+        if not groups:
+            raise ValueError('balanced_index_groups must contain at least one non-empty group.')
+        sampled: list[int] = []
+        offset = int(torch.randint(0, len(groups), (1,)).item())
+        for item_index in range(batch_size):
+            group = groups[(offset + item_index) % len(groups)]
+            sampled.append(group[int(torch.randint(0, len(group), (1,)).item())])
+        indices = torch.tensor(sampled, dtype=torch.long)
+    else:
+        indices = torch.randint(0, len(pairs), (batch_size,))
+    contexts: list[Tensor] = []
+    targets: list[Tensor] = []
+    masks: list[Tensor] = []
+    for index in indices.tolist():
+        prefix_ids, response_ids = pairs[index]
+        contexts.append(_pad_or_trim_prefix(prefix_ids, seq_len=seq_len, pad_token_id=pad_token_id))
+        target, loss_mask = _make_query_block_targets(
+            response_ids,
+            target_len=target_len,
+            query_block_start_token_id=query_block_start_token_id,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+        )
+        targets.append(target)
+        masks.append(loss_mask)
+    target_device = torch.device(device)
+    return NextTokenBatch(
+        context=torch.stack(contexts, dim=0).to(target_device),
+        target=torch.stack(targets, dim=0).to(target_device),
+        loss_mask=torch.stack(masks, dim=0).to(target_device),
+    )
+
+
+class QueryBlockPairBatchDataset(IterableDataset[tuple[Tensor, Tensor, Tensor]]):
+    def __init__(
+        self,
+        pairs: Sequence[tuple[Tensor, Tensor]],
+        *,
+        seq_len: int,
+        target_len: int,
+        batch_size: int,
+        query_block_start_token_id: int,
+        eos_token_id: int,
+        pad_token_id: int,
+        balanced_index_groups: Sequence[Sequence[int]] | None = None,
+    ) -> None:
+        super().__init__()
+        self.pairs = tuple((prefix.detach().cpu(), response.detach().cpu()) for prefix, response in pairs)
+        self.balanced_index_groups = (
+            tuple(tuple(int(index) for index in group) for group in balanced_index_groups if group)
+            if balanced_index_groups
+            else None
+        )
+        self.seq_len = seq_len
+        self.target_len = target_len
+        self.batch_size = batch_size
+        self.query_block_start_token_id = query_block_start_token_id
+        self.eos_token_id = eos_token_id
+        self.pad_token_id = pad_token_id
+
+    def __iter__(self):
+        while True:
+            batch = sample_query_block_pair_batch(
+                self.pairs,
+                seq_len=self.seq_len,
+                target_len=self.target_len,
+                batch_size=self.batch_size,
+                query_block_start_token_id=self.query_block_start_token_id,
+                eos_token_id=self.eos_token_id,
+                pad_token_id=self.pad_token_id,
+                device='cpu',
+                balanced_index_groups=self.balanced_index_groups,
+            )
+            assert batch.loss_mask is not None
+            yield batch.context, batch.target, batch.loss_mask
 
 
 def sample_prefix_response_batch(
@@ -2177,10 +2425,66 @@ def _make_train_batch_iterator(
             persistent_workers=True,
             prefetch_factor=max(1, prefetch_factor),
         )
-        for context, target in loader:
+        for context, target, loss_mask in loader:
             yield NextTokenBatch(
                 context=context.to(target_device, non_blocking=True),
                 target=target.to(target_device, non_blocking=True),
+                loss_mask=None if loss_mask is None else loss_mask.to(target_device, non_blocking=True),
+            )
+
+
+def _make_query_block_pair_batch_iterator(
+    pairs: Sequence[tuple[Tensor, Tensor]],
+    *,
+    seq_len: int,
+    target_len: int,
+    batch_size: int,
+    query_block_start_token_id: int,
+    eos_token_id: int,
+    pad_token_id: int,
+    device: torch.device | str,
+    data_workers: int,
+    prefetch_factor: int,
+    balanced_index_groups: Sequence[Sequence[int]] | None = None,
+):
+    target_device = torch.device(device)
+    if data_workers <= 0:
+        while True:
+            yield sample_query_block_pair_batch(
+                pairs,
+                seq_len=seq_len,
+                target_len=target_len,
+                batch_size=batch_size,
+                query_block_start_token_id=query_block_start_token_id,
+                eos_token_id=eos_token_id,
+                pad_token_id=pad_token_id,
+                device=target_device,
+                balanced_index_groups=balanced_index_groups,
+            )
+    else:
+        dataset = QueryBlockPairBatchDataset(
+            pairs,
+            seq_len=seq_len,
+            target_len=target_len,
+            batch_size=batch_size,
+            query_block_start_token_id=query_block_start_token_id,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            balanced_index_groups=balanced_index_groups,
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=None,
+            num_workers=data_workers,
+            pin_memory=target_device.type == 'cuda',
+            persistent_workers=True,
+            prefetch_factor=max(1, prefetch_factor),
+        )
+        for context, target, loss_mask in loader:
+            yield NextTokenBatch(
+                context=context.to(target_device, non_blocking=True),
+                target=target.to(target_device, non_blocking=True),
+                loss_mask=loss_mask.to(target_device, non_blocking=True),
             )
 
 
@@ -2238,6 +2542,25 @@ def _make_prefix_response_batch_iterator(
                 target=target.to(target_device, non_blocking=True),
                 loss_mask=loss_mask.to(target_device, non_blocking=True),
             )
+
+
+def _cross_entropy_with_optional_mask(
+    logits: Tensor,
+    target: Tensor,
+    loss_mask: Tensor | None,
+) -> Tensor:
+    losses = F.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]),
+        target.reshape(-1),
+        reduction='none',
+    )
+    if loss_mask is None:
+        return losses.mean()
+    flat_mask = loss_mask.reshape(-1).to(device=losses.device, dtype=losses.dtype)
+    mask_total = flat_mask.sum()
+    if mask_total.item() <= 0:
+        raise ValueError('loss_mask must select at least one target position.')
+    return (losses * flat_mask).sum() / mask_total
 
 
 def compute_next_token_loss(
@@ -2314,9 +2637,10 @@ def compute_next_token_loss(
                 teacher_forcing_chunk_size=teacher_forcing_chunk_size,
             )
             compressed_b = None
-        main_loss = F.cross_entropy(
-            logits.reshape(-1, logits.shape[-1]),
-            batch.target.reshape(-1),
+        main_loss = _cross_entropy_with_optional_mask(
+            logits,
+            batch.target,
+            batch.loss_mask,
         )
         loss = main_loss
         loss_stats["loss/main"] = float(main_loss.detach().item())
@@ -2326,9 +2650,17 @@ def compute_next_token_loss(
                 if start >= target_width:
                     continue
                 clipped_end = min(end, target_width)
-                bucket_loss = F.cross_entropy(
-                    logits[:, start:clipped_end, :].reshape(-1, logits.shape[-1]),
-                    batch.target[:, start:clipped_end].reshape(-1),
+                bucket_mask = (
+                    None
+                    if batch.loss_mask is None
+                    else batch.loss_mask[:, start:clipped_end]
+                )
+                if bucket_mask is not None and bucket_mask.sum().item() <= 0:
+                    continue
+                bucket_loss = _cross_entropy_with_optional_mask(
+                    logits[:, start:clipped_end, :],
+                    batch.target[:, start:clipped_end],
+                    bucket_mask,
                 )
                 loss_stats[f"query_block_pos_loss/{start:03d}_{clipped_end - 1:03d}"] = float(
                     bucket_loss.detach().item()
@@ -2447,6 +2779,51 @@ def estimate_next_token_loss(
 
 
 @torch.no_grad()
+def estimate_query_block_pair_loss(
+    model: nn.Module,
+    pairs: Sequence[tuple[Tensor, Tensor]],
+    *,
+    seq_len: int,
+    target_len: int,
+    batch_size: int,
+    query_block_start_token_id: int,
+    eos_token_id: int,
+    pad_token_id: int,
+    device: torch.device | str,
+    eval_steps: int,
+    autocast_device_type: str | None = None,
+    autocast_dtype: torch.dtype | None = None,
+    balanced_index_groups: Sequence[Sequence[int]] | None = None,
+) -> float:
+    was_training = model.training
+    model.eval()
+    losses: list[float] = []
+    for _ in range(eval_steps):
+        batch = sample_query_block_pair_batch(
+            pairs,
+            seq_len=seq_len,
+            target_len=target_len,
+            batch_size=batch_size,
+            query_block_start_token_id=query_block_start_token_id,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            device=device,
+            balanced_index_groups=balanced_index_groups,
+        )
+        loss, _ = compute_next_token_loss(
+            model,
+            batch,
+            query_block=True,
+            autocast_device_type=autocast_device_type,
+            autocast_dtype=autocast_dtype,
+        )
+        losses.append(float(loss.item()))
+    if was_training:
+        model.train()
+    return sum(losses) / len(losses)
+
+
+@torch.no_grad()
 def estimate_prefix_response_loss(
     model: nn.Module,
     pairs: Sequence[tuple[Tensor, Tensor]],
@@ -2538,6 +2915,7 @@ def train_next_token_model(
     edge_prob_cap: float = 0.55,
     learning_rate_schedule: str = "none",
     learning_rate_warmup_steps: int = 0,
+    learning_rate_warmup_start: float | None = None,
     grad_breakdown_start_step: int | None = None,
 ) -> TrainingHistory:
     if grad_accum_steps <= 0:
@@ -2587,6 +2965,7 @@ def train_next_token_model(
             base_learning_rate=learning_rate,
             schedule=learning_rate_schedule,
             warmup_steps=learning_rate_warmup_steps,
+            warmup_start_learning_rate=learning_rate_warmup_start,
             step=step,
             start_step=start_step,
             total_steps=schedule_total_steps,
@@ -2722,6 +3101,229 @@ def train_next_token_model(
     )
 
 
+def train_query_block_pair_model(
+    model: nn.Module,
+    train_pairs: Sequence[tuple[Tensor, Tensor]],
+    val_pairs: Sequence[tuple[Tensor, Tensor]],
+    *,
+    seq_len: int,
+    target_len: int,
+    batch_size: int,
+    query_block_start_token_id: int,
+    eos_token_id: int,
+    pad_token_id: int,
+    device: torch.device | str,
+    steps: int,
+    eval_interval: int,
+    eval_steps: int,
+    learning_rate: float,
+    weight_decay: float = 0.0,
+    grad_clip: float | None = 1.0,
+    grad_accum_steps: int = 1,
+    data_workers: int = 0,
+    prefetch_factor: int = 2,
+    step_setup_callback: Callable[[int, int], None] | None = None,
+    progress_callback: Callable[[int, int, float], None] | None = None,
+    step_callback: Callable[[int, float, float], None] | None = None,
+    loss_stats_callback: Callable[[int, dict[str, float]], None] | None = None,
+    grad_stats_callback: Callable[[int, dict[str, float]], None] | None = None,
+    eval_callback: Callable[[int, float, float], None] | None = None,
+    checkpoint_callback: Callable[[int, float, float, nn.Module, torch.optim.Optimizer], None] | None = None,
+    eval_on_first_step: bool = True,
+    autocast_device_type: str | None = None,
+    autocast_dtype: torch.dtype | None = None,
+    balanced_index_groups: Sequence[Sequence[int]] | None = None,
+    val_balanced_index_groups: Sequence[Sequence[int]] | None = None,
+    start_step: int = 0,
+    total_steps: int | None = None,
+    optimizer_state_dict: dict[str, object] | None = None,
+    checkpoint_interval: int | None = None,
+    b_diversity_loss_weight: float = 0.0,
+    b_diversity_unweighted_per_layer: bool = False,
+    b_diversity_per_layer_weight: float = 1.0,
+    b_cosine_margin: float = 0.20,
+    b_cosine_early_margin: float = 0.35,
+    route_concentration_loss_weight: float = 0.0,
+    route_load_cap: float = 0.25,
+    edge_prob_cap: float = 0.55,
+    learning_rate_schedule: str = 'none',
+    learning_rate_warmup_steps: int = 0,
+    learning_rate_warmup_start: float | None = None,
+    grad_breakdown_start_step: int | None = None,
+) -> TrainingHistory:
+    if grad_accum_steps <= 0:
+        raise ValueError('grad_accum_steps must be positive.')
+    model.to(device)
+    model.train()
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=learning_rate,
+        weight_decay=weight_decay,
+    )
+    if optimizer_state_dict is not None:
+        try:
+            optimizer.load_state_dict(optimizer_state_dict)
+        except ValueError as exc:
+            print(f'optimizer_state_load_skipped | reason={exc}')
+    _set_optimizer_hyperparams(
+        optimizer,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+    )
+    eval_steps_seen: list[int] = []
+    train_step_losses: list[float] = []
+    grad_norms: list[float] = []
+    train_losses: list[float] = []
+    val_losses: list[float] = []
+    batch_iter = _make_query_block_pair_batch_iterator(
+        train_pairs,
+        seq_len=seq_len,
+        target_len=target_len,
+        batch_size=batch_size,
+        query_block_start_token_id=query_block_start_token_id,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        device=device,
+        data_workers=data_workers,
+        prefetch_factor=prefetch_factor,
+        balanced_index_groups=balanced_index_groups,
+    )
+
+    schedule_total_steps = total_steps if total_steps is not None else start_step + steps
+    for relative_step in range(1, steps + 1):
+        step = start_step + relative_step
+        if step_setup_callback is not None:
+            step_setup_callback(step, schedule_total_steps)
+        current_learning_rate = _resolve_scheduled_learning_rate(
+            base_learning_rate=learning_rate,
+            schedule=learning_rate_schedule,
+            warmup_steps=learning_rate_warmup_steps,
+            warmup_start_learning_rate=learning_rate_warmup_start,
+            step=step,
+            start_step=start_step,
+            total_steps=schedule_total_steps,
+        )
+        _set_optimizer_hyperparams(
+            optimizer,
+            learning_rate=current_learning_rate,
+        )
+        optimizer.zero_grad(set_to_none=True)
+        accumulated_loss = 0.0
+        accumulated_loss_stats: dict[str, list[float]] = {}
+        for _ in range(grad_accum_steps):
+            batch = next(batch_iter)
+            loss, _ = compute_next_token_loss(
+                model,
+                batch,
+                query_block=True,
+                autocast_device_type=autocast_device_type,
+                autocast_dtype=autocast_dtype,
+                b_diversity_loss_weight=b_diversity_loss_weight,
+                b_diversity_unweighted_per_layer=b_diversity_unweighted_per_layer,
+                b_diversity_per_layer_weight=b_diversity_per_layer_weight,
+                b_cosine_margin=b_cosine_margin,
+                b_cosine_early_margin=b_cosine_early_margin,
+                route_concentration_loss_weight=route_concentration_loss_weight,
+                route_load_cap=route_load_cap,
+                edge_prob_cap=edge_prob_cap,
+            )
+            if not torch.isfinite(loss).item():
+                raise FloatingPointError(f'Non-finite loss at step {step}: {loss.item()}')
+            accumulated_loss += float(loss.item())
+            loss_stats = getattr(model, 'last_loss_stats', None)
+            if loss_stats:
+                for key, value in loss_stats.items():
+                    accumulated_loss_stats.setdefault(key, []).append(value)
+            (loss / grad_accum_steps).backward()
+        grad_norm = 0.0
+        if grad_clip is not None:
+            grad_norm = float(
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip).item()
+            )
+        else:
+            grads = [parameter.grad.norm() for parameter in model.parameters() if parameter.grad is not None]
+            if grads:
+                grad_norm = float(torch.stack(grads).norm().item())
+        if not math.isfinite(grad_norm):
+            raise FloatingPointError(f'Non-finite grad norm at step {step}: {grad_norm}')
+        if (
+            grad_stats_callback is not None
+            and (grad_breakdown_start_step is None or step >= grad_breakdown_start_step)
+        ):
+            grad_stats_callback(step, _collect_grad_group_norms(model))
+        optimizer.step()
+        step_loss = accumulated_loss / grad_accum_steps
+        train_step_losses.append(step_loss)
+        grad_norms.append(grad_norm)
+        if progress_callback is not None:
+            progress_callback(step, schedule_total_steps, step_loss)
+        if step_callback is not None:
+            step_callback(step, step_loss, grad_norm)
+        if loss_stats_callback is not None and accumulated_loss_stats:
+            loss_stats_callback(
+                step,
+                {
+                    key: sum(values) / len(values)
+                    for key, values in sorted(accumulated_loss_stats.items())
+                    if values
+                },
+            )
+        if (
+            checkpoint_callback is not None
+            and checkpoint_interval is not None
+            and checkpoint_interval > 0
+            and step % checkpoint_interval == 0
+        ):
+            checkpoint_callback(step, step_loss, None, model, optimizer)
+
+        if step % eval_interval == 0 or (eval_on_first_step and step == start_step + 1) or step == schedule_total_steps:
+            eval_steps_seen.append(step)
+            train_eval = estimate_query_block_pair_loss(
+                model,
+                train_pairs,
+                seq_len=seq_len,
+                target_len=target_len,
+                batch_size=batch_size,
+                query_block_start_token_id=query_block_start_token_id,
+                eos_token_id=eos_token_id,
+                pad_token_id=pad_token_id,
+                device=device,
+                eval_steps=eval_steps,
+                autocast_device_type=autocast_device_type,
+                autocast_dtype=autocast_dtype,
+                balanced_index_groups=balanced_index_groups,
+            )
+            val_eval = estimate_query_block_pair_loss(
+                model,
+                val_pairs,
+                seq_len=seq_len,
+                target_len=target_len,
+                batch_size=batch_size,
+                query_block_start_token_id=query_block_start_token_id,
+                eos_token_id=eos_token_id,
+                pad_token_id=pad_token_id,
+                device=device,
+                eval_steps=eval_steps,
+                autocast_device_type=autocast_device_type,
+                autocast_dtype=autocast_dtype,
+                balanced_index_groups=val_balanced_index_groups,
+            )
+            train_losses.append(train_eval)
+            val_losses.append(val_eval)
+            if checkpoint_callback is not None:
+                checkpoint_callback(step, train_eval, val_eval, model, optimizer)
+            if eval_callback is not None:
+                eval_callback(step, train_eval, val_eval)
+
+    return TrainingHistory(
+        eval_steps=tuple(eval_steps_seen),
+        train_step_losses=tuple(train_step_losses),
+        grad_norms=tuple(grad_norms),
+        train_losses=tuple(train_losses),
+        val_losses=tuple(val_losses),
+    )
+
+
 def train_prefix_response_model(
     model: nn.Module,
     train_pairs: Sequence[tuple[Tensor, Tensor]],
@@ -2758,6 +3360,7 @@ def train_prefix_response_model(
     checkpoint_interval: int | None = None,
     learning_rate_schedule: str = "none",
     learning_rate_warmup_steps: int = 0,
+    learning_rate_warmup_start: float | None = None,
 ) -> TrainingHistory:
     if grad_accum_steps <= 0:
         raise ValueError("grad_accum_steps must be positive.")
@@ -2806,6 +3409,7 @@ def train_prefix_response_model(
             base_learning_rate=learning_rate,
             schedule=learning_rate_schedule,
             warmup_steps=learning_rate_warmup_steps,
+            warmup_start_learning_rate=learning_rate_warmup_start,
             step=step,
             start_step=start_step,
             total_steps=schedule_total_steps,

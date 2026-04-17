@@ -43,8 +43,12 @@ from progressive_b_example import (
     build_progressive_b_stage_specs,
     perplexity_from_loss,
     sample_next_token_batch,
+    sample_prefix_response_batch,
+    sample_query_block_pair_batch,
     split_train_val,
+    train_prefix_response_model,
     train_next_token_model,
+    train_query_block_pair_model,
 )
 
 
@@ -791,6 +795,16 @@ def _encode_byte_bpe_text_worker(text: str) -> list[int]:
     return list(map(int, _BYTE_BPE_WORKER_TOKENIZER.encode(text).ids))
 
 
+def _encode_byte_bpe_dialogue_pair_worker(pair: tuple[str, str]) -> tuple[list[int], list[int]]:
+    if _BYTE_BPE_WORKER_TOKENIZER is None:
+        raise RuntimeError("Byte BPE worker was not initialized.")
+    prefix, response = pair
+    return (
+        list(map(int, _BYTE_BPE_WORKER_TOKENIZER.encode(prefix).ids)),
+        list(map(int, _BYTE_BPE_WORKER_TOKENIZER.encode(response).ids)),
+    )
+
+
 def encode_text_in_chunks(
     vocab: object,
     text: str,
@@ -1167,31 +1181,51 @@ def encode_dialogue_pairs(
     vocab: object,
     workers: int = 0,
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    if workers <= 1 or not isinstance(vocab, SubwordVocab):
+    if workers <= 1:
         return [(vocab.encode(pair.prefix), vocab.encode(pair.response)) for pair in pairs]
-    if vocab.model_path is None:
-        raise ValueError("Parallel subword encoding requires a tokenizer model path.")
     pair_count = len(pairs)
     chunksize = max(1, pair_count // (workers * 16)) if pair_count else 1
     text_pairs = ((pair.prefix, pair.response) for pair in pairs)
     encoded: list[tuple[torch.Tensor, torch.Tensor]] = []
-    with ProcessPoolExecutor(
-        max_workers=workers,
-        initializer=_init_subword_encode_worker,
-        initargs=(str(vocab.model_path),),
-    ) as executor:
-        for prefix_ids, response_ids in executor.map(
-            _encode_subword_dialogue_pair_worker,
-            text_pairs,
-            chunksize=chunksize,
-        ):
-            encoded.append(
-                (
-                    torch.tensor(prefix_ids, dtype=torch.long),
-                    torch.tensor(response_ids, dtype=torch.long),
+    if isinstance(vocab, SubwordVocab):
+        if vocab.model_path is None:
+            raise ValueError("Parallel subword encoding requires a tokenizer model path.")
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            initializer=_init_subword_encode_worker,
+            initargs=(str(vocab.model_path),),
+        ) as executor:
+            for prefix_ids, response_ids in executor.map(
+                _encode_subword_dialogue_pair_worker,
+                text_pairs,
+                chunksize=chunksize,
+            ):
+                encoded.append(
+                    (
+                        torch.tensor(prefix_ids, dtype=torch.long),
+                        torch.tensor(response_ids, dtype=torch.long),
+                    )
                 )
-            )
-    return encoded
+        return encoded
+    if isinstance(vocab, ByteBPEVocab):
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            initializer=_init_byte_bpe_encode_worker,
+            initargs=(str(vocab.vocab_path), str(vocab.merges_path)),
+        ) as executor:
+            for prefix_ids, response_ids in executor.map(
+                _encode_byte_bpe_dialogue_pair_worker,
+                text_pairs,
+                chunksize=chunksize,
+            ):
+                encoded.append(
+                    (
+                        torch.tensor(prefix_ids, dtype=torch.long),
+                        torch.tensor(response_ids, dtype=torch.long),
+                    )
+                )
+        return encoded
+    return [(vocab.encode(pair.prefix), vocab.encode(pair.response)) for pair in pairs]
 
 
 def require_special_token_ids(vocab: object) -> dict[str, int]:
@@ -1404,62 +1438,16 @@ def log_history_to_tensorboard(
         for step, loss in enumerate(history.train_step_losses, start=1):
             writer.add_scalar("train/minibatch_loss", loss, step)
             writer.add_scalar("train/epoch", step / steps_per_epoch, step)
-        for step, grad_norm in enumerate(history.grad_norms, start=1):
-            writer.add_scalar("train/grad_norm", grad_norm, step)
         for step, train_loss, val_loss in zip(
             history.eval_steps,
             history.train_losses,
             history.val_losses,
             strict=True,
         ):
-            writer.add_scalar("eval/train_loss", train_loss, step)
-            writer.add_scalar("eval/val_loss", val_loss, step)
-            writer.add_scalar("eval/train_ppl", perplexity_from_loss(train_loss), step)
-            writer.add_scalar("eval/val_ppl", perplexity_from_loss(val_loss), step)
-    writer.add_text("sample/prompt", format_tensorboard_text(prompt_text))
-    writer.add_text("sample/generated", format_tensorboard_text(generated_text))
-    writer.add_hparams(
-        {
-            "seq_len": int(summary["seq_len"]),
-            "batch_size": int(summary["batch_size"]),
-            "dim": int(summary["dim"]),
-            "warmup_layers": int(summary["warmup_layers"]),
-            "final_refine_layers": int(summary["final_refine_layers"]),
-            "lite_layers": int(summary["lite_layers"]),
-            "mid_layers": int(summary["mid_layers"]),
-            "full_layers": int(summary["full_layers"]),
-            "route_topk": int(summary["route_topk"]),
-            "learning_rate": float(summary["learning_rate"]),
-            "weight_decay": float(summary["weight_decay"]),
-            "value_norm_layernorm": bool(summary["value_norm_kind"] == "layernorm"),
-            "value_norm_rmsnorm": bool(summary["value_norm_kind"] == "rmsnorm"),
-            "norm_position_pre": bool(summary["norm_position"] == "pre"),
-            "propagation_residual": bool(summary["propagation_residual"]),
-            "route_mode_dense": bool(summary["route_mode"] == "dense"),
-            "sequence_dense": bool(summary["sequence_propagation"] == "dense"),
-            "expanded_dense": bool(summary["expanded_propagation"] == "dense"),
-            "compressed_dense": bool(summary["compressed_propagation"] == "dense"),
-            "subword_vocab_size": int(summary["subword_vocab_size"]),
-            "value_residual_scale": float(summary["value_residual_scale"]),
-            "state_residual_scale": float(summary["state_residual_scale"]),
-            "route_temperature": float(summary["route_temperature"]),
-            "alpha_scale": float(summary["alpha_scale"]),
-            "beta_s_to_b_scale": float(summary["beta_s_to_b_scale"]),
-            "beta_b_to_s_scale": float(summary["beta_b_to_s_scale"]),
-            "s_delta_scale": float(summary["s_delta_scale"]),
-            "b_delta_scale": float(summary["b_delta_scale"]),
-            "cross_delta_scale": float(summary["cross_delta_scale"]),
-            "b_schedule_min": float(summary["b_schedule_min"]),
-            "b_schedule_max": float(summary["b_schedule_max"]),
-        },
-        {
-            "hparam/final_train_loss": float(summary["final_train_loss"]),
-            "hparam/final_val_loss": float(summary["final_val_loss"]),
-            "hparam/best_val_loss": float(summary["best_val_loss"]),
-            "hparam/runtime_seconds": float(summary["runtime_seconds"]),
-        },
-        run_name="hparams",
-    )
+            writer.add_scalar("eval/metrics/train_loss", train_loss, step)
+            writer.add_scalar("eval/metrics/val_loss", val_loss, step)
+            writer.add_scalar("eval/metrics/train_ppl", perplexity_from_loss(train_loss), step)
+            writer.add_scalar("eval/metrics/val_ppl", perplexity_from_loss(val_loss), step)
     writer.flush()
 
 
@@ -1513,6 +1501,24 @@ def select_prefix_response_prompt_tokens(
     if not train_response_pairs:
         raise ValueError("prefix_response prompt selection requires at least one train pair.")
     prompt_ids = train_response_pairs[0][0]
+    return prompt_ids, vocab.decode(prompt_ids.tolist())
+
+
+def select_pair_prompt_tokens(
+    *,
+    args: argparse.Namespace,
+    vocab: object,
+    train_pairs: Sequence[tuple[torch.Tensor, torch.Tensor]],
+) -> tuple[torch.Tensor, str]:
+    if args.prompt_text:
+        prompt = args.prompt_text
+        prompt_ids = vocab.encode(prompt)
+        if prompt_ids.numel() == 0:
+            raise ValueError("--prompt-text must encode to at least one token.")
+        return prompt_ids, prompt
+    if not train_pairs:
+        raise ValueError("pair prompt selection requires at least one train pair.")
+    prompt_ids = train_pairs[0][0]
     return prompt_ids, vocab.decode(prompt_ids.tolist())
 
 
@@ -1601,6 +1607,7 @@ def run_single_experiment(
     val_tokens: torch.Tensor,
     train_balanced_index_groups: Sequence[Sequence[int]] | None,
     train_balanced_token_groups: Sequence[torch.Tensor] | None,
+    val_balanced_index_groups: Sequence[Sequence[int]] | None,
     val_balanced_token_groups: Sequence[torch.Tensor] | None,
     device: torch.device | str,
     teacher_forcing: bool,
@@ -1623,6 +1630,7 @@ def run_single_experiment(
         raise ValueError("grad-accum-steps must be positive.")
     effective_batch_size = args.batch_size * grad_accum_steps
     response_objective = False
+    pair_query_block = query_block and train_response_pairs is not None
     query_block_start_token_id: int | None = None
     if response_objective:
         if train_response_pairs is None or val_response_pairs is None or special_token_ids is None:
@@ -1630,6 +1638,11 @@ def run_single_experiment(
         if args.response_len <= 0:
             raise ValueError("response-len must be positive.")
         steps_per_epoch = max(1, math.ceil(len(train_response_pairs) / effective_batch_size))
+    elif pair_query_block:
+        if train_response_pairs is None or val_response_pairs is None or special_token_ids is None:
+            raise ValueError("pair query_block requires encoded pairs and special ids.")
+        steps_per_epoch = max(1, math.ceil(len(train_response_pairs) / effective_batch_size))
+        query_block_start_token_id = special_token_ids["query_block_start"]
     else:
         steps_per_epoch = estimate_steps_per_epoch(
             token_count=int(train_tokens.numel()),
@@ -1680,6 +1693,7 @@ def run_single_experiment(
         warmup_layers=int(effective_config["warmup_layers"]),
         stage_specs=stage_specs,
         final_refine_layers=int(effective_config["final_refine_layers"]),
+        query_refine_layers=args.query_refine_layers,
         s_window=args.s_window,
         route_topk=int(effective_config["route_topk"]),
         expanded_topk=int(effective_config["route_topk"]),
@@ -1734,7 +1748,7 @@ def run_single_experiment(
         f"experiment={experiment_name} | params={parameter_count:,} | "
         f"dim={effective_config['dim']} | warmup={effective_config['warmup_layers']} | "
         f"stages={effective_config['lite_layers']}/{effective_config['mid_layers']}/{effective_config['full_layers']} | "
-        f"refine={effective_config['final_refine_layers']} | route_mode={args.route_mode} | "
+        f"refine={effective_config['final_refine_layers']} | qrefine={args.query_refine_layers} | route_mode={args.route_mode} | "
         f"route_topk={effective_config['route_topk']} | route_kind={args.route_kind} | "
         f"query_topk={args.query_topk or int(effective_config['route_topk'])} | "
         f"edge_dropout={args.edge_dropout_p:.3f} | "
@@ -1772,6 +1786,7 @@ def run_single_experiment(
         f"learning_rate={args.learning_rate:.6g} | "
         f"lr_schedule={args.learning_rate_schedule} | "
         f"lr_warmup_steps={args.learning_rate_warmup_steps} | "
+        f"lr_warmup_start={args.learning_rate_warmup_start} | "
         f"grad_breakdown={args.grad_breakdown} | "
         f"grad_breakdown_start_step={args.grad_breakdown_start_step}"
     )
@@ -1873,6 +1888,7 @@ def run_single_experiment(
                 "b_cosine_early_margin": args.b_cosine_early_margin,
                 "learning_rate_schedule": args.learning_rate_schedule,
                 "learning_rate_warmup_steps": args.learning_rate_warmup_steps,
+                "learning_rate_warmup_start": args.learning_rate_warmup_start,
                 "alpha_scale": args.alpha_scale,
                 "beta_s_to_b_scale": args.beta_s_to_b_scale,
                 "beta_b_to_s_scale": args.beta_b_to_s_scale,
@@ -2013,7 +2029,15 @@ def run_single_experiment(
                 sample_topk=args.sample_topk,
             )
             return prompt_text, vocab.decode(response_ids.tolist())
-        prompt_ids, prompt_text = select_prompt_tokens(args=args, vocab=vocab, train_tokens=train_tokens)
+        if pair_query_block:
+            assert train_response_pairs is not None
+            prompt_ids, prompt_text = select_pair_prompt_tokens(
+                args=args,
+                vocab=vocab,
+                train_pairs=train_response_pairs,
+            )
+        else:
+            prompt_ids, prompt_text = select_prompt_tokens(args=args, vocab=vocab, train_tokens=train_tokens)
         generated = generate_next_tokens_with_sampling(
             model,
             prompt_ids,
@@ -2063,100 +2087,32 @@ def run_single_experiment(
             return
         writer.add_scalar("train/minibatch_loss", minibatch_loss, step)
         writer.add_scalar("train/epoch", step / steps_per_epoch, step)
-        writer.add_scalar("train/grad_norm", grad_norm, step)
         if step == 1 or step == train_steps or (args.log_interval > 0 and step % args.log_interval == 0):
             writer.flush()
 
     def loss_stats_tensorboard_callback(step: int, stats: dict[str, float]) -> None:
         if writer is None:
             return
-        for key, value in sorted(stats.items()):
-            if key.startswith("query_block_pos_loss/"):
-                continue
-            writer.add_scalar(key, value, step)
         bucket_ppl = {
             key.removeprefix("query_block_pos_loss/"): perplexity_from_loss(value)
             for key, value in sorted(stats.items())
             if key.startswith("query_block_pos_loss/")
         }
         if bucket_ppl:
-            writer.add_scalars("train/minibatch_ppl_by_distance", bucket_ppl, step)
+            writer.add_scalars("train/query_block_pos_ppl", bucket_ppl, step)
         if step == 1 or step == train_steps or (args.log_interval > 0 and step % args.log_interval == 0):
             writer.flush()
 
     def grad_stats_tensorboard_callback(step: int, stats: dict[str, float]) -> None:
-        if writer is None:
-            return
-        for key, value in sorted(stats.items()):
-            writer.add_scalar(key, value, step)
-        if step == 1 or step == train_steps or (args.log_interval > 0 and step % args.log_interval == 0):
-            writer.flush()
+        return
 
     def eval_tensorboard_callback(step: int, train_loss: float, val_loss: float) -> None:
-        runtime_stats: dict[str, float] | None = None
         if writer is not None:
-            writer.add_scalar("eval/train_loss", train_loss, step)
-            writer.add_scalar("eval/val_loss", val_loss, step)
-            writer.add_scalar("eval/train_ppl", perplexity_from_loss(train_loss), step)
-            writer.add_scalar("eval/val_ppl", perplexity_from_loss(val_loss), step)
-            if response_objective:
-                assert special_token_ids is not None
-                stats_pairs = val_response_pairs or train_response_pairs
-                assert stats_pairs is not None
-                stats_batch = sample_prefix_response_batch(
-                    stats_pairs,
-                    seq_len=args.seq_len,
-                    response_len=args.response_len,
-                    batch_size=1,
-                    bos_token_id=special_token_ids["assistant"],
-                    eos_token_id=special_token_ids["eos"],
-                    pad_token_id=special_token_ids["pad"],
-                    device=device,
-                )
-                stats_context = stats_batch.context[:1]
-            else:
-                stats_batch = sample_next_token_batch(
-                    val_tokens,
-                    seq_len=args.seq_len,
-                    batch_size=1,
-                    device=device,
-                    teacher_forcing=teacher_forcing,
-                    full_sequence_causal=full_sequence_causal,
-                    target_len=args.target_len if query_block else 1,
-                    balanced_token_groups=val_balanced_token_groups,
-                    query_block_start_token_id=query_block_start_token_id if query_block else None,
-                )
-                stats_context = stats_batch.context[:1]
-            runtime_stats = model.collect_runtime_stats(stats_context)
-            eval_runtime_rows.append(
-                {
-                    "record_type": "eval_runtime",
-                    "step": step,
-                    "epoch": step / steps_per_epoch,
-                    **runtime_stats,
-                }
-            )
-            for key, value in sorted(runtime_stats.items()):
-                writer.add_scalar(f"eval/runtime/{key}", value, step)
-            sample_prompt, sample_generated = make_eval_sample()
-            writer.add_text(
-                "eval/sample",
-                format_tensorboard_sample(
-                    prompt_text=sample_prompt,
-                    generated_text=sample_generated,
-                ),
-                step,
-            )
+            writer.add_scalar("eval/metrics/train_loss", train_loss, step)
+            writer.add_scalar("eval/metrics/val_loss", val_loss, step)
+            writer.add_scalar("eval/metrics/train_ppl", perplexity_from_loss(train_loss), step)
+            writer.add_scalar("eval/metrics/val_ppl", perplexity_from_loss(val_loss), step)
             writer.flush()
-            sample_message = (
-                f"eval_sample | step={step}\n"
-                f"--- prompt ---\n{sample_prompt}\n\n"
-                f"--- sample ---\n{sample_generated}"
-            )
-            if progress_bar is not None:
-                progress_bar.write(sample_message)
-            else:
-                print(sample_message)
         if trial is not None:
             trial.report(val_loss, step)
             if trial.should_prune():
@@ -2204,6 +2160,7 @@ def run_single_experiment(
                 checkpoint_interval=args.checkpoint_interval,
                 learning_rate_schedule=args.learning_rate_schedule,
                 learning_rate_warmup_steps=args.learning_rate_warmup_steps,
+                learning_rate_warmup_start=args.learning_rate_warmup_start,
                 step_setup_callback=step_setup_callback,
                 progress_callback=progress_callback,
                 step_callback=step_tensorboard_callback,
@@ -2212,6 +2169,58 @@ def run_single_experiment(
                 eval_on_first_step=eval_on_first_step,
                 autocast_device_type=autocast_device_type,
                 autocast_dtype=autocast_dtype,
+            )
+        elif pair_query_block:
+            assert train_response_pairs is not None
+            assert val_response_pairs is not None
+            assert special_token_ids is not None
+            history = train_query_block_pair_model(
+                model,
+                train_response_pairs,
+                val_response_pairs,
+                seq_len=args.seq_len,
+                target_len=args.target_len,
+                batch_size=args.batch_size,
+                query_block_start_token_id=special_token_ids["query_block_start"],
+                eos_token_id=special_token_ids["eos"],
+                pad_token_id=special_token_ids["pad"],
+                device=device,
+                steps=train_steps - resume_step,
+                eval_interval=effective_eval_interval,
+                eval_steps=args.eval_steps,
+                learning_rate=args.learning_rate,
+                weight_decay=args.weight_decay,
+                grad_accum_steps=grad_accum_steps,
+                data_workers=args.data_workers,
+                prefetch_factor=args.prefetch_factor,
+                step_setup_callback=step_setup_callback,
+                progress_callback=progress_callback,
+                step_callback=step_tensorboard_callback,
+                loss_stats_callback=loss_stats_tensorboard_callback,
+                grad_stats_callback=grad_stats_tensorboard_callback if args.grad_breakdown else None,
+                eval_callback=eval_tensorboard_callback,
+                checkpoint_callback=training_checkpoint_callback,
+                eval_on_first_step=eval_on_first_step,
+                autocast_device_type=autocast_device_type,
+                autocast_dtype=autocast_dtype,
+                balanced_index_groups=train_balanced_index_groups,
+                val_balanced_index_groups=val_balanced_index_groups,
+                start_step=resume_step,
+                total_steps=train_steps,
+                optimizer_state_dict=optimizer_state_dict,
+                checkpoint_interval=args.checkpoint_interval,
+                b_diversity_loss_weight=args.b_diversity_loss_weight,
+                b_diversity_unweighted_per_layer=args.b_diversity_unweighted_per_layer,
+                b_diversity_per_layer_weight=args.b_diversity_per_layer_weight,
+                b_cosine_margin=args.b_cosine_margin,
+                b_cosine_early_margin=args.b_cosine_early_margin,
+                route_concentration_loss_weight=args.route_concentration_loss_weight,
+                route_load_cap=args.route_load_cap,
+                edge_prob_cap=args.edge_prob_cap,
+                learning_rate_schedule=args.learning_rate_schedule,
+                learning_rate_warmup_steps=args.learning_rate_warmup_steps,
+                learning_rate_warmup_start=args.learning_rate_warmup_start,
+                grad_breakdown_start_step=args.grad_breakdown_start_step if args.grad_breakdown else None,
             )
         else:
             history = train_next_token_model(
@@ -2262,6 +2271,7 @@ def run_single_experiment(
                 edge_prob_cap=args.edge_prob_cap,
                 learning_rate_schedule=args.learning_rate_schedule,
                 learning_rate_warmup_steps=args.learning_rate_warmup_steps,
+                learning_rate_warmup_start=args.learning_rate_warmup_start,
                 grad_breakdown_start_step=args.grad_breakdown_start_step if args.grad_breakdown else None,
             )
     except Exception:
@@ -2389,6 +2399,7 @@ def run_single_experiment(
         "learning_rate": args.learning_rate,
         "learning_rate_schedule": args.learning_rate_schedule,
         "learning_rate_warmup_steps": args.learning_rate_warmup_steps,
+        "learning_rate_warmup_start": args.learning_rate_warmup_start,
         "weight_decay": args.weight_decay,
         "precision": args.precision,
         "s_window": args.s_window,
@@ -2648,6 +2659,7 @@ def main() -> None:
     parser.add_argument("--dim", type=int, default=48)
     parser.add_argument("--warmup-layers", type=int, default=2)
     parser.add_argument("--final-refine-layers", type=int, default=2)
+    parser.add_argument("--query-refine-layers", type=int)
     parser.add_argument("--lite-layers", type=int, default=2)
     parser.add_argument("--mid-layers", type=int, default=2)
     parser.add_argument("--full-layers", type=int, default=1)
@@ -2673,6 +2685,7 @@ def main() -> None:
         default="none",
     )
     parser.add_argument("--learning-rate-warmup-steps", type=int, default=0)
+    parser.add_argument("--learning-rate-warmup-start", type=float)
     parser.add_argument("--grad-breakdown", action="store_true")
     parser.add_argument("--grad-breakdown-start-step", type=int, default=0)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
@@ -2703,13 +2716,13 @@ def main() -> None:
     parser.add_argument("--route-temperature", type=float, default=1.0)
     parser.add_argument(
         "--route-kind",
-        choices=("diagonal_bilinear", "low_rank_bilinear", "hadamard_mlp"),
+        choices=("diagonal_bilinear", "low_rank_bilinear", "hadamard_mlp", "additive_low_rank"),
         default="diagonal_bilinear",
     )
     parser.add_argument("--route-hidden-dim", type=int)
     parser.add_argument(
         "--pairwise-kind",
-        choices=("diagonal_bilinear", "low_rank_bilinear", "hadamard_mlp"),
+        choices=("diagonal_bilinear", "low_rank_bilinear", "hadamard_mlp", "additive_low_rank"),
         default="diagonal_bilinear",
     )
     parser.add_argument("--pairwise-hidden-dim", type=int)
@@ -2777,6 +2790,7 @@ def main() -> None:
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--run-name", default="progressive_b")
     parser.add_argument("--output-dir", default="artifacts/training_runs")
+    parser.add_argument("--session-dir")
     parser.add_argument("--tensorboard", action="store_true")
     parser.add_argument("--tensorboard-dir")
     parser.add_argument("--save-checkpoint", action="store_true")
@@ -2790,6 +2804,7 @@ def main() -> None:
     full_sequence_causal = False
     query_next_token = args.training_objective == "query_next_token"
     query_block = args.training_objective == "query_block"
+    pair_query_block_objective = query_block
     prefix_response = False
     next_sentence_response = False
     response_objective = False
@@ -2806,6 +2821,8 @@ def main() -> None:
         raise ValueError("route-temperature must be positive.")
     if args.query_topk is not None and args.query_topk <= 0:
         raise ValueError("query-topk must be positive.")
+    if args.query_refine_layers is not None and args.query_refine_layers <= 0:
+        raise ValueError("query-refine-layers must be positive.")
     if args.data_workers < 0:
         raise ValueError("data-workers must be non-negative.")
     if args.pretokenize_workers < 0:
@@ -2826,6 +2843,8 @@ def main() -> None:
         raise ValueError("route-concentration-loss-weight must be non-negative.")
     if args.learning_rate_warmup_steps < 0:
         raise ValueError("learning-rate-warmup-steps must be non-negative.")
+    if args.learning_rate_warmup_start is not None and args.learning_rate_warmup_start < 0.0:
+        raise ValueError("learning-rate-warmup-start must be non-negative.")
     if args.grad_breakdown_start_step < 0:
         raise ValueError("grad-breakdown-start-step must be non-negative.")
     if not 0.0 <= args.b_cosine_margin < 1.0:
@@ -2860,7 +2879,7 @@ def main() -> None:
         raise ValueError("usage-ema-decay must be in [0, 1).")
 
     dialogue_pairs: list[DialoguePairText] | None = None
-    if prefix_response:
+    if prefix_response or pair_query_block_objective:
         dialogue_pairs, corpus = load_dialogue_pairs(
             jsonl_sources=args.jsonl_source,
             hf_dataset=args.hf_dataset,
@@ -2888,7 +2907,7 @@ def main() -> None:
             prefix_sentences=args.sentence_prefix_count,
             min_chars=args.sentence_min_chars,
         )
-    elif query_next_token or query_block:
+    elif query_next_token:
         corpus = load_token_stream_corpus(
             default_text=DEFAULT_TEXT,
             text_file=args.text_file,
@@ -2920,7 +2939,7 @@ def main() -> None:
             max_chars=args.corpus_max_chars,
             separator=args.corpus_separator,
         )
-    if (query_next_token or query_block) and not corpus.metadata.get("eos_at_document_boundaries"):
+    if query_next_token and not corpus.metadata.get("eos_at_document_boundaries"):
         corpus = append_eos_markers_to_corpus(corpus, separator=args.corpus_separator)
     print(
         f"corpus={corpus.source_label} | chars={corpus.char_count:,} | "
@@ -2951,7 +2970,7 @@ def main() -> None:
     effective_pretokenize_workers = min(args.pretokenize_workers, os.cpu_count() or 1)
     if not response_objective and effective_pretokenize_workers > 1 and isinstance(vocab, ByteBPEVocab):
         print(f"parallel_byte_bpe_encoding | workers={effective_pretokenize_workers}", flush=True)
-    if response_objective:
+    if response_objective or pair_query_block_objective:
         tokens = torch.empty(0, dtype=torch.long)
         train_tokens = tokens
         val_tokens = tokens
@@ -3028,13 +3047,14 @@ def main() -> None:
     train_response_pairs = None
     val_response_pairs = None
     train_balanced_index_groups = None
+    val_balanced_index_groups = None
     if 'val_balanced_token_groups' not in locals():
         val_balanced_token_groups = None
-    if response_objective or not (
+    if response_objective or pair_query_block_objective or not (
         (query_next_token or query_block) and args.balance_batch_by_source and args.jsonl_source
     ):
         train_balanced_token_groups = None
-    if response_objective:
+    if response_objective or pair_query_block_objective:
         assert dialogue_pairs is not None
         if args.balance_batch_by_source:
             train_pair_texts, val_pair_texts = split_dialogue_pairs_by_source(dialogue_pairs)
@@ -3042,6 +3062,7 @@ def main() -> None:
             train_pair_texts, val_pair_texts = split_dialogue_pairs(dialogue_pairs)
         if args.balance_batch_by_source:
             train_balanced_index_groups = build_source_balanced_index_groups(train_pair_texts)
+            val_balanced_index_groups = build_source_balanced_index_groups(val_pair_texts)
             print(
                 "balanced_source_batches | "
                 f"groups={len(train_balanced_index_groups)} | "
@@ -3077,6 +3098,12 @@ def main() -> None:
             f"train_pairs={len(train_response_pairs or ()):,} | "
             f"val_pairs={len(val_response_pairs or ()):,} | response_len={args.response_len}"
         )
+    elif query_block:
+        print(
+            f"query_block_pairs={len(dialogue_pairs or ()):,} | "
+            f"train_pairs={len(train_response_pairs or ()):,} | "
+            f"val_pairs={len(val_response_pairs or ()):,} | target_len={args.target_len}"
+        )
     if tokenizer_model_path is not None:
         print(f"tokenizer_model={tokenizer_model_path}")
 
@@ -3089,8 +3116,11 @@ def main() -> None:
         if name != "custom":
             resolve_model_scale_preset(name)
 
-    session_dir = create_run_directory(args.output_dir, args.run_name)
-    ensure_directory(session_dir)
+    if args.session_dir:
+        session_dir = ensure_directory(args.session_dir)
+    else:
+        session_dir = create_run_directory(args.output_dir, args.run_name)
+        ensure_directory(session_dir)
     print(f"session_dir={session_dir}")
 
     summaries: list[dict[str, Any]] = []
@@ -3107,6 +3137,7 @@ def main() -> None:
             val_tokens=val_tokens,
             train_balanced_index_groups=train_balanced_index_groups,
             train_balanced_token_groups=train_balanced_token_groups,
+            val_balanced_index_groups=val_balanced_index_groups,
             val_balanced_token_groups=val_balanced_token_groups,
             device=device,
             teacher_forcing=teacher_forcing,

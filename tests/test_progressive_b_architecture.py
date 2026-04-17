@@ -8,6 +8,8 @@ from jakal_net import Layer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
+import progressive_b_example as progressive_b_module  # noqa: E402
+
 from progressive_b_example import (  # noqa: E402
     ProgressiveBExampleLM,
     ProgressiveBJointBlock,
@@ -105,7 +107,7 @@ class ProgressiveBArchitectureTests(unittest.TestCase):
         self.assertEqual(compressed_b.num_nodes, 6)
         self.assertEqual(compressed_b.val.shape, (4, 6, 8))
 
-    def test_joint_block_initializes_b_from_position_encoding(self) -> None:
+    def test_joint_block_initializes_b_from_learnable_slots(self) -> None:
         torch.manual_seed(22)
         s_layer = Layer(
             dim=4,
@@ -126,8 +128,12 @@ class ProgressiveBArchitectureTests(unittest.TestCase):
 
         prepared = block._prepare_compressed_layer(s_layer, None, 7)
 
-        self.assertTrue(torch.equal(prepared.state, torch.zeros_like(prepared.state)))
+        self.assertTrue(block.compressed_slot_state.requires_grad)
+        self.assertTrue(block.compressed_slot_val.requires_grad)
+        self.assertGreater(float(prepared.state.abs().sum().item()), 0.0)
+        self.assertTrue(torch.allclose(prepared.state[0], prepared.state[1]))
         self.assertEqual(prepared.val.shape, (2, 7, 4))
+        self.assertTrue(torch.allclose(prepared.val[0], prepared.val[1]))
         self.assertFalse(torch.allclose(prepared.val[:, 0, :], prepared.val[:, -1, :]))
 
     def test_example_lm_accepts_longer_sequence_than_reference_length(self) -> None:
@@ -193,26 +199,29 @@ class ProgressiveBArchitectureTests(unittest.TestCase):
         token_ids = torch.randint(0, 32, (2, 8))
 
         transition_calls: list[tuple[int, int]] = []
-        propagation_calls: list[tuple[int, int]] = []
+        propagation_calls: list[int] = []
         original_transition = model.query_transition.compute_delta
-        original_propagation = model.query_propagation.compute_delta
+        original_query_helper = progressive_b_module._compute_dense_causal_propagation_delta
 
         def record_transition(src_layer, dst_layer):
             transition_calls.append((src_layer.num_nodes, dst_layer.num_nodes))
             return original_transition(src_layer, dst_layer)
 
-        def record_propagation(query_layer, source_layer):
-            propagation_calls.append((query_layer.num_nodes, source_layer.num_nodes))
-            return original_propagation(query_layer, source_layer)
+        def record_propagation(propagation, query_layer):
+            propagation_calls.append(query_layer.num_nodes)
+            return original_query_helper(propagation, query_layer)
 
         model.query_transition.compute_delta = record_transition
-        model.query_propagation.compute_delta = record_propagation
+        progressive_b_module._compute_dense_causal_propagation_delta = record_propagation
 
-        logits = model.forward_query_block(token_ids, target_len=4)
+        try:
+            logits = model.forward_query_block(token_ids, target_len=4)
+        finally:
+            progressive_b_module._compute_dense_causal_propagation_delta = original_query_helper
 
         self.assertEqual(logits.shape, (2, 4, 32))
         self.assertEqual(transition_calls, [(8, 4)])
-        self.assertEqual(propagation_calls, [(1, 1), (1, 2), (1, 3), (1, 4)])
+        self.assertEqual(propagation_calls, [4])
 
 
 

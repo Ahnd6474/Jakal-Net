@@ -1,7 +1,26 @@
 from __future__ import annotations
 
+import os
+
 import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
+
+
+def _env_block_size(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = int(raw)
+    if value <= 0:
+        raise ValueError(f"{name} must be positive, got {value}.")
+    return value
+
+
+_HADAMARD_PAIRWISE_BLOCK_SIZE = _env_block_size("JAKAL_HADAMARD_PAIRWISE_BLOCK_SIZE", 8)
+_HADAMARD_ROUTE_BLOCK_SIZE = _env_block_size("JAKAL_HADAMARD_ROUTE_BLOCK_SIZE", 8)
+_ADDITIVE_PAIRWISE_BLOCK_SIZE = _env_block_size("JAKAL_ADDITIVE_PAIRWISE_BLOCK_SIZE", 128)
+_ADDITIVE_ROUTE_BLOCK_SIZE = _env_block_size("JAKAL_ADDITIVE_ROUTE_BLOCK_SIZE", 128)
 
 
 class ScalarAffine(nn.Module):
@@ -74,9 +93,75 @@ class HadamardMLPPairwise(nn.Module):
         self.activation = nn.SiLU()
 
     def forward(self, target_val: Tensor, source_val: Tensor) -> Tensor:
-        interaction = target_val.unsqueeze(-2) * source_val.unsqueeze(-3)
-        hidden = self.activation(self.proj_in(interaction))
-        return self.proj_out(hidden).squeeze(-1)
+        target_nodes = target_val.shape[-2]
+        source_nodes = source_val.shape[-2]
+        row_blocks: list[Tensor] = []
+        for target_start in range(0, target_nodes, _HADAMARD_PAIRWISE_BLOCK_SIZE):
+            target_end = min(target_start + _HADAMARD_PAIRWISE_BLOCK_SIZE, target_nodes)
+            target_chunk = target_val[..., target_start:target_end, :]
+            col_blocks: list[Tensor] = []
+            for source_start in range(0, source_nodes, _HADAMARD_PAIRWISE_BLOCK_SIZE):
+                source_end = min(source_start + _HADAMARD_PAIRWISE_BLOCK_SIZE, source_nodes)
+                source_chunk = source_val[..., source_start:source_end, :]
+                hidden = torch.einsum(
+                    "...id,hd,...jd->...ijh",
+                    target_chunk,
+                    self.proj_in.weight,
+                    source_chunk,
+                )
+                if self.proj_in.bias is not None:
+                    hidden = hidden + self.proj_in.bias.view(
+                        *((1,) * (hidden.ndim - 1)),
+                        -1,
+                    )
+                hidden = self.activation(hidden)
+                col_blocks.append(self.proj_out(hidden).squeeze(-1))
+            row_blocks.append(torch.cat(col_blocks, dim=-1))
+        return torch.cat(row_blocks, dim=-2)
+
+
+class AdditiveLowRankPairwise(nn.Module):
+    def __init__(self, dim: int, rank: int | None = None, *, bias: bool = True) -> None:
+        super().__init__()
+        width = dim if rank is None else rank
+        if width <= 0:
+            raise ValueError("rank must be positive.")
+        self.target_proj = nn.Linear(dim, width, bias=False)
+        self.source_proj = nn.Linear(dim, width, bias=False)
+        self.target_out = nn.Linear(width, 1, bias=False)
+        self.source_out = nn.Linear(width, 1, bias=False)
+        self.interaction_weight = nn.Parameter(torch.empty(width))
+        nn.init.normal_(self.interaction_weight, mean=0.0, std=0.02)
+        self.bias = nn.Parameter(torch.zeros(())) if bias else None
+        self.activation = nn.SiLU()
+
+    def forward(self, target_val: Tensor, source_val: Tensor) -> Tensor:
+        projected_target = self.target_proj(target_val)
+        projected_source = self.source_proj(source_val)
+        target_linear = self.target_out(projected_target).squeeze(-1)
+        source_linear = self.source_out(projected_source).squeeze(-1)
+        target_nodes = projected_target.shape[-2]
+        source_nodes = projected_source.shape[-2]
+        row_blocks: list[Tensor] = []
+        for target_start in range(0, target_nodes, _ADDITIVE_PAIRWISE_BLOCK_SIZE):
+            target_end = min(target_start + _ADDITIVE_PAIRWISE_BLOCK_SIZE, target_nodes)
+            target_chunk = projected_target[..., target_start:target_end, :]
+            target_term = target_linear[..., target_start:target_end].unsqueeze(-1)
+            col_blocks: list[Tensor] = []
+            for source_start in range(0, source_nodes, _ADDITIVE_PAIRWISE_BLOCK_SIZE):
+                source_end = min(source_start + _ADDITIVE_PAIRWISE_BLOCK_SIZE, source_nodes)
+                source_chunk = projected_source[..., source_start:source_end, :]
+                source_term = source_linear[..., source_start:source_end].unsqueeze(-2)
+                interaction = self.activation(
+                    target_chunk.unsqueeze(-2) * source_chunk.unsqueeze(-3)
+                )
+                scores = torch.einsum("...ijr,r->...ij", interaction, self.interaction_weight)
+                scores = scores + target_term + source_term
+                if self.bias is not None:
+                    scores = scores + self.bias
+                col_blocks.append(scores)
+            row_blocks.append(torch.cat(col_blocks, dim=-1))
+        return torch.cat(row_blocks, dim=-2)
 
 
 class DiagonalBilinearRoute(nn.Module):
@@ -189,17 +274,99 @@ class SourceTargetHadamardMLPRoute(nn.Module):
         self.activation = nn.SiLU()
 
     def forward(self, source_val: Tensor, target_val: Tensor) -> Tensor:
-        projected_source = self.source_proj(source_val).unsqueeze(-2)
-        projected_target = self.target_proj(target_val).unsqueeze(-3)
-        interaction = projected_source * projected_target
-        source_features = projected_source.expand_as(interaction)
-        target_features = projected_target.expand_as(interaction)
-        features = torch.cat(
-            (source_features, target_features, interaction),
+        projected_source = self.source_proj(source_val)
+        projected_target = self.target_proj(target_val)
+        width = projected_source.shape[-1]
+        source_weight, target_weight, hadamard_weight = torch.split(
+            self.proj_in.weight,
+            width,
             dim=-1,
         )
-        hidden = self.activation(self.proj_in(features))
-        return self.proj_out(hidden).squeeze(-1)
+        source_linear = F.linear(projected_source, source_weight)
+        target_linear = F.linear(projected_target, target_weight, self.proj_in.bias)
+        source_nodes = projected_source.shape[-2]
+        target_nodes = projected_target.shape[-2]
+        row_blocks: list[Tensor] = []
+        for source_start in range(0, source_nodes, _HADAMARD_ROUTE_BLOCK_SIZE):
+            source_end = min(source_start + _HADAMARD_ROUTE_BLOCK_SIZE, source_nodes)
+            source_chunk = projected_source[..., source_start:source_end, :]
+            source_linear_chunk = source_linear[..., source_start:source_end, :].unsqueeze(-2)
+            col_blocks: list[Tensor] = []
+            for target_start in range(0, target_nodes, _HADAMARD_ROUTE_BLOCK_SIZE):
+                target_end = min(target_start + _HADAMARD_ROUTE_BLOCK_SIZE, target_nodes)
+                target_chunk = projected_target[..., target_start:target_end, :]
+                target_linear_chunk = target_linear[..., target_start:target_end, :].unsqueeze(-3)
+                hidden = torch.einsum(
+                    "...id,hd,...kd->...ikh",
+                    source_chunk,
+                    hadamard_weight,
+                    target_chunk,
+                )
+                hidden = hidden + source_linear_chunk
+                hidden = hidden + target_linear_chunk
+                hidden = self.activation(hidden)
+                col_blocks.append(self.proj_out(hidden).squeeze(-1))
+            row_blocks.append(torch.cat(col_blocks, dim=-1))
+        return torch.cat(row_blocks, dim=-2)
+
+
+class AdditiveLowRankRoute(nn.Module):
+    expects_pairwise_inputs = True
+
+    def __init__(
+        self,
+        src_dim: int,
+        dst_dim: int | None = None,
+        *,
+        route_dim: int | None = None,
+        hidden_dim: int | None = None,
+        bias: bool = True,
+    ) -> None:
+        super().__init__()
+        target_dim = src_dim if dst_dim is None else dst_dim
+        width = (
+            hidden_dim
+            if hidden_dim is not None
+            else (route_dim if route_dim is not None else max(src_dim, target_dim))
+        )
+        if width <= 0:
+            raise ValueError("hidden_dim/rank must be positive.")
+        self.source_proj = nn.Linear(src_dim, width, bias=False)
+        self.target_proj = nn.Linear(target_dim, width, bias=False)
+        self.source_out = nn.Linear(width, 1, bias=False)
+        self.target_out = nn.Linear(width, 1, bias=False)
+        self.interaction_weight = nn.Parameter(torch.empty(width))
+        nn.init.normal_(self.interaction_weight, mean=0.0, std=0.02)
+        self.bias = nn.Parameter(torch.zeros(())) if bias else None
+        self.activation = nn.SiLU()
+
+    def forward(self, source_val: Tensor, target_val: Tensor) -> Tensor:
+        projected_source = self.source_proj(source_val)
+        projected_target = self.target_proj(target_val)
+        source_linear = self.source_out(projected_source).squeeze(-1)
+        target_linear = self.target_out(projected_target).squeeze(-1)
+        source_nodes = projected_source.shape[-2]
+        target_nodes = projected_target.shape[-2]
+        row_blocks: list[Tensor] = []
+        for source_start in range(0, source_nodes, _ADDITIVE_ROUTE_BLOCK_SIZE):
+            source_end = min(source_start + _ADDITIVE_ROUTE_BLOCK_SIZE, source_nodes)
+            source_chunk = projected_source[..., source_start:source_end, :]
+            source_term = source_linear[..., source_start:source_end].unsqueeze(-1)
+            col_blocks: list[Tensor] = []
+            for target_start in range(0, target_nodes, _ADDITIVE_ROUTE_BLOCK_SIZE):
+                target_end = min(target_start + _ADDITIVE_ROUTE_BLOCK_SIZE, target_nodes)
+                target_chunk = projected_target[..., target_start:target_end, :]
+                target_term = target_linear[..., target_start:target_end].unsqueeze(-2)
+                interaction = self.activation(
+                    source_chunk.unsqueeze(-2) * target_chunk.unsqueeze(-3)
+                )
+                scores = torch.einsum("...ikr,r->...ik", interaction, self.interaction_weight)
+                scores = scores + source_term + target_term
+                if self.bias is not None:
+                    scores = scores + self.bias
+                col_blocks.append(scores)
+            row_blocks.append(torch.cat(col_blocks, dim=-1))
+        return torch.cat(row_blocks, dim=-2)
 
 
 class LinearRoute(nn.Module):
