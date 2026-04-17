@@ -209,8 +209,12 @@ torch::Tensor pairwise_scores(
     if (!in_weight.has_value() || !out_weight.has_value()) {
       throw std::runtime_error("Hadamard MLP pairwise kernel is missing MLP weights.");
     }
-    auto interaction = target_val.unsqueeze(2) * source_val.unsqueeze(1);
-    auto hidden = linear4d(interaction, in_weight.value(), in_bias);
+    auto hidden = torch::einsum(
+        "bid,hd,bjd->bijh",
+        {target_val, in_weight.value(), source_val});
+    if (in_bias.has_value()) {
+      hidden = hidden + in_bias.value().view({1, 1, 1, -1});
+    }
     hidden = hidden * torch::sigmoid(hidden);
     auto scores = torch::matmul(hidden, out_weight.value().transpose(0, 1)).squeeze(-1);
     if (out_bias.has_value()) {
@@ -311,17 +315,19 @@ torch::Tensor pairwise_route_block_logits(
     }
     auto projected_source = linear3d(src_val, source_weight.value(), source_bias);
     auto projected_target = linear3d(dst_val, target_weight.value(), target_bias);
-    auto source_features =
-        projected_source.unsqueeze(2).expand(
-            {projected_source.size(0), projected_source.size(1), projected_target.size(1),
-             projected_source.size(2)});
-    auto target_features =
-        projected_target.unsqueeze(1).expand(
-            {projected_target.size(0), projected_source.size(1), projected_target.size(1),
-             projected_target.size(2)});
-    auto interaction = source_features * target_features;
-    auto features = torch::cat({source_features, target_features, interaction}, -1);
-    auto hidden = linear4d(features, hidden_weight.value(), hidden_bias);
+    const auto width = projected_source.size(2);
+    auto hidden_slices = hidden_weight.value().split(width, 1);
+    if (hidden_slices.size() != 3) {
+      throw std::runtime_error(
+          "Hadamard MLP route hidden_weight must split into source/target/hadamard slices.");
+    }
+    auto source_linear = linear3d(projected_source, hidden_slices[0], c10::nullopt);
+    auto target_linear = linear3d(projected_target, hidden_slices[1], hidden_bias);
+    auto hidden = torch::einsum(
+        "bid,hd,bkd->bikh",
+        {projected_source, hidden_slices[2], projected_target});
+    hidden = hidden + source_linear.unsqueeze(2);
+    hidden = hidden + target_linear.unsqueeze(1);
     hidden = hidden * torch::sigmoid(hidden);
     scores = torch::matmul(hidden, out_weight.value().transpose(0, 1)).squeeze(-1);
     if (out_bias.has_value()) {
@@ -1090,7 +1096,8 @@ std::tuple<torch::Tensor, torch::Tensor> transition_pairwise_dense(
   const auto state_acc_dtype = accumulator_dtype(projected_state.scalar_type());
   const auto val_acc_dtype = accumulator_dtype(projected_val.scalar_type());
 
-  if (can_use_full_dense_logits(flat_src_val, batch_flat, src_nodes, dst_nodes)) {
+  if (route_kind != "source_target_hadamard_mlp_route" &&
+      can_use_full_dense_logits(flat_src_val, batch_flat, src_nodes, dst_nodes)) {
     auto logits = pairwise_route_block_logits(
         route_kind,
         flat_src_val,

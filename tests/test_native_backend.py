@@ -200,6 +200,11 @@ class CudaNativeBackendTests(unittest.TestCase):
             torch.allclose(left.delta_val, right.delta_val, atol=atol, rtol=rtol)
         )
 
+    def assert_tensor_close(
+        self, left: torch.Tensor, right: torch.Tensor, *, atol: float = 1e-5, rtol: float = 1e-5
+    ) -> None:
+        self.assertTrue(torch.allclose(left, right, atol=atol, rtol=rtol))
+
     def test_dense_propagation_native_uses_cuda_backend_and_matches_reference(self) -> None:
         torch.manual_seed(30)
         layer = Layer(
@@ -309,6 +314,126 @@ class CudaNativeBackendTests(unittest.TestCase):
             )
         self.assertGreater(wrapped.call_count, 0)
         self.assert_delta_close(reference, native_delta)
+
+    def test_dense_propagation_native_hadamard_mlp_backward_matches_reference_on_cuda(self) -> None:
+        torch.manual_seed(302)
+        base_val = torch.randn(2, 6, 4, device=self.device)
+        base_state = torch.randn(2, 6, device=self.device)
+        reference_layer = Layer(
+            dim=4,
+            num_nodes=6,
+            state=base_state.clone().requires_grad_(True),
+            val=base_val.clone().requires_grad_(True),
+        )
+        native_layer = Layer(
+            dim=4,
+            num_nodes=6,
+            state=base_state.clone().requires_grad_(True),
+            val=base_val.clone().requires_grad_(True),
+        )
+        reference = Propagation(
+            pairwise_fn=HadamardMLPPairwise(dim=4, hidden_dim=7).to(self.device),
+            state_proj_fn=_state_proj_fn,
+            val_proj_fn=_val_proj_fn,
+            implementation="reference",
+        )
+        native = Propagation(
+            pairwise_fn=HadamardMLPPairwise(dim=4, hidden_dim=7).to(self.device),
+            state_proj_fn=_state_proj_fn,
+            val_proj_fn=_val_proj_fn,
+            implementation="native",
+            target_block_size=3,
+            source_block_size=2,
+        )
+        native.pairwise_fn.load_state_dict(reference.pairwise_fn.state_dict())
+
+        reference_delta = reference.compute_delta(reference_layer)
+        native_delta = native.compute_delta(native_layer)
+        self.assert_delta_close(reference_delta, native_delta)
+
+        torch.manual_seed(3021)
+        state_weight = torch.randn_like(reference_delta.delta_state)
+        val_weight = torch.randn_like(reference_delta.delta_val)
+        reference_loss = (reference_delta.delta_state * state_weight).sum() + (
+            reference_delta.delta_val * val_weight
+        ).sum()
+        native_loss = (native_delta.delta_state * state_weight).sum() + (
+            native_delta.delta_val * val_weight
+        ).sum()
+        reference_loss.backward()
+        native_loss.backward()
+
+        self.assert_tensor_close(reference_layer.state.grad, native_layer.state.grad)
+        self.assert_tensor_close(reference_layer.val.grad, native_layer.val.grad)
+        for reference_param, native_param in zip(
+            reference.pairwise_fn.parameters(),
+            native.pairwise_fn.parameters(),
+            strict=True,
+        ):
+            self.assertIsNotNone(reference_param.grad)
+            self.assertIsNotNone(native_param.grad)
+            self.assert_tensor_close(reference_param.grad, native_param.grad)
+
+    def test_query_dense_propagation_native_hadamard_mlp_backward_matches_reference_on_cuda(self) -> None:
+        torch.manual_seed(303)
+        reference_query_val = torch.randn(2, 3, 4, device=self.device, requires_grad=True)
+        native_query_val = reference_query_val.detach().clone().requires_grad_(True)
+        reference_source_val = torch.randn(2, 6, 4, device=self.device, requires_grad=True)
+        native_source_val = reference_source_val.detach().clone().requires_grad_(True)
+        reference_source_state = torch.randn(2, 6, device=self.device, requires_grad=True)
+        native_source_state = reference_source_state.detach().clone().requires_grad_(True)
+        pairwise_reference = HadamardMLPPairwise(dim=4, hidden_dim=7).to(self.device)
+        pairwise_native = HadamardMLPPairwise(dim=4, hidden_dim=7).to(self.device)
+        pairwise_native.load_state_dict(pairwise_reference.state_dict())
+
+        reference_scores = pairwise_reference(reference_query_val, reference_source_val)
+        reference_edges = torch.nn.functional.softsign(reference_scores)
+        reference_delta_state = torch.einsum(
+            "...ij,...j->...i",
+            reference_edges,
+            reference_source_state,
+        )
+        reference_delta_val = torch.einsum(
+            "...ij,...jd->...id",
+            reference_edges,
+            reference_source_val,
+        )
+        native_delta = native_backend.propagation_query_dense_native(
+            pairwise_fn=pairwise_native,
+            edge_compress_name="softsign",
+            query_val=native_query_val,
+            source_val=native_source_val,
+            projected_state=native_source_state,
+            projected_val=native_source_val,
+            query_block_size=2,
+            source_block_size=3,
+        )
+        self.assert_tensor_close(reference_delta_state, native_delta.delta_state)
+        self.assert_tensor_close(reference_delta_val, native_delta.delta_val)
+
+        torch.manual_seed(3031)
+        state_weight = torch.randn_like(reference_delta_state)
+        val_weight = torch.randn_like(reference_delta_val)
+        reference_loss = (reference_delta_state * state_weight).sum() + (
+            reference_delta_val * val_weight
+        ).sum()
+        native_loss = (native_delta.delta_state * state_weight).sum() + (
+            native_delta.delta_val * val_weight
+        ).sum()
+        reference_loss.backward()
+        native_loss.backward()
+
+        self.assert_tensor_close(reference_query_val.grad, native_query_val.grad)
+        self.assert_tensor_close(reference_source_val.grad, native_source_val.grad)
+        self.assert_tensor_close(reference_source_state.grad, native_source_state.grad)
+        for reference_param, native_param in zip(
+            pairwise_reference.parameters(),
+            pairwise_native.parameters(),
+            strict=True,
+        ):
+            self.assertIsNotNone(reference_param.grad)
+            self.assertIsNotNone(native_param.grad)
+            self.assert_tensor_close(reference_param.grad, native_param.grad)
 
     def test_sparse_propagation_native_window_and_topk_match_reference_on_cuda(self) -> None:
         torch.manual_seed(31)
@@ -475,6 +600,92 @@ class CudaNativeBackendTests(unittest.TestCase):
                 native_delta = native.compute_delta(src, dst)
             self.assertGreater(wrapped.call_count, 0)
             self.assert_delta_close(reference_delta, native_delta)
+
+    def test_dense_transition_native_hadamard_route_backward_matches_reference_on_cuda(self) -> None:
+        torch.manual_seed(321)
+        base_src_state = torch.randn(2, 7, device=self.device)
+        base_src_val = torch.randn(2, 7, 4, device=self.device)
+        base_dst_state = torch.randn(2, 6, device=self.device)
+        base_dst_val = torch.randn(2, 6, 4, device=self.device)
+        reference_src = Layer(
+            dim=4,
+            num_nodes=7,
+            state=base_src_state.clone().requires_grad_(True),
+            val=base_src_val.clone().requires_grad_(True),
+        )
+        native_src = Layer(
+            dim=4,
+            num_nodes=7,
+            state=base_src_state.clone().requires_grad_(True),
+            val=base_src_val.clone().requires_grad_(True),
+        )
+        reference_dst = Layer(
+            dim=4,
+            num_nodes=6,
+            state=base_dst_state.clone().requires_grad_(True),
+            val=base_dst_val.clone().requires_grad_(True),
+        )
+        native_dst = Layer(
+            dim=4,
+            num_nodes=6,
+            state=base_dst_state.clone().requires_grad_(True),
+            val=base_dst_val.clone().requires_grad_(True),
+        )
+        reference = Transition(
+            route_fn=SourceTargetHadamardMLPRoute(
+                src_dim=4,
+                dst_dim=4,
+                route_dim=5,
+                hidden_dim=7,
+            ).to(self.device),
+            state_activation_fn=lambda x: torch.nn.functional.softplus(x) + 0.1,
+            val_proj_fn=_val_proj_fn,
+            state_proj_fn=_state_proj_fn,
+            implementation="reference",
+        )
+        native = Transition(
+            route_fn=SourceTargetHadamardMLPRoute(
+                src_dim=4,
+                dst_dim=4,
+                route_dim=5,
+                hidden_dim=7,
+            ).to(self.device),
+            state_activation_fn=lambda x: torch.nn.functional.softplus(x) + 0.1,
+            val_proj_fn=_val_proj_fn,
+            state_proj_fn=_state_proj_fn,
+            implementation="native",
+            src_block_size=3,
+            dst_block_size=2,
+        )
+        native.route_fn.load_state_dict(reference.route_fn.state_dict())
+
+        reference_delta = reference.compute_delta(reference_src, reference_dst)
+        native_delta = native.compute_delta(native_src, native_dst)
+        self.assert_delta_close(reference_delta, native_delta)
+
+        torch.manual_seed(3211)
+        state_weight = torch.randn_like(reference_delta.delta_state)
+        val_weight = torch.randn_like(reference_delta.delta_val)
+        reference_loss = (reference_delta.delta_state * state_weight).sum() + (
+            reference_delta.delta_val * val_weight
+        ).sum()
+        native_loss = (native_delta.delta_state * state_weight).sum() + (
+            native_delta.delta_val * val_weight
+        ).sum()
+        reference_loss.backward()
+        native_loss.backward()
+
+        self.assert_tensor_close(reference_src.state.grad, native_src.state.grad)
+        self.assert_tensor_close(reference_src.val.grad, native_src.val.grad)
+        self.assert_tensor_close(reference_dst.val.grad, native_dst.val.grad)
+        for reference_param, native_param in zip(
+            reference.route_fn.parameters(),
+            native.route_fn.parameters(),
+            strict=True,
+        ):
+            self.assertIsNotNone(reference_param.grad)
+            self.assertIsNotNone(native_param.grad)
+            self.assert_tensor_close(reference_param.grad, native_param.grad)
 
     def test_sparse_transition_native_matches_reference_on_cuda(self) -> None:
         torch.manual_seed(33)

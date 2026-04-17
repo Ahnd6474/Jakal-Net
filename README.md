@@ -4,30 +4,131 @@ Jakal-Net is a PyTorch research playground for latent-node propagation,
 sparse routing, and the Progressive-B language-model experiments built on top
 of those operators.
 
-The current codebase has two layers:
+The codebase is split into two layers:
 
-- `src/jakal_net/`: reusable operator primitives (`Layer`, propagation,
-  transition, sparse routing, native backend dispatch).
-- `scripts/`: experiment code, including the Progressive-B example LM,
-  corpus builders, training loops, checkpointing, TensorBoard logging, and
-  native extension build helpers.
+- `src/jakal_net/`: reusable operator primitives such as `Layer`,
+  propagation, transition, sparse routing, and native backend dispatch.
+- `scripts/`: experiment code for Progressive-B, corpus builders, training
+  loops, checkpointing, TensorBoard logging, and native extension build
+  helpers.
 
 ## Architecture
 
 ![Jakal-Net Progressive-B architecture](docs/architecture.svg)
 
-At a high level, the example LM encodes a fixed-length prefix into an `S`
-sequence workspace, repeatedly exchanges information with a compressed/expanded
-`B` bottleneck workspace, then decodes future tokens through query slots. The
-query path is the only prediction path in the current model:
+Progressive-B is not a standard decoder-only LM stack. It encodes a fixed
+prefix into a sequence workspace `S`, repeatedly exchanges information with a
+compressed and expanded latent memory workspace `B`, then predicts future
+tokens through a separate query path.
+
+At a high level, the current query-block path is:
 
 ```text
-prefix ids -> S/B encoder -> query transition -> query propagation -> query head -> token logits
+prefix ids
+  -> token/position embedding
+  -> S warmup
+  -> Progressive-B joint blocks over S and B
+  -> final S refinement
+  -> query slots
+  -> query transition
+  -> query propagation
+  -> query head
+  -> token logits
 ```
 
-There is no legacy LM head and no GRU response decoder. The vocabulary
-projection is owned by the query head so the trainable parameters match the
-query-block objective.
+There is no legacy LM head and no GRU response decoder in the current model.
+The vocabulary projection belongs to the query head, so trainable parameters
+track the query-based objective directly.
+
+## Core Architecture
+
+### 1. Sequence workspace `S`
+
+`S` is the token-aligned workspace. Each token position owns:
+
+- a scalar state in `Layer.state`
+- a vector value in `Layer.val`
+
+`S` starts from token embeddings plus learned positional encodings, then runs
+window or dense same-layer propagation. This is the part of the model that
+most closely resembles a conventional sequence encoder, except that it is
+expressed with the general `Layer` / `Propagation` operator API instead of a
+Transformer block API.
+
+### 2. Bottleneck workspace `B`
+
+`B` is the latent memory system. Each Progressive-B joint block creates or
+updates two `B` views:
+
+- expanded `B`: wider latent workspace used for richer internal propagation
+- compressed `B`: smaller bottleneck workspace used to carry summarized state
+  across blocks
+
+Inside each joint block, information moves through:
+
+1. same-layer propagation on `S`
+2. `S -> expanded B` routing
+3. same-layer propagation inside expanded `B`
+4. `expanded B -> S` routing
+5. `expanded B -> compressed B` compression
+6. optional `S -> compressed B` update
+7. same-layer propagation inside compressed `B`
+
+That is the central architectural idea of this repository: sequence processing
+is mediated by a reusable latent memory workspace instead of relying only on a
+single token-aligned stream.
+
+### 3. Query prediction path
+
+Prediction does not read directly from the last token state. Instead, the model
+creates a dedicated query workspace:
+
+- one query slot per future token position
+- `query_transition` routes information from encoded `S` into those slots
+- `query_propagation` updates the slots causally from left to right
+- `query_head` maps final query slot values to vocabulary logits
+
+This makes the forecasting path explicit. The encoded prefix lives in `S`,
+while the prediction process lives in a separate query layer with its own
+causal propagation.
+
+### 4. Execution backends
+
+The same architecture can run through several implementations:
+
+- `reference`
+- `streaming`
+- `kernel`
+- `native`
+
+The backend choice changes execution strategy, not the high-level model graph.
+
+## Compared With Existing LM Architectures
+
+The most useful comparison point is a standard decoder-only Transformer LM.
+
+| Aspect | Standard decoder-only LM | Jakal-Net Progressive-B |
+| --- | --- | --- |
+| Main working space | Single token-aligned hidden sequence | Token-aligned `S` plus latent `B` workspaces |
+| Cross-token interaction | Self-attention over the same sequence | `Propagation` on `S`, plus routed interaction through expanded and compressed `B` |
+| Long-range summarization | Implicit inside attention layers and residual stream | Explicit latent memory bottleneck carried across joint blocks |
+| Prediction path | Read logits from the final token stream | Build dedicated query slots, route `S` into them, then propagate queries causally |
+| Architectural unit | Attention + MLP block | General propagation + transition operators composed into joint `S/B` blocks |
+| Sparsity control | Usually attention mask or custom sparse attention kernels | Window, top-k, query-top-k, dense, and routed sparse transitions |
+| Execution abstraction | Usually tied closely to one attention implementation | Same operator graph can dispatch to reference, streaming, kernel, or native backends |
+
+Another way to say it:
+
+- A standard decoder-only LM keeps one residual stream and predicts from that
+  stream directly.
+- Progressive-B separates encoding, latent memory exchange, and prediction into
+  different workspaces.
+- The architectural bet is that explicit routed latent memory may scale
+  differently from a pure token-only stack and can support more flexible sparse
+  execution paths.
+
+This repository is therefore closer to an operator research platform for
+alternative LM structure than to a conventional Transformer implementation.
 
 ## Current Capabilities
 
@@ -37,16 +138,15 @@ query-block objective.
 - Reference, streaming, kernel, and native backend implementations.
 - Native C++/CUDA extension support for selected propagation and transition
   kernels.
-- Progressive-B example LM with warmup `S` propagation, lite/mid/full B stages,
-  final `S` refinement, query transition, query propagation, and query-only
-  vocab prediction.
+- Progressive-B example LM with warmup `S` propagation, lite/mid/full `B`
+  stages, final `S` refinement, query transition, query propagation, and
+  query-only vocab prediction.
 - Training objectives: `query_next_token` and `query_block`.
 - Byte-level BPE tokenization, including larger vocabularies for code and
   LaTeX-heavy corpora.
-- TensorBoard logging focused on total minibatch loss and four overlaid
-  distance-bucket minibatch perplexity curves.
-- Resumable-style checkpoint payloads plus best/last/final checkpoint
-  artifacts.
+- TensorBoard logging focused on total minibatch loss and overlaid
+  distance-bucket perplexity curves.
+- Best/last/final checkpoint artifacts for experiment tracking.
 
 ## Repository Layout
 
@@ -186,14 +286,11 @@ PYTHONPATH=src python scripts/train_progressive_b_lm.py \
 
 The training script writes:
 
-- TensorBoard events under each run directory. The current scalar layout is
-  intentionally small: `train/minibatch_loss` plus
-  `train/minibatch_ppl_by_distance` overlaid for token ranges `000_015`,
-  `016_031`, `032_063`, and `064_127`.
-- Run summaries, metrics, samples, and checkpoints under
-  `artifacts/training_runs/`.
-- Best and last checkpoints under `custom/checkpoints/` when
-  `--save-checkpoint` is enabled.
+- TensorBoard events under each run directory
+- run summaries, metrics, samples, and checkpoints under
+  `artifacts/training_runs/`
+- best and last checkpoints under `custom/checkpoints/` when
+  `--save-checkpoint` is enabled
 
 Launch TensorBoard against the current artifact root:
 
@@ -203,8 +300,8 @@ tensorboard --logdir artifacts/training_runs
 
 ## Losses and Prediction Head
 
-`query_block` predicts a block of future tokens from a prefix. It first builds
-query slots from the encoded `S` workspace, lets those slots receive routed
+`query_block` predicts a block of future tokens from a prefix. It builds query
+slots from the encoded `S` workspace, lets those slots receive routed
 information from `S`, then updates query slots left-to-right through query
 propagation. The query head maps the final query slot values to vocabulary
 logits.
@@ -218,7 +315,7 @@ Two auxiliary losses can be enabled:
 - `--b-diversity-loss-weight` penalizes compressed `B` nodes whose cosine
   similarity exceeds `--b-cosine-margin`.
 - `--route-concentration-loss-weight` penalizes route or edge concentration
-  only when destination load or single-edge probability exceeds the configured
+  only when destination load or single-edge probability exceeds configured
   caps. It is not a uniform-routing loss; it specifically discourages collapse
   onto one node.
 
@@ -250,8 +347,8 @@ building route logits and reducing transported source values into destination
 nodes.
 
 `SparseTransition` keeps only top-k destination routes per source before
-transport. It supports edge dropout and usage-aware dropout in the experimental
-paths used by Progressive-B.
+transport. It supports edge dropout and usage-aware dropout in the
+experimental paths used by Progressive-B.
 
 ## Progressive-B Example LM
 
@@ -270,21 +367,21 @@ encoder:
 7. Query propagation updates the slots left-to-right.
 8. The query head projects query slot values to vocabulary logits.
 
-The current large query-block configuration uses low-rank bilinear pairwise
-scorers and routers with `route_topk=32`, `seq_len=512`, `target_len=128`, and
-a byte BPE vocabulary sized for mixed dialogue, science, wiki, code, and LaTeX
-text.
+The current large query-block configurations use bilinear, Hadamard-MLP, or
+additive-style pairwise/route modules depending on the experiment, along with
+byte BPE vocabularies sized for mixed dialogue, science, wiki, code, and
+LaTeX-heavy text.
 
 ## Corpus Paths
 
 The training CLI can read:
 
-- Plain text files with `--text-file`.
-- Repeated text files, directories, or globs with `--text-source`.
-- JSONL text records with `--jsonl-source --jsonl-text-key`.
-- Hugging Face datasets with `--hf-dataset`.
-- Explicit dialogue/prefix-response records with `prefix` and `response`
-  fields.
+- plain text files with `--text-file`
+- repeated text files, directories, or globs with `--text-source`
+- JSONL text records with `--jsonl-source --jsonl-text-key`
+- Hugging Face datasets with `--hf-dataset`
+- explicit dialogue or prefix/response records with `prefix` and `response`
+  fields
 
 `next_sentence_response` first converts source text or explicit JSONL records
 into prefix/response pairs, then trains the response decoder with masked
@@ -294,8 +391,8 @@ cross-entropy over the response tokens.
 
 - Keep generated artifacts out of commits unless the artifact is intentionally
   part of a regression fixture.
-- Prefer `artifacts/tensorboard/<run-name>` for TensorBoard runs and archive old
-  runs outside the active logdir when the UI gets noisy.
+- Prefer `artifacts/tensorboard/<run-name>` for TensorBoard runs and archive
+  old runs outside the active logdir when the UI gets noisy.
 - Run smoke tests and unit tests before pushing operator changes.
 - If native backend behavior changes, update both `native/` and
   `tests/test_native_backend.py`.
