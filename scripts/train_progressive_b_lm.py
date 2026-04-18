@@ -1288,13 +1288,21 @@ def generate_next_tokens_with_sampling(
     was_training = model.training
     model.eval()
     generated = prompt.to(device).clone()
+    if generated.numel() == 0:
+        if was_training:
+            model.train()
+        return generated
     tokens_remaining = max_new_tokens
     while tokens_remaining > 0:
         context = generated[-seq_len:].unsqueeze(0)
+        if context.shape[-1] <= 0:
+            break
+        start_offset = 0
         if training_objective == "query_block":
-            block_len = max(1, target_len) + int(query_block_start_token_id is not None)
-            block_len = min(block_len, tokens_remaining)
-            logits = model.forward_query_block(context, target_len=block_len)
+            content_len = min(max(1, target_len), tokens_remaining)
+            query_nodes = content_len + int(query_block_start_token_id is not None)
+            logits = model.forward_query_block(context, target_len=query_nodes)
+            start_offset = 1 if query_block_start_token_id is not None else 0
         elif training_objective == "query_next_token":
             logits = model.forward_query_next_token(context)
         else:
@@ -1302,7 +1310,7 @@ def generate_next_tokens_with_sampling(
         if logits.ndim == 2:
             logits = logits.unsqueeze(1)
         sampled_tokens: list[torch.Tensor] = []
-        for offset in range(logits.shape[1]):
+        for offset in range(start_offset, logits.shape[1]):
             step_logits = logits[:, offset, :]
             if temperature is None:
                 next_token = torch.argmax(step_logits, dim=-1)
@@ -1322,6 +1330,8 @@ def generate_next_tokens_with_sampling(
             if eos_token_id is not None and int(next_token.item()) == eos_token_id:
                 tokens_remaining = 0
                 break
+        if not sampled_tokens:
+            break
         generated = torch.cat((generated, torch.cat(sampled_tokens, dim=0)), dim=0)
     if was_training:
         model.train()
@@ -1715,6 +1725,7 @@ def run_single_experiment(
         alpha_scale=args.alpha_scale,
         beta_s_to_b_scale=args.beta_s_to_b_scale,
         beta_b_to_s_scale=args.beta_b_to_s_scale,
+        warmup_delta_scale=args.warmup_delta_scale,
         s_delta_scale=args.s_delta_scale,
         b_delta_scale=args.b_delta_scale,
         cross_delta_scale=args.cross_delta_scale,
@@ -1735,6 +1746,9 @@ def run_single_experiment(
         b_to_s_slot_dropout_p=args.b_to_s_slot_dropout_p,
         include_query_head=query_next_token or query_block,
     )
+    if args.freeze_position_encoding:
+        for parameter in model.position_encoding.parameters():
+            parameter.requires_grad_(False)
     parameter_count = count_parameters(model)
 
     run_dir = session_dir / slugify_run_name(experiment_name)
@@ -1792,6 +1806,7 @@ def run_single_experiment(
         f"lr_min_ratio={args.learning_rate_min_ratio:.3f} | "
         f"query_block_front_weight={args.query_block_front_weight:.3f} | "
         f"relative_update_clip={args.relative_update_clip:.4f} | "
+        f"freeze_position_encoding={args.freeze_position_encoding} | "
         f"grad_breakdown={args.grad_breakdown} | "
         f"grad_breakdown_start_step={args.grad_breakdown_start_step}"
     )
@@ -1872,6 +1887,7 @@ def run_single_experiment(
                 "implementation": args.implementation,
                 "precision": args.precision,
                 "value_norm_kind": value_norm_kind,
+                "freeze_position_encoding": args.freeze_position_encoding,
                 "norm_position": args.norm_position,
                 "propagation_residual": not args.disable_propagation_residual,
                 "route_mode": args.route_mode,
@@ -1907,6 +1923,7 @@ def run_single_experiment(
                 "alpha_scale": args.alpha_scale,
                 "beta_s_to_b_scale": args.beta_s_to_b_scale,
                 "beta_b_to_s_scale": args.beta_b_to_s_scale,
+                "warmup_delta_scale": args.warmup_delta_scale,
                 "s_delta_scale": args.s_delta_scale,
                 "b_delta_scale": args.b_delta_scale,
                 "cross_delta_scale": args.cross_delta_scale,
@@ -2127,7 +2144,20 @@ def run_single_experiment(
             writer.flush()
 
     def grad_stats_tensorboard_callback(step: int, stats: dict[str, float]) -> None:
-        return
+        if writer is None:
+            return
+        for key, value in sorted(stats.items()):
+            writer.add_scalar(f"debug/{key}", value, step)
+        if step == 1 or step == train_steps or (args.log_interval > 0 and step % args.log_interval == 0):
+            writer.flush()
+
+    def clip_stats_tensorboard_callback(step: int, stats: dict[str, float]) -> None:
+        if writer is None:
+            return
+        for key, value in sorted(stats.items()):
+            writer.add_scalar(f"debug/{key}", value, step)
+        if step == 1 or step == train_steps or (args.log_interval > 0 and step % args.log_interval == 0):
+            writer.flush()
 
     def eval_tensorboard_callback(step: int, train_loss: float, val_loss: float) -> None:
         if writer is not None:
@@ -2198,6 +2228,7 @@ def run_single_experiment(
                 step_setup_callback=step_setup_callback,
                 progress_callback=progress_callback,
                 step_callback=step_tensorboard_callback,
+                clip_stats_callback=clip_stats_tensorboard_callback if args.grad_breakdown and args.relative_update_clip > 0.0 else None,
                 eval_callback=eval_tensorboard_callback,
                 checkpoint_callback=training_checkpoint_callback,
                 eval_on_first_step=eval_on_first_step,
@@ -2232,6 +2263,7 @@ def run_single_experiment(
                 step_callback=step_tensorboard_callback,
                 loss_stats_callback=loss_stats_tensorboard_callback,
                 grad_stats_callback=grad_stats_tensorboard_callback if args.grad_breakdown else None,
+                clip_stats_callback=clip_stats_tensorboard_callback if args.grad_breakdown and args.relative_update_clip > 0.0 else None,
                 eval_callback=eval_tensorboard_callback,
                 checkpoint_callback=training_checkpoint_callback,
                 eval_on_first_step=eval_on_first_step,
@@ -2286,6 +2318,7 @@ def run_single_experiment(
                 step_callback=step_tensorboard_callback,
                 loss_stats_callback=loss_stats_tensorboard_callback,
                 grad_stats_callback=grad_stats_tensorboard_callback if args.grad_breakdown else None,
+                clip_stats_callback=clip_stats_tensorboard_callback if args.grad_breakdown and args.relative_update_clip > 0.0 else None,
                 eval_callback=eval_tensorboard_callback,
                 checkpoint_callback=training_checkpoint_callback,
                 eval_on_first_step=eval_on_first_step,
@@ -2402,6 +2435,7 @@ def run_single_experiment(
         "route_topk": effective_config["route_topk"],
         "query_topk": args.query_topk or int(effective_config["route_topk"]),
         "value_norm_kind": value_norm_kind,
+        "freeze_position_encoding": args.freeze_position_encoding,
         "norm_position": args.norm_position,
         "propagation_residual": not args.disable_propagation_residual,
         "route_mode": args.route_mode,
@@ -2430,6 +2464,7 @@ def run_single_experiment(
         "alpha_scale": args.alpha_scale,
         "beta_s_to_b_scale": args.beta_s_to_b_scale,
         "beta_b_to_s_scale": args.beta_b_to_s_scale,
+        "warmup_delta_scale": args.warmup_delta_scale,
         "s_delta_scale": args.s_delta_scale,
         "b_delta_scale": args.b_delta_scale,
         "cross_delta_scale": args.cross_delta_scale,
@@ -2747,6 +2782,7 @@ def main() -> None:
         choices=("layernorm", "rmsnorm"),
         default="layernorm",
     )
+    parser.add_argument("--freeze-position-encoding", action="store_true")
     parser.add_argument(
         "--norm-position",
         choices=("pre", "post"),
@@ -2818,7 +2854,8 @@ def main() -> None:
     parser.add_argument("--alpha-scale", type=float, default=1.0)
     parser.add_argument("--beta-s-to-b-scale", type=float, default=1.0)
     parser.add_argument("--beta-b-to-s-scale", type=float, default=1.0)
-    parser.add_argument("--s-delta-scale", type=float, default=0.25)
+    parser.add_argument("--warmup-delta-scale", type=float, default=0.0)
+    parser.add_argument("--s-delta-scale", type=float, default=0.10)
     parser.add_argument("--b-delta-scale", type=float, default=0.20)
     parser.add_argument("--cross-delta-scale", type=float, default=0.15)
     parser.add_argument(

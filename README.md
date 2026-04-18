@@ -310,6 +310,18 @@ useful when the model shows intermittent loss and gradient spikes.
   norm `lr * ||grad||` is limited to a fixed fraction of the parameter norm.
   This is useful when global grad clipping alone does not prevent repeated
   large routed updates in the query path.
+- `--warmup-delta-scale` controls the residual gain on the `s_warmup` path.
+  The current default is `0.0`, which keeps the warmup operators in the
+  forward structure but removes their residual add from the learned sequence
+  trunk.
+- `--s-delta-scale` controls the residual gain on the sequence warmup and
+  same-sequence propagation path. In current Progressive-B query-block runs,
+  this has a large effect on stability because the shared `S` trunk feeds every
+  later joint block and query transition.
+- `--freeze-position-encoding` is a diagnostic switch that disables learning on
+  the learned positional encoder. It is useful for separating positional
+  instability from broader sequence-trunk instability, but it should be treated
+  as an experiment flag rather than the default training recipe.
 
 In practical terms:
 
@@ -318,9 +330,20 @@ In practical terms:
   later-token quality
 - use `--relative-update-clip 0.01` to keep each tensor update below roughly
   `1%` of its parameter norm
+- use `--warmup-delta-scale 0.0` to disable the `s_warmup` residual path while
+  keeping the rest of the model unchanged
+- use `--s-delta-scale 0.1` as a safer default when `query_block` training
+  shows repeated sequence-side gradient explosions; `0.25` is noticeably more
+  aggressive on the current 512-dim setup
+- use `--freeze-position-encoding` only as a debugging control when you need to
+  check whether positional learning is the primary source of a spike
 
 These controls can be combined with the existing global grad norm clip,
 learning-rate warmup, and cosine decay schedule.
+
+For post-run spike inspection, use `scripts/debug_progressive_b_events.py` to
+scan a TensorBoard event file and print the dominant grad tags over a step
+window.
 
 Launch TensorBoard against the current artifact root:
 

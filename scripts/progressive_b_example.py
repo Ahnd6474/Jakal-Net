@@ -174,10 +174,19 @@ def _apply_relative_update_clip(
     *,
     max_relative_update: float,
     min_parameter_norm: float = 1.0,
-) -> float:
+) -> dict[str, float]:
     if max_relative_update <= 0.0:
-        return 1.0
+        return {
+            "relative_update_clip/fraction": 0.0,
+            "relative_update_clip/floor_fraction": 0.0,
+            "relative_update_clip/min_scale": 1.0,
+            "relative_update_clip/clipped_tensors": 0.0,
+            "relative_update_clip/total_tensors": 0.0,
+        }
     min_scale = 1.0
+    total_tensors = 0
+    clipped_tensors = 0
+    floored_tensors = 0
     for param_group in optimizer.param_groups:
         learning_rate = float(param_group.get("lr", 0.0))
         if learning_rate <= 0.0:
@@ -189,15 +198,27 @@ def _apply_relative_update_clip(
             grad_norm = float(gradient.detach().norm().item())
             if not math.isfinite(grad_norm) or grad_norm <= 0.0:
                 continue
+            total_tensors += 1
             parameter_norm = float(parameter.detach().norm().item())
+            if parameter_norm < min_parameter_norm:
+                floored_tensors += 1
             reference_norm = max(parameter_norm, min_parameter_norm)
             max_grad_norm = (max_relative_update * reference_norm) / learning_rate
             if grad_norm <= max_grad_norm:
                 continue
+            clipped_tensors += 1
             scale = max_grad_norm / grad_norm
             gradient.mul_(scale)
             min_scale = min(min_scale, scale)
-    return min_scale
+    fraction = clipped_tensors / total_tensors if total_tensors > 0 else 0.0
+    floor_fraction = floored_tensors / total_tensors if total_tensors > 0 else 0.0
+    return {
+        "relative_update_clip/fraction": fraction,
+        "relative_update_clip/floor_fraction": floor_fraction,
+        "relative_update_clip/min_scale": min_scale,
+        "relative_update_clip/clipped_tensors": float(clipped_tensors),
+        "relative_update_clip/total_tensors": float(total_tensors),
+    }
 
 
 def _resolve_scheduled_learning_rate(
@@ -233,15 +254,15 @@ def _resolve_scheduled_learning_rate(
     )
 
 
-def _grad_group_keys(parameter_name: str) -> tuple[str, ...]:
+def _grad_group_keys(parameter_name: str, *, key_prefix: str = "grad") -> tuple[str, ...]:
     groups: list[str] = []
     if parameter_name.startswith("joint_blocks."):
         parts = parameter_name.split(".")
         if len(parts) >= 3:
             block_index = parts[1]
             component = parts[2]
-            groups.append(f"grad/joint_blocks/{block_index}/total")
-            groups.append(f"grad/joint_blocks/{block_index}/{component}")
+            groups.append(f"{key_prefix}/joint_blocks/{block_index}/total")
+            groups.append(f"{key_prefix}/joint_blocks/{block_index}/{component}")
         return tuple(groups)
     direct_prefixes = (
         "token_embedding",
@@ -256,22 +277,33 @@ def _grad_group_keys(parameter_name: str) -> tuple[str, ...]:
     )
     for prefix in direct_prefixes:
         if parameter_name.startswith(prefix):
-            return (f"grad/{prefix}",)
+            return (f"{key_prefix}/{prefix}",)
     if parameter_name.startswith("s_warmup."):
-        return ("grad/s_warmup",)
+        parts = parameter_name.split(".")
+        if len(parts) >= 2 and parts[1].isdigit():
+            layer_index = parts[1]
+            return (
+                f"{key_prefix}/s_warmup",
+                f"{key_prefix}/s_warmup/{layer_index}",
+            )
+        return (f"{key_prefix}/s_warmup",)
     if parameter_name.startswith("s_refine."):
-        return ("grad/s_refine",)
-    return ("grad/other",)
+        return (f"{key_prefix}/s_refine",)
+    return (f"{key_prefix}/other",)
 
 
-def _collect_grad_group_norms(model: nn.Module) -> dict[str, float]:
+def _collect_grad_group_norms(
+    model: nn.Module,
+    *,
+    key_prefix: str = "grad",
+) -> dict[str, float]:
     grad_square_sums: dict[str, float] = {}
     for name, parameter in model.named_parameters():
         if parameter.grad is None:
             continue
         grad = parameter.grad.detach().float()
         square_sum = float(grad.square().sum().item())
-        for group in _grad_group_keys(name):
+        for group in _grad_group_keys(name, key_prefix=key_prefix):
             grad_square_sums[group] = grad_square_sums.get(group, 0.0) + square_sum
     return {
         key: math.sqrt(value)
@@ -799,6 +831,7 @@ class ProgressiveBJointBlock(nn.Module):
         alpha_scale: float = 1.0,
         beta_s_to_b_scale: float = 1.0,
         beta_b_to_s_scale: float = 1.0,
+        warmup_delta_scale: float = 0.0,
         s_delta_scale: float = 0.25,
         b_delta_scale: float = 0.20,
         cross_delta_scale: float = 0.15,
@@ -836,6 +869,7 @@ class ProgressiveBJointBlock(nn.Module):
         self.runtime_b_schedule_scale = 1.0
         self.value_residual_scale = value_residual_scale
         self.state_residual_scale = state_residual_scale
+        self.warmup_delta_scale = warmup_delta_scale
         self.s_delta_scale = s_delta_scale
         self.b_delta_scale = b_delta_scale
         self.cross_delta_scale = cross_delta_scale
@@ -1332,6 +1366,7 @@ class ProgressiveBExampleLM(nn.Module):
         alpha_scale: float = 1.0,
         beta_s_to_b_scale: float = 1.0,
         beta_b_to_s_scale: float = 1.0,
+        warmup_delta_scale: float = 0.0,
         s_delta_scale: float = 0.25,
         b_delta_scale: float = 0.20,
         cross_delta_scale: float = 0.15,
@@ -1368,6 +1403,7 @@ class ProgressiveBExampleLM(nn.Module):
         self.alpha_scale = alpha_scale
         self.beta_s_to_b_scale = beta_s_to_b_scale
         self.beta_b_to_s_scale = beta_b_to_s_scale
+        self.warmup_delta_scale = warmup_delta_scale
         self.s_delta_scale = s_delta_scale
         self.b_delta_scale = b_delta_scale
         self.cross_delta_scale = cross_delta_scale
@@ -1406,6 +1442,8 @@ class ProgressiveBExampleLM(nn.Module):
         self.b_diversity_final_margin = 0.20
         self.last_b_diversity_losses: dict[str, Tensor] | None = None
         self.last_b_diversity_stats: dict[str, float] | None = None
+        self.track_activation_grads = False
+        self._activation_grad_samples: dict[str, list[float]] = {}
 
         self.token_embedding = nn.Embedding(vocab_size, dim)
         self.position_encoding = LearnedPositionEncoding(dim)
@@ -1670,6 +1708,43 @@ class ProgressiveBExampleLM(nn.Module):
             stats[f"{prefix}_adjacent_cosine"] = float(cosine.item())
         return stats
 
+    def reset_activation_grad_stats(self) -> None:
+        self._activation_grad_samples = {}
+
+    def set_activation_grad_tracking(self, enabled: bool) -> None:
+        self.track_activation_grads = enabled
+        if not enabled:
+            self._activation_grad_samples = {}
+
+    def consume_activation_grad_stats(self) -> dict[str, float]:
+        stats = {
+            key: sum(values) / len(values)
+            for key, values in sorted(self._activation_grad_samples.items())
+            if values
+        }
+        self._activation_grad_samples = {}
+        return stats
+
+    def _record_activation_grad(self, key: str, grad: Tensor) -> None:
+        grad_norm = float(grad.detach().float().norm().item())
+        self._activation_grad_samples.setdefault(key, []).append(grad_norm)
+
+    def _register_layer_activation_grad(self, prefix: str, layer: Layer) -> None:
+        if not self.track_activation_grads or not torch.is_grad_enabled():
+            return
+        if layer.val.requires_grad:
+            layer.val.register_hook(
+                lambda grad, key=f"activation_grad/{prefix}/val": self._record_activation_grad(
+                    key, grad
+                )
+            )
+        if layer.state.requires_grad:
+            layer.state.register_hook(
+                lambda grad, key=f"activation_grad/{prefix}/state": self._record_activation_grad(
+                    key, grad
+                )
+            )
+
     def collect_runtime_stats(self, token_ids: Tensor) -> dict[str, float]:
         was_training = self.training
         self.eval()
@@ -1730,10 +1805,15 @@ class ProgressiveBExampleLM(nn.Module):
         b_diversity_losses: dict[str, Tensor] = {}
         b_diversity_stats: dict[str, float] = {}
 
-        for op in self.s_warmup:
+        for warmup_index, op in enumerate(self.s_warmup):
             delta = op.compute_delta(self._prepare_sequence_input(s_layer))
-            s_layer = self._apply_sequence_delta(s_layer, delta, scale=0.25)
+            s_layer = self._apply_sequence_delta(
+                s_layer,
+                delta,
+                scale=self.warmup_delta_scale,
+            )
             s_layer = self._finalize_sequence_layer(s_layer)
+            self._register_layer_activation_grad(f"s_warmup/{warmup_index}", s_layer)
         for block_index, block in enumerate(self.joint_blocks):
             s_layer, compressed_b = block(s_layer, compressed_b)
             if self.collect_b_diversity_losses and compressed_b is not None:
@@ -2976,6 +3056,7 @@ def train_next_token_model(
     step_callback: Callable[[int, float, float], None] | None = None,
     loss_stats_callback: Callable[[int, dict[str, float]], None] | None = None,
     grad_stats_callback: Callable[[int, dict[str, float]], None] | None = None,
+    clip_stats_callback: Callable[[int, dict[str, float]], None] | None = None,
     eval_callback: Callable[[int, float, float], None] | None = None,
     checkpoint_callback: Callable[[int, float, float, nn.Module, torch.optim.Optimizer], None] | None = None,
     eval_on_first_step: bool = True,
@@ -3072,6 +3153,17 @@ def train_next_token_model(
                 learning_rate=current_learning_rate,
             )
         optimizer.zero_grad(set_to_none=True)
+        track_activation_grads = (
+            grad_stats_callback is not None
+            and (grad_breakdown_start_step is None or step >= grad_breakdown_start_step)
+        )
+        set_activation_tracking = getattr(model, "set_activation_grad_tracking", None)
+        if callable(set_activation_tracking):
+            set_activation_tracking(track_activation_grads)
+        if track_activation_grads:
+            reset_activation_stats = getattr(model, "reset_activation_grad_stats", None)
+            if callable(reset_activation_stats):
+                reset_activation_stats()
         accumulated_loss = 0.0
         accumulated_loss_stats: dict[str, list[float]] = {}
         for _ in range(grad_accum_steps):
@@ -3104,6 +3196,12 @@ def train_next_token_model(
                 for key, value in loss_stats.items():
                     accumulated_loss_stats.setdefault(key, []).append(value)
             (loss / grad_accum_steps).backward()
+        grad_stats: dict[str, float] | None = None
+        if (
+            grad_stats_callback is not None
+            and (grad_breakdown_start_step is None or step >= grad_breakdown_start_step)
+        ):
+            grad_stats = _collect_grad_group_norms(model, key_prefix="grad_preclip")
         grad_norm = 0.0
         if grad_clip is not None:
             grad_norm = float(
@@ -3115,15 +3213,18 @@ def train_next_token_model(
                 grad_norm = float(torch.stack(grads).norm().item())
         if not math.isfinite(grad_norm):
             raise FloatingPointError(f"Non-finite grad norm at step {step}: {grad_norm}")
-        if (
-            grad_stats_callback is not None
-            and (grad_breakdown_start_step is None or step >= grad_breakdown_start_step)
-        ):
-            grad_stats_callback(step, _collect_grad_group_norms(model))
-        _apply_relative_update_clip(
+        if grad_stats is not None:
+            grad_stats.update(_collect_grad_group_norms(model, key_prefix="grad_postclip"))
+            consume_activation_stats = getattr(model, "consume_activation_grad_stats", None)
+            if callable(consume_activation_stats):
+                grad_stats.update(consume_activation_stats())
+            grad_stats_callback(step, grad_stats)
+        clip_stats = _apply_relative_update_clip(
             optimizer,
             max_relative_update=relative_update_clip,
         )
+        if clip_stats_callback is not None and relative_update_clip > 0.0:
+            clip_stats_callback(step, clip_stats)
         optimizer.step()
         step_loss = accumulated_loss / grad_accum_steps
         train_step_losses.append(step_loss)
@@ -3231,6 +3332,7 @@ def train_query_block_pair_model(
     step_callback: Callable[[int, float, float], None] | None = None,
     loss_stats_callback: Callable[[int, dict[str, float]], None] | None = None,
     grad_stats_callback: Callable[[int, dict[str, float]], None] | None = None,
+    clip_stats_callback: Callable[[int, dict[str, float]], None] | None = None,
     eval_callback: Callable[[int, float, float], None] | None = None,
     checkpoint_callback: Callable[[int, float, float, nn.Module, torch.optim.Optimizer], None] | None = None,
     eval_on_first_step: bool = True,
@@ -3326,6 +3428,17 @@ def train_query_block_pair_model(
                 learning_rate=current_learning_rate,
             )
         optimizer.zero_grad(set_to_none=True)
+        track_activation_grads = (
+            grad_stats_callback is not None
+            and (grad_breakdown_start_step is None or step >= grad_breakdown_start_step)
+        )
+        set_activation_tracking = getattr(model, "set_activation_grad_tracking", None)
+        if callable(set_activation_tracking):
+            set_activation_tracking(track_activation_grads)
+        if track_activation_grads:
+            reset_activation_stats = getattr(model, "reset_activation_grad_stats", None)
+            if callable(reset_activation_stats):
+                reset_activation_stats()
         accumulated_loss = 0.0
         accumulated_loss_stats: dict[str, list[float]] = {}
         for _ in range(grad_accum_steps):
@@ -3354,6 +3467,12 @@ def train_query_block_pair_model(
                 for key, value in loss_stats.items():
                     accumulated_loss_stats.setdefault(key, []).append(value)
             (loss / grad_accum_steps).backward()
+        grad_stats: dict[str, float] | None = None
+        if (
+            grad_stats_callback is not None
+            and (grad_breakdown_start_step is None or step >= grad_breakdown_start_step)
+        ):
+            grad_stats = _collect_grad_group_norms(model, key_prefix="grad_preclip")
         grad_norm = 0.0
         if grad_clip is not None:
             grad_norm = float(
@@ -3365,15 +3484,18 @@ def train_query_block_pair_model(
                 grad_norm = float(torch.stack(grads).norm().item())
         if not math.isfinite(grad_norm):
             raise FloatingPointError(f'Non-finite grad norm at step {step}: {grad_norm}')
-        if (
-            grad_stats_callback is not None
-            and (grad_breakdown_start_step is None or step >= grad_breakdown_start_step)
-        ):
-            grad_stats_callback(step, _collect_grad_group_norms(model))
-        _apply_relative_update_clip(
+        if grad_stats is not None:
+            grad_stats.update(_collect_grad_group_norms(model, key_prefix="grad_postclip"))
+            consume_activation_stats = getattr(model, "consume_activation_grad_stats", None)
+            if callable(consume_activation_stats):
+                grad_stats.update(consume_activation_stats())
+            grad_stats_callback(step, grad_stats)
+        clip_stats = _apply_relative_update_clip(
             optimizer,
             max_relative_update=relative_update_clip,
         )
+        if clip_stats_callback is not None and relative_update_clip > 0.0:
+            clip_stats_callback(step, clip_stats)
         optimizer.step()
         step_loss = accumulated_loss / grad_accum_steps
         train_step_losses.append(step_loss)
@@ -3473,6 +3595,7 @@ def train_prefix_response_model(
     step_setup_callback: Callable[[int, int], None] | None = None,
     progress_callback: Callable[[int, int, float], None] | None = None,
     step_callback: Callable[[int, float, float], None] | None = None,
+    clip_stats_callback: Callable[[int, dict[str, float]], None] | None = None,
     eval_callback: Callable[[int, float, float], None] | None = None,
     checkpoint_callback: Callable[[int, float, float, nn.Module, torch.optim.Optimizer], None] | None = None,
     eval_on_first_step: bool = True,
@@ -3581,10 +3704,12 @@ def train_prefix_response_model(
                 grad_norm = float(torch.stack(grads).norm().item())
         if not math.isfinite(grad_norm):
             raise FloatingPointError(f"Non-finite grad norm at step {step}: {grad_norm}")
-        _apply_relative_update_clip(
+        clip_stats = _apply_relative_update_clip(
             optimizer,
             max_relative_update=relative_update_clip,
         )
+        if clip_stats_callback is not None and relative_update_clip > 0.0:
+            clip_stats_callback(step, clip_stats)
         optimizer.step()
         step_loss = accumulated_loss / grad_accum_steps
         train_step_losses.append(step_loss)
