@@ -91,7 +91,8 @@ def _apply_scaled_delta(
     if state_scale == 0.0 and val_scale == 0.0:
         return layer
     return layer.apply_delta(
-        _scale_delta(delta, state_scale=state_scale, val_scale=val_scale)
+        _scale_delta(delta, state_scale=state_scale, val_scale=val_scale),
+        merge_mode="replace",
     )
 
 
@@ -173,7 +174,6 @@ def _apply_relative_update_clip(
     optimizer: torch.optim.Optimizer,
     *,
     max_relative_update: float,
-    min_parameter_norm: float = 1.0,
 ) -> dict[str, float]:
     if max_relative_update <= 0.0:
         return {
@@ -186,7 +186,6 @@ def _apply_relative_update_clip(
     min_scale = 1.0
     total_tensors = 0
     clipped_tensors = 0
-    floored_tensors = 0
     for param_group in optimizer.param_groups:
         learning_rate = float(param_group.get("lr", 0.0))
         if learning_rate <= 0.0:
@@ -200,9 +199,7 @@ def _apply_relative_update_clip(
                 continue
             total_tensors += 1
             parameter_norm = float(parameter.detach().norm().item())
-            if parameter_norm < min_parameter_norm:
-                floored_tensors += 1
-            reference_norm = max(parameter_norm, min_parameter_norm)
+            reference_norm = parameter_norm
             max_grad_norm = (max_relative_update * reference_norm) / learning_rate
             if grad_norm <= max_grad_norm:
                 continue
@@ -211,10 +208,9 @@ def _apply_relative_update_clip(
             gradient.mul_(scale)
             min_scale = min(min_scale, scale)
     fraction = clipped_tensors / total_tensors if total_tensors > 0 else 0.0
-    floor_fraction = floored_tensors / total_tensors if total_tensors > 0 else 0.0
     return {
         "relative_update_clip/fraction": fraction,
-        "relative_update_clip/floor_fraction": floor_fraction,
+        "relative_update_clip/floor_fraction": 0.0,
         "relative_update_clip/min_scale": min_scale,
         "relative_update_clip/clipped_tensors": float(clipped_tensors),
         "relative_update_clip/total_tensors": float(total_tensors),
