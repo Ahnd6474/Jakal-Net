@@ -305,11 +305,6 @@ useful when the model shows intermittent loss and gradient spikes.
   receive weights that decay from `front_weight` down to `1.0`, so the first
   predicted tokens matter more than later tokens while still optimizing the
   whole block.
-- `--relative-update-clip` applies an additional optimizer-side clip after
-  global gradient norm clipping. For each parameter tensor, the pending update
-  norm `lr * ||grad||` is limited to a fixed fraction of the parameter norm.
-  This is useful when global grad clipping alone does not prevent repeated
-  large routed updates in the query path.
 - `--warmup-delta-scale` controls the residual gain on the `s_warmup` path.
   The current default is `0.0`, which keeps the warmup operators in the
   forward structure but removes their residual add from the learned sequence
@@ -328,8 +323,6 @@ In practical terms:
 - use `--query-block-front-weight 1.0` to disable front weighting
 - use values such as `2.0` to `4.0` when early-token quality matters more than
   later-token quality
-- use `--relative-update-clip 0.01` to keep each tensor update below roughly
-  `1%` of its parameter norm
 - use `--warmup-delta-scale 0.0` to disable the `s_warmup` residual path while
   keeping the rest of the model unchanged
 - use `--s-delta-scale 0.1` as a safer default when `query_block` training

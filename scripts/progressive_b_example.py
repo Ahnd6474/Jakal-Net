@@ -170,53 +170,6 @@ def _set_optimizer_hyperparams(
             param_group["weight_decay"] = weight_decay
 
 
-def _apply_relative_update_clip(
-    optimizer: torch.optim.Optimizer,
-    *,
-    max_relative_update: float,
-) -> dict[str, float]:
-    if max_relative_update <= 0.0:
-        return {
-            "relative_update_clip/fraction": 0.0,
-            "relative_update_clip/floor_fraction": 0.0,
-            "relative_update_clip/min_scale": 1.0,
-            "relative_update_clip/clipped_tensors": 0.0,
-            "relative_update_clip/total_tensors": 0.0,
-        }
-    min_scale = 1.0
-    total_tensors = 0
-    clipped_tensors = 0
-    for param_group in optimizer.param_groups:
-        learning_rate = float(param_group.get("lr", 0.0))
-        if learning_rate <= 0.0:
-            continue
-        for parameter in param_group["params"]:
-            gradient = parameter.grad
-            if gradient is None:
-                continue
-            grad_norm = float(gradient.detach().norm().item())
-            if not math.isfinite(grad_norm) or grad_norm <= 0.0:
-                continue
-            total_tensors += 1
-            parameter_norm = float(parameter.detach().norm().item())
-            reference_norm = parameter_norm
-            max_grad_norm = (max_relative_update * reference_norm) / learning_rate
-            if grad_norm <= max_grad_norm:
-                continue
-            clipped_tensors += 1
-            scale = max_grad_norm / grad_norm
-            gradient.mul_(scale)
-            min_scale = min(min_scale, scale)
-    fraction = clipped_tensors / total_tensors if total_tensors > 0 else 0.0
-    return {
-        "relative_update_clip/fraction": fraction,
-        "relative_update_clip/floor_fraction": 0.0,
-        "relative_update_clip/min_scale": min_scale,
-        "relative_update_clip/clipped_tensors": float(clipped_tensors),
-        "relative_update_clip/total_tensors": float(total_tensors),
-    }
-
-
 def _resolve_scheduled_learning_rate(
     *,
     base_learning_rate: float,
@@ -3052,7 +3005,6 @@ def train_next_token_model(
     step_callback: Callable[[int, float, float], None] | None = None,
     loss_stats_callback: Callable[[int, dict[str, float]], None] | None = None,
     grad_stats_callback: Callable[[int, dict[str, float]], None] | None = None,
-    clip_stats_callback: Callable[[int, dict[str, float]], None] | None = None,
     eval_callback: Callable[[int, float, float], None] | None = None,
     checkpoint_callback: Callable[[int, float, float, nn.Module, torch.optim.Optimizer], None] | None = None,
     eval_on_first_step: bool = True,
@@ -3078,7 +3030,6 @@ def train_next_token_model(
     learning_rate_warmup_start: float | None = None,
     learning_rate_min_ratio: float = 0.0,
     query_block_front_weight: float = 1.0,
-    relative_update_clip: float = 0.0,
     grad_breakdown_start_step: int | None = None,
 ) -> TrainingHistory:
     if grad_accum_steps <= 0:
@@ -3215,12 +3166,6 @@ def train_next_token_model(
             if callable(consume_activation_stats):
                 grad_stats.update(consume_activation_stats())
             grad_stats_callback(step, grad_stats)
-        clip_stats = _apply_relative_update_clip(
-            optimizer,
-            max_relative_update=relative_update_clip,
-        )
-        if clip_stats_callback is not None and relative_update_clip > 0.0:
-            clip_stats_callback(step, clip_stats)
         optimizer.step()
         step_loss = accumulated_loss / grad_accum_steps
         train_step_losses.append(step_loss)
@@ -3328,7 +3273,6 @@ def train_query_block_pair_model(
     step_callback: Callable[[int, float, float], None] | None = None,
     loss_stats_callback: Callable[[int, dict[str, float]], None] | None = None,
     grad_stats_callback: Callable[[int, dict[str, float]], None] | None = None,
-    clip_stats_callback: Callable[[int, dict[str, float]], None] | None = None,
     eval_callback: Callable[[int, float, float], None] | None = None,
     checkpoint_callback: Callable[[int, float, float, nn.Module, torch.optim.Optimizer], None] | None = None,
     eval_on_first_step: bool = True,
@@ -3353,7 +3297,6 @@ def train_query_block_pair_model(
     learning_rate_warmup_start: float | None = None,
     learning_rate_min_ratio: float = 0.0,
     query_block_front_weight: float = 1.0,
-    relative_update_clip: float = 0.0,
     grad_breakdown_start_step: int | None = None,
 ) -> TrainingHistory:
     if grad_accum_steps <= 0:
@@ -3486,12 +3429,6 @@ def train_query_block_pair_model(
             if callable(consume_activation_stats):
                 grad_stats.update(consume_activation_stats())
             grad_stats_callback(step, grad_stats)
-        clip_stats = _apply_relative_update_clip(
-            optimizer,
-            max_relative_update=relative_update_clip,
-        )
-        if clip_stats_callback is not None and relative_update_clip > 0.0:
-            clip_stats_callback(step, clip_stats)
         optimizer.step()
         step_loss = accumulated_loss / grad_accum_steps
         train_step_losses.append(step_loss)
@@ -3591,7 +3528,6 @@ def train_prefix_response_model(
     step_setup_callback: Callable[[int, int], None] | None = None,
     progress_callback: Callable[[int, int, float], None] | None = None,
     step_callback: Callable[[int, float, float], None] | None = None,
-    clip_stats_callback: Callable[[int, dict[str, float]], None] | None = None,
     eval_callback: Callable[[int, float, float], None] | None = None,
     checkpoint_callback: Callable[[int, float, float, nn.Module, torch.optim.Optimizer], None] | None = None,
     eval_on_first_step: bool = True,
@@ -3606,7 +3542,6 @@ def train_prefix_response_model(
     learning_rate_warmup_steps: int = 0,
     learning_rate_warmup_start: float | None = None,
     learning_rate_min_ratio: float = 0.0,
-    relative_update_clip: float = 0.0,
 ) -> TrainingHistory:
     if grad_accum_steps <= 0:
         raise ValueError("grad_accum_steps must be positive.")
@@ -3700,12 +3635,6 @@ def train_prefix_response_model(
                 grad_norm = float(torch.stack(grads).norm().item())
         if not math.isfinite(grad_norm):
             raise FloatingPointError(f"Non-finite grad norm at step {step}: {grad_norm}")
-        clip_stats = _apply_relative_update_clip(
-            optimizer,
-            max_relative_update=relative_update_clip,
-        )
-        if clip_stats_callback is not None and relative_update_clip > 0.0:
-            clip_stats_callback(step, clip_stats)
         optimizer.step()
         step_loss = accumulated_loss / grad_accum_steps
         train_step_losses.append(step_loss)

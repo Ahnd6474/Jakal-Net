@@ -1805,7 +1805,6 @@ def run_single_experiment(
         f"lr_warmup_start={args.learning_rate_warmup_start} | "
         f"lr_min_ratio={args.learning_rate_min_ratio:.3f} | "
         f"query_block_front_weight={args.query_block_front_weight:.3f} | "
-        f"relative_update_clip={args.relative_update_clip:.4f} | "
         f"freeze_position_encoding={args.freeze_position_encoding} | "
         f"grad_breakdown={args.grad_breakdown} | "
         f"grad_breakdown_start_step={args.grad_breakdown_start_step}"
@@ -1919,7 +1918,6 @@ def run_single_experiment(
                 "learning_rate_warmup_start": args.learning_rate_warmup_start,
                 "learning_rate_min_ratio": args.learning_rate_min_ratio,
                 "query_block_front_weight": args.query_block_front_weight,
-                "relative_update_clip": args.relative_update_clip,
                 "alpha_scale": args.alpha_scale,
                 "beta_s_to_b_scale": args.beta_s_to_b_scale,
                 "beta_b_to_s_scale": args.beta_b_to_s_scale,
@@ -2151,14 +2149,6 @@ def run_single_experiment(
         if step == 1 or step == train_steps or (args.log_interval > 0 and step % args.log_interval == 0):
             writer.flush()
 
-    def clip_stats_tensorboard_callback(step: int, stats: dict[str, float]) -> None:
-        if writer is None:
-            return
-        for key, value in sorted(stats.items()):
-            writer.add_scalar(f"debug/{key}", value, step)
-        if step == 1 or step == train_steps or (args.log_interval > 0 and step % args.log_interval == 0):
-            writer.flush()
-
     def eval_tensorboard_callback(step: int, train_loss: float, val_loss: float) -> None:
         if writer is not None:
             writer.add_scalar("eval/metrics/train_loss", train_loss, step)
@@ -2224,11 +2214,9 @@ def run_single_experiment(
                 learning_rate_warmup_steps=args.learning_rate_warmup_steps,
                 learning_rate_warmup_start=args.learning_rate_warmup_start,
                 learning_rate_min_ratio=args.learning_rate_min_ratio,
-                relative_update_clip=args.relative_update_clip,
                 step_setup_callback=step_setup_callback,
                 progress_callback=progress_callback,
                 step_callback=step_tensorboard_callback,
-                clip_stats_callback=clip_stats_tensorboard_callback if args.grad_breakdown and args.relative_update_clip > 0.0 else None,
                 eval_callback=eval_tensorboard_callback,
                 checkpoint_callback=training_checkpoint_callback,
                 eval_on_first_step=eval_on_first_step,
@@ -2263,7 +2251,6 @@ def run_single_experiment(
                 step_callback=step_tensorboard_callback,
                 loss_stats_callback=loss_stats_tensorboard_callback,
                 grad_stats_callback=grad_stats_tensorboard_callback if args.grad_breakdown else None,
-                clip_stats_callback=clip_stats_tensorboard_callback if args.grad_breakdown and args.relative_update_clip > 0.0 else None,
                 eval_callback=eval_tensorboard_callback,
                 checkpoint_callback=training_checkpoint_callback,
                 eval_on_first_step=eval_on_first_step,
@@ -2288,7 +2275,6 @@ def run_single_experiment(
                 learning_rate_warmup_start=args.learning_rate_warmup_start,
                 learning_rate_min_ratio=args.learning_rate_min_ratio,
                 query_block_front_weight=args.query_block_front_weight,
-                relative_update_clip=args.relative_update_clip,
                 grad_breakdown_start_step=args.grad_breakdown_start_step if args.grad_breakdown else None,
             )
         else:
@@ -2318,7 +2304,6 @@ def run_single_experiment(
                 step_callback=step_tensorboard_callback,
                 loss_stats_callback=loss_stats_tensorboard_callback,
                 grad_stats_callback=grad_stats_tensorboard_callback if args.grad_breakdown else None,
-                clip_stats_callback=clip_stats_tensorboard_callback if args.grad_breakdown and args.relative_update_clip > 0.0 else None,
                 eval_callback=eval_tensorboard_callback,
                 checkpoint_callback=training_checkpoint_callback,
                 eval_on_first_step=eval_on_first_step,
@@ -2344,7 +2329,6 @@ def run_single_experiment(
                 learning_rate_warmup_start=args.learning_rate_warmup_start,
                 learning_rate_min_ratio=args.learning_rate_min_ratio,
                 query_block_front_weight=args.query_block_front_weight,
-                relative_update_clip=args.relative_update_clip,
                 grad_breakdown_start_step=args.grad_breakdown_start_step if args.grad_breakdown else None,
             )
     except Exception:
@@ -2477,7 +2461,6 @@ def run_single_experiment(
         "learning_rate_warmup_start": args.learning_rate_warmup_start,
         "learning_rate_min_ratio": args.learning_rate_min_ratio,
         "query_block_front_weight": args.query_block_front_weight,
-        "relative_update_clip": args.relative_update_clip,
         "weight_decay": args.weight_decay,
         "precision": args.precision,
         "s_window": args.s_window,
@@ -2767,7 +2750,6 @@ def main() -> None:
     parser.add_argument("--learning-rate-min-ratio", type=float, default=0.0)
     parser.add_argument("--reset-optimizer-on-resume", action="store_true")
     parser.add_argument("--query-block-front-weight", type=float, default=1.0)
-    parser.add_argument("--relative-update-clip", type=float, default=0.0)
     parser.add_argument("--grad-breakdown", action="store_true")
     parser.add_argument("--grad-breakdown-start-step", type=int, default=0)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
@@ -2933,8 +2915,6 @@ def main() -> None:
         raise ValueError("learning-rate-min-ratio must be in [0, 1].")
     if args.query_block_front_weight < 1.0:
         raise ValueError("query-block-front-weight must be at least 1.0.")
-    if args.relative_update_clip < 0.0:
-        raise ValueError("relative-update-clip must be non-negative.")
     if args.grad_breakdown_start_step < 0:
         raise ValueError("grad-breakdown-start-step must be non-negative.")
     if not 0.0 <= args.b_cosine_margin < 1.0:

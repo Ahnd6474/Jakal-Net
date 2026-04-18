@@ -79,7 +79,6 @@ def main() -> None:
             "debug/grad_preclip/",
             "debug/grad_postclip/",
             "debug/activation_grad/",
-            "debug/relative_update_clip/",
         ],
         help="Scalar tag prefix whose top values should be printed. Can be repeated.",
     )
