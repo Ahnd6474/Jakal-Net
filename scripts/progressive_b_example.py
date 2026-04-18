@@ -169,12 +169,44 @@ def _set_optimizer_hyperparams(
             param_group["weight_decay"] = weight_decay
 
 
+def _apply_relative_update_clip(
+    optimizer: torch.optim.Optimizer,
+    *,
+    max_relative_update: float,
+    min_parameter_norm: float = 1.0,
+) -> float:
+    if max_relative_update <= 0.0:
+        return 1.0
+    min_scale = 1.0
+    for param_group in optimizer.param_groups:
+        learning_rate = float(param_group.get("lr", 0.0))
+        if learning_rate <= 0.0:
+            continue
+        for parameter in param_group["params"]:
+            gradient = parameter.grad
+            if gradient is None:
+                continue
+            grad_norm = float(gradient.detach().norm().item())
+            if not math.isfinite(grad_norm) or grad_norm <= 0.0:
+                continue
+            parameter_norm = float(parameter.detach().norm().item())
+            reference_norm = max(parameter_norm, min_parameter_norm)
+            max_grad_norm = (max_relative_update * reference_norm) / learning_rate
+            if grad_norm <= max_grad_norm:
+                continue
+            scale = max_grad_norm / grad_norm
+            gradient.mul_(scale)
+            min_scale = min(min_scale, scale)
+    return min_scale
+
+
 def _resolve_scheduled_learning_rate(
     *,
     base_learning_rate: float,
     schedule: str,
     warmup_steps: int,
     warmup_start_learning_rate: float | None,
+    min_learning_rate_ratio: float,
     step: int,
     start_step: int,
     total_steps: int,
@@ -196,7 +228,9 @@ def _resolve_scheduled_learning_rate(
     decay_steps = max(1, total_steps - start_step - warmup_steps)
     decay_progress = min(1.0, max(0.0, (relative_step - warmup_steps) / decay_steps))
     cosine_scale = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
-    return base_learning_rate * cosine_scale
+    return base_learning_rate * (
+        min_learning_rate_ratio + (1.0 - min_learning_rate_ratio) * cosine_scale
+    )
 
 
 def _grad_group_keys(parameter_name: str) -> tuple[str, ...]:
@@ -2548,19 +2582,50 @@ def _cross_entropy_with_optional_mask(
     logits: Tensor,
     target: Tensor,
     loss_mask: Tensor | None,
+    *,
+    position_weights: Tensor | None = None,
 ) -> Tensor:
     losses = F.cross_entropy(
         logits.reshape(-1, logits.shape[-1]),
         target.reshape(-1),
         reduction='none',
     )
-    if loss_mask is None:
+    flat_weights = None
+    if loss_mask is not None:
+        flat_weights = loss_mask.reshape(-1).to(device=losses.device, dtype=losses.dtype)
+    if position_weights is not None:
+        scaled_weights = position_weights.reshape(-1).to(device=losses.device, dtype=losses.dtype)
+        flat_weights = scaled_weights if flat_weights is None else (flat_weights * scaled_weights)
+    if flat_weights is None:
         return losses.mean()
-    flat_mask = loss_mask.reshape(-1).to(device=losses.device, dtype=losses.dtype)
-    mask_total = flat_mask.sum()
+    mask_total = flat_weights.sum()
     if mask_total.item() <= 0:
         raise ValueError('loss_mask must select at least one target position.')
-    return (losses * flat_mask).sum() / mask_total
+    return (losses * flat_weights).sum() / mask_total
+
+
+def _query_block_position_weights(
+    target: Tensor,
+    *,
+    front_weight: float,
+) -> Tensor | None:
+    if front_weight == 1.0:
+        return None
+    target_width = target.shape[-1]
+    if target_width <= 1:
+        return None
+    weights = torch.ones(target_width, device=target.device, dtype=torch.float32)
+    weights[1:] = torch.exp(
+        torch.linspace(
+            math.log(front_weight),
+            0.0,
+            steps=target_width - 1,
+            device=target.device,
+            dtype=torch.float32,
+        )
+    )
+    weights[0] = 0.0
+    return weights.unsqueeze(0).expand(target.shape[0], -1)
 
 
 def compute_next_token_loss(
@@ -2582,6 +2647,7 @@ def compute_next_token_loss(
     route_concentration_loss_weight: float = 0.0,
     route_load_cap: float = 0.25,
     edge_prob_cap: float = 0.55,
+    query_block_front_weight: float = 1.0,
 ) -> tuple[Tensor, Tensor]:
     if teacher_forcing and full_sequence_causal:
         raise ValueError("teacher_forcing and full_sequence_causal cannot both be enabled.")
@@ -2637,13 +2703,26 @@ def compute_next_token_loss(
                 teacher_forcing_chunk_size=teacher_forcing_chunk_size,
             )
             compressed_b = None
-        main_loss = _cross_entropy_with_optional_mask(
+        position_weights = None
+        if query_block and batch.target.ndim > 1:
+            position_weights = _query_block_position_weights(
+                batch.target,
+                front_weight=query_block_front_weight,
+            )
+        average_main_loss = _cross_entropy_with_optional_mask(
             logits,
             batch.target,
             batch.loss_mask,
         )
+        main_loss = _cross_entropy_with_optional_mask(
+            logits,
+            batch.target,
+            batch.loss_mask,
+            position_weights=position_weights,
+        )
         loss = main_loss
         loss_stats["loss/main"] = float(main_loss.detach().item())
+        loss_stats["loss/avg_main"] = float(average_main_loss.detach().item())
         if query_block and batch.target.ndim > 1:
             target_width = batch.target.shape[-1]
             for start, end in ((0, 16), (16, 32), (32, 64), (64, 128)):
@@ -2745,6 +2824,7 @@ def estimate_next_token_loss(
     autocast_dtype: torch.dtype | None = None,
     balanced_token_groups: Sequence[Tensor] | None = None,
     query_block_start_token_id: int | None = None,
+    query_block_front_weight: float = 1.0,
 ) -> float:
     was_training = model.training
     model.eval()
@@ -2771,6 +2851,7 @@ def estimate_next_token_loss(
             teacher_forcing_chunk_size=teacher_forcing_chunk_size,
             autocast_device_type=autocast_device_type,
             autocast_dtype=autocast_dtype,
+            query_block_front_weight=query_block_front_weight,
         )
         losses.append(float(loss.item()))
     if was_training:
@@ -2794,6 +2875,7 @@ def estimate_query_block_pair_loss(
     autocast_device_type: str | None = None,
     autocast_dtype: torch.dtype | None = None,
     balanced_index_groups: Sequence[Sequence[int]] | None = None,
+    query_block_front_weight: float = 1.0,
 ) -> float:
     was_training = model.training
     model.eval()
@@ -2816,6 +2898,7 @@ def estimate_query_block_pair_loss(
             query_block=True,
             autocast_device_type=autocast_device_type,
             autocast_dtype=autocast_dtype,
+            query_block_front_weight=query_block_front_weight,
         )
         losses.append(float(loss.item()))
     if was_training:
@@ -2916,6 +2999,9 @@ def train_next_token_model(
     learning_rate_schedule: str = "none",
     learning_rate_warmup_steps: int = 0,
     learning_rate_warmup_start: float | None = None,
+    learning_rate_min_ratio: float = 0.0,
+    query_block_front_weight: float = 1.0,
+    relative_update_clip: float = 0.0,
     grad_breakdown_start_step: int | None = None,
 ) -> TrainingHistory:
     if grad_accum_steps <= 0:
@@ -2927,16 +3013,25 @@ def train_next_token_model(
         lr=learning_rate,
         weight_decay=weight_decay,
     )
+    loaded_optimizer_state = False
     if optimizer_state_dict is not None:
         try:
             optimizer.load_state_dict(optimizer_state_dict)
+            loaded_optimizer_state = True
         except ValueError as exc:
             print(f"optimizer_state_load_skipped | reason={exc}")
-    _set_optimizer_hyperparams(
-        optimizer,
-        learning_rate=learning_rate,
-        weight_decay=weight_decay,
-    )
+    if loaded_optimizer_state:
+        _set_optimizer_hyperparams(
+            optimizer,
+            learning_rate=optimizer.param_groups[0]["lr"],
+            weight_decay=optimizer.param_groups[0].get("weight_decay"),
+        )
+    else:
+        _set_optimizer_hyperparams(
+            optimizer,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+        )
     eval_steps_seen: list[int] = []
     train_step_losses: list[float] = []
     grad_norms: list[float] = []
@@ -2961,19 +3056,21 @@ def train_next_token_model(
         step = start_step + relative_step
         if step_setup_callback is not None:
             step_setup_callback(step, schedule_total_steps)
-        current_learning_rate = _resolve_scheduled_learning_rate(
-            base_learning_rate=learning_rate,
-            schedule=learning_rate_schedule,
-            warmup_steps=learning_rate_warmup_steps,
-            warmup_start_learning_rate=learning_rate_warmup_start,
-            step=step,
-            start_step=start_step,
-            total_steps=schedule_total_steps,
-        )
-        _set_optimizer_hyperparams(
-            optimizer,
-            learning_rate=current_learning_rate,
-        )
+        if not loaded_optimizer_state:
+            current_learning_rate = _resolve_scheduled_learning_rate(
+                base_learning_rate=learning_rate,
+                schedule=learning_rate_schedule,
+                warmup_steps=learning_rate_warmup_steps,
+                warmup_start_learning_rate=learning_rate_warmup_start,
+                min_learning_rate_ratio=learning_rate_min_ratio,
+                step=step,
+                start_step=start_step,
+                total_steps=schedule_total_steps,
+            )
+            _set_optimizer_hyperparams(
+                optimizer,
+                learning_rate=current_learning_rate,
+            )
         optimizer.zero_grad(set_to_none=True)
         accumulated_loss = 0.0
         accumulated_loss_stats: dict[str, list[float]] = {}
@@ -2997,6 +3094,7 @@ def train_next_token_model(
                 route_concentration_loss_weight=route_concentration_loss_weight,
                 route_load_cap=route_load_cap,
                 edge_prob_cap=edge_prob_cap,
+                query_block_front_weight=query_block_front_weight,
             )
             if not torch.isfinite(loss).item():
                 raise FloatingPointError(f"Non-finite loss at step {step}: {loss.item()}")
@@ -3022,6 +3120,10 @@ def train_next_token_model(
             and (grad_breakdown_start_step is None or step >= grad_breakdown_start_step)
         ):
             grad_stats_callback(step, _collect_grad_group_norms(model))
+        _apply_relative_update_clip(
+            optimizer,
+            max_relative_update=relative_update_clip,
+        )
         optimizer.step()
         step_loss = accumulated_loss / grad_accum_steps
         train_step_losses.append(step_loss)
@@ -3066,6 +3168,7 @@ def train_next_token_model(
                 autocast_dtype=autocast_dtype,
                 balanced_token_groups=balanced_token_groups,
                 query_block_start_token_id=query_block_start_token_id,
+                query_block_front_weight=query_block_front_weight,
             )
             val_eval = estimate_next_token_loss(
                 model,
@@ -3084,6 +3187,7 @@ def train_next_token_model(
                 autocast_dtype=autocast_dtype,
                 balanced_token_groups=val_balanced_token_groups,
                 query_block_start_token_id=query_block_start_token_id,
+                query_block_front_weight=query_block_front_weight,
             )
             train_losses.append(train_eval)
             val_losses.append(val_eval)
@@ -3149,6 +3253,9 @@ def train_query_block_pair_model(
     learning_rate_schedule: str = 'none',
     learning_rate_warmup_steps: int = 0,
     learning_rate_warmup_start: float | None = None,
+    learning_rate_min_ratio: float = 0.0,
+    query_block_front_weight: float = 1.0,
+    relative_update_clip: float = 0.0,
     grad_breakdown_start_step: int | None = None,
 ) -> TrainingHistory:
     if grad_accum_steps <= 0:
@@ -3160,16 +3267,25 @@ def train_query_block_pair_model(
         lr=learning_rate,
         weight_decay=weight_decay,
     )
+    loaded_optimizer_state = False
     if optimizer_state_dict is not None:
         try:
             optimizer.load_state_dict(optimizer_state_dict)
+            loaded_optimizer_state = True
         except ValueError as exc:
             print(f'optimizer_state_load_skipped | reason={exc}')
-    _set_optimizer_hyperparams(
-        optimizer,
-        learning_rate=learning_rate,
-        weight_decay=weight_decay,
-    )
+    if loaded_optimizer_state:
+        _set_optimizer_hyperparams(
+            optimizer,
+            learning_rate=optimizer.param_groups[0]['lr'],
+            weight_decay=optimizer.param_groups[0].get('weight_decay'),
+        )
+    else:
+        _set_optimizer_hyperparams(
+            optimizer,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+        )
     eval_steps_seen: list[int] = []
     train_step_losses: list[float] = []
     grad_norms: list[float] = []
@@ -3194,19 +3310,21 @@ def train_query_block_pair_model(
         step = start_step + relative_step
         if step_setup_callback is not None:
             step_setup_callback(step, schedule_total_steps)
-        current_learning_rate = _resolve_scheduled_learning_rate(
-            base_learning_rate=learning_rate,
-            schedule=learning_rate_schedule,
-            warmup_steps=learning_rate_warmup_steps,
-            warmup_start_learning_rate=learning_rate_warmup_start,
-            step=step,
-            start_step=start_step,
-            total_steps=schedule_total_steps,
-        )
-        _set_optimizer_hyperparams(
-            optimizer,
-            learning_rate=current_learning_rate,
-        )
+        if not loaded_optimizer_state:
+            current_learning_rate = _resolve_scheduled_learning_rate(
+                base_learning_rate=learning_rate,
+                schedule=learning_rate_schedule,
+                warmup_steps=learning_rate_warmup_steps,
+                warmup_start_learning_rate=learning_rate_warmup_start,
+                min_learning_rate_ratio=learning_rate_min_ratio,
+                step=step,
+                start_step=start_step,
+                total_steps=schedule_total_steps,
+            )
+            _set_optimizer_hyperparams(
+                optimizer,
+                learning_rate=current_learning_rate,
+            )
         optimizer.zero_grad(set_to_none=True)
         accumulated_loss = 0.0
         accumulated_loss_stats: dict[str, list[float]] = {}
@@ -3226,6 +3344,7 @@ def train_query_block_pair_model(
                 route_concentration_loss_weight=route_concentration_loss_weight,
                 route_load_cap=route_load_cap,
                 edge_prob_cap=edge_prob_cap,
+                query_block_front_weight=query_block_front_weight,
             )
             if not torch.isfinite(loss).item():
                 raise FloatingPointError(f'Non-finite loss at step {step}: {loss.item()}')
@@ -3251,6 +3370,10 @@ def train_query_block_pair_model(
             and (grad_breakdown_start_step is None or step >= grad_breakdown_start_step)
         ):
             grad_stats_callback(step, _collect_grad_group_norms(model))
+        _apply_relative_update_clip(
+            optimizer,
+            max_relative_update=relative_update_clip,
+        )
         optimizer.step()
         step_loss = accumulated_loss / grad_accum_steps
         train_step_losses.append(step_loss)
@@ -3292,6 +3415,7 @@ def train_query_block_pair_model(
                 autocast_device_type=autocast_device_type,
                 autocast_dtype=autocast_dtype,
                 balanced_index_groups=balanced_index_groups,
+                query_block_front_weight=query_block_front_weight,
             )
             val_eval = estimate_query_block_pair_loss(
                 model,
@@ -3307,6 +3431,7 @@ def train_query_block_pair_model(
                 autocast_device_type=autocast_device_type,
                 autocast_dtype=autocast_dtype,
                 balanced_index_groups=val_balanced_index_groups,
+                query_block_front_weight=query_block_front_weight,
             )
             train_losses.append(train_eval)
             val_losses.append(val_eval)
@@ -3361,6 +3486,8 @@ def train_prefix_response_model(
     learning_rate_schedule: str = "none",
     learning_rate_warmup_steps: int = 0,
     learning_rate_warmup_start: float | None = None,
+    learning_rate_min_ratio: float = 0.0,
+    relative_update_clip: float = 0.0,
 ) -> TrainingHistory:
     if grad_accum_steps <= 0:
         raise ValueError("grad_accum_steps must be positive.")
@@ -3371,16 +3498,25 @@ def train_prefix_response_model(
         lr=learning_rate,
         weight_decay=weight_decay,
     )
+    loaded_optimizer_state = False
     if optimizer_state_dict is not None:
         try:
             optimizer.load_state_dict(optimizer_state_dict)
+            loaded_optimizer_state = True
         except ValueError as exc:
             print(f"optimizer_state_load_skipped | reason={exc}")
-    _set_optimizer_hyperparams(
-        optimizer,
-        learning_rate=learning_rate,
-        weight_decay=weight_decay,
-    )
+    if loaded_optimizer_state:
+        _set_optimizer_hyperparams(
+            optimizer,
+            learning_rate=optimizer.param_groups[0]["lr"],
+            weight_decay=optimizer.param_groups[0].get("weight_decay"),
+        )
+    else:
+        _set_optimizer_hyperparams(
+            optimizer,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+        )
     eval_steps_seen: list[int] = []
     train_step_losses: list[float] = []
     grad_norms: list[float] = []
@@ -3405,19 +3541,21 @@ def train_prefix_response_model(
         step = start_step + relative_step
         if step_setup_callback is not None:
             step_setup_callback(step, schedule_total_steps)
-        current_learning_rate = _resolve_scheduled_learning_rate(
-            base_learning_rate=learning_rate,
-            schedule=learning_rate_schedule,
-            warmup_steps=learning_rate_warmup_steps,
-            warmup_start_learning_rate=learning_rate_warmup_start,
-            step=step,
-            start_step=start_step,
-            total_steps=schedule_total_steps,
-        )
-        _set_optimizer_hyperparams(
-            optimizer,
-            learning_rate=current_learning_rate,
-        )
+        if not loaded_optimizer_state:
+            current_learning_rate = _resolve_scheduled_learning_rate(
+                base_learning_rate=learning_rate,
+                schedule=learning_rate_schedule,
+                warmup_steps=learning_rate_warmup_steps,
+                warmup_start_learning_rate=learning_rate_warmup_start,
+                min_learning_rate_ratio=learning_rate_min_ratio,
+                step=step,
+                start_step=start_step,
+                total_steps=schedule_total_steps,
+            )
+            _set_optimizer_hyperparams(
+                optimizer,
+                learning_rate=current_learning_rate,
+            )
         optimizer.zero_grad(set_to_none=True)
         accumulated_loss = 0.0
         for _ in range(grad_accum_steps):
@@ -3443,6 +3581,10 @@ def train_prefix_response_model(
                 grad_norm = float(torch.stack(grads).norm().item())
         if not math.isfinite(grad_norm):
             raise FloatingPointError(f"Non-finite grad norm at step {step}: {grad_norm}")
+        _apply_relative_update_clip(
+            optimizer,
+            max_relative_update=relative_update_clip,
+        )
         optimizer.step()
         step_loss = accumulated_loss / grad_accum_steps
         train_step_losses.append(step_loss)

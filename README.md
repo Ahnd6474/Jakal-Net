@@ -146,6 +146,8 @@ alternative LM structure than to a conventional Transformer implementation.
   LaTeX-heavy corpora.
 - TensorBoard logging focused on total minibatch loss and overlaid
   distance-bucket perplexity curves.
+- Query-block specific logging for unweighted average perplexity, grad norm,
+  eval samples, and distance-bucket perplexity.
 - Best/last/final checkpoint artifacts for experiment tracking.
 
 ## Repository Layout
@@ -291,6 +293,34 @@ The training script writes:
   `artifacts/training_runs/`
 - best and last checkpoints under `custom/checkpoints/` when
   `--save-checkpoint` is enabled
+
+### Query-Block Optimization Controls
+
+Recent query-block experiments use two extra optimization controls that are
+useful when the model shows intermittent loss and gradient spikes.
+
+- `--query-block-front-weight` applies an exponential position weight over the
+  supervised query-block targets. Position `0` remains a structural
+  `query_block_start` slot with zero loss weight. Positions `1..target_len`
+  receive weights that decay from `front_weight` down to `1.0`, so the first
+  predicted tokens matter more than later tokens while still optimizing the
+  whole block.
+- `--relative-update-clip` applies an additional optimizer-side clip after
+  global gradient norm clipping. For each parameter tensor, the pending update
+  norm `lr * ||grad||` is limited to a fixed fraction of the parameter norm.
+  This is useful when global grad clipping alone does not prevent repeated
+  large routed updates in the query path.
+
+In practical terms:
+
+- use `--query-block-front-weight 1.0` to disable front weighting
+- use values such as `2.0` to `4.0` when early-token quality matters more than
+  later-token quality
+- use `--relative-update-clip 0.01` to keep each tensor update below roughly
+  `1%` of its parameter norm
+
+These controls can be combined with the existing global grad norm clip,
+learning-rate warmup, and cosine decay schedule.
 
 Launch TensorBoard against the current artifact root:
 

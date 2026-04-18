@@ -1438,6 +1438,8 @@ def log_history_to_tensorboard(
         for step, loss in enumerate(history.train_step_losses, start=1):
             writer.add_scalar("train/minibatch_loss", loss, step)
             writer.add_scalar("train/epoch", step / steps_per_epoch, step)
+        for step, grad_norm in enumerate(history.grad_norms, start=1):
+            writer.add_scalar("train/grad_norm", grad_norm, step)
         for step, train_loss, val_loss in zip(
             history.eval_steps,
             history.train_losses,
@@ -1787,6 +1789,9 @@ def run_single_experiment(
         f"lr_schedule={args.learning_rate_schedule} | "
         f"lr_warmup_steps={args.learning_rate_warmup_steps} | "
         f"lr_warmup_start={args.learning_rate_warmup_start} | "
+        f"lr_min_ratio={args.learning_rate_min_ratio:.3f} | "
+        f"query_block_front_weight={args.query_block_front_weight:.3f} | "
+        f"relative_update_clip={args.relative_update_clip:.4f} | "
         f"grad_breakdown={args.grad_breakdown} | "
         f"grad_breakdown_start_step={args.grad_breakdown_start_step}"
     )
@@ -1808,13 +1813,20 @@ def run_single_experiment(
                 f"unexpected={list(load_result.unexpected_keys)}"
             )
         raw_optimizer_state = resume_checkpoint.get("optimizer_state_dict")
-        optimizer_state_dict = raw_optimizer_state if isinstance(raw_optimizer_state, dict) else None
+        optimizer_state_dict = (
+            None
+            if args.reset_optimizer_on_resume
+            else (raw_optimizer_state if isinstance(raw_optimizer_state, dict) else None)
+        )
         restore_rng_state(resume_checkpoint.get("rng_state"))
         if resume_step >= train_steps:
             raise ValueError(
                 f"Resume checkpoint step {resume_step} is already >= requested train_steps {train_steps}."
             )
-        print(f"resume_checkpoint={args.resume_checkpoint} | resume_step={resume_step:,}")
+        print(
+            f"resume_checkpoint={args.resume_checkpoint} | resume_step={resume_step:,} | "
+            f"optimizer_reset={args.reset_optimizer_on_resume}"
+        )
 
     best_checkpoint_val_loss = math.inf
     if resume_checkpoint is not None and resume_checkpoint.get("val_loss") is not None:
@@ -1889,6 +1901,9 @@ def run_single_experiment(
                 "learning_rate_schedule": args.learning_rate_schedule,
                 "learning_rate_warmup_steps": args.learning_rate_warmup_steps,
                 "learning_rate_warmup_start": args.learning_rate_warmup_start,
+                "learning_rate_min_ratio": args.learning_rate_min_ratio,
+                "query_block_front_weight": args.query_block_front_weight,
+                "relative_update_clip": args.relative_update_clip,
                 "alpha_scale": args.alpha_scale,
                 "beta_s_to_b_scale": args.beta_s_to_b_scale,
                 "beta_b_to_s_scale": args.beta_b_to_s_scale,
@@ -2087,12 +2102,20 @@ def run_single_experiment(
             return
         writer.add_scalar("train/minibatch_loss", minibatch_loss, step)
         writer.add_scalar("train/epoch", step / steps_per_epoch, step)
+        writer.add_scalar("train/grad_norm", grad_norm, step)
         if step == 1 or step == train_steps or (args.log_interval > 0 and step % args.log_interval == 0):
             writer.flush()
 
     def loss_stats_tensorboard_callback(step: int, stats: dict[str, float]) -> None:
         if writer is None:
             return
+        average_main_loss = stats.get("loss/avg_main")
+        if average_main_loss is not None and args.training_objective == "query_block":
+            writer.add_scalar(
+                "train/query_block_avg_ppl",
+                perplexity_from_loss(average_main_loss),
+                step,
+            )
         bucket_ppl = {
             key.removeprefix("query_block_pos_loss/"): perplexity_from_loss(value)
             for key, value in sorted(stats.items())
@@ -2112,6 +2135,15 @@ def run_single_experiment(
             writer.add_scalar("eval/metrics/val_loss", val_loss, step)
             writer.add_scalar("eval/metrics/train_ppl", perplexity_from_loss(train_loss), step)
             writer.add_scalar("eval/metrics/val_ppl", perplexity_from_loss(val_loss), step)
+            sample_prompt, sample_generated = make_eval_sample()
+            writer.add_text(
+                "eval/sample",
+                format_tensorboard_sample(
+                    prompt_text=sample_prompt,
+                    generated_text=sample_generated,
+                ),
+                step,
+            )
             writer.flush()
         if trial is not None:
             trial.report(val_loss, step)
@@ -2161,6 +2193,8 @@ def run_single_experiment(
                 learning_rate_schedule=args.learning_rate_schedule,
                 learning_rate_warmup_steps=args.learning_rate_warmup_steps,
                 learning_rate_warmup_start=args.learning_rate_warmup_start,
+                learning_rate_min_ratio=args.learning_rate_min_ratio,
+                relative_update_clip=args.relative_update_clip,
                 step_setup_callback=step_setup_callback,
                 progress_callback=progress_callback,
                 step_callback=step_tensorboard_callback,
@@ -2220,6 +2254,9 @@ def run_single_experiment(
                 learning_rate_schedule=args.learning_rate_schedule,
                 learning_rate_warmup_steps=args.learning_rate_warmup_steps,
                 learning_rate_warmup_start=args.learning_rate_warmup_start,
+                learning_rate_min_ratio=args.learning_rate_min_ratio,
+                query_block_front_weight=args.query_block_front_weight,
+                relative_update_clip=args.relative_update_clip,
                 grad_breakdown_start_step=args.grad_breakdown_start_step if args.grad_breakdown else None,
             )
         else:
@@ -2272,6 +2309,9 @@ def run_single_experiment(
                 learning_rate_schedule=args.learning_rate_schedule,
                 learning_rate_warmup_steps=args.learning_rate_warmup_steps,
                 learning_rate_warmup_start=args.learning_rate_warmup_start,
+                learning_rate_min_ratio=args.learning_rate_min_ratio,
+                query_block_front_weight=args.query_block_front_weight,
+                relative_update_clip=args.relative_update_clip,
                 grad_breakdown_start_step=args.grad_breakdown_start_step if args.grad_breakdown else None,
             )
     except Exception:
@@ -2400,6 +2440,9 @@ def run_single_experiment(
         "learning_rate_schedule": args.learning_rate_schedule,
         "learning_rate_warmup_steps": args.learning_rate_warmup_steps,
         "learning_rate_warmup_start": args.learning_rate_warmup_start,
+        "learning_rate_min_ratio": args.learning_rate_min_ratio,
+        "query_block_front_weight": args.query_block_front_weight,
+        "relative_update_clip": args.relative_update_clip,
         "weight_decay": args.weight_decay,
         "precision": args.precision,
         "s_window": args.s_window,
@@ -2686,6 +2729,10 @@ def main() -> None:
     )
     parser.add_argument("--learning-rate-warmup-steps", type=int, default=0)
     parser.add_argument("--learning-rate-warmup-start", type=float)
+    parser.add_argument("--learning-rate-min-ratio", type=float, default=0.0)
+    parser.add_argument("--reset-optimizer-on-resume", action="store_true")
+    parser.add_argument("--query-block-front-weight", type=float, default=1.0)
+    parser.add_argument("--relative-update-clip", type=float, default=0.0)
     parser.add_argument("--grad-breakdown", action="store_true")
     parser.add_argument("--grad-breakdown-start-step", type=int, default=0)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
@@ -2845,6 +2892,12 @@ def main() -> None:
         raise ValueError("learning-rate-warmup-steps must be non-negative.")
     if args.learning_rate_warmup_start is not None and args.learning_rate_warmup_start < 0.0:
         raise ValueError("learning-rate-warmup-start must be non-negative.")
+    if not 0.0 <= args.learning_rate_min_ratio <= 1.0:
+        raise ValueError("learning-rate-min-ratio must be in [0, 1].")
+    if args.query_block_front_weight < 1.0:
+        raise ValueError("query-block-front-weight must be at least 1.0.")
+    if args.relative_update_clip < 0.0:
+        raise ValueError("relative-update-clip must be non-negative.")
     if args.grad_breakdown_start_step < 0:
         raise ValueError("grad-breakdown-start-step must be non-negative.")
     if not 0.0 <= args.b_cosine_margin < 1.0:
