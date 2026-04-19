@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import nullcontext
 import json
 import math
@@ -24,10 +25,14 @@ from lm_experiment_utils import (
 )
 from train_progressive_b_lm import (
     ASSISTANT_TOKEN,
+    ByteBPEVocab,
     EOS_TOKEN,
     PAD_TOKEN,
     USER_TOKEN,
+    _encode_byte_bpe_text_worker,
     _chat_stream_from_record,
+    _init_byte_bpe_encode_worker,
+    _iter_nonempty_text_chunks,
     _message_content,
     _message_role,
     _text_from_record_keys,
@@ -137,6 +142,14 @@ class DocumentBatch:
     target: torch.Tensor
     loss_mask: torch.Tensor
     reset_mask: torch.Tensor
+
+
+def _tokenize_document_payload_worker(payload: tuple[str, str, str]) -> tuple[str, str, list[int]]:
+    kind, source, body = payload
+    token_ids: list[int] = []
+    for chunk in _iter_nonempty_text_chunks(body, chunk_chars=8_000_000):
+        token_ids.extend(_encode_byte_bpe_text_worker(chunk))
+    return kind, source, token_ids
 
 
 class DocumentChunkBatcher:
@@ -447,25 +460,63 @@ def tokenize_documents(
         "dialogue": special_token_ids["dialogue"],
         "instruction": special_token_ids["instruction"],
     }
-    for document in documents:
-        content_ids = encode_text_in_chunks(vocab, document.body, workers=workers)
+    token_total = 0
+    chunk_total = 0
+    progress_interval = 2_000
+
+    def append_document(kind: str, source: str, content_ids: torch.Tensor, index: int) -> None:
+        nonlocal token_total, chunk_total
         chunks = make_document_chunks(
             content_ids=content_ids,
-            mode_token_id=mode_token_id_map[document.kind],
+            mode_token_id=mode_token_id_map[kind],
             seq_len=seq_len,
             bos_token_id=special_token_ids["bos"],
             cont_token_id=special_token_ids["cont"],
             eos_token_id=special_token_ids["eos"],
             pad_token_id=special_token_ids["pad"],
         )
+        token_count = int(content_ids.numel())
+        token_total += token_count
+        chunk_total += len(chunks)
         tokenized_documents.append(
             TokenizedDocument(
-                kind=document.kind,
-                source=document.source,
+                kind=kind,
+                source=source,
                 chunks=chunks,
-                token_count=int(content_ids.numel()),
+                token_count=token_count,
             )
         )
+        if index % progress_interval == 0 or index == len(documents):
+            avg_chunks = chunk_total / max(1, index)
+            avg_tokens = token_total / max(1, index)
+            print(
+                f"pretokenize_progress | documents={index:,}/{len(documents):,} | chunks={chunk_total:,} | avg_chunks_per_doc={avg_chunks:.2f} | avg_tokens_per_doc={avg_tokens:.1f}",
+                flush=True,
+            )
+
+    if workers > 1 and isinstance(vocab, ByteBPEVocab):
+        payload_count = len(documents)
+        payloads = ((document.kind, document.source, document.body) for document in documents)
+        chunksize = max(8, min(512, payload_count // max(1, workers * 32) or 8))
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            initializer=_init_byte_bpe_encode_worker,
+            initargs=(str(vocab.vocab_path), str(vocab.merges_path)),
+        ) as executor:
+            for index, (kind, source, token_ids) in enumerate(
+                executor.map(_tokenize_document_payload_worker, payloads, chunksize=chunksize),
+                start=1,
+            ):
+                if token_ids:
+                    content_ids = torch.tensor(token_ids, dtype=torch.long)
+                else:
+                    content_ids = torch.empty(0, dtype=torch.long)
+                append_document(kind, source, content_ids, index)
+        return tokenized_documents
+
+    for index, document in enumerate(documents, start=1):
+        content_ids = encode_text_in_chunks(vocab, document.body, workers=workers)
+        append_document(document.kind, document.source, content_ids, index)
     return tokenized_documents
 
 

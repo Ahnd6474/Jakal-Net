@@ -34,6 +34,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--code-target", type=int, default=100_000)
     parser.add_argument("--mixed-target", type=int, default=200_000)
     parser.add_argument("--cache-size", type=int, default=10_000)
+    parser.add_argument("--wiki-max-chars", type=int, default=24_000)
+    parser.add_argument("--math-max-chars", type=int, default=18_000)
+    parser.add_argument("--dialogue-max-messages", type=int, default=16)
+    parser.add_argument("--dialogue-max-chars", type=int, default=1_800)
+    parser.add_argument("--code-max-chars", type=int, default=20_000)
+    parser.add_argument("--mixed-context-max-chars", type=int, default=4_000)
+    parser.add_argument("--mixed-reference-max-chars", type=int, default=2_400)
     return parser.parse_args()
 
 
@@ -157,6 +164,7 @@ def collect_wikipedia(
     handle: Any,
     *,
     target: int,
+    max_chars: int,
     seen_hashes: set[bytes],
     counts: Counter[str],
     source_counts: Counter[str],
@@ -168,7 +176,7 @@ def collect_wikipedia(
     for record in dataset:
         if counts["wiki"] >= target or total_written_ref[0] >= total_limit:
             break
-        text = normalize_text(str(record.get("text", "")), max_chars=4_500)
+        text = normalize_text(str(record.get("text", "")), max_chars=max_chars)
         title = normalize_text(str(record.get("title", "")), max_chars=160)
         if len(text) < 500:
             continue
@@ -196,6 +204,7 @@ def collect_math(
     handle: Any,
     *,
     target: int,
+    max_chars: int,
     seen_hashes: set[bytes],
     counts: Counter[str],
     source_counts: Counter[str],
@@ -207,7 +216,7 @@ def collect_math(
     for index, record in enumerate(dataset):
         if counts["math"] >= target or total_written_ref[0] >= total_limit:
             break
-        text = normalize_text(str(record.get("text", "")), max_chars=4_000)
+        text = normalize_text(str(record.get("text", "")), max_chars=max_chars)
         if len(text) < 300:
             continue
         manifest_record = {
@@ -233,6 +242,8 @@ def collect_dialogue(
     handle: Any,
     *,
     target: int,
+    max_messages: int,
+    max_chars: int,
     seen_hashes: set[bytes],
     counts: Counter[str],
     source_counts: Counter[str],
@@ -243,7 +254,7 @@ def collect_dialogue(
     for record in dataset:
         if counts["dialogue"] >= target or total_written_ref[0] >= total_limit:
             break
-        normalized = normalize_messages(list(record.get("messages") or []), max_messages=8, max_chars=900)
+        normalized = normalize_messages(list(record.get("messages") or []), max_messages=max_messages, max_chars=max_chars)
         if not normalized:
             continue
         manifest_record = {
@@ -269,6 +280,7 @@ def collect_code_instruction_dataset(
     *,
     dataset_name: str,
     target: int,
+    max_chars: int,
     seen_hashes: set[bytes],
     counts: Counter[str],
     source_counts: Counter[str],
@@ -282,7 +294,7 @@ def collect_code_instruction_dataset(
             break
         instruction = normalize_text(str(record.get("instruction", "")), max_chars=600)
         extra_input = normalize_text(str(record.get("input", "")), max_chars=600)
-        output = normalize_code(str(record.get("output", "")), max_chars=5_000)
+        output = normalize_code(str(record.get("output", "")), max_chars=max_chars)
         if len(output) < 40:
             continue
         parts = []
@@ -315,6 +327,7 @@ def collect_leetcode(
     handle: Any,
     *,
     target: int,
+    max_chars: int,
     seen_hashes: set[bytes],
     counts: Counter[str],
     source_counts: Counter[str],
@@ -326,7 +339,7 @@ def collect_leetcode(
     for index, record in enumerate(dataset):
         if counts["code"] >= target or total_written_ref[0] >= total_limit:
             break
-        solution = normalize_code(str(record.get("python", "")), max_chars=5_000)
+        solution = normalize_code(str(record.get("python", "")), max_chars=max_chars)
         if len(solution) < 40:
             continue
         title = normalize_text(str(record.get("title", "")), max_chars=200)
@@ -355,6 +368,7 @@ def collect_code_contests(
     handle: Any,
     *,
     target: int,
+    max_chars: int,
     seen_hashes: set[bytes],
     counts: Counter[str],
     source_counts: Counter[str],
@@ -372,7 +386,7 @@ def collect_code_contests(
         for solution_index, solution in enumerate(list(solutions.get("solution") or [])):
             if counts["code"] >= target or total_written_ref[0] >= total_limit:
                 break
-            normalized = normalize_code(str(solution), max_chars=5_000)
+            normalized = normalize_code(str(solution), max_chars=max_chars)
             if len(normalized) < 40:
                 continue
             body = "\n\n".join(part for part in (title, description, normalized) if part)
@@ -399,6 +413,7 @@ def collect_mbpp(
     handle: Any,
     *,
     target: int,
+    max_chars: int,
     seen_hashes: set[bytes],
     counts: Counter[str],
     source_counts: Counter[str],
@@ -411,7 +426,7 @@ def collect_mbpp(
         if counts["code"] >= target or total_written_ref[0] >= total_limit:
             break
         prompt = normalize_text(str(record.get("text", "")), max_chars=800)
-        code = normalize_code(str(record.get("code", "")), max_chars=4_000)
+        code = normalize_code(str(record.get("code", "")), max_chars=max_chars)
         if len(code) < 40:
             continue
         body = "\n\n".join(part for part in (prompt, code) if part)
@@ -438,6 +453,8 @@ def collect_sql_mixed(
     handle: Any,
     *,
     target: int,
+    context_max_chars: int,
+    reference_max_chars: int,
     seen_hashes: set[bytes],
     counts: Counter[str],
     source_counts: Counter[str],
@@ -451,8 +468,8 @@ def collect_sql_mixed(
         if counts["mixed"] >= target or total_written_ref[0] >= total_limit:
             break
         question = normalize_text(str(record.get("question", "")), max_chars=600)
-        context = normalize_text(str(record.get("context", "")), max_chars=1_600)
-        answer = normalize_code(str(record.get("answer", "")), max_chars=1_200)
+        context = normalize_text(str(record.get("context", "")), max_chars=context_max_chars)
+        answer = normalize_code(str(record.get("answer", "")), max_chars=max(1_200, context_max_chars))
         if len(context) < 120 or len(answer) < 10:
             continue
         sections = []
@@ -461,9 +478,9 @@ def collect_sql_mixed(
         sections.append(f"Context\n{context}")
         sections.append(f"SQL\n{answer}")
         if len(wiki_cache):
-            sections.append(f"Reference\n{wiki_cache.sample()[:800]}")
+            sections.append(f"Reference\n{wiki_cache.sample()[:reference_max_chars]}")
         if len(math_cache):
-            sections.append(f"Math Note\n{math_cache.sample()[:800]}")
+            sections.append(f"Math Note\n{math_cache.sample()[:reference_max_chars]}")
         manifest_record = {
             "text": "\n\n".join(sections),
             "source": f"b-mc2/sql-create-context:{index}",
@@ -486,6 +503,7 @@ def synthesize_mixed(
     handle: Any,
     *,
     target: int,
+    reference_max_chars: int,
     seen_hashes: set[bytes],
     counts: Counter[str],
     source_counts: Counter[str],
@@ -500,11 +518,11 @@ def synthesize_mixed(
             break
         body = (
             "Reference\n"
-            f"{wiki_cache.sample()[:1_400]}\n\n"
+            f"{wiki_cache.sample()[:reference_max_chars]}\n\n"
             "Math\n"
-            f"{math_cache.sample()[:1_200]}\n\n"
+            f"{math_cache.sample()[:reference_max_chars]}\n\n"
             "Code\n"
-            f"{code_cache.sample()[:1_400]}"
+            f"{code_cache.sample()[:reference_max_chars]}"
         )
         manifest_record = {
             "text": body,
@@ -588,6 +606,7 @@ def main() -> None:
         collect_wikipedia(
             handle,
             target=args.wiki_target,
+            max_chars=args.wiki_max_chars,
             seen_hashes=seen_hashes,
             counts=counts,
             source_counts=source_counts,
@@ -598,6 +617,7 @@ def main() -> None:
         collect_math(
             handle,
             target=args.math_target,
+            max_chars=args.math_max_chars,
             seen_hashes=seen_hashes,
             counts=counts,
             source_counts=source_counts,
@@ -608,6 +628,8 @@ def main() -> None:
         collect_dialogue(
             handle,
             target=args.dialogue_target,
+            max_messages=args.dialogue_max_messages,
+            max_chars=args.dialogue_max_chars,
             seen_hashes=seen_hashes,
             counts=counts,
             source_counts=source_counts,
@@ -623,6 +645,7 @@ def main() -> None:
                 handle,
                 dataset_name=dataset_name,
                 target=args.code_target,
+                max_chars=args.code_max_chars,
                 seen_hashes=seen_hashes,
                 counts=counts,
                 source_counts=source_counts,
@@ -636,6 +659,7 @@ def main() -> None:
             collect_leetcode(
                 handle,
                 target=args.code_target,
+                max_chars=args.code_max_chars,
                 seen_hashes=seen_hashes,
                 counts=counts,
                 source_counts=source_counts,
@@ -647,6 +671,7 @@ def main() -> None:
             collect_code_contests(
                 handle,
                 target=args.code_target,
+                max_chars=args.code_max_chars,
                 seen_hashes=seen_hashes,
                 counts=counts,
                 source_counts=source_counts,
@@ -658,6 +683,7 @@ def main() -> None:
             collect_mbpp(
                 handle,
                 target=args.code_target,
+                max_chars=args.code_max_chars,
                 seen_hashes=seen_hashes,
                 counts=counts,
                 source_counts=source_counts,
@@ -669,6 +695,8 @@ def main() -> None:
         collect_sql_mixed(
             handle,
             target=args.mixed_target,
+            context_max_chars=args.mixed_context_max_chars,
+            reference_max_chars=args.mixed_reference_max_chars,
             seen_hashes=seen_hashes,
             counts=counts,
             source_counts=source_counts,
@@ -680,6 +708,7 @@ def main() -> None:
         synthesize_mixed(
             handle,
             target=args.mixed_target,
+            reference_max_chars=args.mixed_reference_max_chars,
             seen_hashes=seen_hashes,
             counts=counts,
             source_counts=source_counts,
