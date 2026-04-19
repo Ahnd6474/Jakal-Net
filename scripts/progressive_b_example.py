@@ -40,6 +40,7 @@ from jakal_net.native_backend import (
     native_supports_device,
     propagation_query_dense_native,
     propagation_query_topk_native,
+    propagation_window_native,
 )
 
 
@@ -1979,10 +1980,28 @@ class ProgressiveBExampleLM(nn.Module):
     ) -> Layer:
         self._require_query_head()
         prepared_query = self._prepare_query_input(query_layer)
-        propagation_delta = _compute_dense_causal_propagation_delta(
-            self.query_propagation,
-            prepared_query,
-        )
+        propagation_delta: LayerDelta
+        if (
+            self.query_propagation.implementation in {"kernel", "native"}
+            and supports_pairwise_kernel(self.query_propagation.pairwise_fn)
+            and native_supports("propagation_window")
+            and native_supports_device(prepared_query.val.device.type)
+        ):
+            propagation_delta = propagation_window_native(
+                pairwise_fn=self.query_propagation.pairwise_fn,
+                edge_compress_name="softsign",
+                layer_val=prepared_query.val,
+                projected_state=prepared_query.state,
+                projected_val=prepared_query.val,
+                window=max(0, prepared_query.num_nodes - 1),
+                target_block_size=self.query_propagation.target_block_size or prepared_query.num_nodes,
+                source_block_size=self.query_propagation.source_block_size or prepared_query.num_nodes,
+            )
+        else:
+            propagation_delta = _compute_dense_causal_propagation_delta(
+                self.query_propagation,
+                prepared_query,
+            )
         query_layer = _apply_scaled_delta(
             query_layer,
             propagation_delta,
@@ -2235,10 +2254,7 @@ def _sample_next_token_item(
         target = tokens[start + 1 : start + seq_len + 1]
     else:
         future_tokens = tokens[start + seq_len : start + seq_len + target_len]
-        if query_block_start_token_id is not None:
-            start_token = torch.tensor([query_block_start_token_id], dtype=torch.long)
-            target = torch.cat((start_token, future_tokens), dim=0)
-        elif target_len > 1:
+        if target_len > 1:
             target = future_tokens
         else:
             target = future_tokens[0]
@@ -2299,10 +2315,7 @@ def sample_next_token_batch(
             [tokens[start + seq_len : start + seq_len + target_len] for start in starts],
             dim=0,
         )
-        if query_block_start_token_id is not None:
-            start_tokens = torch.full((batch_size, 1), query_block_start_token_id, dtype=torch.long)
-            target = torch.cat((start_tokens, future_tokens), dim=1)
-        elif target_len > 1:
+        if target_len > 1:
             target = future_tokens
         else:
             target = future_tokens[:, 0]
@@ -2400,19 +2413,17 @@ def _make_query_block_targets(
     if target_len <= 0:
         raise ValueError('target_len must be positive.')
     response_ids = response_ids.detach().cpu().to(dtype=torch.long)
-    total_len = target_len + 1
-    target = torch.full((total_len,), pad_token_id, dtype=torch.long)
-    loss_mask = torch.zeros(total_len, dtype=torch.float32)
-    # query_block_start is a structural buffer token, not a supervised content target.
-    target[0] = query_block_start_token_id
+    _ = query_block_start_token_id
+    target = torch.full((target_len,), pad_token_id, dtype=torch.long)
+    loss_mask = torch.zeros(target_len, dtype=torch.float32)
     content = response_ids[:target_len]
     used = int(content.numel())
     if used > 0:
-        target[1 : 1 + used] = content
-        loss_mask[1 : 1 + used] = 1.0
+        target[:used] = content
+        loss_mask[:used] = 1.0
     if used < target_len:
-        target[1 + used] = eos_token_id
-        loss_mask[1 + used] = 1.0
+        target[used] = eos_token_id
+        loss_mask[used] = 1.0
     return target, loss_mask
 
 
@@ -2860,17 +2871,15 @@ def _query_block_position_weights(
     target_width = target.shape[-1]
     if target_width <= 1:
         return None
-    weights = torch.ones(target_width, device=target.device, dtype=torch.float32)
-    weights[1:] = torch.exp(
+    weights = torch.exp(
         torch.linspace(
             math.log(front_weight),
             0.0,
-            steps=target_width - 1,
+            steps=target_width,
             device=target.device,
             dtype=torch.float32,
         )
     )
-    weights[0] = 0.0
     return weights.unsqueeze(0).expand(target.shape[0], -1)
 
 
@@ -2894,6 +2903,7 @@ def compute_next_token_loss(
     route_load_cap: float = 0.25,
     edge_prob_cap: float = 0.55,
     query_block_front_weight: float = 1.0,
+    query_block_start_token_id: int | None = None,
 ) -> tuple[Tensor, Tensor]:
     if teacher_forcing and full_sequence_causal:
         raise ValueError("teacher_forcing and full_sequence_causal cannot both be enabled.")
@@ -2935,8 +2945,15 @@ def compute_next_token_loss(
             target_len = batch.target.shape[-1] if batch.target.ndim > 1 else 1
             query_seed_token_ids = None
             query_feedback_token_ids = None
+            if query_block_start_token_id is None:
+                raise ValueError("query_block_start_token_id is required for query_block loss.")
             if batch.target.ndim > 1 and batch.target.shape[-1] > 0:
-                query_seed_token_ids = batch.target[:, :1]
+                query_seed_token_ids = torch.full(
+                    (batch.target.shape[0], 1),
+                    fill_value=query_block_start_token_id,
+                    dtype=batch.target.dtype,
+                    device=batch.target.device,
+                )
                 query_feedback_token_ids = torch.cat((query_seed_token_ids, batch.target[:, :-1]), dim=1)
             logits, _, compressed_b = model.forward_query_block(
                 batch.context,
@@ -3105,6 +3122,7 @@ def estimate_next_token_loss(
             autocast_device_type=autocast_device_type,
             autocast_dtype=autocast_dtype,
             query_block_front_weight=query_block_front_weight,
+            query_block_start_token_id=query_block_start_token_id,
         )
         losses.append(float(loss.item()))
     if was_training:
@@ -3152,6 +3170,7 @@ def estimate_query_block_pair_loss(
             autocast_device_type=autocast_device_type,
             autocast_dtype=autocast_dtype,
             query_block_front_weight=query_block_front_weight,
+            query_block_start_token_id=query_block_start_token_id,
         )
         losses.append(float(loss.item()))
     if was_training:
@@ -3359,6 +3378,7 @@ def train_next_token_model(
                 route_load_cap=route_load_cap,
                 edge_prob_cap=edge_prob_cap,
                 query_block_front_weight=query_block_front_weight,
+                query_block_start_token_id=query_block_start_token_id,
             )
             if not torch.isfinite(loss).item():
                 raise FloatingPointError(f"Non-finite loss at step {step}: {loss.item()}")
@@ -3623,6 +3643,7 @@ def train_query_block_pair_model(
                 route_load_cap=route_load_cap,
                 edge_prob_cap=edge_prob_cap,
                 query_block_front_weight=query_block_front_weight,
+                query_block_start_token_id=query_block_start_token_id,
             )
             if not torch.isfinite(loss).item():
                 raise FloatingPointError(f'Non-finite loss at step {step}: {loss.item()}')

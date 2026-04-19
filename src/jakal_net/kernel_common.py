@@ -137,9 +137,11 @@ def pairwise_kernel_spec(pairwise_fn: object) -> PairwiseKernelSpec:
         )
     if isinstance(pairwise_fn, LowRankBilinearPairwise):
         return PairwiseKernelSpec(
-            kind="bilinear",
-            weight=pairwise_fn.effective_weight(),
+            kind="low_rank_bilinear",
+            weight=pairwise_fn.weight,
             bias=pairwise_fn.bias,
+            in_weight=pairwise_fn.source_proj.weight,
+            out_weight=pairwise_fn.target_proj.weight,
         )
     if isinstance(pairwise_fn, BilinearPairwise):
         return PairwiseKernelSpec(

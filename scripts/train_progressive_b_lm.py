@@ -1374,7 +1374,7 @@ def generate_next_tokens_with_sampling(
         start_offset = 0
         if training_objective == "query_block":
             content_len = min(max(1, target_len), tokens_remaining)
-            query_nodes = content_len + int(query_block_start_token_id is not None)
+            query_nodes = content_len
             query_seed_token_ids = None
             if query_block_start_token_id is not None:
                 query_seed_token_ids = torch.full(
@@ -1390,7 +1390,6 @@ def generate_next_tokens_with_sampling(
             )
             if isinstance(logits, tuple):
                 logits = logits[0]
-            start_offset = 1 if query_block_start_token_id is not None else 0
         elif training_objective == "query_next_token":
             logits = model.forward_query_next_token(context)
         else:

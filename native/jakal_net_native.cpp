@@ -109,6 +109,70 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> query_topk_reduce_backwa
 #endif
 }
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+low_rank_pairwise_topk_forward_cuda_wrapper(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& weighted_projected_state,
+    const torch::Tensor& weighted_projected_val,
+    int64_t topk) {
+#ifdef WITH_CUDA
+  return jakal_net_low_rank_pairwise_topk_forward_cuda(
+      weighted_projected_source,
+      projected_target,
+      weighted_projected_state,
+      weighted_projected_val,
+      topk);
+#else
+  throw std::runtime_error(
+      "low_rank_pairwise_topk_forward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor>
+low_rank_propagation_topk_forward_cuda_wrapper(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    int64_t topk,
+    double score_bias) {
+#ifdef WITH_CUDA
+  return jakal_net_low_rank_propagation_topk_forward_cuda(
+      weighted_projected_source,
+      projected_target,
+      projected_state,
+      projected_val,
+      topk,
+      score_bias);
+#else
+  throw std::runtime_error(
+      "low_rank_propagation_topk_forward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor>
+low_rank_propagation_window_forward_cuda_wrapper(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    int64_t window,
+    double score_bias) {
+#ifdef WITH_CUDA
+  return jakal_net_low_rank_propagation_window_forward_cuda(
+      weighted_projected_source,
+      projected_target,
+      projected_state,
+      projected_val,
+      window,
+      score_bias);
+#else
+  throw std::runtime_error(
+      "low_rank_propagation_window_forward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
 torch::Tensor softsign_backward_cuda_wrapper(
     const torch::Tensor& scores,
     const torch::Tensor& grad_edges) {
@@ -293,6 +357,21 @@ torch::Tensor pairwise_scores(
   if (pairwise_kind == "bilinear") {
     auto target_proj = torch::matmul(target_val, weight);
     auto scores = torch::bmm(target_proj, source_val.transpose(1, 2));
+    if (bias.has_value()) {
+      scores = scores + bias.value();
+    }
+    return scores;
+  }
+
+  if (pairwise_kind == "low_rank_bilinear") {
+    if (!in_weight.has_value() || !out_weight.has_value()) {
+      throw std::runtime_error("Low-rank bilinear pairwise kernel is missing projection weights.");
+    }
+    auto projected_target = torch::matmul(target_val, out_weight.value().transpose(0, 1));
+    auto projected_source = torch::matmul(source_val, in_weight.value().transpose(0, 1));
+    auto weighted_source =
+        projected_source * weight.view({1, 1, -1}).to(projected_source.scalar_type());
+    auto scores = torch::bmm(projected_target, weighted_source.transpose(1, 2));
     if (bias.has_value()) {
       scores = scores + bias.value();
     }
@@ -493,6 +572,9 @@ std::vector<std::string> supported_ops() {
         {
             "query_topk_reduce_cuda",
             "query_topk_reduce_backward_cuda",
+            "low_rank_pairwise_topk_forward_cuda",
+            "low_rank_propagation_topk_forward_cuda",
+            "low_rank_propagation_window_forward_cuda",
             "softsign_backward_cuda",
             "softmax_backward_cuda",
             "diagonal_pairwise_topk_backward_cuda",
@@ -782,6 +864,40 @@ std::tuple<torch::Tensor, torch::Tensor> propagation_window(
   const auto num_nodes = flat_val.size(1);
   const auto out_dim = flat_projected_val.size(2);
 
+#ifdef WITH_CUDA
+  if (pairwise_kind == "low_rank_bilinear" &&
+      edge_compress_name == "softsign" &&
+      flat_val.is_cuda() &&
+      flat_projected_state.is_cuda() &&
+      flat_projected_val.is_cuda() &&
+      in_weight.has_value() &&
+      out_weight.has_value() &&
+      jakal_net_low_rank_propagation_window_forward_cuda_available() &&
+      !flat_val.requires_grad() &&
+      !flat_projected_state.requires_grad() &&
+      !flat_projected_val.requires_grad() &&
+      !in_weight.value().requires_grad() &&
+      !out_weight.value().requires_grad() &&
+      !weight.requires_grad()) {
+    auto projected_target = torch::matmul(flat_val, out_weight.value().transpose(0, 1)).contiguous();
+    auto projected_source = torch::matmul(flat_val, in_weight.value().transpose(0, 1)).contiguous();
+    auto weighted_projected_source =
+        projected_source * weight.view({1, 1, -1}).to(projected_source.scalar_type());
+    const auto score_bias = bias.has_value() ? bias.value().item<double>() : 0.0;
+    auto fused = low_rank_propagation_window_forward_cuda_wrapper(
+        weighted_projected_source,
+        projected_target,
+        flat_projected_state.to(torch::kFloat32).contiguous(),
+        flat_projected_val.to(torch::kFloat32).contiguous(),
+        window,
+        score_bias);
+    return {
+        reshape_state(std::get<0>(fused).to(projected_state.scalar_type()), batch_sizes, num_nodes),
+        reshape_val(std::get<1>(fused).to(projected_val.scalar_type()), batch_sizes, num_nodes, out_dim),
+    };
+  }
+#endif
+
   const auto state_acc_dtype = accumulator_dtype(projected_state.scalar_type());
   const auto val_acc_dtype = accumulator_dtype(projected_val.scalar_type());
   std::vector<torch::Tensor> state_blocks;
@@ -880,6 +996,41 @@ std::tuple<torch::Tensor, torch::Tensor> propagation_topk(
         target_block_size,
         source_block_size);
   }
+
+#ifdef WITH_CUDA
+  if (pairwise_kind == "low_rank_bilinear" &&
+      edge_compress_name == "softsign" &&
+      flat_val.is_cuda() &&
+      flat_projected_state.is_cuda() &&
+      flat_projected_val.is_cuda() &&
+      in_weight.has_value() &&
+      out_weight.has_value() &&
+      jakal_net_low_rank_propagation_topk_forward_cuda_available() &&
+      !flat_val.requires_grad() &&
+      !flat_projected_state.requires_grad() &&
+      !flat_projected_val.requires_grad() &&
+      !in_weight.value().requires_grad() &&
+      !out_weight.value().requires_grad() &&
+      !weight.requires_grad() &&
+      k <= 32) {
+    auto projected_target = torch::matmul(flat_val, out_weight.value().transpose(0, 1)).contiguous();
+    auto projected_source = torch::matmul(flat_val, in_weight.value().transpose(0, 1)).contiguous();
+    auto weighted_projected_source =
+        projected_source * weight.view({1, 1, -1}).to(projected_source.scalar_type());
+    const auto score_bias = bias.has_value() ? bias.value().item<double>() : 0.0;
+    auto fused = low_rank_propagation_topk_forward_cuda_wrapper(
+        weighted_projected_source,
+        projected_target,
+        flat_projected_state.to(torch::kFloat32).contiguous(),
+        flat_projected_val.to(torch::kFloat32).contiguous(),
+        k,
+        score_bias);
+    return {
+        reshape_state(std::get<0>(fused).to(projected_state.scalar_type()), batch_sizes, num_nodes),
+        reshape_val(std::get<1>(fused).to(projected_val.scalar_type()), batch_sizes, num_nodes, out_dim),
+    };
+  }
+#endif
 
   const auto state_acc_dtype = accumulator_dtype(projected_state.scalar_type());
   const auto val_acc_dtype = accumulator_dtype(projected_val.scalar_type());
@@ -1373,6 +1524,54 @@ std::tuple<torch::Tensor, torch::Tensor> transition_pairwise_topk(
   const auto out_dim = flat_projected_val.size(2);
   const auto k = std::min<int64_t>(topk, dst_nodes);
 
+#ifdef WITH_CUDA
+  if (route_kind == "low_rank_bilinear_route" &&
+      flat_src_val.is_cuda() &&
+      flat_dst_val.is_cuda() &&
+      flat_sender_strength.is_cuda() &&
+      flat_projected_state.is_cuda() &&
+      flat_projected_val.is_cuda() &&
+      source_weight.has_value() &&
+      target_weight.has_value() &&
+      jakal_net_low_rank_pairwise_topk_forward_cuda_available() &&
+      !flat_src_val.requires_grad() &&
+      !flat_dst_val.requires_grad() &&
+      !flat_sender_strength.requires_grad() &&
+      !flat_projected_state.requires_grad() &&
+      !flat_projected_val.requires_grad() &&
+      !source_weight.value().requires_grad() &&
+      !target_weight.value().requires_grad() &&
+      !core_weight.requires_grad() &&
+      k <= 32) {
+    auto projected_source =
+        torch::matmul(flat_src_val, source_weight.value().transpose(0, 1)).contiguous();
+    auto weighted_projected_source =
+        projected_source * core_weight.view({1, 1, -1}).to(projected_source.scalar_type());
+    if (temperature != 1.0) {
+      weighted_projected_source = weighted_projected_source / temperature;
+    }
+    auto projected_target =
+        torch::matmul(flat_dst_val, target_weight.value().transpose(0, 1)).contiguous();
+    auto weighted_projected_state =
+        (flat_sender_strength.to(torch::kFloat32) * flat_projected_state.to(torch::kFloat32))
+            .contiguous();
+    auto weighted_projected_val =
+        (flat_sender_strength.to(torch::kFloat32).unsqueeze(-1) *
+         flat_projected_val.to(torch::kFloat32))
+            .contiguous();
+    auto fused = low_rank_pairwise_topk_forward_cuda_wrapper(
+        weighted_projected_source,
+        projected_target,
+        weighted_projected_state,
+        weighted_projected_val,
+        k);
+    return {
+        reshape_state(std::get<0>(fused).to(projected_state.scalar_type()), batch_sizes, dst_nodes),
+        reshape_val(std::get<1>(fused).to(projected_val.scalar_type()), batch_sizes, dst_nodes, out_dim),
+    };
+  }
+#endif
+
   const auto state_acc_dtype = accumulator_dtype(projected_state.scalar_type());
   const auto val_acc_dtype = accumulator_dtype(projected_val.scalar_type());
   auto delta_state = allocate_accumulator({batch_flat, dst_nodes}, flat_projected_state, state_acc_dtype);
@@ -1710,6 +1909,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "query_topk_reduce_backward_cuda",
       &query_topk_reduce_backward_cuda_wrapper,
       "CUDA query top-k reduction backward");
+  m.def(
+      "low_rank_pairwise_topk_forward_cuda",
+      &low_rank_pairwise_topk_forward_cuda_wrapper,
+      "CUDA fused low-rank pairwise top-k forward");
+  m.def(
+      "low_rank_propagation_topk_forward_cuda",
+      &low_rank_propagation_topk_forward_cuda_wrapper,
+      "CUDA fused low-rank propagation top-k forward");
+  m.def(
+      "low_rank_propagation_window_forward_cuda",
+      &low_rank_propagation_window_forward_cuda_wrapper,
+      "CUDA fused low-rank propagation window forward");
   m.def("softsign_backward_cuda", &softsign_backward_cuda_wrapper, "CUDA softsign backward");
   m.def("softmax_backward_cuda", &softmax_backward_cuda_wrapper, "CUDA softmax backward");
   m.def("transition_dense", &transition_dense, "Native dense transition");

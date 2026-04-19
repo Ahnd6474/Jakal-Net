@@ -232,10 +232,14 @@ to match a standard causal next-token objective.
 At a high level:
 
 ```text
-token ids
-  -> token + position embedding
-  -> full causal S backbone
-  -> per-time-step B scan over a small hierarchy
+document
+  -> chunk into max_seq_len windows
+  -> prepend <|bos|> + mode on the first chunk
+  -> prepend <|cont|> + mode on every later chunk
+  -> full causal S backbone inside each chunk
+  -> per-time-step B scan inside each chunk
+  -> carry B_final across chunks in the same document
+  -> reset B only at document boundaries
   -> multi-level B read + aligned S residual
   -> causal prediction propagation
   -> LM head
@@ -243,8 +247,8 @@ token ids
 
 The roles are intentionally separated:
 
-- `S`: full token-aligned causal backbone
-- `B`: small hierarchical latent memory, updated one token step at a time
+- `S`: chunk-local token-aligned causal backbone
+- `B`: document-persistent latent memory, updated one token step at a time
 - prediction stack: causal decoder head over the readout sequence
 
 The default memory recipe matches the current design discussion:
@@ -268,6 +272,10 @@ The current implementation updates memory in this order for each visible token:
 
 This keeps the causal invariant explicit: the logits for position `t+1` are
 built only from the prefix snapshot available after consuming position `t`.
+
+For training, chunk boundaries carry state but not gradient history: the
+current script carries `B` across chunks within a document, then detaches the
+memory state between chunk steps in the same way truncated BPTT would.
 
 ## Repository Layout
 
@@ -407,7 +415,7 @@ PYTHONPATH=src python scripts/train_progressive_b_lm.py \
   --save-checkpoint
 ```
 
-Default causal-memory run:
+Default document-chunked causal-memory run:
 
 ```bash
 PYTHONPATH=src python scripts/train_causal_memory_lm.py \
@@ -426,13 +434,13 @@ PYTHONPATH=src python scripts/train_causal_memory_lm.py \
   --learning-rate 3e-4 \
   --warmup-steps 200 \
   --pretokenize-workers 8 \
-  --carry-memory \
   --tensorboard
 ```
 
 The causal-memory script is intentionally separate from
 `scripts/train_progressive_b_lm.py`. That keeps the older Progressive-B runs
 reproducible while allowing the new architecture to evolve independently.
+Its default training unit is the document, not a flat token stream.
 
 The training script writes:
 
@@ -449,6 +457,29 @@ The causal-memory script writes a parallel run directory with:
 - TensorBoard events when `--tensorboard` is enabled
 - `checkpoints/best.pt`, `checkpoints/last.pt`, and interval checkpoints
 - optional pretokenized token bundles when `--save-pretokenized` is used
+
+### Causal-Memory Document Tokens
+
+The document-chunked path uses explicit structural tokens and treats them as
+normal next-token targets.
+
+Minimum required structural set:
+
+- `<|bos|>`: first chunk of a document
+- `<|cont|>`: every continuation chunk of the same document
+- `<|eos|>`: document end
+- `<|text|>`, `<|code|>`, `<|dialogue|>`, `<|instruction|>`: document mode
+
+Dialogue and instruction documents also use role or response structure tokens:
+
+- `<|user|>`
+- `<|assistant|>`
+- `<|eot|>`
+- `<|response|>`
+
+The current causal-memory script treats `<|cont|>` as mandatory on every
+non-first chunk. The first chunk uses `<|bos|> + mode`, and all later chunks
+use `<|cont|> + mode`.
 
 ### Query-Block Optimization Controls
 

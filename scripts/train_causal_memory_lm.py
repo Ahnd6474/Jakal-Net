@@ -14,6 +14,8 @@ import torch
 from torch.nn import functional as F
 
 from lm_experiment_utils import (
+    _expand_sources,
+    _load_hf_dataset_texts,
     append_jsonl,
     create_run_directory,
     ensure_directory,
@@ -21,11 +23,17 @@ from lm_experiment_utils import (
     write_json,
 )
 from train_progressive_b_lm import (
-    DIALOGUE_SPECIAL_TOKENS,
+    ASSISTANT_TOKEN,
+    EOS_TOKEN,
+    PAD_TOKEN,
+    USER_TOKEN,
+    _chat_stream_from_record,
+    _message_content,
+    _message_role,
+    _text_from_record_keys,
     build_tokenizer,
     count_parameters,
     encode_text_in_chunks,
-    load_token_stream_corpus,
     resolve_autocast_dtype,
 )
 
@@ -38,142 +46,529 @@ except ImportError:
     SummaryWriter = None
 
 
+BOS_TOKEN = "<|bos|>"
+TEXT_TOKEN = "<|text|>"
+CODE_TOKEN = "<|code|>"
+CONT_TOKEN = "<|cont|>"
+DIALOGUE_TOKEN = "<|dialogue|>"
+INSTRUCTION_TOKEN = "<|instruction|>"
+RESPONSE_TOKEN = "<|response|>"
+EOT_TOKEN = "<|eot|>"
+
+CAUSAL_DOC_SPECIAL_TOKENS = (
+    BOS_TOKEN,
+    EOS_TOKEN,
+    PAD_TOKEN,
+    TEXT_TOKEN,
+    CODE_TOKEN,
+    CONT_TOKEN,
+    DIALOGUE_TOKEN,
+    INSTRUCTION_TOKEN,
+    RESPONSE_TOKEN,
+    USER_TOKEN,
+    ASSISTANT_TOKEN,
+    EOT_TOKEN,
+)
+
+MODE_TOKEN_BY_KIND = {
+    "text": TEXT_TOKEN,
+    "code": CODE_TOKEN,
+    "dialogue": DIALOGUE_TOKEN,
+    "instruction": INSTRUCTION_TOKEN,
+}
+
+CODE_SUFFIXES = {
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cs",
+    ".cu",
+    ".go",
+    ".h",
+    ".hpp",
+    ".java",
+    ".js",
+    ".json",
+    ".kt",
+    ".m",
+    ".mdx",
+    ".php",
+    ".py",
+    ".rb",
+    ".rs",
+    ".scala",
+    ".sh",
+    ".sql",
+    ".swift",
+    ".toml",
+    ".ts",
+    ".tsx",
+    ".yaml",
+    ".yml",
+}
+
+
 @dataclass(frozen=True, slots=True)
-class StreamingBatch:
+class SerializedDocument:
+    kind: str
+    source: str
+    body: str
+
+
+@dataclass(frozen=True, slots=True)
+class TokenizedDocument:
+    kind: str
+    source: str
+    chunks: tuple["DocumentChunk", ...]
+    token_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentChunk:
     context: torch.Tensor
     target: torch.Tensor
+    loss_mask: torch.Tensor
+    is_continuation: bool
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentBatch:
+    context: torch.Tensor
+    target: torch.Tensor
+    loss_mask: torch.Tensor
     reset_mask: torch.Tensor
 
 
-class StreamingTokenBatcher:
+class DocumentChunkBatcher:
     def __init__(
         self,
-        tokens: torch.Tensor,
+        documents: Sequence[TokenizedDocument],
         *,
-        seq_len: int,
         batch_size: int,
         device: torch.device,
-        random_starts: bool = True,
     ) -> None:
-        if tokens.ndim != 1:
-            raise ValueError("tokens must be a flat tensor.")
-        if tokens.numel() <= seq_len:
-            raise ValueError("tokens must be longer than seq_len.")
-        self.tokens = tokens.detach().cpu().to(dtype=torch.long).contiguous()
-        self.seq_len = seq_len
+        if not documents:
+            raise ValueError("documents must not be empty.")
+        self.documents = tuple(documents)
         self.batch_size = batch_size
         self.device = device
-        self.random_starts = random_starts
-        self.max_start = int(self.tokens.numel() - seq_len - 1)
-        if self.max_start < 0:
-            raise ValueError("The corpus must be longer than seq_len + 1.")
-        self.positions = torch.zeros(batch_size, dtype=torch.long)
-        self.needs_reset = torch.ones(batch_size, dtype=torch.bool)
+        self.current_doc = [-1] * batch_size
+        self.current_chunk = [0] * batch_size
+        self.needs_reset = [True] * batch_size
 
-    def _sample_start(self) -> int:
-        if self.max_start == 0:
-            return 0
-        return random.randint(0, self.max_start)
+    def _sample_document_index(self) -> int:
+        return random.randrange(len(self.documents))
 
-    def next_batch(self) -> StreamingBatch:
+    def next_batch(self) -> DocumentBatch:
         contexts: list[torch.Tensor] = []
         targets: list[torch.Tensor] = []
+        masks: list[torch.Tensor] = []
         reset_mask = torch.zeros(self.batch_size, dtype=torch.bool)
         for item_index in range(self.batch_size):
-            if bool(self.needs_reset[item_index]):
-                start = self._sample_start() if self.random_starts else 0
-                self.positions[item_index] = start
+            if self.needs_reset[item_index]:
+                self.current_doc[item_index] = self._sample_document_index()
+                self.current_chunk[item_index] = 0
                 reset_mask[item_index] = True
-            start = int(self.positions[item_index].item())
-            stop = start + self.seq_len
-            contexts.append(self.tokens[start:stop])
-            targets.append(self.tokens[start + 1 : stop + 1])
-            next_start = stop
-            if next_start > self.max_start:
+            document = self.documents[self.current_doc[item_index]]
+            chunk = document.chunks[self.current_chunk[item_index]]
+            contexts.append(chunk.context)
+            targets.append(chunk.target)
+            masks.append(chunk.loss_mask)
+            next_chunk = self.current_chunk[item_index] + 1
+            if next_chunk >= len(document.chunks):
                 self.needs_reset[item_index] = True
+                self.current_chunk[item_index] = 0
             else:
-                self.positions[item_index] = next_start
                 self.needs_reset[item_index] = False
-        return StreamingBatch(
+                self.current_chunk[item_index] = next_chunk
+        return DocumentBatch(
             context=torch.stack(contexts, dim=0).to(self.device),
             target=torch.stack(targets, dim=0).to(self.device),
+            loss_mask=torch.stack(masks, dim=0).to(self.device),
             reset_mask=reset_mask.to(self.device),
         )
 
 
-def sample_random_batch(
-    tokens: torch.Tensor,
+def _is_probably_code(text: str, *, source: str = "") -> bool:
+    lower_source = source.lower()
+    if any(lower_source.endswith(suffix) for suffix in CODE_SUFFIXES):
+        return True
+    hints = (
+        "def ",
+        "class ",
+        "import ",
+        "#include",
+        "public static",
+        "fn ",
+        "let ",
+        "const ",
+        "return ",
+        "SELECT ",
+        "{",
+        "};",
+    )
+    hit_count = sum(1 for hint in hints if hint in text)
+    return hit_count >= 2
+
+
+def _normalize_dialogue_body(messages: Sequence[dict[str, Any]]) -> str | None:
+    parts: list[str] = []
+    for message in messages:
+        role = _message_role(message)
+        content = _message_content(message)
+        if not content:
+            continue
+        if role == "user":
+            parts.append(f"{USER_TOKEN}\n{content}\n{EOT_TOKEN}")
+        elif role == "assistant":
+            parts.append(f"{ASSISTANT_TOKEN}\n{content}\n{EOT_TOKEN}")
+    if not parts:
+        return None
+    return "\n".join(parts)
+
+
+def _record_to_document(record: Any, *, source: str) -> SerializedDocument | None:
+    if isinstance(record, str):
+        text = record.strip()
+        if not text:
+            return None
+        return SerializedDocument(
+            kind="code" if _is_probably_code(text, source=source) else "text",
+            source=source,
+            body=text,
+        )
+    if not isinstance(record, dict):
+        return None
+
+    messages = record.get("messages") or record.get("conversations")
+    if isinstance(messages, list):
+        normalized = [message for message in messages if isinstance(message, dict)]
+        dialogue_body = _normalize_dialogue_body(normalized)
+        if dialogue_body:
+            return SerializedDocument(kind="dialogue", source=source, body=dialogue_body)
+
+    prompt = None
+    for key in ("prompt", "instruction", "question", "input"):
+        value = record.get(key)
+        if isinstance(value, str) and value.strip():
+            prompt = value.strip()
+            break
+    response = None
+    for key in ("response", "output", "answer", "completion"):
+        value = record.get(key)
+        if isinstance(value, str) and value.strip():
+            response = value.strip()
+            break
+    if prompt and response:
+        return SerializedDocument(
+            kind="instruction",
+            source=source,
+            body=f"{prompt}\n{RESPONSE_TOKEN}\n{response}",
+        )
+
+    text = _text_from_record_keys(record, ("text", "content", "body", "code", "document"))
+    if text is None:
+        transcript = _chat_stream_from_record(record)
+        if transcript is not None:
+            text = transcript.strip()
+    if text is None or not text.strip():
+        return None
+    kind = "code" if _is_probably_code(text, source=source) else "text"
+    return SerializedDocument(kind=kind, source=source, body=text.strip())
+
+
+def load_serialized_documents(
     *,
+    text_file: str | None,
+    text_sources: Sequence[str],
+    jsonl_sources: Sequence[str],
+    hf_dataset: str | None,
+    hf_config: str | None,
+    hf_split: str,
+    hf_text_key: str,
+    hf_streaming: bool,
+    max_samples: int | None,
+) -> list[SerializedDocument]:
+    documents: list[SerializedDocument] = []
+    seen = 0
+    for raw_source in ([text_file] if text_file else []) + list(text_sources):
+        if raw_source is None:
+            continue
+        for path in _expand_sources((raw_source,), directory_suffixes=(".txt", ".md", ".py", ".json", ".cpp")):
+            text = path.read_text(encoding="utf-8")
+            if not text.strip():
+                continue
+            documents.append(
+                SerializedDocument(
+                    kind="code" if _is_probably_code(text, source=str(path)) else "text",
+                    source=str(path),
+                    body=text.strip(),
+                )
+            )
+            seen += 1
+            if max_samples is not None and seen >= max_samples:
+                return documents
+    for raw_source in jsonl_sources:
+        for path in _expand_sources((raw_source,), directory_suffixes=(".jsonl", ".json")):
+            with path.open("r", encoding="utf-8") as handle:
+                for line_number, raw_line in enumerate(handle, start=1):
+                    line = raw_line.strip().lstrip("\ufeff")
+                    if not line:
+                        continue
+                    document = _record_to_document(
+                        json.loads(line),
+                        source=f"{path}:{line_number}",
+                    )
+                    if document is None:
+                        continue
+                    documents.append(document)
+                    seen += 1
+                    if max_samples is not None and seen >= max_samples:
+                        return documents
+    if hf_dataset is not None and (max_samples is None or seen < max_samples):
+        remaining = None if max_samples is None else max_samples - seen
+        hf_texts = _load_hf_dataset_texts(
+            dataset_name=hf_dataset,
+            config_name=hf_config,
+            split=hf_split,
+            text_key=hf_text_key,
+            streaming=hf_streaming,
+            max_samples=remaining,
+        )
+        for index, text in enumerate(hf_texts):
+            if not text.strip():
+                continue
+            documents.append(SerializedDocument(kind="text", source=f"{hf_dataset}:{index}", body=text.strip()))
+    if not documents:
+        documents.append(
+            SerializedDocument(
+                kind="text",
+                source="default_text",
+                body="Jakal-Net causal memory training sample document.",
+            )
+        )
+    return documents
+
+
+def render_document_for_tokenizer(document: SerializedDocument) -> str:
+    mode_token = MODE_TOKEN_BY_KIND[document.kind]
+    return f"{BOS_TOKEN}\n{mode_token}\n{document.body}\n{EOS_TOKEN}"
+
+
+def build_training_text(documents: Sequence[SerializedDocument]) -> str:
+    return "\n\n".join(render_document_for_tokenizer(document) for document in documents)
+
+
+def build_special_token_id_map(vocab: object) -> dict[str, int]:
+    if not hasattr(vocab, "token_id"):
+        raise ValueError("The causal-memory path requires a tokenizer with explicit special-token ids.")
+    return {
+        "bos": vocab.token_id(BOS_TOKEN),
+        "eos": vocab.token_id(EOS_TOKEN),
+        "pad": vocab.token_id(PAD_TOKEN),
+        "text": vocab.token_id(TEXT_TOKEN),
+        "code": vocab.token_id(CODE_TOKEN),
+        "cont": vocab.token_id(CONT_TOKEN),
+        "dialogue": vocab.token_id(DIALOGUE_TOKEN),
+        "instruction": vocab.token_id(INSTRUCTION_TOKEN),
+        "response": vocab.token_id(RESPONSE_TOKEN),
+        "user": vocab.token_id(USER_TOKEN),
+        "assistant": vocab.token_id(ASSISTANT_TOKEN),
+        "eot": vocab.token_id(EOT_TOKEN),
+    }
+
+
+def make_document_chunks(
+    *,
+    content_ids: torch.Tensor,
+    mode_token_id: int,
     seq_len: int,
-    batch_size: int,
-    device: torch.device,
-) -> StreamingBatch:
-    max_start = int(tokens.numel() - seq_len - 1)
-    if max_start < 0:
-        raise ValueError("The corpus must be longer than seq_len + 1.")
-    starts = torch.randint(0, max_start + 1, (batch_size,))
-    context = torch.stack([tokens[start : start + seq_len] for start in starts.tolist()], dim=0)
-    target = torch.stack(
-        [tokens[start + 1 : start + seq_len + 1] for start in starts.tolist()],
-        dim=0,
-    )
-    return StreamingBatch(
-        context=context.to(device),
-        target=target.to(device),
-        reset_mask=torch.ones(batch_size, dtype=torch.bool, device=device),
-    )
+    bos_token_id: int,
+    cont_token_id: int,
+    eos_token_id: int,
+    pad_token_id: int,
+) -> tuple[DocumentChunk, ...]:
+    if seq_len <= 2:
+        raise ValueError("seq_len must be larger than 2 to fit boundary tokens.")
+    payload_capacity = seq_len - 2
+    content_ids = content_ids.detach().cpu().to(dtype=torch.long)
+    chunks: list[DocumentChunk] = []
+    cursor = 0
+    first = True
+    if content_ids.numel() == 0:
+        context = torch.tensor([bos_token_id, mode_token_id], dtype=torch.long)
+        target = torch.tensor([mode_token_id, eos_token_id], dtype=torch.long)
+        loss_mask = torch.ones(2, dtype=torch.float32)
+        return (
+            DocumentChunk(
+                context=F.pad(context, (0, seq_len - 2), value=pad_token_id),
+                target=F.pad(target, (0, seq_len - 2), value=pad_token_id),
+                loss_mask=F.pad(loss_mask, (0, seq_len - 2), value=0.0),
+                is_continuation=False,
+            ),
+        )
+    while cursor < content_ids.numel():
+        prefix = [bos_token_id, mode_token_id] if first else [cont_token_id, mode_token_id]
+        take = min(payload_capacity, content_ids.numel() - cursor)
+        content_slice = content_ids[cursor : cursor + take]
+        context = torch.tensor(prefix, dtype=torch.long)
+        if content_slice.numel() > 0:
+            context = torch.cat((context, content_slice), dim=0)
+        target = torch.empty_like(context)
+        target[:-1] = context[1:]
+        target[-1] = eos_token_id if cursor + take >= content_ids.numel() else cont_token_id
+        loss_mask = torch.ones(context.shape[0], dtype=torch.float32)
+        pad = seq_len - context.shape[0]
+        chunks.append(
+            DocumentChunk(
+                context=F.pad(context, (0, pad), value=pad_token_id),
+                target=F.pad(target, (0, pad), value=pad_token_id),
+                loss_mask=F.pad(loss_mask, (0, pad), value=0.0),
+                is_continuation=not first,
+            )
+        )
+        cursor += take
+        first = False
+    return tuple(chunks)
+
+
+def tokenize_documents(
+    documents: Sequence[SerializedDocument],
+    *,
+    vocab: object,
+    seq_len: int,
+    special_token_ids: dict[str, int],
+    workers: int,
+) -> list[TokenizedDocument]:
+    tokenized_documents: list[TokenizedDocument] = []
+    mode_token_id_map = {
+        "text": special_token_ids["text"],
+        "code": special_token_ids["code"],
+        "dialogue": special_token_ids["dialogue"],
+        "instruction": special_token_ids["instruction"],
+    }
+    for document in documents:
+        content_ids = encode_text_in_chunks(vocab, document.body, workers=workers)
+        chunks = make_document_chunks(
+            content_ids=content_ids,
+            mode_token_id=mode_token_id_map[document.kind],
+            seq_len=seq_len,
+            bos_token_id=special_token_ids["bos"],
+            cont_token_id=special_token_ids["cont"],
+            eos_token_id=special_token_ids["eos"],
+            pad_token_id=special_token_ids["pad"],
+        )
+        tokenized_documents.append(
+            TokenizedDocument(
+                kind=document.kind,
+                source=document.source,
+                chunks=chunks,
+                token_count=int(content_ids.numel()),
+            )
+        )
+    return tokenized_documents
 
 
 def save_pretokenized_bundle(
     path: Path,
     *,
-    token_ids: torch.Tensor,
+    documents: Sequence[TokenizedDocument],
     vocab_size: int,
     tokenizer_label: str,
     tokenizer_model_path: str | None,
     corpus_info: dict[str, Any],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "token_ids": token_ids.detach().cpu().to(dtype=torch.long),
-            "tokenizer_label": tokenizer_label,
-            "tokenizer_model_path": tokenizer_model_path,
-            "corpus_info": corpus_info,
-            "vocab_size": vocab_size,
-        },
-        path,
-    )
+    payload = {
+        "documents": [
+            {
+                "kind": document.kind,
+                "source": document.source,
+                "token_count": document.token_count,
+                "chunks": [
+                    {
+                        "context": chunk.context,
+                        "target": chunk.target,
+                        "loss_mask": chunk.loss_mask,
+                        "is_continuation": chunk.is_continuation,
+                    }
+                    for chunk in document.chunks
+                ],
+            }
+            for document in documents
+        ],
+        "vocab_size": vocab_size,
+        "tokenizer_label": tokenizer_label,
+        "tokenizer_model_path": tokenizer_model_path,
+        "corpus_info": corpus_info,
+    }
+    torch.save(payload, path)
 
 
 def load_pretokenized_bundle(path: Path) -> dict[str, Any]:
     bundle = torch.load(path, map_location="cpu")
-    if not isinstance(bundle, dict) or "token_ids" not in bundle:
+    if not isinstance(bundle, dict) or "documents" not in bundle:
         raise ValueError(f"Invalid pretokenized bundle: {path}")
-    return bundle
+    documents = [
+        TokenizedDocument(
+            kind=item["kind"],
+            source=item["source"],
+            token_count=int(item["token_count"]),
+            chunks=tuple(
+                DocumentChunk(
+                    context=chunk["context"].detach().cpu().to(dtype=torch.long),
+                    target=chunk["target"].detach().cpu().to(dtype=torch.long),
+                    loss_mask=chunk["loss_mask"].detach().cpu().to(dtype=torch.float32),
+                    is_continuation=bool(chunk["is_continuation"]),
+                )
+                for chunk in item["chunks"]
+            ),
+        )
+        for item in bundle["documents"]
+    ]
+    return {
+        "documents": documents,
+        "vocab_size": int(bundle["vocab_size"]),
+        "tokenizer_label": bundle.get("tokenizer_label"),
+        "tokenizer_model_path": bundle.get("tokenizer_model_path"),
+        "corpus_info": bundle.get("corpus_info") or {},
+    }
+
+
+def split_train_val_documents(
+    documents: Sequence[TokenizedDocument],
+    *,
+    train_fraction: float,
+) -> tuple[list[TokenizedDocument], list[TokenizedDocument]]:
+    if len(documents) < 2:
+        return list(documents), list(documents)
+    split_index = int(len(documents) * train_fraction)
+    split_index = max(1, min(split_index, len(documents) - 1))
+    return list(documents[:split_index]), list(documents[split_index:])
+
+
+def compute_masked_loss(logits: torch.Tensor, target: torch.Tensor, loss_mask: torch.Tensor) -> torch.Tensor:
+    flat_loss = F.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]).float(),
+        target.reshape(-1),
+        reduction="none",
+    )
+    mask = loss_mask.reshape(-1).float()
+    denom = mask.sum().clamp_min(1.0)
+    return (flat_loss * mask).sum() / denom
 
 
 def build_run_name(args: argparse.Namespace) -> str:
     memory_slug = "-".join(str(slot) for slot in args.memory_slots)
     return (
-        f"causal-memory-s{args.s_layers}-b{memory_slug}-p{args.prediction_layers}"
+        f"causal-memory-doc-s{args.s_layers}-b{memory_slug}-p{args.prediction_layers}"
         f"-dim{args.dim}-seq{args.seq_len}"
     )
 
 
-def split_train_val(tokens: torch.Tensor, *, train_fraction: float) -> tuple[torch.Tensor, torch.Tensor]:
-    if tokens.ndim != 1:
-        raise ValueError("tokens must be a flat tensor.")
-    if tokens.numel() < 4:
-        raise ValueError("tokens must contain at least four items to split train/val.")
-    split_index = int(tokens.numel() * train_fraction)
-    split_index = max(2, min(split_index, tokens.numel() - 2))
-    return tokens[:split_index].contiguous(), tokens[split_index:].contiguous()
-
-
-def estimate_steps_per_epoch(*, token_count: int, seq_len: int, batch_size: int) -> int:
-    usable = max(1, token_count - seq_len)
-    return max(1, math.ceil(usable / max(1, batch_size * seq_len)))
+def estimate_steps_per_epoch(*, documents: Sequence[TokenizedDocument], batch_size: int) -> int:
+    total_chunks = sum(len(document.chunks) for document in documents)
+    return max(1, math.ceil(total_chunks / max(1, batch_size)))
 
 
 def perplexity_from_loss(loss_value: float) -> float:
@@ -193,7 +588,6 @@ def compute_learning_rate(
         return base_lr
     if warmup_steps > 0 and step <= warmup_steps:
         return base_lr * (step / warmup_steps)
-    progress = 0.0
     denom = max(1, total_steps - warmup_steps)
     progress = max(0.0, min(1.0, (step - warmup_steps) / denom))
     cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
@@ -203,15 +597,15 @@ def compute_learning_rate(
 def detach_memory_state(memory_state: Sequence[Any] | None) -> tuple[Any, ...] | None:
     if memory_state is None:
         return None
-    detached = []
-    for layer in memory_state:
-        detached.append(layer.with_tensors(state=layer.state.detach(), val=layer.val.detach()))
-    return tuple(detached)
+    return tuple(
+        layer.with_tensors(state=layer.state.detach(), val=layer.val.detach())
+        for layer in memory_state
+    )
 
 
 def run_model(
     model: CausalHierarchicalMemoryLM,
-    batch: StreamingBatch,
+    batch: DocumentBatch,
     *,
     memory_state: Sequence[Any] | None,
     precision: str,
@@ -240,35 +634,49 @@ def run_model(
                 return_memory_state=True,
             )
             assert isinstance(output, MemoryScanOutput)
-            logits = output.logits
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.shape[-1]).float(),
-                batch.target.reshape(-1),
-            )
+            loss = compute_masked_loss(output.logits, batch.target, batch.loss_mask)
     return loss, output.memory_state
 
 
 @torch.no_grad()
 def estimate_eval_loss(
     model: CausalHierarchicalMemoryLM,
-    tokens: torch.Tensor,
+    documents: Sequence[TokenizedDocument],
     *,
-    seq_len: int,
-    batch_size: int,
-    eval_steps: int,
+    eval_documents: int,
     device: torch.device,
     precision: str,
 ) -> float:
+    if not documents:
+        raise ValueError("documents must not be empty.")
     model_was_training = model.training
     model.eval()
-    losses: list[float] = []
-    for _ in range(eval_steps):
-        batch = sample_random_batch(tokens, seq_len=seq_len, batch_size=batch_size, device=device)
-        loss, _ = run_model(model, batch, memory_state=None, precision=precision, grad_enabled=False)
-        losses.append(float(loss.item()))
+    sampled_documents = random.sample(list(documents), k=min(eval_documents, len(documents)))
+    total_loss = 0.0
+    total_weight = 0.0
+    for document in sampled_documents:
+        memory_state: tuple[Any, ...] | None = None
+        for chunk_index, chunk in enumerate(document.chunks):
+            batch = DocumentBatch(
+                context=chunk.context.unsqueeze(0).to(device),
+                target=chunk.target.unsqueeze(0).to(device),
+                loss_mask=chunk.loss_mask.unsqueeze(0).to(device),
+                reset_mask=torch.tensor([chunk_index == 0], device=device, dtype=torch.bool),
+            )
+            loss, memory_state = run_model(
+                model,
+                batch,
+                memory_state=memory_state,
+                precision=precision,
+                grad_enabled=False,
+            )
+            memory_state = detach_memory_state(memory_state)
+            weight = float(chunk.loss_mask.sum().item())
+            total_loss += float(loss.item()) * weight
+            total_weight += weight
     if model_was_training:
         model.train()
-    return float(sum(losses) / max(1, len(losses)))
+    return total_loss / max(1.0, total_weight)
 
 
 def save_checkpoint(
@@ -283,36 +691,35 @@ def save_checkpoint(
     tokenizer_label: str,
     tokenizer_model_path: str | None,
 ) -> None:
-    payload = {
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "step": step,
-        "args": vars(args),
-        "train_loss": train_loss,
-        "val_loss": val_loss,
-        "tokenizer_label": tokenizer_label,
-        "tokenizer_model_path": tokenizer_model_path,
-    }
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, path)
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "step": step,
+            "args": vars(args),
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "tokenizer_label": tokenizer_label,
+            "tokenizer_model_path": tokenizer_model_path,
+        },
+        path,
+    )
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train the causal hierarchical memory LM.")
+    parser = argparse.ArgumentParser(description="Train the document-chunked causal hierarchical memory LM.")
     parser.add_argument("--text-file")
     parser.add_argument("--text-source", action="append", default=[])
     parser.add_argument("--jsonl-source", action="append", default=[])
-    parser.add_argument("--jsonl-text-key", action="append", default=["text", "content", "body"])
     parser.add_argument("--hf-dataset")
     parser.add_argument("--hf-config")
     parser.add_argument("--hf-split", default="train")
     parser.add_argument("--hf-text-key", default="text")
     parser.add_argument("--hf-streaming", action="store_true")
     parser.add_argument("--max-samples", type=int)
-    parser.add_argument("--max-chars", type=int)
-    parser.add_argument("--separator", default="\n\n")
 
-    parser.add_argument("--tokenizer", choices=("char", "subword", "byte_bpe"), default="byte_bpe")
+    parser.add_argument("--tokenizer", choices=("subword", "byte_bpe"), default="byte_bpe")
     parser.add_argument("--subword-vocab-size", type=int, default=16384)
     parser.add_argument("--subword-model-type", default="bpe")
     parser.add_argument("--tokenizer-prefix")
@@ -359,14 +766,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-fraction", type=float, default=0.9)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--eval-interval", type=int, default=200)
-    parser.add_argument("--eval-steps", type=int, default=10)
-    parser.add_argument("--checkpoint-interval", type=int, default=500)
-    parser.add_argument("--carry-memory", action="store_true")
+    parser.add_argument("--eval-documents", type=int, default=8)
 
     parser.add_argument("--output-root", default="artifacts/training_runs")
     parser.add_argument("--run-name")
     parser.add_argument("--tensorboard", action="store_true")
     return parser.parse_args()
+
+
+def summarize_documents(documents: Sequence[SerializedDocument]) -> dict[str, int]:
+    summary: dict[str, int] = {}
+    for document in documents:
+        summary[document.kind] = summary.get(document.kind, 0) + 1
+    return summary
+
+
+def summarize_tokenized_documents(documents: Sequence[TokenizedDocument]) -> dict[str, int]:
+    return {
+        "documents": len(documents),
+        "chunks": sum(len(document.chunks) for document in documents),
+        "tokens": sum(document.token_count for document in documents),
+    }
 
 
 def main() -> None:
@@ -377,61 +797,54 @@ def main() -> None:
         raise ValueError("grad-accum-steps must be positive.")
     if args.batch_size <= 0:
         raise ValueError("batch-size must be positive.")
-    if args.seq_len <= 0:
-        raise ValueError("seq-len must be positive.")
+    if args.seq_len <= 2:
+        raise ValueError("seq-len must be larger than 2.")
     if args.epochs <= 0.0:
         raise ValueError("epochs must be positive.")
-    if args.eval_interval <= 0:
-        raise ValueError("eval-interval must be positive.")
-    if args.eval_steps <= 0:
-        raise ValueError("eval-steps must be positive.")
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
-
     device = resolve_device(args.device)
     print(f"using device: {describe_device(device)}", flush=True)
 
-    tokenizer_model_path: str | None = None
     tokenizer_label: str
-    tokens: torch.Tensor
-    corpus_metadata: dict[str, Any]
+    tokenizer_model_path: str | None
     vocab_size: int
+    corpus_metadata: dict[str, Any]
+    documents: list[TokenizedDocument]
 
     if args.pretokenized_path and Path(args.pretokenized_path).exists():
         bundle = load_pretokenized_bundle(Path(args.pretokenized_path))
-        tokens = bundle["token_ids"].detach().cpu().to(dtype=torch.long)
+        documents = list(bundle["documents"])
         tokenizer_label = str(bundle.get("tokenizer_label") or "unknown")
         tokenizer_model_path = bundle.get("tokenizer_model_path")
+        vocab_size = int(bundle["vocab_size"])
         corpus_metadata = dict(bundle.get("corpus_info") or {})
-        vocab_size = int(bundle.get("vocab_size") or (int(tokens.max().item()) + 1))
         print(
-            f"loaded_pretokenized | path={args.pretokenized_path} | tokens={tokens.numel():,} | tokenizer={tokenizer_label}",
+            f"loaded_pretokenized | path={args.pretokenized_path} | documents={len(documents):,} | tokenizer={tokenizer_label}",
             flush=True,
         )
     else:
-        corpus = load_token_stream_corpus(
-            default_text="Jakal-Net causal memory training sample.",
+        serialized_documents = load_serialized_documents(
             text_file=args.text_file,
             text_sources=tuple(args.text_source),
             jsonl_sources=tuple(args.jsonl_source),
-            jsonl_text_keys=tuple(args.jsonl_text_key),
             hf_dataset=args.hf_dataset,
             hf_config=args.hf_config,
             hf_split=args.hf_split,
             hf_text_key=args.hf_text_key,
             hf_streaming=args.hf_streaming,
             max_samples=args.max_samples,
-            max_chars=args.max_chars,
-            separator=args.separator,
         )
+        document_summary = summarize_documents(serialized_documents)
         print(
-            f"corpus=token_stream | chars={corpus.char_count:,} | samples={corpus.sample_count:,} | files={corpus.file_count} | truncated={corpus.truncated}",
+            f"documents={len(serialized_documents):,} | kinds={document_summary}",
             flush=True,
         )
+        training_text = build_training_text(serialized_documents)
         vocab, tokenizer_label, tokenizer_path = build_tokenizer(
-            corpus.text,
-            text_path=corpus.text_path.as_posix() if corpus.text_path is not None else None,
+            training_text,
+            text_path=None,
             tokenizer=args.tokenizer,
             subword_vocab_size=args.subword_vocab_size,
             subword_model_type=args.subword_model_type,
@@ -439,41 +852,41 @@ def main() -> None:
             subword_character_coverage=args.subword_character_coverage,
             subword_input_sentence_size=args.subword_input_sentence_size,
             subword_num_threads=args.subword_num_threads,
-            user_defined_symbols=DIALOGUE_SPECIAL_TOKENS,
+            user_defined_symbols=CAUSAL_DOC_SPECIAL_TOKENS,
         )
         tokenizer_model_path = None if tokenizer_path is None else str(tokenizer_path)
+        special_token_ids = build_special_token_id_map(vocab)
         workers = min(args.pretokenize_workers, max(1, torch.get_num_threads()))
-        tokens = encode_text_in_chunks(vocab, corpus.text, workers=workers)
-        vocab_size = int(getattr(vocab, "size", int(tokens.max().item()) + 1))
+        documents = tokenize_documents(
+            serialized_documents,
+            vocab=vocab,
+            seq_len=args.seq_len,
+            special_token_ids=special_token_ids,
+            workers=workers,
+        )
+        vocab_size = int(getattr(vocab, "size"))
         corpus_metadata = {
-            "source_label": corpus.source_label,
-            "sample_count": corpus.sample_count,
-            "file_count": corpus.file_count,
-            "char_count": corpus.char_count,
-            "truncated": corpus.truncated,
-            "metadata": corpus.metadata,
+            "document_summary": document_summary,
+            "tokenized_summary": summarize_tokenized_documents(documents),
+            "special_tokens": special_token_ids,
         }
         print(
-            f"tokenizer={tokenizer_label} | tokenizer_model={tokenizer_model_path} | token_count={tokens.numel():,}",
+            f"tokenizer={tokenizer_label} | tokenizer_model={tokenizer_model_path} | tokenized={corpus_metadata['tokenized_summary']}",
             flush=True,
         )
         if args.save_pretokenized and args.pretokenized_path:
             save_pretokenized_bundle(
                 Path(args.pretokenized_path),
-                token_ids=tokens,
+                documents=documents,
+                vocab_size=vocab_size,
                 tokenizer_label=tokenizer_label,
                 tokenizer_model_path=tokenizer_model_path,
                 corpus_info=corpus_metadata,
-                vocab_size=vocab_size,
             )
             print(f"saved_pretokenized | path={args.pretokenized_path}", flush=True)
 
-    train_tokens, val_tokens = split_train_val(tokens, train_fraction=args.train_fraction)
-    steps_per_epoch = estimate_steps_per_epoch(
-        token_count=train_tokens.numel(),
-        seq_len=args.seq_len,
-        batch_size=args.batch_size,
-    )
+    train_documents, val_documents = split_train_val_documents(documents, train_fraction=args.train_fraction)
+    steps_per_epoch = estimate_steps_per_epoch(documents=train_documents, batch_size=args.batch_size)
     total_steps = max(1, int(math.ceil(steps_per_epoch * args.epochs)))
 
     model = CausalHierarchicalMemoryLM(
@@ -491,11 +904,10 @@ def main() -> None:
         pairwise_rank=args.pairwise_rank,
         route_rank=args.route_rank,
         implementation=args.implementation,
-    )
-    model = model.to(device)
+    ).to(device)
     parameter_count = count_parameters(model)
     print(
-        f"model=causal_memory | params={parameter_count:,} | dim={args.dim} | seq_len={args.seq_len} | memory_slots={args.memory_slots}",
+        f"model=causal_memory_doc | params={parameter_count:,} | dim={args.dim} | seq_len={args.seq_len} | memory_slots={args.memory_slots}",
         flush=True,
     )
 
@@ -519,30 +931,16 @@ def main() -> None:
             raise ImportError("tensorboard is not installed.")
         writer = SummaryWriter(log_dir=str(run_dir / "tensorboard"))
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay,
-    )
-
-    scaler = None
-    if args.precision == "fp16" and device.type == "cuda":
-        scaler = torch.cuda.amp.GradScaler()
-
-    train_batcher = StreamingTokenBatcher(
-        train_tokens,
-        seq_len=args.seq_len,
-        batch_size=args.batch_size,
-        device=device,
-        random_starts=True,
-    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    scaler = torch.cuda.amp.GradScaler() if args.precision == "fp16" and device.type == "cuda" else None
+    batcher = DocumentChunkBatcher(train_documents, batch_size=args.batch_size, device=device)
 
     history_rows: list[dict[str, Any]] = []
     train_memory_state: tuple[Any, ...] | None = None
     best_val_loss = float("inf")
     optimizer.zero_grad(set_to_none=True)
-
     start_time = time.time()
+
     for step in range(1, total_steps + 1):
         lr = compute_learning_rate(
             step=step,
@@ -554,15 +952,7 @@ def main() -> None:
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
-        batch = train_batcher.next_batch()
-        if not args.carry_memory:
-            batch = StreamingBatch(
-                context=batch.context,
-                target=batch.target,
-                reset_mask=torch.ones_like(batch.reset_mask, dtype=torch.bool),
-            )
-            train_memory_state = None
-
+        batch = batcher.next_batch()
         if scaler is not None:
             autocast_dtype = resolve_autocast_dtype(args.precision)
             with torch.autocast(device_type=device.type, dtype=autocast_dtype):
@@ -573,10 +963,7 @@ def main() -> None:
                     return_memory_state=True,
                 )
                 assert isinstance(output, MemoryScanOutput)
-                loss = F.cross_entropy(
-                    output.logits.reshape(-1, output.logits.shape[-1]).float(),
-                    batch.target.reshape(-1),
-                )
+                loss = compute_masked_loss(output.logits, batch.target, batch.loss_mask)
                 scaled_loss = loss / args.grad_accum_steps
             scaler.scale(scaled_loss).backward()
             current_memory_state = output.memory_state
@@ -624,10 +1011,8 @@ def main() -> None:
         if step == 1 or step % args.eval_interval == 0 or step == total_steps:
             val_loss = estimate_eval_loss(
                 model,
-                val_tokens,
-                seq_len=args.seq_len,
-                batch_size=args.batch_size,
-                eval_steps=args.eval_steps,
+                val_documents,
+                eval_documents=args.eval_documents,
                 device=device,
                 precision=args.precision,
             )
@@ -654,24 +1039,10 @@ def main() -> None:
                 )
                 write_json(
                     checkpoints_dir / "best.json",
-                    {
-                        "step": step,
-                        "train_loss": train_loss,
-                        "val_loss": val_loss,
-                    },
+                    {"step": step, "train_loss": train_loss, "val_loss": val_loss},
                 )
-        if step % args.checkpoint_interval == 0 or step == total_steps:
-            save_checkpoint(
-                checkpoints_dir / f"step_{step:06d}.pt",
-                model=model,
-                optimizer=optimizer,
-                step=step,
-                args=args,
-                train_loss=train_loss,
-                val_loss=val_loss,
-                tokenizer_label=tokenizer_label,
-                tokenizer_model_path=tokenizer_model_path,
-            )
+
+        if step == total_steps or step % args.eval_interval == 0:
             save_checkpoint(
                 checkpoints_dir / "last.pt",
                 model=model,
@@ -685,11 +1056,7 @@ def main() -> None:
             )
             write_json(
                 checkpoints_dir / "last.json",
-                {
-                    "step": step,
-                    "train_loss": train_loss,
-                    "val_loss": val_loss,
-                },
+                {"step": step, "train_loss": train_loss, "val_loss": val_loss},
             )
 
         row = {

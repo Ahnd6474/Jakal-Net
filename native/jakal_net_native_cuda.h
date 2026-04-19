@@ -6,6 +6,9 @@
 
 bool jakal_net_compiled_with_cuda_source();
 bool jakal_net_query_topk_reduce_cuda_available();
+bool jakal_net_low_rank_pairwise_topk_forward_cuda_available();
+bool jakal_net_low_rank_propagation_topk_forward_cuda_available();
+bool jakal_net_low_rank_propagation_window_forward_cuda_available();
 
 std::tuple<torch::Tensor, torch::Tensor> jakal_net_query_topk_reduce_cuda(
     const torch::Tensor& edges,
@@ -20,6 +23,32 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> jakal_net_query_topk_red
     const torch::Tensor& projected_val,
     const torch::Tensor& grad_delta_state,
     const torch::Tensor& grad_delta_val);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+jakal_net_low_rank_pairwise_topk_forward_cuda(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& weighted_projected_state,
+    const torch::Tensor& weighted_projected_val,
+    int64_t topk);
+
+std::tuple<torch::Tensor, torch::Tensor>
+jakal_net_low_rank_propagation_topk_forward_cuda(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    int64_t topk,
+    double score_bias);
+
+std::tuple<torch::Tensor, torch::Tensor>
+jakal_net_low_rank_propagation_window_forward_cuda(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    int64_t window,
+    double score_bias);
 
 torch::Tensor jakal_net_softsign_backward_cuda(
     const torch::Tensor& scores,

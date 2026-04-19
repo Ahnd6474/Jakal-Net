@@ -163,6 +163,23 @@ class Propagation(nn.Module):
         )
 
     def _compute_delta_kernel_preferred(self, layer: Layer) -> LayerDelta:
+        edge_compress_name = _native_edge_compress_name(self.edge_compress_fn)
+        if (
+            edge_compress_name is not None
+            and supports_pairwise_kernel(self.pairwise_fn)
+            and native_supports("propagation_dense")
+            and native_supports_device(layer.val.device.type)
+        ):
+            projected_state, projected_val = self._project_inputs(layer)
+            return propagation_dense_native(
+                pairwise_fn=self.pairwise_fn,
+                edge_compress_name=edge_compress_name,
+                layer_val=layer.val,
+                projected_state=projected_state,
+                projected_val=projected_val,
+                target_block_size=self.target_block_size or layer.num_nodes,
+                source_block_size=self.source_block_size or layer.num_nodes,
+            )
         if (
             layer.val.device.type == "privateuseone"
             and supports_pairwise_kernel(self.pairwise_fn)
@@ -445,6 +462,35 @@ class SparsePropagation(Propagation):
         return self._compute_topk_delta_streaming(layer)
 
     def _compute_delta_kernel_preferred(self, layer: Layer) -> LayerDelta:
+        edge_compress_name = _native_edge_compress_name(self.edge_compress_fn)
+        if (
+            edge_compress_name is not None
+            and supports_pairwise_kernel(self.pairwise_fn)
+            and native_supports_device(layer.val.device.type)
+        ):
+            projected_state, projected_val = self._project_inputs(layer)
+            if self.sparse_type == "window" and native_supports("propagation_window"):
+                return propagation_window_native(
+                    pairwise_fn=self.pairwise_fn,
+                    edge_compress_name=edge_compress_name,
+                    layer_val=layer.val,
+                    projected_state=projected_state,
+                    projected_val=projected_val,
+                    window=self.window or 0,
+                    target_block_size=self.target_block_size or layer.num_nodes,
+                    source_block_size=self.source_block_size or layer.num_nodes,
+                )
+            if self.sparse_type == "topk" and native_supports("propagation_topk"):
+                return propagation_topk_native(
+                    pairwise_fn=self.pairwise_fn,
+                    edge_compress_name=edge_compress_name,
+                    layer_val=layer.val,
+                    projected_state=projected_state,
+                    projected_val=projected_val,
+                    topk=self.topk or layer.num_nodes,
+                    target_block_size=self.target_block_size or layer.num_nodes,
+                    source_block_size=self.source_block_size or layer.num_nodes,
+                )
         if layer.val.device.type == "privateuseone" and supports_pairwise_kernel(
             self.pairwise_fn
         ):

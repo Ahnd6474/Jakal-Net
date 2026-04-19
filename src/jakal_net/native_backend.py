@@ -33,6 +33,7 @@ from jakal_net.modules import (
 DEFAULT_NATIVE_MODULE = "jakal_net_native"
 NATIVE_MODULE_ENV = "JAKAL_NET_NATIVE_MODULE"
 DISABLE_NATIVE_ENV = "JAKAL_NET_DISABLE_NATIVE"
+EXPERIMENTAL_FUSED_TRAINING_ENV = "JAKAL_NET_ENABLE_EXPERIMENTAL_FUSED_TRAINING"
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,6 +207,15 @@ def _query_backward_ops_available() -> bool:
     )
 
 
+def _experimental_fused_training_enabled() -> bool:
+    return os.environ.get(EXPERIMENTAL_FUSED_TRAINING_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _flatten_query_tensors(
     query_val: Tensor,
     source_val: Tensor,
@@ -273,6 +283,30 @@ def _flatten_dense_tensors(
     )
 
 
+def _flatten_pairwise_transition_tensors(
+    sender_strength: Tensor,
+    src_val: Tensor,
+    dst_val: Tensor,
+    projected_state: Tensor,
+    projected_val: Tensor,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, tuple[int, ...], int, int, int]:
+    batch_shape = tuple(src_val.shape[:-2])
+    src_nodes = src_val.shape[-2]
+    dst_nodes = dst_val.shape[-2]
+    out_dim = projected_val.shape[-1]
+    return (
+        sender_strength.reshape(-1, src_nodes).contiguous(),
+        src_val.reshape(-1, src_nodes, src_val.shape[-1]).contiguous(),
+        dst_val.reshape(-1, dst_nodes, dst_val.shape[-1]).contiguous(),
+        projected_state.reshape(-1, src_nodes).contiguous(),
+        projected_val.reshape(-1, src_nodes, out_dim).contiguous(),
+        batch_shape,
+        src_nodes,
+        dst_nodes,
+        out_dim,
+    )
+
+
 def _save_optional_tensor(tensor: Tensor | None, reference: Tensor) -> Tensor:
     if tensor is not None:
         return tensor
@@ -287,6 +321,45 @@ def _accumulator_dtype_for(tensor: Tensor) -> torch.dtype:
     if tensor.dtype in {torch.float16, torch.bfloat16}:
         return torch.float32
     return tensor.dtype
+
+
+def _gather_sequence_rows(source: Tensor, indices: Tensor) -> Tensor:
+    batch = torch.arange(source.shape[0], device=source.device).view(-1, 1, 1)
+    return source[batch, indices]
+
+
+def _window_source_indices(
+    *,
+    target_nodes: int,
+    source_nodes: int,
+    window: int,
+    device: torch.device,
+) -> tuple[Tensor, Tensor]:
+    width = min(window + 1, source_nodes)
+    base = torch.arange(target_nodes, device=device).unsqueeze(-1)
+    offsets = torch.arange(width, device=device)
+    indices = base - (width - 1 - offsets)
+    valid = indices >= 0
+    return indices.clamp(min=0, max=source_nodes - 1).to(torch.long), valid
+
+
+def _pairwise_transition_reduce_backward(
+    routes: Tensor,
+    indices: Tensor,
+    weighted_state: Tensor,
+    weighted_val: Tensor,
+    grad_delta_state: Tensor,
+    grad_delta_val: Tensor,
+) -> tuple[Tensor, Tensor, Tensor]:
+    selected_grad_state = _gather_sequence_rows(grad_delta_state, indices)
+    selected_grad_val = _gather_sequence_rows(grad_delta_val, indices)
+    grad_routes = selected_grad_state * weighted_state.unsqueeze(-1)
+    grad_routes = grad_routes + (
+        selected_grad_val * weighted_val.unsqueeze(-2)
+    ).sum(dim=-1)
+    grad_weighted_state = (routes * selected_grad_state).sum(dim=-1)
+    grad_weighted_val = (routes.unsqueeze(-1) * selected_grad_val).sum(dim=-2)
+    return grad_routes, grad_weighted_state, grad_weighted_val
 
 
 def _hadamard_pairwise_scores(
@@ -1617,6 +1690,498 @@ class _LowRankTransitionQueryTopK(Function):
         )
 
 
+class _LowRankTransitionPairwiseTopK(Function):
+    @staticmethod
+    def forward(
+        ctx: Any,
+        sender_strength: Tensor,
+        src_val: Tensor,
+        dst_val: Tensor,
+        projected_state: Tensor,
+        projected_val: Tensor,
+        source_weight: Tensor,
+        target_weight: Tensor,
+        core_weight: Tensor,
+        bias: Tensor | None,
+        temperature: float,
+        topk: int,
+        src_block_size: int,
+        dst_block_size: int,
+    ) -> tuple[Tensor, Tensor]:
+        (
+            flat_sender,
+            flat_src,
+            flat_dst,
+            flat_projected_state,
+            flat_projected_val,
+            batch_shape,
+            src_nodes,
+            dst_nodes,
+            out_dim,
+        ) = _flatten_pairwise_transition_tensors(
+            sender_strength,
+            src_val,
+            dst_val,
+            projected_state,
+            projected_val,
+        )
+        k = min(int(topk), dst_nodes)
+        projected_source = torch.matmul(flat_src, source_weight.t()).contiguous()
+        weighted_projected_source = projected_source * core_weight.view(1, 1, -1).to(
+            projected_source.dtype
+        )
+        if temperature != 1.0:
+            weighted_projected_source = weighted_projected_source / float(temperature)
+        projected_target = torch.matmul(flat_dst, target_weight.t()).contiguous()
+        weighted_projected_state = (
+            flat_sender.to(dtype=torch.float32) * flat_projected_state.to(dtype=torch.float32)
+        ).contiguous()
+        weighted_projected_val = (
+            flat_sender.to(dtype=torch.float32).unsqueeze(-1)
+            * flat_projected_val.to(dtype=torch.float32)
+        ).contiguous()
+        delta_state, delta_val, scores, indices = _native_module().low_rank_pairwise_topk_forward_cuda(
+            weighted_projected_source,
+            projected_target,
+            weighted_projected_state,
+            weighted_projected_val,
+            k,
+        )
+        ctx.batch_shape = batch_shape
+        ctx.src_nodes = src_nodes
+        ctx.dst_nodes = dst_nodes
+        ctx.out_dim = out_dim
+        ctx.temperature = float(temperature)
+        ctx.has_bias = bias is not None
+        ctx.save_for_backward(
+            sender_strength,
+            src_val,
+            dst_val,
+            projected_state,
+            projected_val,
+            source_weight,
+            target_weight,
+            core_weight,
+            scores,
+            indices,
+        )
+        return (
+            delta_state.to(dtype=projected_state.dtype).reshape(*batch_shape, dst_nodes),
+            delta_val.to(dtype=projected_val.dtype).reshape(*batch_shape, dst_nodes, out_dim),
+        )
+
+    @staticmethod
+    def backward(ctx: Any, grad_delta_state: Tensor, grad_delta_val: Tensor) -> tuple[Any, ...]:
+        (
+            sender_strength,
+            src_val,
+            dst_val,
+            projected_state,
+            projected_val,
+            source_weight,
+            target_weight,
+            core_weight,
+            scores,
+            indices,
+        ) = ctx.saved_tensors
+        (
+            flat_sender,
+            flat_src,
+            flat_dst,
+            flat_projected_state,
+            flat_projected_val,
+            _batch_shape,
+            src_nodes,
+            _dst_nodes,
+            out_dim,
+        ) = _flatten_pairwise_transition_tensors(
+            sender_strength,
+            src_val,
+            dst_val,
+            projected_state,
+            projected_val,
+        )
+        flat_scores = scores.reshape(-1, src_nodes, scores.shape[-1]).contiguous()
+        flat_indices = indices.reshape(-1, src_nodes, indices.shape[-1]).contiguous()
+        flat_routes = torch.softmax(flat_scores, dim=-1).contiguous()
+        weighted_state = (
+            flat_sender.to(dtype=torch.float32) * flat_projected_state.to(dtype=torch.float32)
+        ).contiguous()
+        weighted_val = (
+            flat_sender.to(dtype=torch.float32).unsqueeze(-1)
+            * flat_projected_val.to(dtype=torch.float32)
+        ).contiguous()
+        flat_grad_state = grad_delta_state.reshape(-1, grad_delta_state.shape[-1]).to(
+            dtype=torch.float32
+        )
+        flat_grad_val = grad_delta_val.reshape(-1, grad_delta_state.shape[-1], out_dim).to(
+            dtype=torch.float32
+        )
+        grad_routes, grad_weighted_state, grad_weighted_val = _pairwise_transition_reduce_backward(
+            flat_routes,
+            flat_indices,
+            weighted_state,
+            weighted_val,
+            flat_grad_state.contiguous(),
+            flat_grad_val.contiguous(),
+        )
+        module = _native_module()
+        grad_scores = module.softmax_backward_cuda(
+            flat_routes.contiguous(),
+            grad_routes.contiguous(),
+        )
+        projected_target = torch.matmul(flat_dst, target_weight.t()).contiguous()
+        projected_source = torch.matmul(flat_src, source_weight.t()).contiguous()
+        (
+            grad_src_route,
+            grad_dst,
+            grad_target_weight_from_kernel,
+            grad_source_weight_from_kernel,
+            grad_core_weight,
+            grad_bias,
+        ) = module.low_rank_pairwise_topk_backward_cuda(
+            flat_src,
+            flat_dst,
+            target_weight.contiguous(),
+            source_weight.contiguous(),
+            core_weight.contiguous(),
+            projected_source,
+            projected_target,
+            flat_indices,
+            grad_scores.contiguous(),
+            ctx.temperature,
+        )
+        grad_sender = (
+            grad_weighted_state * flat_projected_state.to(dtype=torch.float32)
+            + (
+                grad_weighted_val * flat_projected_val.to(dtype=torch.float32)
+            ).sum(dim=-1)
+        )
+        grad_projected_state = grad_weighted_state * flat_sender.to(dtype=torch.float32)
+        grad_projected_val = grad_weighted_val * flat_sender.to(dtype=torch.float32).unsqueeze(-1)
+        return (
+            grad_sender.reshape_as(sender_strength).to(dtype=sender_strength.dtype),
+            grad_src_route.reshape_as(src_val).to(dtype=src_val.dtype),
+            grad_dst.reshape_as(dst_val).to(dtype=dst_val.dtype),
+            grad_projected_state.reshape_as(projected_state).to(dtype=projected_state.dtype),
+            grad_projected_val.reshape_as(projected_val).to(dtype=projected_val.dtype),
+            grad_source_weight_from_kernel,
+            grad_target_weight_from_kernel,
+            grad_core_weight,
+            grad_bias if ctx.has_bias else None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+class _LowRankPropagationTopK(Function):
+    @staticmethod
+    def forward(
+        ctx: Any,
+        layer_val: Tensor,
+        projected_state: Tensor,
+        projected_val: Tensor,
+        source_weight: Tensor,
+        target_weight: Tensor,
+        core_weight: Tensor,
+        bias: Tensor | None,
+        topk: int,
+        target_block_size: int,
+        source_block_size: int,
+    ) -> tuple[Tensor, Tensor]:
+        (
+            flat_val,
+            flat_projected_state,
+            flat_projected_val,
+            batch_shape,
+            nodes,
+            out_dim,
+        ) = _flatten_dense_tensors(layer_val, projected_state, projected_val)
+        k = min(int(topk), nodes)
+        projected_target = torch.matmul(flat_val, target_weight.t()).contiguous()
+        projected_source = torch.matmul(flat_val, source_weight.t()).contiguous()
+        weighted_projected_source = projected_source * core_weight.view(1, 1, -1).to(
+            projected_source.dtype
+        )
+        score_bias = float(bias.item()) if bias is not None else 0.0
+        delta_state, delta_val = _native_module().low_rank_propagation_topk_forward_cuda(
+            weighted_projected_source,
+            projected_target,
+            flat_projected_state.to(dtype=torch.float32).contiguous(),
+            flat_projected_val.to(dtype=torch.float32).contiguous(),
+            k,
+            score_bias,
+        )
+        ctx.k = k
+        ctx.has_bias = bias is not None
+        ctx.save_for_backward(
+            layer_val,
+            projected_state,
+            projected_val,
+            source_weight,
+            target_weight,
+            core_weight,
+            _save_optional_tensor(bias, core_weight),
+        )
+        return (
+            delta_state.to(dtype=projected_state.dtype).reshape(*batch_shape, nodes),
+            delta_val.to(dtype=projected_val.dtype).reshape(*batch_shape, nodes, out_dim),
+        )
+
+    @staticmethod
+    def backward(ctx: Any, grad_delta_state: Tensor, grad_delta_val: Tensor) -> tuple[Any, ...]:
+        (
+            layer_val,
+            projected_state,
+            projected_val,
+            source_weight,
+            target_weight,
+            core_weight,
+            bias_tensor,
+        ) = ctx.saved_tensors
+        bias = _load_optional_tensor(bias_tensor)
+        (
+            flat_val,
+            flat_projected_state,
+            flat_projected_val,
+            _batch_shape,
+            nodes,
+            out_dim,
+        ) = _flatten_dense_tensors(layer_val, projected_state, projected_val)
+        projected_target = torch.matmul(flat_val, target_weight.t()).contiguous()
+        projected_source = torch.matmul(flat_val, source_weight.t()).contiguous()
+        weighted_projected_source = projected_source * core_weight.view(1, 1, -1).to(
+            projected_source.dtype
+        )
+        scores = torch.bmm(projected_target, weighted_projected_source.transpose(1, 2))
+        if bias is not None:
+            scores = scores + bias
+        best_scores, best_indices = scores.topk(ctx.k, dim=-1, largest=True, sorted=True)
+        edges = torch.nn.functional.softsign(best_scores).contiguous()
+        flat_grad_state = grad_delta_state.reshape(-1, nodes).contiguous()
+        flat_grad_val = grad_delta_val.reshape(-1, nodes, out_dim).contiguous()
+        (
+            edges,
+            flat_projected_state,
+            flat_projected_val,
+            flat_grad_state,
+            flat_grad_val,
+        ) = _coerce_query_reduce_backward_inputs(
+            edges,
+            flat_projected_state,
+            flat_projected_val,
+            flat_grad_state,
+            flat_grad_val,
+        )
+        module = _native_module()
+        grad_edges, grad_projected_state, grad_projected_val = module.query_topk_reduce_backward_cuda(
+            edges,
+            best_indices.contiguous(),
+            flat_projected_state,
+            flat_projected_val,
+            flat_grad_state,
+            flat_grad_val,
+        )
+        grad_scores = module.softsign_backward_cuda(
+            best_scores.contiguous(),
+            grad_edges.contiguous(),
+        )
+        (
+            grad_target,
+            grad_source,
+            grad_source_weight,
+            grad_target_weight,
+            grad_core_weight,
+            grad_bias,
+        ) = module.low_rank_pairwise_topk_backward_cuda(
+            flat_val,
+            flat_val,
+            source_weight.contiguous(),
+            target_weight.contiguous(),
+            core_weight.contiguous(),
+            projected_target,
+            projected_source,
+            best_indices.contiguous(),
+            grad_scores.contiguous(),
+            1.0,
+        )
+        grad_layer = grad_target + grad_source
+        return (
+            grad_layer.reshape_as(layer_val).to(dtype=layer_val.dtype),
+            grad_projected_state.reshape_as(projected_state).to(dtype=projected_state.dtype),
+            grad_projected_val.reshape_as(projected_val).to(dtype=projected_val.dtype),
+            grad_source_weight,
+            grad_target_weight,
+            grad_core_weight,
+            grad_bias if ctx.has_bias else None,
+            None,
+            None,
+            None,
+        )
+
+
+class _LowRankPropagationWindow(Function):
+    @staticmethod
+    def forward(
+        ctx: Any,
+        layer_val: Tensor,
+        projected_state: Tensor,
+        projected_val: Tensor,
+        source_weight: Tensor,
+        target_weight: Tensor,
+        core_weight: Tensor,
+        bias: Tensor | None,
+        window: int,
+        target_block_size: int,
+        source_block_size: int,
+    ) -> tuple[Tensor, Tensor]:
+        (
+            flat_val,
+            flat_projected_state,
+            flat_projected_val,
+            batch_shape,
+            nodes,
+            out_dim,
+        ) = _flatten_dense_tensors(layer_val, projected_state, projected_val)
+        projected_target = torch.matmul(flat_val, target_weight.t()).contiguous()
+        projected_source = torch.matmul(flat_val, source_weight.t()).contiguous()
+        weighted_projected_source = projected_source * core_weight.view(1, 1, -1).to(
+            projected_source.dtype
+        )
+        score_bias = float(bias.item()) if bias is not None else 0.0
+        delta_state, delta_val = _native_module().low_rank_propagation_window_forward_cuda(
+            weighted_projected_source,
+            projected_target,
+            flat_projected_state.to(dtype=torch.float32).contiguous(),
+            flat_projected_val.to(dtype=torch.float32).contiguous(),
+            int(window),
+            score_bias,
+        )
+        ctx.window = int(window)
+        ctx.has_bias = bias is not None
+        ctx.save_for_backward(
+            layer_val,
+            projected_state,
+            projected_val,
+            source_weight,
+            target_weight,
+            core_weight,
+            _save_optional_tensor(bias, core_weight),
+        )
+        return (
+            delta_state.to(dtype=projected_state.dtype).reshape(*batch_shape, nodes),
+            delta_val.to(dtype=projected_val.dtype).reshape(*batch_shape, nodes, out_dim),
+        )
+
+    @staticmethod
+    def backward(ctx: Any, grad_delta_state: Tensor, grad_delta_val: Tensor) -> tuple[Any, ...]:
+        (
+            layer_val,
+            projected_state,
+            projected_val,
+            source_weight,
+            target_weight,
+            core_weight,
+            bias_tensor,
+        ) = ctx.saved_tensors
+        bias = _load_optional_tensor(bias_tensor)
+        (
+            flat_val,
+            flat_projected_state,
+            flat_projected_val,
+            _batch_shape,
+            nodes,
+            out_dim,
+        ) = _flatten_dense_tensors(layer_val, projected_state, projected_val)
+        projected_target = torch.matmul(flat_val, target_weight.t()).contiguous()
+        projected_source = torch.matmul(flat_val, source_weight.t()).contiguous()
+        width = min(ctx.window + 1, nodes)
+        index_2d, valid_2d = _window_source_indices(
+            target_nodes=nodes,
+            source_nodes=nodes,
+            window=ctx.window,
+            device=flat_val.device,
+        )
+        flat_indices = index_2d.view(1, nodes, width).expand(flat_val.shape[0], -1, -1).contiguous()
+        valid = valid_2d.view(1, nodes, width).expand(flat_val.shape[0], -1, -1)
+        selected_projected_source = _gather_sequence_rows(projected_source, flat_indices)
+        weighted_selected_source = selected_projected_source * core_weight.view(1, 1, 1, -1).to(
+            selected_projected_source.dtype
+        )
+        scores = (
+            projected_target.unsqueeze(-2) * weighted_selected_source
+        ).sum(dim=-1)
+        if bias is not None:
+            scores = scores + bias
+        edges = torch.nn.functional.softsign(scores)
+        edges = edges * valid.to(dtype=edges.dtype)
+        flat_grad_state = grad_delta_state.reshape(-1, nodes).contiguous()
+        flat_grad_val = grad_delta_val.reshape(-1, nodes, out_dim).contiguous()
+        (
+            edges,
+            flat_projected_state,
+            flat_projected_val,
+            flat_grad_state,
+            flat_grad_val,
+        ) = _coerce_query_reduce_backward_inputs(
+            edges,
+            flat_projected_state,
+            flat_projected_val,
+            flat_grad_state,
+            flat_grad_val,
+        )
+        module = _native_module()
+        grad_edges, grad_projected_state, grad_projected_val = module.query_topk_reduce_backward_cuda(
+            edges.contiguous(),
+            flat_indices,
+            flat_projected_state,
+            flat_projected_val,
+            flat_grad_state,
+            flat_grad_val,
+        )
+        valid_f32 = valid.to(dtype=grad_edges.dtype)
+        grad_edges = grad_edges * valid_f32
+        grad_scores = module.softsign_backward_cuda(
+            scores.contiguous(),
+            grad_edges.contiguous(),
+        )
+        grad_scores = grad_scores * valid_f32
+        (
+            grad_target,
+            grad_source,
+            grad_source_weight,
+            grad_target_weight,
+            grad_core_weight,
+            grad_bias,
+        ) = module.low_rank_pairwise_topk_backward_cuda(
+            flat_val,
+            flat_val,
+            source_weight.contiguous(),
+            target_weight.contiguous(),
+            core_weight.contiguous(),
+            projected_target,
+            projected_source,
+            flat_indices,
+            grad_scores.contiguous(),
+            1.0,
+        )
+        grad_layer = grad_target + grad_source
+        return (
+            grad_layer.reshape_as(layer_val).to(dtype=layer_val.dtype),
+            grad_projected_state.reshape_as(projected_state).to(dtype=projected_state.dtype),
+            grad_projected_val.reshape_as(projected_val).to(dtype=projected_val.dtype),
+            grad_source_weight,
+            grad_target_weight,
+            grad_core_weight,
+            grad_bias if ctx.has_bias else None,
+            None,
+            None,
+            None,
+        )
+
+
 def propagation_dense_native(
     *,
     pairwise_fn: object,
@@ -1719,6 +2284,31 @@ def propagation_window_native(
 ) -> Any:
     if not supports_pairwise_kernel(pairwise_fn):
         raise TypeError("Unsupported pairwise_fn for native propagation.")
+    use_cuda_autograd = (
+        _experimental_fused_training_enabled()
+        and edge_compress_name == "softsign"
+        and _query_backward_ops_available()
+        and native_supports("low_rank_propagation_window_forward_cuda")
+        and native_supports("low_rank_pairwise_topk_backward_cuda")
+        and isinstance(pairwise_fn, LowRankBilinearPairwise)
+        and _cuda_float_tensor(layer_val)
+        and _cuda_float_tensor(projected_state)
+        and _cuda_float_tensor(projected_val)
+    )
+    if use_cuda_autograd:
+        delta_state, delta_val = _LowRankPropagationWindow.apply(
+            layer_val,
+            projected_state,
+            projected_val,
+            pairwise_fn.source_proj.weight,
+            pairwise_fn.target_proj.weight,
+            pairwise_fn.weight,
+            pairwise_fn.bias,
+            window,
+            target_block_size,
+            source_block_size,
+        )
+        return LayerDelta(delta_state=delta_state, delta_val=delta_val)
     spec = pairwise_kernel_spec(pairwise_fn)
     return _to_layer_delta(_native_module().propagation_window(
         spec.kind,
@@ -1751,6 +2341,32 @@ def propagation_topk_native(
 ) -> Any:
     if not supports_pairwise_kernel(pairwise_fn):
         raise TypeError("Unsupported pairwise_fn for native propagation.")
+    use_cuda_autograd = (
+        _experimental_fused_training_enabled()
+        and edge_compress_name == "softsign"
+        and _query_backward_ops_available()
+        and native_supports("low_rank_propagation_topk_forward_cuda")
+        and native_supports("low_rank_pairwise_topk_backward_cuda")
+        and isinstance(pairwise_fn, LowRankBilinearPairwise)
+        and topk <= 32
+        and _cuda_float_tensor(layer_val)
+        and _cuda_float_tensor(projected_state)
+        and _cuda_float_tensor(projected_val)
+    )
+    if use_cuda_autograd:
+        delta_state, delta_val = _LowRankPropagationTopK.apply(
+            layer_val,
+            projected_state,
+            projected_val,
+            pairwise_fn.source_proj.weight,
+            pairwise_fn.target_proj.weight,
+            pairwise_fn.weight,
+            pairwise_fn.bias,
+            topk,
+            target_block_size,
+            source_block_size,
+        )
+        return LayerDelta(delta_state=delta_state, delta_val=delta_val)
     spec = pairwise_kernel_spec(pairwise_fn)
     return _to_layer_delta(_native_module().propagation_topk(
         spec.kind,
@@ -1786,7 +2402,8 @@ def propagation_query_topk_native(
     if not supports_pairwise_kernel(pairwise_fn):
         raise TypeError("Unsupported pairwise_fn for native query propagation.")
     use_cuda_autograd = (
-        _query_backward_ops_available()
+        _experimental_fused_training_enabled()
+        and _query_backward_ops_available()
         and native_supports("propagation_query_topk_select")
         and native_supports("diagonal_pairwise_topk_backward_cuda")
         and native_supports("low_rank_pairwise_topk_backward_cuda")
@@ -1989,7 +2606,8 @@ def transition_query_topk_native(
     inner = getattr(route_fn, "route_fn", route_fn)
     temperature = float(getattr(route_fn, "temperature", 1.0))
     use_cuda_autograd = (
-        _query_backward_ops_available()
+        _experimental_fused_training_enabled()
+        and _query_backward_ops_available()
         and native_supports("transition_query_topk_select")
         and native_supports("diagonal_pairwise_topk_backward_cuda")
         and native_supports("low_rank_pairwise_topk_backward_cuda")
@@ -2071,6 +2689,37 @@ def transition_pairwise_topk_native(
 ) -> Any:
     if not supports_pairwise_route_kernel(route_fn):
         raise TypeError("Unsupported pairwise route_fn for native sparse transition.")
+    inner = getattr(route_fn, "route_fn", route_fn)
+    temperature = float(getattr(route_fn, "temperature", 1.0))
+    use_cuda_autograd = (
+        _query_backward_ops_available()
+        and native_supports("low_rank_pairwise_topk_forward_cuda")
+        and native_supports("low_rank_pairwise_topk_backward_cuda")
+        and isinstance(inner, LowRankBilinearRoute)
+        and topk <= 32
+        and _cuda_float_tensor(sender_strength)
+        and _cuda_float_tensor(src_val)
+        and _cuda_float_tensor(dst_val)
+        and _cuda_float_tensor(projected_state)
+        and _cuda_float_tensor(projected_val)
+    )
+    if use_cuda_autograd:
+        delta_state, delta_val = _LowRankTransitionPairwiseTopK.apply(
+            sender_strength,
+            src_val,
+            dst_val,
+            projected_state,
+            projected_val,
+            inner.source_proj.weight,
+            inner.target_proj.weight,
+            inner.weight,
+            inner.bias,
+            temperature,
+            topk,
+            src_block_size,
+            dst_block_size,
+        )
+        return LayerDelta(delta_state=delta_state, delta_val=delta_val)
     spec = pairwise_route_kernel_spec(route_fn)
     return _to_layer_delta(_native_module().transition_pairwise_topk(
         spec.kind,
