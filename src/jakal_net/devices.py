@@ -18,7 +18,9 @@ def resolve_device(device_name: str) -> torch.device:
     return torch.device(device_name)
 
 
-def describe_device(device_name: str) -> str:
+def describe_device(device_name: str | torch.device) -> str:
+    if not isinstance(device_name, str):
+        return str(device_name)
     normalized = device_name.strip().lower()
     if normalized in {"directml", "dml"}:
         try:
