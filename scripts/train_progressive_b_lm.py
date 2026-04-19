@@ -1539,13 +1539,9 @@ def log_history_to_tensorboard(
             epoch_step = step / steps_per_epoch
             writer.add_scalar("train/minibatch_loss", loss, step)
             writer.add_scalar("train/epoch", epoch_step, step)
-            writer.add_scalar("train/epoch_step", epoch_step, step)
         for step, grad_norm in enumerate(history.grad_norms, start=1):
             writer.add_scalar("train/grad_norm", grad_norm, step)
         for step, stats in enumerate(history.train_step_stats, start=1):
-            query_head_loss = stats.get("loss/query_head")
-            if query_head_loss is not None:
-                writer.add_scalar("train/query_head_loss", query_head_loss, step)
             avg_query_head_loss = stats.get("loss/avg_query_head")
             if avg_query_head_loss is not None:
                 writer.add_scalar("train/avg_ppl", perplexity_from_loss(avg_query_head_loss), step)
@@ -2261,7 +2257,6 @@ def run_single_experiment(
         epoch_step = step / steps_per_epoch
         writer.add_scalar("train/minibatch_loss", minibatch_loss, step)
         writer.add_scalar("train/epoch", epoch_step, step)
-        writer.add_scalar("train/epoch_step", epoch_step, step)
         writer.add_scalar("train/grad_norm", grad_norm, step)
         if step == 1 or step == train_steps or (args.log_interval > 0 and step % args.log_interval == 0):
             writer.flush()
@@ -2269,9 +2264,6 @@ def run_single_experiment(
     def loss_stats_tensorboard_callback(step: int, stats: dict[str, float]) -> None:
         if writer is None:
             return
-        query_head_loss = stats.get("loss/query_head")
-        if query_head_loss is not None:
-            writer.add_scalar("train/query_head_loss", query_head_loss, step)
         average_query_head_loss = stats.get("loss/avg_query_head")
         if average_query_head_loss is not None and args.training_objective == "query_block":
             writer.add_scalar(
@@ -2306,22 +2298,13 @@ def run_single_experiment(
             prompt_ids, prompt_text = select_eval_prompt()
             sample_prompt, sample_generated = make_eval_sample(prompt_ids, prompt_text, sample_source="query_head")
             writer.add_text(
-                "eval/sample",
+                "eval/sample_query_head" if pair_query_block else "eval/sample",
                 format_tensorboard_sample(
                     prompt_text=sample_prompt,
                     generated_text=sample_generated,
                 ),
                 step,
             )
-            if pair_query_block:
-                writer.add_text(
-                    "eval/sample_query_head",
-                    format_tensorboard_sample(
-                        prompt_text=sample_prompt,
-                        generated_text=sample_generated,
-                    ),
-                    step,
-                )
             writer.flush()
         if trial is not None:
             trial.report(val_loss, step)

@@ -2966,8 +2966,6 @@ def compute_next_token_loss(
             position_weights=position_weights,
         )
         loss = main_loss
-        loss_stats["loss/main"] = float(main_loss.detach().item())
-        loss_stats["loss/avg_main"] = float(average_main_loss.detach().item())
         loss_stats["loss/query_head"] = float(main_loss.detach().item())
         loss_stats["loss/avg_query_head"] = float(average_main_loss.detach().item())
         if query_block and batch.target.ndim > 1:
