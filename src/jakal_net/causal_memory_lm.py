@@ -5,6 +5,7 @@ from typing import Sequence
 
 import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
 
 from jakal_net.core import Layer, LayerDelta
 from jakal_net.modules import (
@@ -19,7 +20,7 @@ from jakal_net.modules import (
     LowRankBilinearRoute,
 )
 from jakal_net.propagation import SparsePropagation
-from jakal_net.transition import SparseTransition, Transition
+from jakal_net.transition import SparseTransition
 
 
 def _make_pairwise(
@@ -136,7 +137,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
         dim: int = 512,
         max_seq_len: int = 2048,
         s_layers: int = 2,
-        memory_slots: Sequence[int] = (512, 128, 32),
+        memory_slots: Sequence[int] = (256, 64, 16),
         prediction_layers: int = 2,
         s_window: int | None = None,
         prediction_window: int = 64,
@@ -234,17 +235,8 @@ class CausalHierarchicalMemoryLM(nn.Module):
             )
             self.skip_gates[key] = nn.Parameter(torch.tensor(-1.5))
 
-        self.read_template_state = nn.Parameter(torch.zeros(()))
         self.read_template_val = nn.Parameter(torch.empty(dim))
         nn.init.normal_(self.read_template_val, mean=0.0, std=0.02)
-        self.read_transitions = nn.ModuleList(
-            Transition(
-                route_fn=_make_route(route_kind, dim=dim, rank=route_rank),
-                implementation=implementation,
-                merge_mode="add",
-            )
-            for _ in self.memory_slots
-        )
         self.read_projections = nn.ModuleList(nn.Linear(dim, dim, bias=False) for _ in self.memory_slots)
         self.read_gates = nn.ParameterList(nn.Parameter(torch.zeros(())) for _ in self.memory_slots)
 
@@ -286,17 +278,6 @@ class CausalHierarchicalMemoryLM(nn.Module):
             state=token_state.unsqueeze(-1),
             val=token_val.unsqueeze(-2),
         )
-
-    def _make_read_template(
-        self,
-        *,
-        batch_size: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> Layer:
-        state = self.read_template_state.expand(batch_size, 1).to(device=device, dtype=dtype)
-        val = self.read_template_val.expand(batch_size, 1, -1).to(device=device, dtype=dtype)
-        return Layer(dim=self.dim, num_nodes=1, state=state.clone(), val=val.clone())
 
     def _reset_memory_items(
         self,
@@ -413,19 +394,19 @@ class CausalHierarchicalMemoryLM(nn.Module):
         return tuple(next_levels)
 
     def _read_memory(self, memory_state: Sequence[Layer]) -> Tensor:
-        batch_size = memory_state[0].state.shape[0]
-        device = memory_state[0].val.device
-        dtype = memory_state[0].val.dtype
         read_terms: list[Tensor] = []
-        for level, transition, projection, gate in zip(
+        for level, projection, gate in zip(
             memory_state,
-            self.read_transitions,
             self.read_projections,
             self.read_gates,
         ):
-            read_layer = self._make_read_template(batch_size=batch_size, device=device, dtype=dtype)
-            read_layer = transition(level, read_layer)
-            read_terms.append(torch.sigmoid(gate) * projection(read_layer.val[:, 0, :]))
+            sender_strength = F.softplus(level.state).unsqueeze(-1)
+            read_summary = (sender_strength * level.val).sum(dim=-2)
+            read_summary = read_summary + self.read_template_val.to(
+                device=level.val.device,
+                dtype=level.val.dtype,
+            ).unsqueeze(0)
+            read_terms.append(torch.sigmoid(gate) * projection(read_summary))
         return torch.stack(read_terms, dim=0).sum(dim=0)
 
     def forward(

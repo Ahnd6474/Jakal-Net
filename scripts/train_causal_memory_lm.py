@@ -788,7 +788,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-len", type=int, default=2048)
     parser.add_argument("--dim", type=int, default=512)
     parser.add_argument("--s-layers", type=int, default=2)
-    parser.add_argument("--memory-slots", type=int, nargs="+", default=[512, 128, 32])
+    parser.add_argument("--memory-slots", type=int, nargs="+", default=[256, 64, 16])
     parser.add_argument("--prediction-layers", type=int, default=2)
     parser.add_argument("--s-window", type=int, default=2048)
     parser.add_argument("--prediction-window", type=int, default=64)
