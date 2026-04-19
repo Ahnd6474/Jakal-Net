@@ -470,6 +470,40 @@ def main() -> None:
         src_block_size=64,
         dst_block_size=64,
     )
+    sparse_transition_pairwise_reference = SparseTransition(
+        route_fn=_clone_module(query_route_template).to(device),
+        topk=8,
+        state_proj_fn=_clone_module(state_proj_template).to(device),
+        val_proj_fn=_clone_module(val_proj_template).to(device),
+        implementation="reference",
+    )
+    sparse_transition_pairwise_streaming = SparseTransition(
+        route_fn=_clone_module(query_route_template).to(device),
+        topk=8,
+        state_proj_fn=_clone_module(state_proj_template).to(device),
+        val_proj_fn=_clone_module(val_proj_template).to(device),
+        implementation="streaming",
+        src_block_size=64,
+        dst_block_size=64,
+    )
+    sparse_transition_pairwise_kernel = SparseTransition(
+        route_fn=_clone_module(query_route_template).to(device),
+        topk=8,
+        state_proj_fn=_clone_module(state_proj_template).to(device),
+        val_proj_fn=_clone_module(val_proj_template).to(device),
+        implementation="kernel",
+        src_block_size=64,
+        dst_block_size=64,
+    )
+    sparse_transition_pairwise_native = SparseTransition(
+        route_fn=_clone_module(query_route_template).to(device),
+        topk=8,
+        state_proj_fn=_clone_module(state_proj_template).to(device),
+        val_proj_fn=_clone_module(val_proj_template).to(device),
+        implementation="native",
+        src_block_size=64,
+        dst_block_size=64,
+    )
 
     benchmarks: list[tuple[str, list[tuple[str, Callable[[], object]]], int]] = [
         (
@@ -519,6 +553,36 @@ def main() -> None:
                 ("kernel", lambda: sparse_transition_kernel.compute_delta(trans_src, trans_dst)),
                 ("streaming", lambda: sparse_transition_streaming.compute_delta(trans_src, trans_dst)),
                 ("native", lambda: sparse_transition_native.compute_delta(trans_src, trans_dst)),
+            ],
+            batch_factor * trans_src.num_nodes * 8,
+        ),
+        (
+            "SparseTransition(pairwise_topk)",
+            [
+                (
+                    "reference",
+                    lambda: sparse_transition_pairwise_reference.compute_delta(
+                        trans_src, trans_dst
+                    ),
+                ),
+                (
+                    "streaming",
+                    lambda: sparse_transition_pairwise_streaming.compute_delta(
+                        trans_src, trans_dst
+                    ),
+                ),
+                (
+                    "kernel",
+                    lambda: sparse_transition_pairwise_kernel.compute_delta(
+                        trans_src, trans_dst
+                    ),
+                ),
+                (
+                    "native",
+                    lambda: sparse_transition_pairwise_native.compute_delta(
+                        trans_src, trans_dst
+                    ),
+                ),
             ],
             batch_factor * trans_src.num_nodes * 8,
         ),
