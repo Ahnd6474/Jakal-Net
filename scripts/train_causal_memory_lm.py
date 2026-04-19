@@ -790,7 +790,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--s-layers", type=int, default=2)
     parser.add_argument("--memory-slots", type=int, nargs="+", default=[256, 64, 16])
     parser.add_argument("--prediction-layers", type=int, default=2)
-    parser.add_argument("--s-window", type=int, default=2048)
+    parser.add_argument("--s-window", type=int, default=256)
+    parser.add_argument("--s-microbatch-size", type=int, default=0)
     parser.add_argument("--prediction-window", type=int, default=64)
     parser.add_argument("--memory-topk", type=int, default=16)
     parser.add_argument(
@@ -948,6 +949,7 @@ def main() -> None:
         memory_slots=tuple(args.memory_slots),
         prediction_layers=args.prediction_layers,
         s_window=args.s_window,
+        s_microbatch_size=None if args.s_microbatch_size <= 0 else args.s_microbatch_size,
         prediction_window=args.prediction_window,
         memory_topk=args.memory_topk,
         pairwise_kind=args.pairwise_kind,
@@ -958,7 +960,8 @@ def main() -> None:
     ).to(device)
     parameter_count = count_parameters(model)
     print(
-        f"model=causal_memory_doc | params={parameter_count:,} | dim={args.dim} | seq_len={args.seq_len} | memory_slots={args.memory_slots}",
+        f"model=causal_memory_doc | params={parameter_count:,} | dim={args.dim} | seq_len={args.seq_len} | "
+        f"s_window={args.s_window} | s_microbatch_size={args.s_microbatch_size} | memory_slots={args.memory_slots}",
         flush=True,
     )
 

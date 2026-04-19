@@ -75,6 +75,49 @@ class CausalMemoryLMTests(unittest.TestCase):
         self.assertTrue(torch.allclose(carried_output.logits[0], fresh_output.logits[0]))
         self.assertFalse(torch.allclose(carried_output.logits[1], fresh_output.logits[1]))
 
+    def test_s_microbatch_matches_full_batch_forward(self) -> None:
+        torch.manual_seed(9)
+        base_model = CausalHierarchicalMemoryLM(
+            vocab_size=24,
+            dim=8,
+            max_seq_len=12,
+            s_layers=1,
+            memory_slots=(5, 3),
+            prediction_layers=1,
+            s_window=8,
+            prediction_window=4,
+            memory_topk=2,
+            pairwise_rank=4,
+            route_rank=4,
+        )
+        microbatched_model = CausalHierarchicalMemoryLM(
+            vocab_size=24,
+            dim=8,
+            max_seq_len=12,
+            s_layers=1,
+            memory_slots=(5, 3),
+            prediction_layers=1,
+            s_window=8,
+            s_microbatch_size=2,
+            prediction_window=4,
+            memory_topk=2,
+            pairwise_rank=4,
+            route_rank=4,
+        )
+        microbatched_model.load_state_dict(base_model.state_dict())
+        token_ids = torch.randint(0, 24, (4, 5))
+
+        base_output = base_model(token_ids, return_memory_state=True)
+        micro_output = microbatched_model(token_ids, return_memory_state=True)
+
+        assert isinstance(base_output, MemoryScanOutput)
+        assert isinstance(micro_output, MemoryScanOutput)
+        self.assertTrue(torch.allclose(base_output.logits, micro_output.logits))
+        self.assertEqual(len(base_output.memory_state), len(micro_output.memory_state))
+        for base_layer, micro_layer in zip(base_output.memory_state, micro_output.memory_state):
+            self.assertTrue(torch.allclose(base_layer.state, micro_layer.state))
+            self.assertTrue(torch.allclose(base_layer.val, micro_layer.val))
+
     def test_document_chunks_insert_continuation_prefix(self) -> None:
         chunks = make_document_chunks(
             content_ids=torch.tensor([10, 11, 12, 13, 14, 15, 16], dtype=torch.long),

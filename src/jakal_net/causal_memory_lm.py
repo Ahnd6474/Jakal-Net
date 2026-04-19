@@ -140,6 +140,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
         memory_slots: Sequence[int] = (256, 64, 16),
         prediction_layers: int = 2,
         s_window: int | None = None,
+        s_microbatch_size: int | None = None,
         prediction_window: int = 64,
         memory_topk: int = 16,
         pairwise_kind: str = "low_rank_bilinear",
@@ -160,6 +161,8 @@ class CausalHierarchicalMemoryLM(nn.Module):
             raise ValueError("s_layers must be positive.")
         if prediction_layers <= 0:
             raise ValueError("prediction_layers must be positive.")
+        if s_microbatch_size is not None and s_microbatch_size <= 0:
+            raise ValueError("s_microbatch_size must be positive when provided.")
         if not memory_slots:
             raise ValueError("memory_slots must contain at least one level.")
         if any(slots <= 0 for slots in memory_slots):
@@ -170,6 +173,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
         self.num_memory_levels = len(tuple(memory_slots))
         self.memory_slots = tuple(int(slots) for slots in memory_slots)
         self.prediction_window = prediction_window
+        self.s_microbatch_size = s_microbatch_size
 
         self.token_embedding = nn.Embedding(vocab_size, dim)
         self.position_encoding = LearnedPositionEncoding(dim)
@@ -270,15 +274,6 @@ class CausalHierarchicalMemoryLM(nn.Module):
             for level in self.memory_levels
         )
 
-    def _make_single_token_layer(self, token_val: Tensor) -> Layer:
-        token_state = self.value_to_state(token_val).squeeze(-1)
-        return Layer(
-            dim=self.dim,
-            num_nodes=1,
-            state=token_state.unsqueeze(-1),
-            val=token_val.unsqueeze(-2),
-        )
-
     def _reset_memory_items(
         self,
         memory_state: Sequence[Layer],
@@ -342,6 +337,21 @@ class CausalHierarchicalMemoryLM(nn.Module):
             layer = _apply_delta(layer, propagation.compute_delta(layer), residual=True)
             layer = _layer_with_val_norm(layer, norm)
         return layer
+
+    def _encode_sequence_microbatched(self, input_ids: Tensor) -> Layer:
+        if self.s_microbatch_size is None or input_ids.shape[0] <= self.s_microbatch_size:
+            return self._encode_sequence(input_ids)
+
+        chunks: list[Layer] = []
+        for start in range(0, input_ids.shape[0], self.s_microbatch_size):
+            end = min(start + self.s_microbatch_size, input_ids.shape[0])
+            chunks.append(self._encode_sequence(input_ids[start:end]))
+        return Layer(
+            dim=self.dim,
+            num_nodes=chunks[0].num_nodes,
+            state=torch.cat([chunk.state for chunk in chunks], dim=0),
+            val=torch.cat([chunk.val for chunk in chunks], dim=0),
+        )
 
     def _update_memory(
         self,
@@ -409,6 +419,38 @@ class CausalHierarchicalMemoryLM(nn.Module):
             read_terms.append(torch.sigmoid(gate) * projection(read_summary))
         return torch.stack(read_terms, dim=0).sum(dim=0)
 
+    def _scan_memory_batch(
+        self,
+        aligned_s: Tensor,
+        memory_state: Sequence[Layer],
+    ) -> tuple[Layer, tuple[Layer, ...]]:
+        batch_size, seq_len, _ = aligned_s.shape
+        current_memory = tuple(memory_state)
+        projected_s = self.s_prediction_proj(aligned_s)
+        query_val = aligned_s.new_empty(batch_size, seq_len, self.dim)
+
+        # The time axis remains recurrent, but every step updates every document stream
+        # in the batch together.
+        for time_index in range(seq_len):
+            token_val = aligned_s.narrow(1, time_index, 1)
+            token_layer = Layer(
+                dim=self.dim,
+                num_nodes=1,
+                state=self.value_to_state(token_val).squeeze(-1),
+                val=token_val,
+            )
+            current_memory = self._update_memory(token_layer, current_memory)
+            read_vector = self._read_memory(current_memory)
+            query_val[:, time_index, :] = self.prediction_input_norm(
+                projected_s[:, time_index, :] + read_vector
+            )
+
+        query_state = self.value_to_state(query_val).squeeze(-1)
+        return (
+            Layer(dim=self.dim, num_nodes=seq_len, state=query_state, val=query_val),
+            current_memory,
+        )
+
     def forward(
         self,
         input_ids: Tensor,
@@ -418,7 +460,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
         return_memory_state: bool = False,
         return_layers: bool = False,
     ) -> Tensor | MemoryScanOutput:
-        sequence_layer = self._encode_sequence(input_ids)
+        sequence_layer = self._encode_sequence_microbatched(input_ids)
         aligned_s = sequence_layer.val[:, 1:, :]
         batch_size, seq_len, _ = aligned_s.shape
         device = aligned_s.device
@@ -434,21 +476,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
             device=device,
             dtype=dtype,
         )
-
-        query_values: list[Tensor] = []
-        for time_index in range(seq_len):
-            token_layer = self._make_single_token_layer(aligned_s[:, time_index, :])
-            current_memory = self._update_memory(token_layer, current_memory)
-            read_vector = self._read_memory(current_memory)
-            query_values.append(
-                self.prediction_input_norm(
-                    self.s_prediction_proj(aligned_s[:, time_index, :]) + read_vector
-                )
-            )
-
-        query_val = torch.stack(query_values, dim=1)
-        query_state = self.value_to_state(query_val).squeeze(-1)
-        query_layer = Layer(dim=self.dim, num_nodes=seq_len, state=query_state, val=query_val)
+        query_layer, current_memory = self._scan_memory_batch(aligned_s, current_memory)
         for propagation, norm in zip(self.prediction_layers, self.prediction_norms):
             query_layer = _apply_delta(query_layer, propagation.compute_delta(query_layer), residual=True)
             query_layer = _layer_with_val_norm(query_layer, norm)
