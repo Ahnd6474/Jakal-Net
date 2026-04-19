@@ -263,6 +263,48 @@ class ProgressiveBArchitectureTests(unittest.TestCase):
 
         self.assertEqual(logits.shape, (2, 5, 32))
 
+    def test_query_block_teacher_forced_feedback_runs_single_refine_pass(self) -> None:
+        torch.manual_seed(27)
+        model = ProgressiveBExampleLM(
+            vocab_size=32,
+            dim=8,
+            seq_nodes=8,
+            warmup_layers=1,
+            final_refine_layers=1,
+        )
+        token_ids = torch.randint(0, 32, (2, 8))
+        feedback_tokens = torch.randint(0, 32, (2, 4))
+        seed_tokens = feedback_tokens[:, :1]
+        transition_calls: list[tuple[int, int]] = []
+        propagation_calls: list[int] = []
+        original_compute_delta = model.query_transition.compute_delta
+        original_query_helper = progressive_b_module._compute_dense_causal_propagation_delta
+
+        def record_transition(src_layer, dst_layer):
+            transition_calls.append((src_layer.num_nodes, dst_layer.num_nodes))
+            return original_compute_delta(src_layer, dst_layer)
+
+        def record_propagation(propagation, query_layer):
+            propagation_calls.append(query_layer.num_nodes)
+            return original_query_helper(propagation, query_layer)
+
+        model.query_transition.compute_delta = record_transition
+        progressive_b_module._compute_dense_causal_propagation_delta = record_propagation
+
+        try:
+            logits = model.forward_query_block(
+                token_ids,
+                target_len=4,
+                query_seed_token_ids=seed_tokens,
+                query_feedback_token_ids=feedback_tokens,
+            )
+        finally:
+            progressive_b_module._compute_dense_causal_propagation_delta = original_query_helper
+
+        self.assertEqual(logits.shape, (2, 4, 32))
+        self.assertEqual(transition_calls, [(8, 4)])
+        self.assertEqual(propagation_calls, [4])
+
 
 
 if __name__ == "__main__":

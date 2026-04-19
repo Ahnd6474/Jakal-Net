@@ -2096,20 +2096,26 @@ class ProgressiveBExampleLM(nn.Module):
                 current_query_layer = self.apply_query_propagation(current_query_layer)
             return current_query_layer
 
-        query_layer = refine_with_feedback(query_layer)
-        draft_query = self.query_head_norm(query_layer.val)
-        draft_logits = self.query_head(draft_query)
         seed_len = 0 if query_seed_token_ids is None else query_seed_token_ids.shape[1]
         if query_feedback_token_ids is not None:
             feedback = self._token_id_feedback(query_feedback_token_ids)
+            if seed_len > 0:
+                seed_feedback = self._token_id_feedback(query_seed_token_ids)
+                feedback = feedback.clone()
+                feedback[:, :seed_len, :] = seed_feedback.to(feedback.dtype)
+            query_layer = self._inject_query_feedback(query_layer, feedback)
+            query_layer = refine_with_feedback(query_layer)
         else:
+            query_layer = refine_with_feedback(query_layer)
+            draft_query = self.query_head_norm(query_layer.val)
+            draft_logits = self.query_head(draft_query)
             feedback = self._soft_token_feedback(draft_logits)
-        if seed_len > 0:
-            seed_feedback = self._token_id_feedback(query_seed_token_ids)
-            feedback = feedback.clone()
-            feedback[:, :seed_len, :] = seed_feedback.to(feedback.dtype)
-        query_layer = self._inject_query_feedback(query_layer, feedback)
-        query_layer = refine_with_feedback(query_layer)
+            if seed_len > 0:
+                seed_feedback = self._token_id_feedback(query_seed_token_ids)
+                feedback = feedback.clone()
+                feedback[:, :seed_len, :] = seed_feedback.to(feedback.dtype)
+            query_layer = self._inject_query_feedback(query_layer, feedback)
+            query_layer = refine_with_feedback(query_layer)
 
         if self.collect_aux_losses and query_transition_losses:
             aux_losses["route_concentration/query_transition"] = torch.stack(query_transition_losses).mean()
