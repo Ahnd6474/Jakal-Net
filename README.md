@@ -92,6 +92,17 @@ This makes the forecasting path explicit. The encoded prefix lives in `S`,
 while the prediction process lives in a separate query layer with its own
 causal propagation.
 
+For `query_block` training, the current head uses teacher-forced token feedback
+before query refinement:
+
+- build one query slot per target position
+- inject shifted target-token embeddings into those query slots during training
+- run `query_transition` and causal `query_propagation`
+- read logits from the refined query slots
+
+At inference time there is no gold feedback, so the same path falls back to
+self-conditioned soft token feedback.
+
 ### 4. Execution backends
 
 The same architecture can run through several implementations:
@@ -149,6 +160,62 @@ alternative LM structure than to a conventional Transformer implementation.
 - Query-block specific logging for unweighted average perplexity, grad norm,
   eval samples, and distance-bucket perplexity.
 - Best/last/final checkpoint artifacts for experiment tracking.
+
+## Current Query-Block Training Recipe
+
+The current scratch recipe used for the teacher-forced query-feedback head is:
+
+```bash
+PYTHONPATH=src python -u scripts/train_progressive_b_lm.py \
+  --device cuda \
+  --training-objective query_block \
+  --jsonl-source artifacts/data/query_block_instruction_dialogue_arxiv_pubmed_code_wiki_10m.jsonl \
+  --balance-batch-by-source \
+  --tokenizer byte_bpe \
+  --subword-vocab-size 16384 \
+  --tokenizer-prefix artifacts/tokenizers/query_block_mix_byte_bpe_16384 \
+  --epochs 1.0 \
+  --eval-interval 100 \
+  --checkpoint-interval 1000 \
+  --batch-size 64 \
+  --grad-accum-steps 10 \
+  --seq-len 512 \
+  --target-len 192 \
+  --dim 512 \
+  --warmup-layers 0 \
+  --final-refine-layers 1 \
+  --query-refine-layers 4 \
+  --lite-layers 2 \
+  --mid-layers 5 \
+  --full-layers 2 \
+  --route-topk 16 \
+  --query-topk 16 \
+  --route-kind low_rank_bilinear \
+  --pairwise-kind low_rank_bilinear \
+  --route-mode topk \
+  --expanded-propagation topk \
+  --compressed-propagation topk \
+  --sequence-propagation window \
+  --precision bf16 \
+  --implementation kernel \
+  --s-window 32 \
+  --edge-dropout-p 0.1 \
+  --learning-rate-schedule cosine \
+  --learning-rate-warmup-steps 1000 \
+  --learning-rate-warmup-start 1e-4 \
+  --learning-rate 5e-4 \
+  --learning-rate-min-ratio 0.5 \
+  --query-block-front-weight 1.0 \
+  --block-residual \
+  --query-residual \
+  --share-route-families \
+  --tensorboard \
+  --save-checkpoint
+```
+
+On the current 95 GB GPU target, a random-token forward/backward/step check
+passes at `batch_size=64` and OOMs at `batch_size=72`, so `64` is the safe
+single-step batch ceiling for this configuration.
 
 ## Repository Layout
 
