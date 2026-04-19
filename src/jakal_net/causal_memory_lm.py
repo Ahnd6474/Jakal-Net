@@ -22,6 +22,8 @@ from jakal_net.modules import (
 from jakal_net.propagation import SparsePropagation
 from jakal_net.transition import SparseTransition
 
+_STATE_LIMIT = 12.0
+
 
 def _make_pairwise(
     kind: str,
@@ -62,7 +64,8 @@ def _layer_with_val_norm(layer: Layer, norm: nn.LayerNorm) -> Layer:
 
 
 def _apply_delta(layer: Layer, delta: LayerDelta, *, residual: bool = True) -> Layer:
-    return layer.apply_delta(delta, merge_mode="add" if residual else "replace")
+    updated = layer.apply_delta(delta, merge_mode="add" if residual else "replace")
+    return updated.with_tensors(state=updated.state.tanh() * _STATE_LIMIT)
 
 
 def _clone_layer(layer: Layer) -> Layer:
@@ -445,7 +448,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
             self.read_projections,
             self.read_gates,
         ):
-            sender_strength = F.softplus(level.state).unsqueeze(-1)
+            sender_strength = F.softplus(level.state.clamp(min=-_STATE_LIMIT, max=_STATE_LIMIT)).unsqueeze(-1)
             read_summary = (sender_strength * level.val).sum(dim=-2)
             read_summary = read_summary + self.read_template_val.to(
                 device=level.val.device,
