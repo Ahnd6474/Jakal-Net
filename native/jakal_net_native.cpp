@@ -82,6 +82,100 @@ bool supports_cuda_runtime() {
 #endif
 }
 
+std::tuple<torch::Tensor, torch::Tensor> query_topk_reduce_cuda_wrapper(
+    const torch::Tensor& edges,
+    const torch::Tensor& indices,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val) {
+#ifdef WITH_CUDA
+  return jakal_net_query_topk_reduce_cuda(edges, indices, projected_state, projected_val);
+#else
+  throw std::runtime_error("query_topk_reduce_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> query_topk_reduce_backward_cuda_wrapper(
+    const torch::Tensor& edges,
+    const torch::Tensor& indices,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    const torch::Tensor& grad_delta_state,
+    const torch::Tensor& grad_delta_val) {
+#ifdef WITH_CUDA
+  return jakal_net_query_topk_reduce_backward_cuda(
+      edges, indices, projected_state, projected_val, grad_delta_state, grad_delta_val);
+#else
+  throw std::runtime_error("query_topk_reduce_backward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+torch::Tensor softsign_backward_cuda_wrapper(
+    const torch::Tensor& scores,
+    const torch::Tensor& grad_edges) {
+#ifdef WITH_CUDA
+  return jakal_net_softsign_backward_cuda(scores, grad_edges);
+#else
+  throw std::runtime_error("softsign_backward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+torch::Tensor softmax_backward_cuda_wrapper(
+    const torch::Tensor& routes,
+    const torch::Tensor& grad_routes) {
+#ifdef WITH_CUDA
+  return jakal_net_softmax_backward_cuda(routes, grad_routes);
+#else
+  throw std::runtime_error("softmax_backward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+diagonal_pairwise_topk_backward_cuda_wrapper(
+    const torch::Tensor& query_val,
+    const torch::Tensor& source_val,
+    const torch::Tensor& weight,
+    const torch::Tensor& indices,
+    const torch::Tensor& grad_scores,
+    double temperature) {
+#ifdef WITH_CUDA
+  return jakal_net_diagonal_pairwise_topk_backward_cuda(
+      query_val, source_val, weight, indices, grad_scores, temperature);
+#else
+  throw std::runtime_error(
+      "diagonal_pairwise_topk_backward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+low_rank_pairwise_topk_backward_cuda_wrapper(
+    const torch::Tensor& query_val,
+    const torch::Tensor& source_val,
+    const torch::Tensor& source_weight,
+    const torch::Tensor& target_weight,
+    const torch::Tensor& core_weight,
+    const torch::Tensor& projected_query,
+    const torch::Tensor& projected_source,
+    const torch::Tensor& indices,
+    const torch::Tensor& grad_scores,
+    double temperature) {
+#ifdef WITH_CUDA
+  return jakal_net_low_rank_pairwise_topk_backward_cuda(
+      query_val,
+      source_val,
+      source_weight,
+      target_weight,
+      core_weight,
+      projected_query,
+      projected_source,
+      indices,
+      grad_scores,
+      temperature);
+#else
+  throw std::runtime_error(
+      "low_rank_pairwise_topk_backward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
 void require_supported_device(const torch::Tensor& tensor, const std::string& name) {
   if (!tensor.device().is_cpu() && !tensor.device().is_cuda()) {
     throw std::runtime_error(
@@ -381,7 +475,7 @@ std::tuple<torch::Tensor, torch::Tensor> gather_by_indices(
 }
 
 std::vector<std::string> supported_ops() {
-  return {
+  auto ops = std::vector<std::string>{
       "propagation_dense",
       "propagation_window",
       "propagation_topk",
@@ -390,7 +484,22 @@ std::vector<std::string> supported_ops() {
       "transition_pairwise_dense",
       "transition_pairwise_topk",
       "transition_topk",
+      "transition_query_topk",
+      "transition_query_topk_select",
   };
+  if (jakal_net_compiled_with_cuda_source()) {
+    ops.insert(
+        ops.end(),
+        {
+            "query_topk_reduce_cuda",
+            "query_topk_reduce_backward_cuda",
+            "softsign_backward_cuda",
+            "softmax_backward_cuda",
+            "diagonal_pairwise_topk_backward_cuda",
+            "low_rank_pairwise_topk_backward_cuda",
+        });
+  }
+  return ops;
 }
 
 std::vector<std::string> supported_devices() {
@@ -1341,6 +1450,251 @@ std::tuple<torch::Tensor, torch::Tensor> transition_pairwise_topk(
   };
 }
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> transition_query_topk_core(
+    const std::string& route_kind,
+    const c10::optional<torch::Tensor>& source_weight,
+    const c10::optional<torch::Tensor>& source_bias,
+    const c10::optional<torch::Tensor>& target_weight,
+    const c10::optional<torch::Tensor>& target_bias,
+    const torch::Tensor& core_weight,
+    const c10::optional<torch::Tensor>& bias,
+    const c10::optional<torch::Tensor>& hidden_weight,
+    const c10::optional<torch::Tensor>& hidden_bias,
+    const c10::optional<torch::Tensor>& out_weight,
+    const c10::optional<torch::Tensor>& out_bias,
+    double temperature,
+    const torch::Tensor& sender_strength,
+    const torch::Tensor& src_val,
+    const torch::Tensor& query_val,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    int64_t topk,
+    int64_t query_block_size,
+    int64_t source_block_size,
+    bool use_cuda_reduce) {
+  require_supported_device(sender_strength, "sender_strength");
+  require_supported_device(src_val, "src_val");
+  require_supported_device(query_val, "query_val");
+  require_supported_device(projected_state, "projected_state");
+  require_supported_device(projected_val, "projected_val");
+  require_query_source_shapes(query_val, src_val, projected_state, projected_val);
+  if (topk <= 0) {
+    throw std::runtime_error("topk must be positive.");
+  }
+
+  auto batch_sizes = batch_shape(query_val, 2);
+  auto flat_src_val = flatten_val(src_val).contiguous();
+  auto flat_query_val = flatten_val(query_val).contiguous();
+  auto flat_sender_strength = flatten_state(sender_strength).contiguous();
+  auto flat_projected_state = flatten_state(projected_state).contiguous();
+  auto flat_projected_val = flatten_val(projected_val).contiguous();
+  const auto batch_flat = flat_src_val.size(0);
+  const auto source_nodes = flat_src_val.size(1);
+  const auto query_nodes = flat_query_val.size(1);
+  const auto out_dim = flat_projected_val.size(2);
+  const auto k = std::min<int64_t>(topk, source_nodes);
+
+  auto selected_scores = torch::full(
+      {batch_flat, query_nodes, k},
+      -std::numeric_limits<float>::infinity(),
+      flat_query_val.options());
+  auto selected_indices = torch::zeros(
+      {batch_flat, query_nodes, k},
+      flat_query_val.options().dtype(torch::kLong));
+
+  const auto query_step =
+      query_block_size <= 0 ? query_nodes : std::min(query_block_size, query_nodes);
+  const auto source_step =
+      source_block_size <= 0 ? source_nodes : std::min(source_block_size, source_nodes);
+
+  for (int64_t query_start = 0; query_start < query_nodes; query_start += query_step) {
+    const auto query_end = std::min(query_start + query_step, query_nodes);
+    const auto block_nodes = query_end - query_start;
+    auto query_block = flat_query_val.slice(1, query_start, query_end);
+    auto best_values = torch::full(
+        {batch_flat, block_nodes, k},
+        -std::numeric_limits<float>::infinity(),
+        flat_query_val.options());
+    auto best_indices = torch::zeros(
+        {batch_flat, block_nodes, k},
+        flat_query_val.options().dtype(torch::kLong));
+
+    for (int64_t source_start = 0; source_start < source_nodes; source_start += source_step) {
+      const auto source_end = std::min(source_start + source_step, source_nodes);
+      auto source_block = flat_src_val.slice(1, source_start, source_end);
+      auto logits = pairwise_route_block_logits(
+                        route_kind,
+                        source_block,
+                        query_block,
+                        source_weight,
+                        source_bias,
+                        target_weight,
+                        target_bias,
+                        core_weight,
+                        bias,
+                        hidden_weight,
+                        hidden_bias,
+                        out_weight,
+                        out_bias,
+                        temperature)
+                        .transpose(1, 2)
+                        .contiguous();
+      auto block_indices = torch::arange(
+                               source_start,
+                               source_end,
+                               flat_query_val.options().dtype(torch::kLong))
+                               .view({1, 1, source_end - source_start})
+                               .expand({batch_flat, block_nodes, source_end - source_start});
+      auto candidate_values = torch::cat({best_values, logits}, -1);
+      auto candidate_indices = torch::cat({best_indices, block_indices}, -1);
+      auto topk_result = candidate_values.topk(k, -1, true, true);
+      best_values = std::get<0>(topk_result);
+      best_indices = candidate_indices.gather(-1, std::get<1>(topk_result));
+    }
+
+    selected_scores.slice(1, query_start, query_end).copy_(best_values);
+    selected_indices.slice(1, query_start, query_end).copy_(best_indices);
+  }
+
+  auto routes = torch::softmax(selected_scores, -1);
+
+  torch::Tensor delta_state;
+  torch::Tensor delta_val;
+  if (
+      use_cuda_reduce && query_val.is_cuda()
+#ifdef WITH_CUDA
+      && jakal_net_query_topk_reduce_cuda_available()
+#endif
+  ) {
+    auto weighted_state = (flat_sender_strength * flat_projected_state).contiguous();
+    auto weighted_val =
+        (flat_sender_strength.unsqueeze(-1) * flat_projected_val).contiguous();
+    auto reduced = query_topk_reduce_cuda_wrapper(
+        routes.contiguous(),
+        selected_indices.contiguous(),
+        weighted_state,
+        weighted_val);
+    delta_state = std::get<0>(reduced);
+    delta_val = std::get<1>(reduced);
+  } else {
+    const auto state_acc_dtype = accumulator_dtype(projected_state.scalar_type());
+    const auto val_acc_dtype = accumulator_dtype(projected_val.scalar_type());
+    auto weighted_state =
+        (flat_sender_strength.to(state_acc_dtype) *
+         flat_projected_state.to(state_acc_dtype))
+            .contiguous();
+    auto weighted_val =
+        (flat_sender_strength.to(val_acc_dtype).unsqueeze(-1) *
+         flat_projected_val.to(val_acc_dtype))
+            .contiguous();
+    auto gathered = gather_by_indices(weighted_state, weighted_val, selected_indices);
+    delta_state =
+        (routes.to(state_acc_dtype) * std::get<0>(gathered)).sum(-1).to(projected_state.scalar_type());
+    delta_val =
+        (routes.to(val_acc_dtype).unsqueeze(-1) * std::get<1>(gathered))
+            .sum(-2)
+            .to(projected_val.scalar_type());
+  }
+
+  std::vector<int64_t> selection_shape = batch_sizes;
+  selection_shape.push_back(query_nodes);
+  selection_shape.push_back(k);
+  return {
+      reshape_state(delta_state, batch_sizes, query_nodes),
+      reshape_val(delta_val, batch_sizes, query_nodes, out_dim),
+      selected_scores.reshape(selection_shape),
+      selected_indices.reshape(selection_shape),
+  };
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+transition_query_topk_select(
+    const std::string& route_kind,
+    const c10::optional<torch::Tensor>& source_weight,
+    const c10::optional<torch::Tensor>& target_weight,
+    const torch::Tensor& core_weight,
+    const c10::optional<torch::Tensor>& bias,
+    double temperature,
+    const torch::Tensor& sender_strength,
+    const torch::Tensor& src_val,
+    const torch::Tensor& query_val,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    int64_t topk,
+    int64_t query_block_size,
+    int64_t source_block_size,
+    bool use_cuda_reduce) {
+  return transition_query_topk_core(
+      route_kind,
+      source_weight,
+      c10::nullopt,
+      target_weight,
+      c10::nullopt,
+      core_weight,
+      bias,
+      c10::nullopt,
+      c10::nullopt,
+      c10::nullopt,
+      c10::nullopt,
+      temperature,
+      sender_strength,
+      src_val,
+      query_val,
+      projected_state,
+      projected_val,
+      topk,
+      query_block_size,
+      source_block_size,
+      use_cuda_reduce);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> transition_query_topk(
+    const std::string& route_kind,
+    const c10::optional<torch::Tensor>& source_weight,
+    const c10::optional<torch::Tensor>& source_bias,
+    const c10::optional<torch::Tensor>& target_weight,
+    const c10::optional<torch::Tensor>& target_bias,
+    const torch::Tensor& core_weight,
+    const c10::optional<torch::Tensor>& bias,
+    const c10::optional<torch::Tensor>& hidden_weight,
+    const c10::optional<torch::Tensor>& hidden_bias,
+    const c10::optional<torch::Tensor>& out_weight,
+    const c10::optional<torch::Tensor>& out_bias,
+    double temperature,
+    const torch::Tensor& sender_strength,
+    const torch::Tensor& src_val,
+    const torch::Tensor& query_val,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    int64_t topk,
+    int64_t query_block_size,
+    int64_t source_block_size,
+    bool use_cuda_reduce) {
+  auto result = transition_query_topk_core(
+      route_kind,
+      source_weight,
+      source_bias,
+      target_weight,
+      target_bias,
+      core_weight,
+      bias,
+      hidden_weight,
+      hidden_bias,
+      out_weight,
+      out_bias,
+      temperature,
+      sender_strength,
+      src_val,
+      query_val,
+      projected_state,
+      projected_val,
+      topk,
+      query_block_size,
+      source_block_size,
+      use_cuda_reduce);
+  return {std::get<0>(result), std::get<1>(result)};
+}
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -1351,8 +1705,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("propagation_query_dense", &propagation_query_dense, "Native dense query-conditioned propagation");
   m.def("propagation_window", &propagation_window, "Native window propagation");
   m.def("propagation_topk", &propagation_topk, "Native top-k propagation");
+  m.def("query_topk_reduce_cuda", &query_topk_reduce_cuda_wrapper, "CUDA query top-k reduction");
+  m.def(
+      "query_topk_reduce_backward_cuda",
+      &query_topk_reduce_backward_cuda_wrapper,
+      "CUDA query top-k reduction backward");
+  m.def("softsign_backward_cuda", &softsign_backward_cuda_wrapper, "CUDA softsign backward");
+  m.def("softmax_backward_cuda", &softmax_backward_cuda_wrapper, "CUDA softmax backward");
   m.def("transition_dense", &transition_dense, "Native dense transition");
   m.def("transition_pairwise_dense", &transition_pairwise_dense, "Native pairwise dense transition");
   m.def("transition_pairwise_topk", &transition_pairwise_topk, "Native pairwise sparse transition");
+  m.def("transition_query_topk", &transition_query_topk, "Native query-conditioned sparse transition");
+  m.def(
+      "transition_query_topk_select",
+      &transition_query_topk_select,
+      "Native query-conditioned sparse transition top-k selection");
   m.def("transition_topk", &transition_topk, "Native sparse transition");
+  m.def(
+      "diagonal_pairwise_topk_backward_cuda",
+      &diagonal_pairwise_topk_backward_cuda_wrapper,
+      "CUDA diagonal pairwise top-k backward");
+  m.def(
+      "low_rank_pairwise_topk_backward_cuda",
+      &low_rank_pairwise_topk_backward_cuda_wrapper,
+      "CUDA low-rank pairwise top-k backward");
 }

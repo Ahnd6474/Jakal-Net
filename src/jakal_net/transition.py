@@ -481,6 +481,25 @@ class SparseTransition(Transition):
     ) -> LayerDelta:
         if src_layer.val.device.type == "privateuseone":
             return self._compute_delta_directml_fallback(src_layer, dst_layer)
+        if (
+            supports_pairwise_route_kernel(self.route_fn)
+            and native_supports("transition_pairwise_topk")
+            and native_supports_device(src_layer.val.device.type)
+        ):
+            projected_val, projected_state, sender_strength = self._project_inputs(
+                src_layer, dst_layer
+            )
+            return transition_pairwise_topk_native(
+                route_fn=self.route_fn,
+                sender_strength=sender_strength,
+                src_val=src_layer.val,
+                dst_val=dst_layer.val,
+                projected_state=projected_state,
+                projected_val=projected_val,
+                topk=self.topk,
+                src_block_size=self.src_block_size or src_layer.num_nodes,
+                dst_block_size=self.dst_block_size or dst_layer.num_nodes,
+            )
         if not _route_uses_pairwise_inputs(self.route_fn) and supports_route_kernel(
             self.route_fn
         ):

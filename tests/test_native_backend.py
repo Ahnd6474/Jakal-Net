@@ -790,6 +790,50 @@ class CudaNativeBackendTests(unittest.TestCase):
             self.assertGreater(wrapped.call_count, 0)
             self.assert_delta_close(reference_delta, native_delta)
 
+    def test_sparse_transition_kernel_prefers_native_pairwise_topk_on_cuda(self) -> None:
+        torch.manual_seed(341)
+        src = Layer(
+            dim=4,
+            num_nodes=7,
+            state=torch.randn(2, 7, device=self.device),
+            val=torch.randn(2, 7, 4, device=self.device),
+        )
+        dst = Layer(
+            dim=4,
+            num_nodes=6,
+            state=torch.randn(2, 6, device=self.device),
+            val=torch.randn(2, 6, 4, device=self.device),
+        )
+        reference = SparseTransition(
+            route_fn=LowRankBilinearRoute(src_dim=4, dst_dim=4, rank=3).to(self.device),
+            topk=2,
+            state_activation_fn=lambda x: x + 1.25,
+            val_proj_fn=_val_proj_fn,
+            state_proj_fn=_state_proj_fn,
+            implementation="reference",
+        )
+        kernel = SparseTransition(
+            route_fn=LowRankBilinearRoute(src_dim=4, dst_dim=4, rank=3).to(self.device),
+            topk=2,
+            state_activation_fn=lambda x: x + 1.25,
+            val_proj_fn=_val_proj_fn,
+            state_proj_fn=_state_proj_fn,
+            implementation="kernel",
+            src_block_size=3,
+            dst_block_size=2,
+        )
+        kernel.route_fn.load_state_dict(reference.route_fn.state_dict())
+
+        module = native_backend._native_module()
+        with mock.patch.object(
+            module,
+            "transition_pairwise_topk",
+            wraps=module.transition_pairwise_topk,
+        ) as wrapped:
+            kernel_delta = kernel.compute_delta(src, dst)
+        self.assertGreater(wrapped.call_count, 0)
+        self.assert_delta_close(reference.compute_delta(src, dst), kernel_delta)
+
 
 if __name__ == "__main__":
     unittest.main()
