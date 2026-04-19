@@ -719,7 +719,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hf-streaming", action="store_true")
     parser.add_argument("--max-samples", type=int)
 
-    parser.add_argument("--tokenizer", choices=("subword", "byte_bpe"), default="byte_bpe")
+    parser.add_argument("--tokenizer", choices=("byte_bpe",), default="byte_bpe")
     parser.add_argument("--subword-vocab-size", type=int, default=16384)
     parser.add_argument("--subword-model-type", default="bpe")
     parser.add_argument("--tokenizer-prefix")

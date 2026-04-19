@@ -417,6 +417,8 @@ PYTHONPATH=src python scripts/train_progressive_b_lm.py \
 
 Default document-chunked causal-memory run:
 
+`scripts/train_causal_memory_lm.py` is pinned to `byte_bpe` for the document-chunked causal-memory path.
+
 ```bash
 PYTHONPATH=src python scripts/train_causal_memory_lm.py \
   --device cuda \
