@@ -2017,13 +2017,15 @@ class ProgressiveBExampleLM(nn.Module):
         feedback = self.query_feedback_norm(feedback)
         return self.query_feedback_proj(feedback)
 
-    def _inject_query_feedback(
+    def _set_query_inputs(
         self,
         query_layer: Layer,
         feedback: Tensor,
     ) -> Layer:
-        updated_val = query_layer.val + feedback.to(query_layer.val.dtype)
-        return query_layer.with_tensors(val=updated_val)
+        updated_val = feedback.to(query_layer.val.dtype)
+        updated_state = self.state_init(updated_val).squeeze(-1).to(query_layer.state.dtype)
+        updated_layer = query_layer.with_tensors(state=updated_state, val=updated_val)
+        return self._finalize_query_layer(updated_layer)
 
     def update_query_slot(
         self,
@@ -2103,7 +2105,7 @@ class ProgressiveBExampleLM(nn.Module):
                 seed_feedback = self._token_id_feedback(query_seed_token_ids)
                 feedback = feedback.clone()
                 feedback[:, :seed_len, :] = seed_feedback.to(feedback.dtype)
-            query_layer = self._inject_query_feedback(query_layer, feedback)
+            query_layer = self._set_query_inputs(query_layer, feedback)
             query_layer = refine_with_feedback(query_layer)
         else:
             query_layer = refine_with_feedback(query_layer)
@@ -2114,7 +2116,7 @@ class ProgressiveBExampleLM(nn.Module):
                 seed_feedback = self._token_id_feedback(query_seed_token_ids)
                 feedback = feedback.clone()
                 feedback[:, :seed_len, :] = seed_feedback.to(feedback.dtype)
-            query_layer = self._inject_query_feedback(query_layer, feedback)
+            query_layer = self._set_query_inputs(query_layer, feedback)
             query_layer = refine_with_feedback(query_layer)
 
         if self.collect_aux_losses and query_transition_losses:
