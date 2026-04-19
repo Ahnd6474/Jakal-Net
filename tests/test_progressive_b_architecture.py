@@ -220,8 +220,48 @@ class ProgressiveBArchitectureTests(unittest.TestCase):
             progressive_b_module._compute_dense_causal_propagation_delta = original_query_helper
 
         self.assertEqual(logits.shape, (2, 4, 32))
-        self.assertEqual(transition_calls, [(8, 4)])
-        self.assertEqual(propagation_calls, [4])
+        self.assertEqual(transition_calls, [(8, 4)] * 2)
+        self.assertEqual(propagation_calls, [4] * 2)
+
+    def test_query_block_accepts_seed_tokens_for_structural_slots(self) -> None:
+        torch.manual_seed(25)
+        model = ProgressiveBExampleLM(
+            vocab_size=32,
+            dim=8,
+            seq_nodes=8,
+            warmup_layers=1,
+            final_refine_layers=1,
+        )
+        token_ids = torch.randint(0, 32, (2, 8))
+        seed_tokens = torch.full((2, 1), 31, dtype=torch.long)
+
+        logits = model.forward_query_block(
+            token_ids,
+            target_len=5,
+            query_seed_token_ids=seed_tokens,
+        )
+
+        self.assertEqual(logits.shape, (2, 5, 32))
+
+    def test_query_block_accepts_parallel_feedback_tokens(self) -> None:
+        torch.manual_seed(26)
+        model = ProgressiveBExampleLM(
+            vocab_size=32,
+            dim=8,
+            seq_nodes=8,
+            warmup_layers=1,
+            final_refine_layers=1,
+        )
+        token_ids = torch.randint(0, 32, (2, 8))
+        feedback_tokens = torch.randint(0, 32, (2, 5))
+
+        logits = model.forward_query_block(
+            token_ids,
+            target_len=5,
+            query_feedback_token_ids=feedback_tokens,
+        )
+
+        self.assertEqual(logits.shape, (2, 5, 32))
 
 
 

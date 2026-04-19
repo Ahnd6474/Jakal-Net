@@ -69,6 +69,64 @@ def restore_rng_state(payload: object) -> None:
     if torch.cuda.is_available() and isinstance(cuda_state, list):
         torch.cuda.set_rng_state_all(cuda_state)
 
+
+def _route_role_and_suffix(parameter_name: str) -> tuple[str, str] | None:
+    if parameter_name.startswith("query_transition.route_fn."):
+        return ("query_transition", parameter_name.removeprefix("query_transition.route_fn."))
+    markers = (
+        (".expand_transition.route_fn.", "expand_transition"),
+        (".b_to_s.route_fn.", "b_to_s"),
+        (".compress_transition.route_fn.", "compress_transition"),
+        (".s_to_b.route_fn.", "s_to_b"),
+        (".compressed_adapter.route_fn.", "compressed_adapter"),
+    )
+    for marker, role in markers:
+        if marker in parameter_name:
+            _, suffix = parameter_name.split(marker, maxsplit=1)
+            return (role, suffix)
+    return None
+
+
+def merge_route_families_for_resume(
+    *,
+    checkpoint_state_dict: dict[str, torch.Tensor],
+    model_state_dict: dict[str, torch.Tensor],
+) -> tuple[dict[str, torch.Tensor], dict[str, int]]:
+    role_suffix_values: dict[str, dict[str, list[torch.Tensor]]] = {}
+    role_module_names: dict[str, set[str]] = {}
+    for name, value in checkpoint_state_dict.items():
+        match = _route_role_and_suffix(name)
+        if match is None or not isinstance(value, torch.Tensor):
+            continue
+        role, suffix = match
+        role_suffix_values.setdefault(role, {}).setdefault(suffix, []).append(value.detach().float())
+        role_module_names.setdefault(role, set()).add(name.rsplit(".route_fn.", maxsplit=1)[0])
+    if not role_suffix_values:
+        return checkpoint_state_dict, {}
+
+    role_suffix_average: dict[str, dict[str, torch.Tensor]] = {}
+    for role, suffix_map in role_suffix_values.items():
+        averaged_suffixes: dict[str, torch.Tensor] = {}
+        for suffix, values in suffix_map.items():
+            averaged_suffixes[suffix] = torch.stack(values, dim=0).mean(dim=0)
+        role_suffix_average[role] = averaged_suffixes
+
+    merged_state_dict = dict(checkpoint_state_dict)
+    for name, reference in model_state_dict.items():
+        match = _route_role_and_suffix(name)
+        if match is None:
+            continue
+        role, suffix = match
+        averaged_value = role_suffix_average.get(role, {}).get(suffix)
+        if averaged_value is None:
+            continue
+        merged_state_dict[name] = averaged_value.to(dtype=reference.dtype)
+
+    return (
+        merged_state_dict,
+        {role: len(module_names) for role, module_names in sorted(role_module_names.items())},
+    )
+
 try:
     import sentencepiece as spm
 except ImportError:
@@ -1279,11 +1337,27 @@ def generate_next_tokens_with_sampling(
     eos_token_id: int | None = None,
     target_len: int = 1,
     query_block_start_token_id: int | None = None,
+    sample_source: str = "query_head",
 ) -> torch.Tensor:
     if temperature is not None and temperature <= 0.0:
         raise ValueError("temperature must be positive when sampling is enabled.")
     if sample_topk is not None and sample_topk <= 0:
         raise ValueError("sample-topk must be positive.")
+    if sample_source != "query_head":
+        raise ValueError(f"Unsupported sample_source: {sample_source!r}.")
+
+    def sample_from_logits(step_logits: torch.Tensor) -> torch.Tensor:
+        if temperature is None:
+            return torch.argmax(step_logits, dim=-1)
+        scaled_logits = step_logits / temperature
+        if sample_topk is not None:
+            k = min(sample_topk, scaled_logits.shape[-1])
+            topk_logits, topk_indices = torch.topk(scaled_logits, k=k, dim=-1)
+            probs = torch.softmax(topk_logits, dim=-1)
+            sampled_offset = torch.multinomial(probs, num_samples=1)
+            return topk_indices.gather(-1, sampled_offset).reshape(-1)
+        probs = torch.softmax(scaled_logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1).reshape(-1)
 
     was_training = model.training
     model.eval()
@@ -1301,7 +1375,21 @@ def generate_next_tokens_with_sampling(
         if training_objective == "query_block":
             content_len = min(max(1, target_len), tokens_remaining)
             query_nodes = content_len + int(query_block_start_token_id is not None)
-            logits = model.forward_query_block(context, target_len=query_nodes)
+            query_seed_token_ids = None
+            if query_block_start_token_id is not None:
+                query_seed_token_ids = torch.full(
+                    (1, 1),
+                    fill_value=query_block_start_token_id,
+                    dtype=torch.long,
+                    device=context.device,
+                )
+            logits = model.forward_query_block(
+                context,
+                target_len=query_nodes,
+                query_seed_token_ids=query_seed_token_ids,
+            )
+            if isinstance(logits, tuple):
+                logits = logits[0]
             start_offset = 1 if query_block_start_token_id is not None else 0
         elif training_objective == "query_next_token":
             logits = model.forward_query_next_token(context)
@@ -1312,19 +1400,7 @@ def generate_next_tokens_with_sampling(
         sampled_tokens: list[torch.Tensor] = []
         for offset in range(start_offset, logits.shape[1]):
             step_logits = logits[:, offset, :]
-            if temperature is None:
-                next_token = torch.argmax(step_logits, dim=-1)
-            else:
-                scaled_logits = step_logits / temperature
-                if sample_topk is not None:
-                    k = min(sample_topk, scaled_logits.shape[-1])
-                    topk_logits, topk_indices = torch.topk(scaled_logits, k=k, dim=-1)
-                    probs = torch.softmax(topk_logits, dim=-1)
-                    sampled_offset = torch.multinomial(probs, num_samples=1)
-                    next_token = topk_indices.gather(-1, sampled_offset).reshape(-1)
-                else:
-                    probs = torch.softmax(scaled_logits, dim=-1)
-                    next_token = torch.multinomial(probs, num_samples=1).reshape(-1)
+            next_token = sample_from_logits(step_logits)
             sampled_tokens.append(next_token)
             tokens_remaining -= 1
             if eos_token_id is not None and int(next_token.item()) == eos_token_id:
@@ -1383,19 +1459,32 @@ def resolve_effective_model_config(
 
 def build_metrics_rows(history: TrainingHistory, *, steps_per_epoch: int) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    train_step_stats = history.train_step_stats
     for step, (loss, grad_norm) in enumerate(
         zip(history.train_step_losses, history.grad_norms, strict=True),
         start=1,
     ):
-        rows.append(
-            {
-                "record_type": "train_step",
-                "step": step,
-                "epoch": step / steps_per_epoch,
-                "minibatch_loss": loss,
-                "grad_norm": grad_norm,
-            }
-        )
+        epoch_step = step / steps_per_epoch
+        row = {
+            "record_type": "train_step",
+            "step": step,
+            "epoch": epoch_step,
+            "epoch_step": epoch_step,
+            "minibatch_loss": loss,
+            "grad_norm": grad_norm,
+        }
+        stats = train_step_stats[step - 1] if step - 1 < len(train_step_stats) else {}
+        query_head_loss = stats.get("loss/query_head")
+        if query_head_loss is not None:
+            row["query_head_loss"] = query_head_loss
+        avg_query_head_loss = stats.get("loss/avg_query_head")
+        if avg_query_head_loss is not None:
+            row["avg_ppl"] = perplexity_from_loss(avg_query_head_loss)
+        for key, value in sorted(stats.items()):
+            if key.startswith("query_block_pos_loss/"):
+                bucket = key.removeprefix("query_block_pos_loss/")
+                row[f"ppl_distance_{bucket}"] = perplexity_from_loss(value)
+        rows.append(row)
     for step, train_loss, val_loss in zip(
         history.eval_steps,
         history.train_losses,
@@ -1420,6 +1509,7 @@ def maybe_create_summary_writer(
     *,
     enabled: bool,
     tensorboard_dir: Path,
+    purge_step: int | None = None,
 ) -> SummaryWriter | None:
     if not enabled:
         return None
@@ -1429,7 +1519,7 @@ def maybe_create_summary_writer(
             "Install dependencies from requirements-base.txt first."
         )
     tensorboard_dir.mkdir(parents=True, exist_ok=True)
-    return SummaryWriter(log_dir=str(tensorboard_dir))
+    return SummaryWriter(log_dir=str(tensorboard_dir), purge_step=purge_step)
 
 
 def log_history_to_tensorboard(
@@ -1446,10 +1536,26 @@ def log_history_to_tensorboard(
         return
     if include_scalars:
         for step, loss in enumerate(history.train_step_losses, start=1):
+            epoch_step = step / steps_per_epoch
             writer.add_scalar("train/minibatch_loss", loss, step)
-            writer.add_scalar("train/epoch", step / steps_per_epoch, step)
+            writer.add_scalar("train/epoch", epoch_step, step)
+            writer.add_scalar("train/epoch_step", epoch_step, step)
         for step, grad_norm in enumerate(history.grad_norms, start=1):
             writer.add_scalar("train/grad_norm", grad_norm, step)
+        for step, stats in enumerate(history.train_step_stats, start=1):
+            query_head_loss = stats.get("loss/query_head")
+            if query_head_loss is not None:
+                writer.add_scalar("train/query_head_loss", query_head_loss, step)
+            avg_query_head_loss = stats.get("loss/avg_query_head")
+            if avg_query_head_loss is not None:
+                writer.add_scalar("train/avg_ppl", perplexity_from_loss(avg_query_head_loss), step)
+            bucket_ppl = {
+                key.removeprefix("query_block_pos_loss/"): perplexity_from_loss(value)
+                for key, value in sorted(stats.items())
+                if key.startswith("query_block_pos_loss/")
+            }
+            if bucket_ppl:
+                writer.add_scalars("train/ppl_by_distance", bucket_ppl, step)
         for step, train_loss, val_loss in zip(
             history.eval_steps,
             history.train_losses,
@@ -1720,6 +1826,8 @@ def run_single_experiment(
         compressed_window=args.compressed_window,
         implementation=args.implementation,
         propagation_residual=not args.disable_propagation_residual,
+        block_residual=args.block_residual,
+        query_residual=args.query_residual,
         value_residual_scale=args.value_residual_scale,
         state_residual_scale=args.state_residual_scale,
         alpha_scale=args.alpha_scale,
@@ -1745,6 +1853,7 @@ def run_single_experiment(
         s_to_b_slot_dropout_p=args.s_to_b_slot_dropout_p,
         b_to_s_slot_dropout_p=args.b_to_s_slot_dropout_p,
         include_query_head=query_next_token or query_block,
+        share_route_families=args.share_route_families,
     )
     if args.freeze_position_encoding:
         for parameter in model.position_encoding.parameters():
@@ -1767,6 +1876,8 @@ def run_single_experiment(
         f"refine={effective_config['final_refine_layers']} | qrefine={args.query_refine_layers} | route_mode={args.route_mode} | "
         f"route_topk={effective_config['route_topk']} | route_kind={args.route_kind} | "
         f"query_topk={args.query_topk or int(effective_config['route_topk'])} | "
+        f"block_residual={args.block_residual} | query_residual={args.query_residual} | "
+        f"share_route_families={args.share_route_families} | "
         f"edge_dropout={args.edge_dropout_p:.3f} | "
         f"usage_dropout={args.usage_dropout_base:.3f}/{args.usage_dropout_scale:.3f}/{args.usage_dropout_max:.3f} | "
         f"b_slot_dropout={args.b_slot_dropout_p:.3f} | "
@@ -1811,7 +1922,7 @@ def run_single_experiment(
     )
 
     start_time = time.perf_counter()
-    writer = maybe_create_summary_writer(enabled=args.tensorboard, tensorboard_dir=tensorboard_dir)
+    writer: SummaryWriter | None = None
     eval_runtime_rows: list[dict[str, Any]] = []
     resume_checkpoint: dict[str, Any] | None = None
     resume_step = 0
@@ -1819,7 +1930,18 @@ def run_single_experiment(
     if args.resume_checkpoint:
         resume_checkpoint = torch.load(args.resume_checkpoint, map_location="cpu")
         resume_step = int(resume_checkpoint.get("step") or 0)
-        load_result = model.load_state_dict(resume_checkpoint["model_state_dict"], strict=False)
+        resume_model_state_dict = resume_checkpoint["model_state_dict"]
+        if args.share_route_families:
+            resume_model_state_dict, route_merge_counts = merge_route_families_for_resume(
+                checkpoint_state_dict=resume_model_state_dict,
+                model_state_dict=model.state_dict(),
+            )
+            if route_merge_counts:
+                route_merge_counts_text = ", ".join(
+                    f"{role}={count}" for role, count in sorted(route_merge_counts.items())
+                )
+                print(f"resume_route_merge_by_role | {route_merge_counts_text}")
+        load_result = model.load_state_dict(resume_model_state_dict, strict=False)
         if load_result.missing_keys or load_result.unexpected_keys:
             print(
                 "resume_state_dict_load | "
@@ -1841,6 +1963,11 @@ def run_single_experiment(
             f"resume_checkpoint={args.resume_checkpoint} | resume_step={resume_step:,} | "
             f"optimizer_reset={args.reset_optimizer_on_resume}"
         )
+    writer = maybe_create_summary_writer(
+        enabled=args.tensorboard,
+        tensorboard_dir=tensorboard_dir,
+        purge_step=resume_step + 1 if resume_step > 0 else None,
+    )
 
     best_checkpoint_val_loss = math.inf
     if resume_checkpoint is not None and resume_checkpoint.get("val_loss") is not None:
@@ -2039,7 +2166,7 @@ def run_single_experiment(
         else:
             print(checkpoint_message)
 
-    def make_eval_sample() -> tuple[str, str]:
+    def select_eval_prompt() -> tuple[torch.Tensor, str]:
         if response_objective:
             assert train_response_pairs is not None
             assert special_token_ids is not None
@@ -2048,6 +2175,26 @@ def run_single_experiment(
                 vocab=vocab,
                 train_response_pairs=train_response_pairs,
             )
+            return prompt_ids, prompt_text
+        if pair_query_block:
+            assert train_response_pairs is not None
+            prompt_ids, prompt_text = select_pair_prompt_tokens(
+                args=args,
+                vocab=vocab,
+                train_pairs=train_response_pairs,
+            )
+        else:
+            prompt_ids, prompt_text = select_prompt_tokens(args=args, vocab=vocab, train_tokens=train_tokens)
+        return prompt_ids, prompt_text
+
+    def make_eval_sample(
+        prompt_ids: torch.Tensor,
+        prompt_text: str,
+        *,
+        sample_source: str = "query_head",
+    ) -> tuple[str, str]:
+        if response_objective:
+            assert special_token_ids is not None
             response_ids = generate_prefix_response_with_sampling(
                 model,
                 prompt_ids[-args.seq_len :],
@@ -2059,15 +2206,6 @@ def run_single_experiment(
                 sample_topk=args.sample_topk,
             )
             return prompt_text, vocab.decode(response_ids.tolist())
-        if pair_query_block:
-            assert train_response_pairs is not None
-            prompt_ids, prompt_text = select_pair_prompt_tokens(
-                args=args,
-                vocab=vocab,
-                train_pairs=train_response_pairs,
-            )
-        else:
-            prompt_ids, prompt_text = select_prompt_tokens(args=args, vocab=vocab, train_tokens=train_tokens)
         generated = generate_next_tokens_with_sampling(
             model,
             prompt_ids,
@@ -2085,6 +2223,7 @@ def run_single_experiment(
                 else None
             ),
             query_block_start_token_id=query_block_start_token_id if query_block else None,
+            sample_source=sample_source,
         )
         return prompt_text, vocab.decode(generated.tolist())
 
@@ -2105,8 +2244,12 @@ def run_single_experiment(
         progress_message = (
             f"progress | experiment={experiment_name} | step={step:>5d}/{total_steps:<5d} | "
             f"epoch={step / steps_per_epoch:.3f} | {100.0 * step / total_steps:5.1f}% | "
-            f"minibatch_loss={minibatch_loss:.4f} | elapsed={elapsed:.1f}s"
+            f"minibatch_loss={minibatch_loss:.4f}"
         )
+        latest_loss_stats = getattr(model, "last_loss_stats", None) or {}
+        if "loss/query_head" in latest_loss_stats:
+            progress_message += f" | query_loss={latest_loss_stats['loss/query_head']:.4f}"
+        progress_message += f" | elapsed={elapsed:.1f}s"
         if progress_bar is not None:
             progress_bar.write(progress_message)
         else:
@@ -2115,8 +2258,10 @@ def run_single_experiment(
     def step_tensorboard_callback(step: int, minibatch_loss: float, grad_norm: float) -> None:
         if writer is None:
             return
+        epoch_step = step / steps_per_epoch
         writer.add_scalar("train/minibatch_loss", minibatch_loss, step)
-        writer.add_scalar("train/epoch", step / steps_per_epoch, step)
+        writer.add_scalar("train/epoch", epoch_step, step)
+        writer.add_scalar("train/epoch_step", epoch_step, step)
         writer.add_scalar("train/grad_norm", grad_norm, step)
         if step == 1 or step == train_steps or (args.log_interval > 0 and step % args.log_interval == 0):
             writer.flush()
@@ -2124,11 +2269,14 @@ def run_single_experiment(
     def loss_stats_tensorboard_callback(step: int, stats: dict[str, float]) -> None:
         if writer is None:
             return
-        average_main_loss = stats.get("loss/avg_main")
-        if average_main_loss is not None and args.training_objective == "query_block":
+        query_head_loss = stats.get("loss/query_head")
+        if query_head_loss is not None:
+            writer.add_scalar("train/query_head_loss", query_head_loss, step)
+        average_query_head_loss = stats.get("loss/avg_query_head")
+        if average_query_head_loss is not None and args.training_objective == "query_block":
             writer.add_scalar(
-                "train/query_block_avg_ppl",
-                perplexity_from_loss(average_main_loss),
+                "train/avg_ppl",
+                perplexity_from_loss(average_query_head_loss),
                 step,
             )
         bucket_ppl = {
@@ -2137,7 +2285,7 @@ def run_single_experiment(
             if key.startswith("query_block_pos_loss/")
         }
         if bucket_ppl:
-            writer.add_scalars("train/query_block_pos_ppl", bucket_ppl, step)
+            writer.add_scalars("train/ppl_by_distance", bucket_ppl, step)
         if step == 1 or step == train_steps or (args.log_interval > 0 and step % args.log_interval == 0):
             writer.flush()
 
@@ -2155,7 +2303,8 @@ def run_single_experiment(
             writer.add_scalar("eval/metrics/val_loss", val_loss, step)
             writer.add_scalar("eval/metrics/train_ppl", perplexity_from_loss(train_loss), step)
             writer.add_scalar("eval/metrics/val_ppl", perplexity_from_loss(val_loss), step)
-            sample_prompt, sample_generated = make_eval_sample()
+            prompt_ids, prompt_text = select_eval_prompt()
+            sample_prompt, sample_generated = make_eval_sample(prompt_ids, prompt_text, sample_source="query_head")
             writer.add_text(
                 "eval/sample",
                 format_tensorboard_sample(
@@ -2164,6 +2313,15 @@ def run_single_experiment(
                 ),
                 step,
             )
+            if pair_query_block:
+                writer.add_text(
+                    "eval/sample_query_head",
+                    format_tensorboard_sample(
+                        prompt_text=sample_prompt,
+                        generated_text=sample_generated,
+                    ),
+                    step,
+                )
             writer.flush()
         if trial is not None:
             trial.report(val_loss, step)
@@ -2422,6 +2580,8 @@ def run_single_experiment(
         "freeze_position_encoding": args.freeze_position_encoding,
         "norm_position": args.norm_position,
         "propagation_residual": not args.disable_propagation_residual,
+        "block_residual": args.block_residual,
+        "query_residual": args.query_residual,
         "route_mode": args.route_mode,
         "sequence_propagation": args.sequence_propagation,
         "expanded_propagation": args.expanded_propagation,
@@ -2786,6 +2946,11 @@ def main() -> None:
     )
     parser.add_argument("--route-hidden-dim", type=int)
     parser.add_argument(
+        "--share-route-families",
+        action="store_true",
+        help="Share route parameters across the 6 transition roles and average per-role route weights when resuming older checkpoints.",
+    )
+    parser.add_argument(
         "--pairwise-kind",
         choices=("diagonal_bilinear", "low_rank_bilinear", "hadamard_mlp", "additive_low_rank"),
         default="diagonal_bilinear",
@@ -2833,6 +2998,8 @@ def main() -> None:
     parser.add_argument("--compressed-window", type=int)
     parser.add_argument("--disable-layer-norm", action="store_true")
     parser.add_argument("--disable-propagation-residual", action="store_true")
+    parser.add_argument("--block-residual", action="store_true")
+    parser.add_argument("--query-residual", action="store_true")
     parser.add_argument("--alpha-scale", type=float, default=1.0)
     parser.add_argument("--beta-s-to-b-scale", type=float, default=1.0)
     parser.add_argument("--beta-b-to-s-scale", type=float, default=1.0)

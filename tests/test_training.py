@@ -26,6 +26,7 @@ from train_progressive_b_lm import (  # noqa: E402
     QUERY_BLOCK_START_TOKEN,
     USER_TOKEN,
     build_tokenizer,
+    generate_next_tokens_with_sampling,
 )
 
 class TrainingTests(unittest.TestCase):
@@ -79,6 +80,32 @@ class TrainingTests(unittest.TestCase):
 
         self.assertEqual(batch.context.shape, (4, 5))
         self.assertEqual(batch.target.shape, (4,))
+
+    def test_query_block_sampling_returns_generated_tokens(self) -> None:
+        torch.manual_seed(9)
+        model = ProgressiveBExampleLM(
+            vocab_size=32,
+            dim=8,
+            seq_nodes=8,
+            warmup_layers=1,
+            final_refine_layers=1,
+        )
+        prompt = torch.randint(0, 32, (8,), dtype=torch.long)
+
+        generated = generate_next_tokens_with_sampling(
+            model,
+            prompt,
+            max_new_tokens=4,
+            seq_len=8,
+            device="cpu",
+            temperature=None,
+            sample_topk=None,
+            training_objective="query_block",
+            target_len=4,
+            query_block_start_token_id=31,
+        )
+
+        self.assertEqual(generated.shape, (12,))
 
     def test_query_block_sampling_prepends_start_token(self) -> None:
         tokens = torch.arange(40, dtype=torch.long)

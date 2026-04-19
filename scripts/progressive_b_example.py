@@ -87,12 +87,13 @@ def _apply_scaled_delta(
     *,
     state_scale: float = 1.0,
     val_scale: float = 1.0,
+    merge_mode: str = "replace",
 ) -> Layer:
     if state_scale == 0.0 and val_scale == 0.0:
         return layer
     return layer.apply_delta(
         _scale_delta(delta, state_scale=state_scale, val_scale=val_scale),
-        merge_mode="replace",
+        merge_mode=merge_mode,
     )
 
 
@@ -221,6 +222,8 @@ def _grad_group_keys(parameter_name: str, *, key_prefix: str = "grad") -> tuple[
         "query_propagation",
         "query_head",
         "query_head_norm",
+        "query_feedback_proj",
+        "query_feedback_norm",
         "sequence_val_norm",
         "query_val_norm",
     )
@@ -419,6 +422,40 @@ def _make_sparse_or_dense_propagation(
     raise ValueError(f"Unsupported sparse_type: {sparse_type!r}.")
 
 
+def _make_route_fn(
+    *,
+    dim: int,
+    route_kind: str,
+    route_hidden_dim: int | None,
+    route_temperature: float,
+) -> nn.Module:
+    if route_kind == "diagonal_bilinear":
+        route_fn: nn.Module = DiagonalBilinearRoute(src_dim=dim, dst_dim=dim)
+    elif route_kind == "low_rank_bilinear":
+        route_fn = LowRankBilinearRoute(
+            src_dim=dim,
+            dst_dim=dim,
+            rank=route_hidden_dim or max(1, dim // 2),
+        )
+    elif route_kind == "additive_low_rank":
+        route_fn = AdditiveLowRankRoute(
+            src_dim=dim,
+            dst_dim=dim,
+            hidden_dim=route_hidden_dim or max(1, dim // 16),
+        )
+    elif route_kind == "hadamard_mlp":
+        route_fn = SourceTargetHadamardMLPRoute(
+            src_dim=dim,
+            dst_dim=dim,
+            hidden_dim=route_hidden_dim,
+        )
+    else:
+        raise ValueError(f"Unsupported route_kind: {route_kind!r}.")
+    if route_temperature != 1.0:
+        route_fn = TemperatureScaledRoute(route_fn, route_temperature)
+    return route_fn
+
+
 def _dense_causal_block_mask(
     *,
     target_start: int,
@@ -615,6 +652,7 @@ def _make_transition(
     route_hidden_dim: int | None,
     route_temperature: float,
     implementation: str,
+    route_fn: nn.Module | None = None,
     merge_mode: str = "add",
     edge_dropout_p: float = 0.0,
     usage_dropout_base: float = 0.0,
@@ -622,30 +660,13 @@ def _make_transition(
     usage_dropout_max: float = 0.0,
     usage_ema_decay: float = 0.99,
 ) -> Transition | SparseTransition:
-    if route_kind == "diagonal_bilinear":
-        route_fn: nn.Module = DiagonalBilinearRoute(src_dim=dim, dst_dim=dim)
-    elif route_kind == "low_rank_bilinear":
-        route_fn = LowRankBilinearRoute(
-            src_dim=dim,
-            dst_dim=dim,
-            rank=route_hidden_dim or max(1, dim // 2),
+    if route_fn is None:
+        route_fn = _make_route_fn(
+            dim=dim,
+            route_kind=route_kind,
+            route_hidden_dim=route_hidden_dim,
+            route_temperature=route_temperature,
         )
-    elif route_kind == "additive_low_rank":
-        route_fn = AdditiveLowRankRoute(
-            src_dim=dim,
-            dst_dim=dim,
-            hidden_dim=route_hidden_dim or max(1, dim // 16),
-        )
-    elif route_kind == "hadamard_mlp":
-        route_fn = SourceTargetHadamardMLPRoute(
-            src_dim=dim,
-            dst_dim=dim,
-            hidden_dim=route_hidden_dim,
-        )
-    else:
-        raise ValueError(f"Unsupported route_kind: {route_kind!r}.")
-    if route_temperature != 1.0:
-        route_fn = TemperatureScaledRoute(route_fn, route_temperature)
     if route_mode == "dense" or route_topk <= 0:
         return Transition(
             route_fn=route_fn,
@@ -775,6 +796,7 @@ class ProgressiveBJointBlock(nn.Module):
         compressed_window: int | None = None,
         implementation: str = "streaming",
         propagation_residual: bool = True,
+        block_residual: bool = False,
         value_residual_scale: float = 1.0,
         state_residual_scale: float = 1.0,
         alpha_scale: float = 1.0,
@@ -798,6 +820,11 @@ class ProgressiveBJointBlock(nn.Module):
         s_pairwise_fn: nn.Module | None = None,
         expanded_pairwise_fn: nn.Module | None = None,
         compressed_pairwise_fn: nn.Module | None = None,
+        expand_route_fn: nn.Module | None = None,
+        b_to_s_route_fn: nn.Module | None = None,
+        compress_route_fn: nn.Module | None = None,
+        s_to_b_route_fn: nn.Module | None = None,
+        compressed_adapter_route_fn: nn.Module | None = None,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -818,6 +845,7 @@ class ProgressiveBJointBlock(nn.Module):
         self.runtime_b_schedule_scale = 1.0
         self.value_residual_scale = value_residual_scale
         self.state_residual_scale = state_residual_scale
+        self.block_residual = block_residual
         self.warmup_delta_scale = warmup_delta_scale
         self.s_delta_scale = s_delta_scale
         self.b_delta_scale = b_delta_scale
@@ -868,6 +896,7 @@ class ProgressiveBJointBlock(nn.Module):
             route_hidden_dim=route_hidden_dim,
             route_temperature=route_temperature,
             implementation=implementation,
+            route_fn=expand_route_fn,
             edge_dropout_p=edge_dropout_p,
             usage_dropout_base=usage_dropout_base,
             usage_dropout_scale=usage_dropout_scale,
@@ -891,6 +920,7 @@ class ProgressiveBJointBlock(nn.Module):
             route_hidden_dim=route_hidden_dim,
             route_temperature=route_temperature,
             implementation=implementation,
+            route_fn=b_to_s_route_fn,
             edge_dropout_p=edge_dropout_p,
             usage_dropout_base=usage_dropout_base,
             usage_dropout_scale=usage_dropout_scale,
@@ -905,6 +935,7 @@ class ProgressiveBJointBlock(nn.Module):
             route_hidden_dim=route_hidden_dim,
             route_temperature=route_temperature,
             implementation=implementation,
+            route_fn=compress_route_fn,
             edge_dropout_p=edge_dropout_p,
             usage_dropout_base=usage_dropout_base,
             usage_dropout_scale=usage_dropout_scale,
@@ -919,6 +950,7 @@ class ProgressiveBJointBlock(nn.Module):
             route_hidden_dim=route_hidden_dim,
             route_temperature=route_temperature,
             implementation=implementation,
+            route_fn=s_to_b_route_fn,
             edge_dropout_p=edge_dropout_p,
             usage_dropout_base=usage_dropout_base,
             usage_dropout_scale=usage_dropout_scale,
@@ -935,7 +967,11 @@ class ProgressiveBJointBlock(nn.Module):
             residual=propagation_residual,
         )
         self.compressed_adapter = Transition(
-            route_fn=BilinearPairwiseRoute(src_dim=dim, dst_dim=dim),
+            route_fn=(
+                BilinearPairwiseRoute(src_dim=dim, dst_dim=dim)
+                if compressed_adapter_route_fn is None
+                else compressed_adapter_route_fn
+            ),
             merge_mode="add",
             implementation=implementation,
         )
@@ -983,6 +1019,7 @@ class ProgressiveBJointBlock(nn.Module):
             delta,
             state_scale=path_scale * self.state_residual_scale,
             val_scale=path_scale * self.value_residual_scale,
+            merge_mode="add" if self.block_residual else "replace",
         )
 
     @staticmethod
@@ -1310,6 +1347,8 @@ class ProgressiveBExampleLM(nn.Module):
         compressed_window: int | None = None,
         implementation: str = "streaming",
         propagation_residual: bool = True,
+        block_residual: bool = False,
+        query_residual: bool = False,
         value_residual_scale: float = 1.0,
         state_residual_scale: float = 1.0,
         alpha_scale: float = 1.0,
@@ -1336,6 +1375,10 @@ class ProgressiveBExampleLM(nn.Module):
         prediction_slot_index: int = -1,
         query_topk: int | None = None,
         include_query_head: bool = True,
+        include_query_rnn_head: bool = False,
+        query_rnn_hidden_dim: int | None = None,
+        query_rnn_head_width: int | None = None,
+        share_route_families: bool = False,
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
@@ -1343,6 +1386,8 @@ class ProgressiveBExampleLM(nn.Module):
         self.seq_nodes = seq_nodes
         self.prediction_slot_index = prediction_slot_index
         self.propagation_residual = propagation_residual
+        self.block_residual = block_residual
+        self.query_residual = query_residual
         self.route_mode = route_mode
         self.sequence_sparse_type = sequence_sparse_type
         self.value_norm_kind = value_norm_kind
@@ -1372,12 +1417,22 @@ class ProgressiveBExampleLM(nn.Module):
         self.pairwise_hidden_dim = pairwise_hidden_dim
         self.query_topk = query_topk or route_topk
         self.include_query_head = include_query_head
+        # Keep the legacy arguments accepted for checkpoint/backward compatibility,
+        # but the architecture now uses query-slot self-conditioning instead of an
+        # auxiliary RNN readout path.
+        self.include_query_rnn_head = False
+        self.query_rnn_hidden_dim = query_rnn_hidden_dim or max(1, dim // 4)
+        self.query_rnn_head_width = query_rnn_head_width
+        self.share_route_families = share_route_families
+        self.last_query_rnn_states: Tensor | None = None
         self.query_refine_layers = max(
             1,
             final_refine_layers if query_refine_layers is None else int(query_refine_layers),
         )
         if self.query_topk <= 0:
             raise ValueError("query_topk must be positive.")
+        if self.include_query_rnn_head and not self.include_query_head:
+            raise ValueError("include_query_rnn_head requires include_query_head.")
         self.stage_specs = tuple(stage_specs or build_progressive_b_stage_specs(seq_nodes))
         self.track_stats = False
         self.last_runtime_stats: dict[str, float] | None = None
@@ -1429,8 +1484,47 @@ class ProgressiveBExampleLM(nn.Module):
         shared_expanded_pairwise = pairwise_factory()
         shared_compressed_pairwise = pairwise_factory()
         query_pairwise = pairwise_factory()
+        shared_query_transition_route_fn: nn.Module | None = None
+        shared_expand_route_fn: nn.Module | None = None
+        shared_b_to_s_route_fn: nn.Module | None = None
+        shared_compress_route_fn: nn.Module | None = None
+        shared_s_to_b_route_fn: nn.Module | None = None
+        shared_compressed_adapter_route_fn: nn.Module | None = None
+        if share_route_families:
+            shared_expand_route_fn = _make_route_fn(
+                dim=dim,
+                route_kind=route_kind,
+                route_hidden_dim=route_hidden_dim,
+                route_temperature=route_temperature,
+            )
+            shared_b_to_s_route_fn = _make_route_fn(
+                dim=dim,
+                route_kind=route_kind,
+                route_hidden_dim=route_hidden_dim,
+                route_temperature=route_temperature,
+            )
+            shared_compress_route_fn = _make_route_fn(
+                dim=dim,
+                route_kind=route_kind,
+                route_hidden_dim=route_hidden_dim,
+                route_temperature=route_temperature,
+            )
+            shared_s_to_b_route_fn = _make_route_fn(
+                dim=dim,
+                route_kind=route_kind,
+                route_hidden_dim=route_hidden_dim,
+                route_temperature=route_temperature,
+            )
+            shared_compressed_adapter_route_fn = BilinearPairwiseRoute(src_dim=dim, dst_dim=dim)
         if include_query_head:
             self.query_val_norm = _make_value_norm(dim, value_norm_kind)
+            if share_route_families:
+                shared_query_transition_route_fn = _make_route_fn(
+                    dim=dim,
+                    route_kind=route_kind,
+                    route_hidden_dim=route_hidden_dim,
+                    route_temperature=route_temperature,
+                )
             self.query_transition = _make_transition(
                 dim=dim,
                 route_topk=self.query_topk,
@@ -1439,6 +1533,7 @@ class ProgressiveBExampleLM(nn.Module):
                 route_hidden_dim=route_hidden_dim,
                 route_temperature=route_temperature,
                 implementation=implementation,
+                route_fn=shared_query_transition_route_fn,
                 edge_dropout_p=edge_dropout_p,
                 usage_dropout_base=usage_dropout_base,
                 usage_dropout_scale=usage_dropout_scale,
@@ -1489,6 +1584,7 @@ class ProgressiveBExampleLM(nn.Module):
                     compressed_window=compressed_window,
                     implementation=implementation,
                     propagation_residual=propagation_residual,
+                    block_residual=block_residual,
                     value_residual_scale=value_residual_scale,
                     state_residual_scale=state_residual_scale,
                     alpha_scale=alpha_scale,
@@ -1511,6 +1607,11 @@ class ProgressiveBExampleLM(nn.Module):
                     s_pairwise_fn=shared_s_pairwise,
                     expanded_pairwise_fn=shared_expanded_pairwise,
                     compressed_pairwise_fn=shared_compressed_pairwise,
+                    expand_route_fn=shared_expand_route_fn,
+                    b_to_s_route_fn=shared_b_to_s_route_fn,
+                    compress_route_fn=shared_compress_route_fn,
+                    s_to_b_route_fn=shared_s_to_b_route_fn,
+                    compressed_adapter_route_fn=shared_compressed_adapter_route_fn,
                 )
                 for stage in self.stage_specs
                 for _ in range(stage.num_layers)
@@ -1531,6 +1632,8 @@ class ProgressiveBExampleLM(nn.Module):
         )
         if include_query_head:
             self.query_head_norm = _make_value_norm(dim, value_norm_kind)
+            self.query_feedback_norm = _make_value_norm(dim, value_norm_kind)
+            self.query_feedback_proj = nn.Linear(dim, dim)
             self.query_head = nn.Sequential(
                 nn.Linear(dim, 4 * dim),
                 nn.GELU(),
@@ -1695,6 +1798,8 @@ class ProgressiveBExampleLM(nn.Module):
             )
 
     def collect_runtime_stats(self, token_ids: Tensor) -> dict[str, float]:
+        if token_ids.numel() == 0 or token_ids.shape[-1] == 0:
+            return {}
         was_training = self.training
         self.eval()
         self.set_track_stats(True)
@@ -1864,6 +1969,7 @@ class ProgressiveBExampleLM(nn.Module):
             transition_delta,
             state_scale=self.cross_delta_scale * self.state_residual_scale,
             val_scale=self.cross_delta_scale * self.value_residual_scale,
+            merge_mode="add" if self.query_residual else "replace",
         )
         return self._finalize_query_layer(query_layer)
 
@@ -1882,6 +1988,7 @@ class ProgressiveBExampleLM(nn.Module):
             propagation_delta,
             state_scale=self.s_delta_scale * self.state_residual_scale,
             val_scale=self.s_delta_scale * self.value_residual_scale,
+            merge_mode="add" if self.query_residual else "replace",
         )
         return self._finalize_query_layer(query_layer)
 
@@ -1896,6 +2003,27 @@ class ProgressiveBExampleLM(nn.Module):
             query_layer = self.apply_query_transition(source_layer, query_layer)
             query_layer = self.apply_query_propagation(query_layer)
         return query_layer
+
+    def _soft_token_feedback(self, logits: Tensor) -> Tensor:
+        token_probs = torch.softmax(logits.float(), dim=-1)
+        token_table = self.token_embedding.weight.float()
+        feedback = torch.matmul(token_probs, token_table)
+        feedback = feedback.to(dtype=self.token_embedding.weight.dtype)
+        feedback = self.query_feedback_norm(feedback)
+        return self.query_feedback_proj(feedback)
+
+    def _token_id_feedback(self, token_ids: Tensor) -> Tensor:
+        feedback = self.token_embedding(token_ids)
+        feedback = self.query_feedback_norm(feedback)
+        return self.query_feedback_proj(feedback)
+
+    def _inject_query_feedback(
+        self,
+        query_layer: Layer,
+        feedback: Tensor,
+    ) -> Layer:
+        updated_val = query_layer.val + feedback.to(query_layer.val.dtype)
+        return query_layer.with_tensors(val=updated_val)
 
     def update_query_slot(
         self,
@@ -1912,11 +2040,25 @@ class ProgressiveBExampleLM(nn.Module):
         token_ids: Tensor,
         *,
         target_len: int,
+        query_seed_token_ids: Tensor | None = None,
+        query_feedback_token_ids: Tensor | None = None,
         return_layers: bool = False,
     ) -> Tensor | tuple[Tensor, Layer, Layer | None]:
         self._require_query_head()
         if target_len <= 0:
             raise ValueError("target_len must be positive.")
+        if query_seed_token_ids is not None:
+            if query_seed_token_ids.ndim != 2:
+                raise ValueError("query_seed_token_ids must have shape [batch, seed_len].")
+            if query_seed_token_ids.shape[0] != token_ids.shape[0]:
+                raise ValueError("query_seed_token_ids batch size must match token_ids.")
+            if query_seed_token_ids.shape[1] > target_len:
+                raise ValueError("query_seed_token_ids cannot be longer than target_len.")
+        if query_feedback_token_ids is not None:
+            if query_feedback_token_ids.ndim != 2:
+                raise ValueError("query_feedback_token_ids must have shape [batch, target_len].")
+            if query_feedback_token_ids.shape != (token_ids.shape[0], target_len):
+                raise ValueError("query_feedback_token_ids shape must match [batch, target_len].")
         s_layer, compressed_b = self.encode_prefix(token_ids)
         aux_losses: dict[str, Tensor] = {}
         aux_stats: dict[str, float] = {}
@@ -1937,18 +2079,38 @@ class ProgressiveBExampleLM(nn.Module):
         query_layer = self.initialize_query_layer(s_layer, query_nodes=target_len)
         query_transition_losses: list[Tensor] = []
         query_transition_max_loads: list[Tensor] = []
-        for _ in range(self.query_refine_layers):
-            if self.collect_aux_losses:
-                query_transition_loss, query_transition_max_load = _transition_route_concentration_loss(
-                    self.query_transition,
-                    self._prepare_sequence_input(s_layer),
-                    self._prepare_query_input(query_layer),
-                    load_cap=self.route_load_cap,
-                )
-                query_transition_losses.append(query_transition_loss)
-                query_transition_max_loads.append(query_transition_max_load)
-            query_layer = self.apply_query_transition(s_layer, query_layer)
-            query_layer = self.apply_query_propagation(query_layer)
+
+        def refine_with_feedback(current_query_layer: Layer) -> Layer:
+            nonlocal query_transition_losses, query_transition_max_loads
+            for _ in range(self.query_refine_layers):
+                if self.collect_aux_losses:
+                    query_transition_loss, query_transition_max_load = _transition_route_concentration_loss(
+                        self.query_transition,
+                        self._prepare_sequence_input(s_layer),
+                        self._prepare_query_input(current_query_layer),
+                        load_cap=self.route_load_cap,
+                    )
+                    query_transition_losses.append(query_transition_loss)
+                    query_transition_max_loads.append(query_transition_max_load)
+                current_query_layer = self.apply_query_transition(s_layer, current_query_layer)
+                current_query_layer = self.apply_query_propagation(current_query_layer)
+            return current_query_layer
+
+        query_layer = refine_with_feedback(query_layer)
+        draft_query = self.query_head_norm(query_layer.val)
+        draft_logits = self.query_head(draft_query)
+        seed_len = 0 if query_seed_token_ids is None else query_seed_token_ids.shape[1]
+        if query_feedback_token_ids is not None:
+            feedback = self._token_id_feedback(query_feedback_token_ids)
+        else:
+            feedback = self._soft_token_feedback(draft_logits)
+        if seed_len > 0:
+            seed_feedback = self._token_id_feedback(query_seed_token_ids)
+            feedback = feedback.clone()
+            feedback[:, :seed_len, :] = seed_feedback.to(feedback.dtype)
+        query_layer = self._inject_query_feedback(query_layer, feedback)
+        query_layer = refine_with_feedback(query_layer)
+
         if self.collect_aux_losses and query_transition_losses:
             aux_losses["route_concentration/query_transition"] = torch.stack(query_transition_losses).mean()
             aux_stats["route_concentration/query_transition_max_load"] = float(
@@ -1956,8 +2118,8 @@ class ProgressiveBExampleLM(nn.Module):
             )
         self.last_aux_losses = aux_losses if aux_losses else None
         self.last_aux_stats = aux_stats if aux_stats else None
-        query_slots = self.query_head_norm(query_layer.val)
-        logits = self.query_head(query_slots)
+        final_query = self.query_head_norm(query_layer.val)
+        logits = self.query_head(final_query)
         if return_layers:
             return logits, s_layer, compressed_b
         return logits
@@ -2032,6 +2194,7 @@ class TrainingHistory:
     grad_norms: tuple[float, ...]
     train_losses: tuple[float, ...]
     val_losses: tuple[float, ...]
+    train_step_stats: tuple[dict[str, float], ...] = ()
 
 
 def build_char_vocab(text: str) -> CharVocab:
@@ -2633,6 +2796,52 @@ def _cross_entropy_with_optional_mask(
     return (losses * flat_weights).sum() / mask_total
 
 
+def _chunked_cross_entropy_with_optional_mask_from_states(
+    states: Tensor,
+    target: Tensor,
+    loss_mask: Tensor | None,
+    *,
+    head_norm: nn.Module,
+    head: nn.Module,
+    position_weights: Tensor | None = None,
+    chunk_size: int = 16,
+) -> Tensor:
+    if chunk_size <= 0:
+        raise ValueError('chunk_size must be positive.')
+    weighted_total = states.new_zeros((), dtype=torch.float32)
+    weight_total = states.new_zeros((), dtype=torch.float32)
+    for start in range(0, target.shape[-1], chunk_size):
+        end = min(target.shape[-1], start + chunk_size)
+        chunk_states = head_norm(states[:, start:end, :])
+        chunk_logits = head(chunk_states)
+        chunk_losses = F.cross_entropy(
+            chunk_logits.reshape(-1, chunk_logits.shape[-1]),
+            target[:, start:end].reshape(-1),
+            reduction='none',
+        )
+        chunk_weights = None
+        if loss_mask is not None:
+            chunk_weights = loss_mask[:, start:end].reshape(-1).to(
+                device=chunk_losses.device,
+                dtype=chunk_losses.dtype,
+            )
+        if position_weights is not None:
+            chunk_position_weights = position_weights[:, start:end].reshape(-1).to(
+                device=chunk_losses.device,
+                dtype=chunk_losses.dtype,
+            )
+            chunk_weights = (
+                chunk_position_weights if chunk_weights is None else (chunk_weights * chunk_position_weights)
+            )
+        if chunk_weights is None:
+            chunk_weights = torch.ones_like(chunk_losses)
+        weighted_total = weighted_total + (chunk_losses * chunk_weights).sum()
+        weight_total = weight_total + chunk_weights.sum()
+    if weight_total.item() <= 0:
+        raise ValueError('loss_mask must select at least one target position.')
+    return weighted_total / weight_total
+
+
 def _query_block_position_weights(
     target: Tensor,
     *,
@@ -2716,9 +2925,16 @@ def compute_next_token_loss(
     ):
         if query_block:
             target_len = batch.target.shape[-1] if batch.target.ndim > 1 else 1
+            query_seed_token_ids = None
+            query_feedback_token_ids = None
+            if batch.target.ndim > 1 and batch.target.shape[-1] > 0:
+                query_seed_token_ids = batch.target[:, :1]
+                query_feedback_token_ids = torch.cat((query_seed_token_ids, batch.target[:, :-1]), dim=1)
             logits, _, compressed_b = model.forward_query_block(
                 batch.context,
                 target_len=target_len,
+                query_seed_token_ids=query_seed_token_ids,
+                query_feedback_token_ids=query_feedback_token_ids,
                 return_layers=True,
             )
         elif query_next_token:
@@ -2752,6 +2968,8 @@ def compute_next_token_loss(
         loss = main_loss
         loss_stats["loss/main"] = float(main_loss.detach().item())
         loss_stats["loss/avg_main"] = float(average_main_loss.detach().item())
+        loss_stats["loss/query_head"] = float(main_loss.detach().item())
+        loss_stats["loss/avg_query_head"] = float(average_main_loss.detach().item())
         if query_block and batch.target.ndim > 1:
             target_width = batch.target.shape[-1]
             for start, end in ((0, 16), (16, 32), (32, 64), (64, 128)):
@@ -3065,6 +3283,7 @@ def train_next_token_model(
     grad_norms: list[float] = []
     train_losses: list[float] = []
     val_losses: list[float] = []
+    train_step_stats: list[dict[str, float]] = []
     batch_iter = _make_train_batch_iterator(
         train_tokens,
         seq_len=seq_len,
@@ -3170,19 +3389,18 @@ def train_next_token_model(
         step_loss = accumulated_loss / grad_accum_steps
         train_step_losses.append(step_loss)
         grad_norms.append(grad_norm)
+        averaged_loss_stats = {
+            key: sum(values) / len(values)
+            for key, values in sorted(accumulated_loss_stats.items())
+            if values
+        }
+        train_step_stats.append(averaged_loss_stats)
         if progress_callback is not None:
             progress_callback(step, schedule_total_steps, step_loss)
         if step_callback is not None:
             step_callback(step, step_loss, grad_norm)
-        if loss_stats_callback is not None and accumulated_loss_stats:
-            loss_stats_callback(
-                step,
-                {
-                    key: sum(values) / len(values)
-                    for key, values in sorted(accumulated_loss_stats.items())
-                    if values
-                },
-            )
+        if loss_stats_callback is not None and averaged_loss_stats:
+            loss_stats_callback(step, averaged_loss_stats)
         if (
             checkpoint_callback is not None
             and checkpoint_interval is not None
@@ -3244,6 +3462,7 @@ def train_next_token_model(
         grad_norms=tuple(grad_norms),
         train_losses=tuple(train_losses),
         val_losses=tuple(val_losses),
+        train_step_stats=tuple(train_step_stats),
     )
 
 
@@ -3332,6 +3551,7 @@ def train_query_block_pair_model(
     grad_norms: list[float] = []
     train_losses: list[float] = []
     val_losses: list[float] = []
+    train_step_stats: list[dict[str, float]] = []
     batch_iter = _make_query_block_pair_batch_iterator(
         train_pairs,
         seq_len=seq_len,
@@ -3433,19 +3653,18 @@ def train_query_block_pair_model(
         step_loss = accumulated_loss / grad_accum_steps
         train_step_losses.append(step_loss)
         grad_norms.append(grad_norm)
+        averaged_loss_stats = {
+            key: sum(values) / len(values)
+            for key, values in sorted(accumulated_loss_stats.items())
+            if values
+        }
+        train_step_stats.append(averaged_loss_stats)
         if progress_callback is not None:
             progress_callback(step, schedule_total_steps, step_loss)
         if step_callback is not None:
             step_callback(step, step_loss, grad_norm)
-        if loss_stats_callback is not None and accumulated_loss_stats:
-            loss_stats_callback(
-                step,
-                {
-                    key: sum(values) / len(values)
-                    for key, values in sorted(accumulated_loss_stats.items())
-                    if values
-                },
-            )
+        if loss_stats_callback is not None and averaged_loss_stats:
+            loss_stats_callback(step, averaged_loss_stats)
         if (
             checkpoint_callback is not None
             and checkpoint_interval is not None
@@ -3501,6 +3720,7 @@ def train_query_block_pair_model(
         grad_norms=tuple(grad_norms),
         train_losses=tuple(train_losses),
         val_losses=tuple(val_losses),
+        train_step_stats=tuple(train_step_stats),
     )
 
 
