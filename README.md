@@ -152,9 +152,12 @@ alternative LM structure than to a conventional Transformer implementation.
 - Progressive-B example LM with warmup `S` propagation, lite/mid/full `B`
   stages, final `S` refinement, query transition, query propagation, and
   query-only vocab prediction.
+- Experimental causal hierarchical-memory LM with full causal `S` backbone,
+  sequential `B` scan, and a separate causal prediction head stack.
 - Training objectives: `query_next_token` and `query_block`.
 - Byte-level BPE tokenization, including larger vocabularies for code and
   LaTeX-heavy corpora.
+- Pretokenized token-stream loading/saving for the causal-memory training path.
 - TensorBoard logging focused on total minibatch loss and overlaid
   distance-bucket perplexity curves.
 - Query-block specific logging for unweighted average perplexity, grad norm,
@@ -217,11 +220,61 @@ On the current 95 GB GPU target, a random-token forward/backward/step check
 passes at `batch_size=64` and OOMs at `batch_size=72`, so `64` is the safe
 single-step batch ceiling for this configuration.
 
+## Causal Hierarchical Memory LM
+
+There is now a second experimental training path alongside Progressive-B:
+`scripts/train_causal_memory_lm.py`.
+
+This path keeps the existing operator philosophy (`Propagation` for same-layer
+refinement, `Transition` for cross-layer movement) but changes the model graph
+to match a standard causal next-token objective.
+
+At a high level:
+
+```text
+token ids
+  -> token + position embedding
+  -> full causal S backbone
+  -> per-time-step B scan over a small hierarchy
+  -> multi-level B read + aligned S residual
+  -> causal prediction propagation
+  -> LM head
+```
+
+The roles are intentionally separated:
+
+- `S`: full token-aligned causal backbone
+- `B`: small hierarchical latent memory, updated one token step at a time
+- prediction stack: causal decoder head over the readout sequence
+
+The default memory recipe matches the current design discussion:
+
+- `max_seq_len=2048`
+- `dim=512`
+- `S` layers: `2`
+- `B` slots: `512 -> 128 -> 32`
+- prediction layers: `2`
+
+The current implementation updates memory in this order for each visible token:
+
+1. read the aligned causal `S` state for the current position
+2. write into `B^0`
+3. propagate inside each `B` level
+4. compress upward through `B^0 -> B^1 -> B^2`
+5. apply weak gated skip updates (`S -> B^1`, `B^0 -> B^2`)
+6. read every `B` level into one prediction vector
+7. combine that read with the aligned `S` residual
+8. run a separate causal prediction stack before the LM head
+
+This keeps the causal invariant explicit: the logits for position `t+1` are
+built only from the prefix snapshot available after consuming position `t`.
+
 ## Repository Layout
 
 | Path | Purpose |
 | --- | --- |
 | `src/jakal_net/core.py` | `Layer`, `LayerDelta`, block helpers, validation |
+| `src/jakal_net/causal_memory_lm.py` | Experimental causal hierarchical-memory LM |
 | `src/jakal_net/propagation.py` | Dense and sparse same-layer propagation |
 | `src/jakal_net/transition.py` | Dense and sparse cross-layer routing |
 | `src/jakal_net/modules.py` | Pairwise scorers, route modules, position encoding |
@@ -229,6 +282,7 @@ single-step batch ceiling for this configuration.
 | `native/` | C++/CUDA extension source |
 | `scripts/progressive_b_example.py` | Progressive-B model and training utilities |
 | `scripts/train_progressive_b_lm.py` | CLI training entry point |
+| `scripts/train_causal_memory_lm.py` | Separate causal-memory LM training entry point |
 | `scripts/build_mixed_next_sentence_corpus.py` | Mixed dialogue/science/wiki/code pair corpus builder |
 | `tests/` | Unit tests and native backend checks |
 | `docs/architecture.svg` | Architecture diagram used by this README |
@@ -353,6 +407,33 @@ PYTHONPATH=src python scripts/train_progressive_b_lm.py \
   --save-checkpoint
 ```
 
+Default causal-memory run:
+
+```bash
+PYTHONPATH=src python scripts/train_causal_memory_lm.py \
+  --device cuda \
+  --jsonl-source artifacts/data/query_block_instruction_dialogue_arxiv_pubmed_code_wiki_10m.jsonl \
+  --tokenizer byte_bpe \
+  --subword-vocab-size 16384 \
+  --tokenizer-prefix artifacts/tokenizers/causal_memory_byte_bpe_16384 \
+  --seq-len 2048 \
+  --dim 512 \
+  --s-layers 2 \
+  --memory-slots 512 128 32 \
+  --prediction-layers 2 \
+  --batch-size 4 \
+  --grad-accum-steps 1 \
+  --learning-rate 3e-4 \
+  --warmup-steps 200 \
+  --pretokenize-workers 8 \
+  --carry-memory \
+  --tensorboard
+```
+
+The causal-memory script is intentionally separate from
+`scripts/train_progressive_b_lm.py`. That keeps the older Progressive-B runs
+reproducible while allowing the new architecture to evolve independently.
+
 The training script writes:
 
 - TensorBoard events under each run directory
@@ -360,6 +441,14 @@ The training script writes:
   `artifacts/training_runs/`
 - best and last checkpoints under `custom/checkpoints/` when
   `--save-checkpoint` is enabled
+
+The causal-memory script writes a parallel run directory with:
+
+- `config.json`
+- `history.jsonl` and `history.csv`
+- TensorBoard events when `--tensorboard` is enabled
+- `checkpoints/best.pt`, `checkpoints/last.pt`, and interval checkpoints
+- optional pretokenized token bundles when `--save-pretokenized` is used
 
 ### Query-Block Optimization Controls
 
