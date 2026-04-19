@@ -118,6 +118,28 @@ class CausalMemoryLMTests(unittest.TestCase):
             self.assertTrue(torch.allclose(base_layer.state, micro_layer.state))
             self.assertTrue(torch.allclose(base_layer.val, micro_layer.val))
 
+    def test_forward_logits_remain_finite(self) -> None:
+        torch.manual_seed(10)
+        model = CausalHierarchicalMemoryLM(
+            vocab_size=64,
+            dim=16,
+            max_seq_len=16,
+            s_layers=2,
+            memory_slots=(8, 4, 2),
+            prediction_layers=2,
+            s_window=8,
+            s_microbatch_size=1,
+            prediction_window=4,
+            memory_topk=2,
+            pairwise_rank=8,
+            route_rank=8,
+        )
+        token_ids = torch.randint(0, 64, (2, 8))
+
+        logits = model(token_ids)
+
+        self.assertTrue(torch.isfinite(logits).all().item())
+
     def test_document_chunks_insert_continuation_prefix(self) -> None:
         chunks = make_document_chunks(
             content_ids=torch.tensor([10, 11, 12, 13, 14, 15, 16], dtype=torch.long),

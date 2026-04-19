@@ -334,8 +334,11 @@ class CausalHierarchicalMemoryLM(nn.Module):
         )
         layer = Layer(dim=self.dim, num_nodes=seq_len + 1, state=seq_state, val=seq_val)
         for propagation, norm in zip(self.sequence_layers, self.sequence_norms):
-            layer = _apply_delta(layer, propagation.compute_delta(layer), residual=True)
-            layer = _layer_with_val_norm(layer, norm)
+            layer = _apply_delta(
+                layer,
+                propagation.compute_delta(_layer_with_val_norm(layer, norm)),
+                residual=True,
+            )
         return layer
 
     def _encode_sequence_microbatched(self, input_ids: Tensor) -> Layer:
@@ -361,23 +364,43 @@ class CausalHierarchicalMemoryLM(nn.Module):
         next_levels: list[Layer] = []
         first_level_module = self.memory_levels[0]
         level = memory_state[0]
-        level = _apply_delta(level, first_level_module.write.compute_delta(token_layer, level), residual=True)
-        level = _apply_delta(level, first_level_module.propagation.compute_delta(level), residual=True)
-        level = _layer_with_val_norm(level, first_level_module.val_norm)
+        level = _apply_delta(
+            level,
+            first_level_module.write.compute_delta(
+                token_layer,
+                _layer_with_val_norm(level, first_level_module.val_norm),
+            ),
+            residual=True,
+        )
+        level = _apply_delta(
+            level,
+            first_level_module.propagation.compute_delta(
+                _layer_with_val_norm(level, first_level_module.val_norm)
+            ),
+            residual=True,
+        )
         next_levels.append(level)
 
         for level_index in range(1, self.num_memory_levels):
             level_module = self.memory_levels[level_index]
             level = memory_state[level_index]
             parent = next_levels[level_index - 1]
+            normalized_level = _layer_with_val_norm(level, level_module.val_norm)
+            normalized_parent = _layer_with_val_norm(parent, self.level_norms[level_index - 1])
             level = _apply_delta(
                 level,
-                self.level_transitions[level_index - 1].compute_delta(parent, level),
+                self.level_transitions[level_index - 1].compute_delta(
+                    normalized_parent,
+                    normalized_level,
+                ),
                 residual=True,
             )
             if level_index == 1 and "token_to_1" in self.skip_transitions:
                 gate = torch.sigmoid(self.skip_gates["token_to_1"])
-                skip_delta = self.skip_transitions["token_to_1"].compute_delta(token_layer, level)
+                skip_delta = self.skip_transitions["token_to_1"].compute_delta(
+                    token_layer,
+                    normalized_level,
+                )
                 level = _apply_delta(
                     level,
                     LayerDelta(
@@ -389,7 +412,14 @@ class CausalHierarchicalMemoryLM(nn.Module):
             key = f"{level_index - 2}_to_{level_index}"
             if key in self.skip_transitions:
                 gate = torch.sigmoid(self.skip_gates[key])
-                skip_delta = self.skip_transitions[key].compute_delta(next_levels[level_index - 2], level)
+                normalized_skip_source = _layer_with_val_norm(
+                    next_levels[level_index - 2],
+                    self.level_norms[level_index - 2],
+                )
+                skip_delta = self.skip_transitions[key].compute_delta(
+                    normalized_skip_source,
+                    normalized_level,
+                )
                 level = _apply_delta(
                     level,
                     LayerDelta(
@@ -398,8 +428,13 @@ class CausalHierarchicalMemoryLM(nn.Module):
                     ),
                     residual=True,
                 )
-            level = _apply_delta(level, level_module.propagation.compute_delta(level), residual=True)
-            level = _layer_with_val_norm(level, level_module.val_norm)
+            level = _apply_delta(
+                level,
+                level_module.propagation.compute_delta(
+                    _layer_with_val_norm(level, level_module.val_norm)
+                ),
+                residual=True,
+            )
             next_levels.append(level)
         return tuple(next_levels)
 
@@ -478,8 +513,11 @@ class CausalHierarchicalMemoryLM(nn.Module):
         )
         query_layer, current_memory = self._scan_memory_batch(aligned_s, current_memory)
         for propagation, norm in zip(self.prediction_layers, self.prediction_norms):
-            query_layer = _apply_delta(query_layer, propagation.compute_delta(query_layer), residual=True)
-            query_layer = _layer_with_val_norm(query_layer, norm)
+            query_layer = _apply_delta(
+                query_layer,
+                propagation.compute_delta(_layer_with_val_norm(query_layer, norm)),
+                residual=True,
+            )
 
         logits = self.lm_head(self.output_norm(query_layer.val))
         if not (return_memory_state or return_layers):
