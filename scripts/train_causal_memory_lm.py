@@ -878,6 +878,16 @@ def save_checkpoint(
     )
 
 
+def load_checkpoint(path: Path, *, device: torch.device) -> dict[str, Any]:
+    try:
+        checkpoint = torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(path, map_location=device)
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"Invalid checkpoint: {path}")
+    return checkpoint
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the document-chunked causal hierarchical memory LM.")
     parser.add_argument("--text-file")
@@ -942,6 +952,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--output-root", default="artifacts/training_runs")
     parser.add_argument("--run-name")
+    parser.add_argument("--resume-checkpoint")
     parser.add_argument("--tensorboard", action="store_true")
     return parser.parse_args()
 
@@ -1115,11 +1126,26 @@ def main() -> None:
 
     history_rows: list[dict[str, Any]] = []
     train_memory_state: tuple[Any, ...] | None = None
+    start_step = 0
     best_val_loss = float("inf")
+    if args.resume_checkpoint:
+        checkpoint_path = Path(args.resume_checkpoint)
+        checkpoint = load_checkpoint(checkpoint_path, device=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        start_step = int(checkpoint.get("step", 0))
+        checkpoint_val_loss = checkpoint.get("val_loss")
+        if checkpoint_val_loss is not None:
+            best_val_loss = float(checkpoint_val_loss)
+        print(
+            f"resumed_checkpoint | path={checkpoint_path} | step={start_step} | "
+            f"train_loss={checkpoint.get('train_loss')} | val_loss={checkpoint.get('val_loss')}",
+            flush=True,
+        )
     optimizer.zero_grad(set_to_none=True)
     start_time = time.time()
 
-    for step in range(1, total_steps + 1):
+    for step in range(start_step + 1, total_steps + 1):
         lr = compute_learning_rate(
             step=step,
             total_steps=total_steps,
