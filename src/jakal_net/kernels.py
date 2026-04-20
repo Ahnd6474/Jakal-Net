@@ -25,6 +25,50 @@ from jakal_net.kernel_common import (
 )
 
 
+def _signed_abs_softmax(logits: Tensor, *, dim: int = -1) -> Tensor:
+    clean_logits = torch.nan_to_num(logits)
+    return torch.sign(clean_logits) * torch.softmax(clean_logits.abs(), dim=dim)
+
+
+def _edge_compress_name(edge_compress_fn: Callable[[Tensor], Tensor]) -> str | None:
+    return getattr(edge_compress_fn, "__name__", "")
+
+
+def _compress_edges(
+    scores: Tensor,
+    edge_compress_fn: Callable[[Tensor], Tensor],
+    *,
+    mask: Tensor | None = None,
+) -> Tensor:
+    if _edge_compress_name(edge_compress_fn) in {"signed_abs_softmax", "_signed_abs_softmax_edges"}:
+        clean_scores = torch.nan_to_num(scores)
+        signs = torch.sign(clean_scores)
+        magnitudes = clean_scores.abs()
+        if mask is not None:
+            bool_mask = mask.to(dtype=torch.bool)
+            signs = signs * bool_mask.to(dtype=signs.dtype)
+            magnitudes = magnitudes.masked_fill(~bool_mask, -torch.inf)
+        return torch.nan_to_num(signs * torch.softmax(magnitudes, dim=-1))
+    edges = edge_compress_fn(scores)
+    if mask is not None:
+        edges = edges * mask.to(dtype=edges.dtype)
+    return edges
+
+
+def _compress_routes(logits: Tensor, *, route_compress_name: str) -> Tensor:
+    if route_compress_name == "softmax":
+        return torch.softmax(logits, dim=-1)
+    if route_compress_name == "signed_abs_softmax":
+        return _signed_abs_softmax(logits, dim=-1)
+    raise ValueError(f"Unsupported route_compress_name: {route_compress_name!r}.")
+
+
+def _weight_edges(edges: Tensor, flat_source_state: Tensor | None, source_start: int, source_end: int) -> Tensor:
+    if flat_source_state is None:
+        return edges
+    return edges * flat_source_state[:, source_start:source_end].unsqueeze(1)
+
+
 def propagation_dense_kernel(
     *,
     pairwise_fn: object,
@@ -32,6 +76,7 @@ def propagation_dense_kernel(
     layer_val: Tensor,
     projected_state: Tensor,
     projected_val: Tensor,
+    source_state: Tensor | None = None,
     target_block_size: int | None = 128,
     source_block_size: int | None = 128,
     accumulator_dtype: torch.dtype | None = None,
@@ -43,6 +88,7 @@ def propagation_dense_kernel(
     flat_val = flatten_val(layer_val)
     flat_projected_state = flatten_state(projected_state)
     flat_projected_val = flatten_val(projected_val)
+    flat_source_state = None if source_state is None else flatten_state(source_state)
     state_acc_dtype = allocate_accumulator(
         (1,),
         device=layer_val.device,
@@ -79,7 +125,12 @@ def propagation_dense_kernel(
         ):
             source_val = flat_val[:, source_start:source_end, :]
             scores = pairwise_scores_dense(pairwise_fn, target_val, source_val)
-            edges = edge_compress_fn(scores)
+            edges = _weight_edges(
+                _compress_edges(scores, edge_compress_fn),
+                flat_source_state,
+                source_start,
+                source_end,
+            )
             state_edges = edges.to(dtype=state_acc_dtype)
             val_edges = edges.to(dtype=val_acc_dtype)
 
@@ -109,6 +160,7 @@ def propagation_window_kernel(
     layer_val: Tensor,
     projected_state: Tensor,
     projected_val: Tensor,
+    source_state: Tensor | None = None,
     window: int,
     target_block_size: int | None = 128,
     source_block_size: int | None = 128,
@@ -124,6 +176,7 @@ def propagation_window_kernel(
     flat_val = flatten_val(layer_val)
     flat_projected_state = flatten_state(projected_state)
     flat_projected_val = flatten_val(projected_val)
+    flat_source_state = None if source_state is None else flatten_state(source_state)
     state_acc_dtype = allocate_accumulator(
         (1,),
         device=layer_val.device,
@@ -158,11 +211,17 @@ def propagation_window_kernel(
             accumulator_dtype=accumulator_dtype,
         )
 
-        for source_offset_start, source_offset_end in iter_blocks(
-            source_ceiling - source_floor,
-            source_block_size,
-            name="source_block_size",
-        ):
+        source_width = source_ceiling - source_floor
+        if _edge_compress_name(edge_compress_fn) in {"signed_abs_softmax", "_signed_abs_softmax_edges"}:
+            source_blocks = ((0, source_width),)
+        else:
+            source_blocks = iter_blocks(
+                source_width,
+                source_block_size,
+                name="source_block_size",
+            )
+
+        for source_offset_start, source_offset_end in source_blocks:
             source_start = source_floor + source_offset_start
             source_end = source_floor + source_offset_end
             source_val = flat_val[:, source_start:source_end, :]
@@ -175,7 +234,8 @@ def propagation_window_kernel(
                 window,
                 device=layer_val.device,
             ).view(1, target_end - target_start, source_end - source_start)
-            edges = edge_compress_fn(scores) * mask.to(dtype=scores.dtype)
+            edges = _compress_edges(scores, edge_compress_fn, mask=mask)
+            edges = _weight_edges(edges, flat_source_state, source_start, source_end)
             state_edges = edges.to(dtype=state_acc_dtype)
             val_edges = edges.to(dtype=val_acc_dtype)
 
@@ -205,6 +265,7 @@ def propagation_topk_kernel(
     layer_val: Tensor,
     projected_state: Tensor,
     projected_val: Tensor,
+    source_state: Tensor | None = None,
     topk: int,
     target_block_size: int | None = 128,
     source_block_size: int | None = 128,
@@ -243,6 +304,7 @@ def propagation_topk_kernel(
             layer_val=layer_val,
             projected_state=projected_state,
             projected_val=projected_val,
+            source_state=source_state,
             target_block_size=target_block_size,
             source_block_size=source_block_size,
             accumulator_dtype=accumulator_dtype,
@@ -291,7 +353,13 @@ def propagation_topk_kernel(
         if best_scores is None or best_indices is None:
             continue
 
-        edges = edge_compress_fn(best_scores)
+        edges = _compress_edges(best_scores, edge_compress_fn)
+        if source_state is not None:
+            selected_source_state = gather_state_by_indices(
+                flatten_state(source_state),
+                best_indices,
+            )
+            edges = edges * selected_source_state
         selected_state = gather_state_by_indices(flat_projected_state, best_indices)
         selected_val = gather_val_by_indices(flat_projected_val, best_indices)
 
@@ -322,6 +390,7 @@ def transition_dense_kernel(
     projected_state: Tensor,
     projected_val: Tensor,
     dst_nodes: int,
+    route_compress_name: str = "softmax",
     src_block_size: int | None = 128,
     dst_block_size: int | None = 128,
     accumulator_dtype: torch.dtype | None = None,
@@ -375,7 +444,8 @@ def transition_dense_kernel(
                     "route_fn returned an unexpected block shape in kernel path, "
                     f"expected {expected_shape}, got {tuple(logits_block.shape)}."
                 )
-            softmax_stats = online_softmax_stats_step(softmax_stats, logits_block)
+            stats_logits = logits_block.abs() if route_compress_name == "signed_abs_softmax" else logits_block
+            softmax_stats = online_softmax_stats_step(softmax_stats, stats_logits)
 
         if softmax_stats is None:
             continue
@@ -400,9 +470,16 @@ def transition_dense_kernel(
                 start=dst_start,
                 end=dst_end,
             )
-            routes_block = normalize_with_online_softmax(
-                logits_block, softmax_stats
-            )
+            if route_compress_name == "softmax":
+                routes_block = normalize_with_online_softmax(
+                    logits_block, softmax_stats
+                )
+            elif route_compress_name == "signed_abs_softmax":
+                routes_block = torch.sign(torch.nan_to_num(logits_block)) * normalize_with_online_softmax(
+                    logits_block.abs(), softmax_stats
+                )
+            else:
+                raise ValueError(f"Unsupported route_compress_name: {route_compress_name!r}.")
             delta_state[:, dst_start:dst_end] += torch.bmm(
                 routes_block.to(dtype=state_acc_dtype).transpose(1, 2).contiguous(),
                 state_sender.unsqueeze(-1),
@@ -431,6 +508,7 @@ def transition_topk_kernel(
     projected_val: Tensor,
     dst_nodes: int,
     topk: int,
+    route_compress_name: str = "softmax",
     src_block_size: int | None = 128,
     dst_block_size: int | None = 128,
     accumulator_dtype: torch.dtype | None = None,
@@ -453,6 +531,7 @@ def transition_topk_kernel(
             projected_state=projected_state,
             projected_val=projected_val,
             dst_nodes=dst_nodes,
+            route_compress_name=route_compress_name,
             src_block_size=src_block_size,
             dst_block_size=dst_block_size,
             accumulator_dtype=accumulator_dtype,
@@ -523,7 +602,7 @@ def transition_topk_kernel(
                 candidate_indices, selected.indices, dim=-1
             )
 
-        routes = torch.softmax(best_values, dim=-1)
+        routes = _compress_routes(best_values, route_compress_name=route_compress_name)
         state_contrib = (
             routes.to(dtype=state_acc_dtype)
             * (

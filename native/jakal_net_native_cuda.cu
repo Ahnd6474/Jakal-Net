@@ -133,7 +133,8 @@ __global__ void low_rank_pairwise_topk_forward_kernel(
     int64_t dst_nodes,
     int64_t rank_dim,
     int64_t out_dim,
-    int64_t k) {
+    int64_t k,
+    bool signed_abs_softmax) {
   const int64_t linear_row = blockIdx.x;
   const int64_t batch = linear_row / src_nodes;
   const int64_t src = linear_row - batch * src_nodes;
@@ -189,10 +190,12 @@ __global__ void low_rank_pairwise_topk_forward_kernel(
       }
     }
 
-    float max_score = merged_scores[0];
+    float max_score = signed_abs_softmax ? fabsf(merged_scores[0]) : merged_scores[0];
     float denom = 0.0f;
     for (int64_t rank = 0; rank < k; ++rank) {
-      const float route = expf(merged_scores[rank] - max_score);
+      const float normalized_score =
+          signed_abs_softmax ? fabsf(merged_scores[rank]) : merged_scores[rank];
+      const float route = expf(normalized_score - max_score);
       shared_routes[rank] = route;
       denom += route;
     }
@@ -200,6 +203,13 @@ __global__ void low_rank_pairwise_topk_forward_kernel(
     const int64_t output_base = (batch * src_nodes + src) * k;
     for (int64_t rank = 0; rank < k; ++rank) {
       shared_routes[rank] /= denom;
+      if (signed_abs_softmax) {
+        if (merged_scores[rank] < 0.0f) {
+          shared_routes[rank] = -shared_routes[rank];
+        } else if (merged_scores[rank] == 0.0f) {
+          shared_routes[rank] = 0.0f;
+        }
+      }
       topk_scores[output_base + rank] = merged_scores[rank];
       topk_indices[output_base + rank] = merged_indices[rank];
       selected_indices[rank] = static_cast<int32_t>(merged_indices[rank]);
@@ -697,7 +707,8 @@ jakal_net_low_rank_pairwise_topk_forward_cuda(
     const torch::Tensor& projected_target,
     const torch::Tensor& weighted_projected_state,
     const torch::Tensor& weighted_projected_val,
-    int64_t topk) {
+    int64_t topk,
+    bool signed_abs_softmax) {
   require_cuda_contiguous(weighted_projected_source, "weighted_projected_source");
   require_cuda_contiguous(projected_target, "projected_target");
   require_cuda_contiguous(weighted_projected_state, "weighted_projected_state");
@@ -776,7 +787,8 @@ jakal_net_low_rank_pairwise_topk_forward_cuda(
                 dst_nodes,
                 rank_dim,
                 out_dim,
-                k);
+                k,
+                signed_abs_softmax);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
       });
 

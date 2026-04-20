@@ -265,6 +265,20 @@ def _coerce_query_reduce_backward_inputs(
     )
 
 
+def _signed_abs_softmax_from_scores(scores: Tensor) -> Tensor:
+    clean_scores = torch.nan_to_num(scores)
+    return torch.sign(clean_scores) * torch.softmax(clean_scores.abs(), dim=-1)
+
+
+def _signed_abs_softmax_backward(scores: Tensor, grad_routes: Tensor) -> Tensor:
+    clean_scores = torch.nan_to_num(scores)
+    signs = torch.sign(clean_scores)
+    probs = torch.softmax(clean_scores.abs(), dim=-1)
+    signed_routes = signs * probs
+    dot = (grad_routes * signed_routes).sum(dim=-1, keepdim=True)
+    return signs * probs * (signs * grad_routes - dot)
+
+
 def _flatten_dense_tensors(
     layer_val: Tensor,
     projected_state: Tensor,
@@ -1707,6 +1721,7 @@ class _LowRankTransitionPairwiseTopK(Function):
         topk: int,
         src_block_size: int,
         dst_block_size: int,
+        signed_abs_softmax: bool,
     ) -> tuple[Tensor, Tensor]:
         (
             flat_sender,
@@ -1746,6 +1761,7 @@ class _LowRankTransitionPairwiseTopK(Function):
             weighted_projected_state,
             weighted_projected_val,
             k,
+            signed_abs_softmax,
         )
         ctx.batch_shape = batch_shape
         ctx.src_nodes = src_nodes
@@ -1753,6 +1769,7 @@ class _LowRankTransitionPairwiseTopK(Function):
         ctx.out_dim = out_dim
         ctx.temperature = float(temperature)
         ctx.has_bias = bias is not None
+        ctx.signed_abs_softmax = bool(signed_abs_softmax)
         ctx.save_for_backward(
             sender_strength,
             src_val,
@@ -1803,7 +1820,11 @@ class _LowRankTransitionPairwiseTopK(Function):
         )
         flat_scores = scores.reshape(-1, src_nodes, scores.shape[-1]).contiguous()
         flat_indices = indices.reshape(-1, src_nodes, indices.shape[-1]).contiguous()
-        flat_routes = torch.softmax(flat_scores, dim=-1).contiguous()
+        flat_routes = (
+            _signed_abs_softmax_from_scores(flat_scores)
+            if ctx.signed_abs_softmax
+            else torch.softmax(flat_scores, dim=-1)
+        ).contiguous()
         weighted_state = (
             flat_sender.to(dtype=torch.float32) * flat_projected_state.to(dtype=torch.float32)
         ).contiguous()
@@ -1826,10 +1847,16 @@ class _LowRankTransitionPairwiseTopK(Function):
             flat_grad_val.contiguous(),
         )
         module = _native_module()
-        grad_scores = module.softmax_backward_cuda(
-            flat_routes.contiguous(),
-            grad_routes.contiguous(),
-        )
+        if ctx.signed_abs_softmax:
+            grad_scores = _signed_abs_softmax_backward(
+                flat_scores.contiguous(),
+                grad_routes.contiguous(),
+            )
+        else:
+            grad_scores = module.softmax_backward_cuda(
+                flat_routes.contiguous(),
+                grad_routes.contiguous(),
+            )
         projected_target = torch.matmul(flat_dst, target_weight.t()).contiguous()
         projected_source = torch.matmul(flat_src, source_weight.t()).contiguous()
         (
@@ -1869,6 +1896,7 @@ class _LowRankTransitionPairwiseTopK(Function):
             grad_target_weight_from_kernel,
             grad_core_weight,
             grad_bias if ctx.has_bias else None,
+            None,
             None,
             None,
             None,
@@ -2686,6 +2714,7 @@ def transition_pairwise_topk_native(
     topk: int,
     src_block_size: int,
     dst_block_size: int,
+    route_compress_name: str = "softmax",
 ) -> Any:
     if not supports_pairwise_route_kernel(route_fn):
         raise TypeError("Unsupported pairwise route_fn for native sparse transition.")
@@ -2718,8 +2747,14 @@ def transition_pairwise_topk_native(
             topk,
             src_block_size,
             dst_block_size,
+            route_compress_name == "signed_abs_softmax",
         )
         return LayerDelta(delta_state=delta_state, delta_val=delta_val)
+    if route_compress_name != "softmax":
+        raise TypeError(
+            "Native sparse pairwise transition supports signed_abs_softmax only "
+            "through the CUDA low-rank autograd path."
+        )
     spec = pairwise_route_kernel_spec(route_fn)
     return _to_layer_delta(_native_module().transition_pairwise_topk(
         spec.kind,

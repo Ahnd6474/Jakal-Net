@@ -42,10 +42,40 @@ from jakal_net.native_backend import (
 )
 
 
-def _native_edge_compress_name(edge_compress_fn: Callable[[Tensor], Tensor]) -> str | None:
+def _edge_compress_name(edge_compress_fn: Callable[[Tensor], Tensor]) -> str | None:
     name = getattr(edge_compress_fn, "__name__", "")
     if edge_compress_fn is F.softsign or name == "softsign":
         return "softsign"
+    if name in {"signed_abs_softmax", "_signed_abs_softmax_edges"}:
+        return "signed_abs_softmax"
+    return None
+
+
+def _compress_edges(
+    scores: Tensor,
+    edge_compress_fn: Callable[[Tensor], Tensor],
+    *,
+    mask: Tensor | None = None,
+) -> Tensor:
+    if _edge_compress_name(edge_compress_fn) == "signed_abs_softmax":
+        clean_scores = torch.nan_to_num(scores)
+        signs = torch.sign(clean_scores)
+        magnitudes = clean_scores.abs()
+        if mask is not None:
+            bool_mask = mask.to(dtype=torch.bool)
+            signs = signs * bool_mask.to(dtype=signs.dtype)
+            magnitudes = magnitudes.masked_fill(~bool_mask, -torch.inf)
+        return torch.nan_to_num(signs * torch.softmax(magnitudes, dim=-1))
+    edges = edge_compress_fn(scores)
+    if mask is not None:
+        edges = edges * mask.to(dtype=edges.dtype)
+    return edges
+
+
+def _native_edge_compress_name(edge_compress_fn: Callable[[Tensor], Tensor]) -> str | None:
+    name = _edge_compress_name(edge_compress_fn)
+    if name == "softsign":
+        return name
     return None
 
 
@@ -203,6 +233,7 @@ class Propagation(nn.Module):
                 layer_val=layer.val,
                 projected_state=projected_state,
                 projected_val=projected_val,
+                source_state=layer.state if self.state_weight_edges else None,
                 target_block_size=self.target_block_size,
                 source_block_size=self.source_block_size,
                 accumulator_dtype=self.accumulator_dtype,
@@ -215,6 +246,7 @@ class Propagation(nn.Module):
                 layer_val=layer.val,
                 projected_state=projected_state,
                 projected_val=projected_val,
+                source_state=layer.state if self.state_weight_edges else None,
                 target_block_size=self.target_block_size,
                 source_block_size=self.source_block_size,
                 accumulator_dtype=self.accumulator_dtype,
@@ -307,7 +339,6 @@ class SparsePropagation(Propagation):
     def _compute_delta_reference(self, layer: Layer) -> LayerDelta:
         projected_state, projected_val = self._project_inputs(layer)
         scores = self.compute_scores(layer)
-        edges = self.edge_compress_fn(scores)
 
         if self.sparse_type == "window":
             mask_2d = causal_window_mask(
@@ -323,13 +354,15 @@ class SparsePropagation(Propagation):
         else:
             mask = build_topk_mask(scores, self.topk or layer.num_nodes)
 
-        masked_edges = edges * mask.to(dtype=edges.dtype)
+        masked_edges = _compress_edges(scores, self.edge_compress_fn, mask=mask)
         masked_edges = self._weight_edges(masked_edges, layer.state)
         delta_state = torch.einsum("...ij,...j->...i", masked_edges, projected_state)
         delta_val = torch.einsum("...ij,...jd->...id", masked_edges, projected_val)
         return LayerDelta(delta_state=delta_state, delta_val=delta_val)
 
     def _compute_window_delta_streaming(self, layer: Layer) -> LayerDelta:
+        if _edge_compress_name(self.edge_compress_fn) == "signed_abs_softmax":
+            return self._compute_delta_reference(layer)
         projected_state, projected_val = self._project_inputs(layer)
         delta_state, delta_val = self._allocate_delta_buffers(
             layer, projected_state, projected_val
@@ -369,7 +402,7 @@ class SparsePropagation(Propagation):
                     device=scores.device,
                 )
                 mask = mask_2d.view((1,) * len(layer.batch_shape) + mask_2d.shape)
-                edges = self.edge_compress_fn(scores) * mask.to(dtype=scores.dtype)
+                edges = _compress_edges(scores, self.edge_compress_fn, mask=mask)
                 edges = self._weight_edges(
                     edges,
                     layer.state[..., global_source_start:global_source_end],
@@ -458,7 +491,7 @@ class SparsePropagation(Propagation):
             if best_scores is None or best_indices is None:
                 continue
 
-            compressed_edges = self.edge_compress_fn(best_scores)
+            compressed_edges = _compress_edges(best_scores, self.edge_compress_fn)
             if self.state_weight_edges:
                 selected_source_state = gather_state_by_indices(layer.state, best_indices)
                 compressed_edges = compressed_edges * selected_source_state
@@ -526,6 +559,7 @@ class SparsePropagation(Propagation):
                     layer_val=layer.val,
                     projected_state=projected_state,
                     projected_val=projected_val,
+                    source_state=layer.state if self.state_weight_edges else None,
                     window=self.window or 0,
                     target_block_size=self.target_block_size,
                     source_block_size=self.source_block_size,
@@ -537,6 +571,7 @@ class SparsePropagation(Propagation):
                 layer_val=layer.val,
                 projected_state=projected_state,
                 projected_val=projected_val,
+                source_state=layer.state if self.state_weight_edges else None,
                 topk=self.topk or layer.num_nodes,
                 target_block_size=self.target_block_size,
                 source_block_size=self.source_block_size,
@@ -551,6 +586,7 @@ class SparsePropagation(Propagation):
                     layer_val=layer.val,
                     projected_state=projected_state,
                     projected_val=projected_val,
+                    source_state=layer.state if self.state_weight_edges else None,
                     window=self.window or 0,
                     target_block_size=self.target_block_size,
                     source_block_size=self.source_block_size,
@@ -562,6 +598,7 @@ class SparsePropagation(Propagation):
                 layer_val=layer.val,
                 projected_state=projected_state,
                 projected_val=projected_val,
+                source_state=layer.state if self.state_weight_edges else None,
                 topk=self.topk or layer.num_nodes,
                 target_block_size=self.target_block_size,
                 source_block_size=self.source_block_size,

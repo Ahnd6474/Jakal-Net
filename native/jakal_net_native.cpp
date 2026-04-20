@@ -115,14 +115,16 @@ low_rank_pairwise_topk_forward_cuda_wrapper(
     const torch::Tensor& projected_target,
     const torch::Tensor& weighted_projected_state,
     const torch::Tensor& weighted_projected_val,
-    int64_t topk) {
+    int64_t topk,
+    bool signed_abs_softmax) {
 #ifdef WITH_CUDA
   return jakal_net_low_rank_pairwise_topk_forward_cuda(
       weighted_projected_source,
       projected_target,
       weighted_projected_state,
       weighted_projected_val,
-      topk);
+      topk,
+      signed_abs_softmax);
 #else
   throw std::runtime_error(
       "low_rank_pairwise_topk_forward_cuda requires a CUDA-enabled build.");
@@ -1564,7 +1566,8 @@ std::tuple<torch::Tensor, torch::Tensor> transition_pairwise_topk(
         projected_target,
         weighted_projected_state,
         weighted_projected_val,
-        k);
+        k,
+        false);
     return {
         reshape_state(std::get<0>(fused).to(projected_state.scalar_type()), batch_sizes, dst_nodes),
         reshape_val(std::get<1>(fused).to(projected_val.scalar_type()), batch_sizes, dst_nodes, out_dim),

@@ -31,6 +31,11 @@ def _val_proj_fn(val: torch.Tensor) -> torch.Tensor:
     return val * 0.75 + 0.5
 
 
+def _signed_abs_softmax_edges(scores: torch.Tensor) -> torch.Tensor:
+    clean_scores = torch.nan_to_num(scores)
+    return torch.sign(clean_scores) * torch.softmax(clean_scores.abs(), dim=-1)
+
+
 def _make_route_fn(src_dim: int, dst_nodes: int):
     weight = torch.arange(1, src_dim * dst_nodes + 1, dtype=torch.float32).view(
         src_dim, dst_nodes
@@ -177,6 +182,41 @@ class JakalNetModuleTests(unittest.TestCase):
 
         self.assert_delta_close(reference(layer), kernel(layer))
 
+    def test_sparse_window_propagation_kernel_matches_signed_state_weight_reference(self) -> None:
+        torch.manual_seed(31)
+        layer = Layer(
+            dim=3,
+            num_nodes=8,
+            state=torch.randn(2, 8),
+            val=torch.randn(2, 8, 3),
+        )
+
+        reference = SparsePropagation(
+            pairwise_fn=DiagonalBilinearPairwise(dim=3),
+            edge_compress_fn=_signed_abs_softmax_edges,
+            state_proj_fn=_state_proj_fn,
+            val_proj_fn=_val_proj_fn,
+            sparse_type="window",
+            window=2,
+            state_weight_edges=True,
+            implementation="reference",
+        )
+        kernel = SparsePropagation(
+            pairwise_fn=DiagonalBilinearPairwise(dim=3),
+            edge_compress_fn=_signed_abs_softmax_edges,
+            state_proj_fn=_state_proj_fn,
+            val_proj_fn=_val_proj_fn,
+            sparse_type="window",
+            window=2,
+            state_weight_edges=True,
+            implementation="kernel",
+            target_block_size=3,
+            source_block_size=2,
+        )
+        kernel.pairwise_fn.load_state_dict(reference.pairwise_fn.state_dict())
+
+        self.assert_delta_close(reference(layer), kernel(layer))
+
     def test_sparse_topk_propagation_streaming_matches_reference(self) -> None:
         torch.manual_seed(2)
         layer = Layer(
@@ -231,6 +271,41 @@ class JakalNetModuleTests(unittest.TestCase):
             sparse_type="topk",
             topk=3,
             implementation="kernel",
+        )
+        kernel.pairwise_fn.load_state_dict(reference.pairwise_fn.state_dict())
+
+        self.assert_delta_close(reference(layer), kernel(layer))
+
+    def test_sparse_topk_propagation_kernel_matches_signed_state_weight_reference(self) -> None:
+        torch.manual_seed(32)
+        layer = Layer(
+            dim=5,
+            num_nodes=9,
+            state=torch.randn(2, 9),
+            val=torch.randn(2, 9, 5),
+        )
+
+        reference = SparsePropagation(
+            pairwise_fn=BilinearPairwise(dim=5),
+            edge_compress_fn=_signed_abs_softmax_edges,
+            state_proj_fn=_state_proj_fn,
+            val_proj_fn=_val_proj_fn,
+            sparse_type="topk",
+            topk=3,
+            state_weight_edges=True,
+            implementation="reference",
+        )
+        kernel = SparsePropagation(
+            pairwise_fn=BilinearPairwise(dim=5),
+            edge_compress_fn=_signed_abs_softmax_edges,
+            state_proj_fn=_state_proj_fn,
+            val_proj_fn=_val_proj_fn,
+            sparse_type="topk",
+            topk=3,
+            state_weight_edges=True,
+            implementation="kernel",
+            target_block_size=4,
+            source_block_size=2,
         )
         kernel.pairwise_fn.load_state_dict(reference.pairwise_fn.state_dict())
 
@@ -432,6 +507,39 @@ class JakalNetModuleTests(unittest.TestCase):
             route_fn=LinearRoute(src_dim=3, dst_nodes=6),
             topk=2,
             state_activation_fn=lambda x: x + 1.25,
+            val_proj_fn=lambda val: torch.cat((val, val[..., :1]), dim=-1),
+            state_proj_fn=_state_proj_fn,
+            implementation="kernel",
+        )
+        kernel.route_fn.load_state_dict(reference.route_fn.state_dict())
+
+        self.assert_delta_close(reference.compute_delta(src, dst), kernel.compute_delta(src, dst))
+
+    def test_sparse_transition_kernel_matches_signed_abs_reference(self) -> None:
+        torch.manual_seed(33)
+        src = Layer(
+            dim=3,
+            num_nodes=8,
+            state=torch.randn(2, 8),
+            val=torch.randn(2, 8, 3),
+        )
+        dst = Layer.zeros(dim=4, num_nodes=6, batch_shape=(2,))
+        route_fn = LinearRoute(src_dim=3, dst_nodes=6)
+
+        reference = SparseTransition(
+            route_fn=route_fn,
+            topk=2,
+            state_activation_fn=lambda x: x + 1.25,
+            route_compress_name="signed_abs_softmax",
+            val_proj_fn=lambda val: torch.cat((val, val[..., :1]), dim=-1),
+            state_proj_fn=_state_proj_fn,
+            implementation="reference",
+        )
+        kernel = SparseTransition(
+            route_fn=LinearRoute(src_dim=3, dst_nodes=6),
+            topk=2,
+            state_activation_fn=lambda x: x + 1.25,
+            route_compress_name="signed_abs_softmax",
             val_proj_fn=lambda val: torch.cat((val, val[..., :1]), dim=-1),
             state_proj_fn=_state_proj_fn,
             implementation="kernel",

@@ -226,7 +226,7 @@ class Transition(nn.Module):
                 source_nodes=src_end - src_start,
                 dst_nodes=dst_layer.num_nodes,
             )
-            routes = torch.softmax(logits, dim=-1)
+            routes = self._compress_routes(logits)
             weighted_routes = routes * sender_strength[..., src_start:src_end].unsqueeze(-1)
 
             delta_state += torch.einsum(
@@ -263,6 +263,7 @@ class Transition(nn.Module):
                 projected_state=projected_state,
                 projected_val=projected_val,
                 dst_nodes=dst_layer.num_nodes,
+                route_compress_name=self.route_compress_name,
                 src_block_size=self.src_block_size,
                 dst_block_size=self.dst_block_size,
                 accumulator_dtype=self.accumulator_dtype,
@@ -274,12 +275,10 @@ class Transition(nn.Module):
             logits = self.compute_route_logits(src_layer, dst_layer)
             routes = self._compress_routes(logits)
             self.last_stats = _summarize_routes(routes)
-        if self.route_compress_name != "softmax":
-            if self.implementation == "reference" or src_layer.val.device.type == "privateuseone":
-                return self._compute_delta_reference(src_layer, dst_layer)
-            return self._compute_delta_streaming(src_layer, dst_layer)
         if self.implementation == "native":
             if (
+                self.route_compress_name == "softmax"
+                and
                 supports_pairwise_route_kernel(self.route_fn)
                 and native_supports("transition_pairwise_dense")
                 and native_supports_device(src_layer.val.device.type)
@@ -298,6 +297,8 @@ class Transition(nn.Module):
                     dst_block_size=self.dst_block_size or dst_layer.num_nodes,
                 )
             if (
+                self.route_compress_name == "softmax"
+                and
                 not _route_uses_pairwise_inputs(self.route_fn)
                 and supports_route_kernel(self.route_fn)
                 and native_supports("transition_dense")
@@ -523,17 +524,23 @@ class SparseTransition(Transition):
             projected_val, projected_state, sender_strength = self._project_inputs(
                 src_layer, dst_layer
             )
-            return transition_pairwise_topk_native(
-                route_fn=self.route_fn,
-                sender_strength=sender_strength,
-                src_val=src_layer.val,
-                dst_val=dst_layer.val,
-                projected_state=projected_state,
-                projected_val=projected_val,
-                topk=self.topk,
-                src_block_size=self.src_block_size or src_layer.num_nodes,
-                dst_block_size=self.dst_block_size or dst_layer.num_nodes,
-            )
+            try:
+                return transition_pairwise_topk_native(
+                    route_fn=self.route_fn,
+                    sender_strength=sender_strength,
+                    src_val=src_layer.val,
+                    dst_val=dst_layer.val,
+                    projected_state=projected_state,
+                    projected_val=projected_val,
+                    topk=self.topk,
+                    src_block_size=self.src_block_size or src_layer.num_nodes,
+                    dst_block_size=self.dst_block_size or dst_layer.num_nodes,
+                    route_compress_name=self.route_compress_name,
+                )
+            except TypeError:
+                if self.route_compress_name != "softmax":
+                    return self._compute_delta_streaming(src_layer, dst_layer)
+                raise
         if not _route_uses_pairwise_inputs(self.route_fn) and supports_route_kernel(
             self.route_fn
         ):
@@ -547,6 +554,7 @@ class SparseTransition(Transition):
                 projected_state=projected_state,
                 projected_val=projected_val,
                 dst_nodes=dst_layer.num_nodes,
+                route_compress_name=self.route_compress_name,
                 topk=self.topk,
                 src_block_size=self.src_block_size,
                 dst_block_size=self.dst_block_size,
@@ -569,10 +577,6 @@ class SparseTransition(Transition):
                 dense_routes.scatter_(-1, topk_indices, routes)
                 routes = dense_routes
             self.last_stats = _summarize_routes(routes, topk_indices=topk_indices)
-        if self.route_compress_name != "softmax":
-            if self.implementation == "reference" or src_layer.val.device.type == "privateuseone":
-                return self._compute_delta_reference(src_layer, dst_layer)
-            return self._compute_delta_streaming(src_layer, dst_layer)
         if self.implementation == "native":
             if (
                 supports_pairwise_route_kernel(self.route_fn)
@@ -582,18 +586,26 @@ class SparseTransition(Transition):
                 projected_val, projected_state, sender_strength = self._project_inputs(
                     src_layer, dst_layer
                 )
-                return transition_pairwise_topk_native(
-                    route_fn=self.route_fn,
-                    sender_strength=sender_strength,
-                    src_val=src_layer.val,
-                    dst_val=dst_layer.val,
-                    projected_state=projected_state,
-                    projected_val=projected_val,
-                    topk=self.topk,
-                    src_block_size=self.src_block_size or src_layer.num_nodes,
-                    dst_block_size=self.dst_block_size or dst_layer.num_nodes,
-                )
+                try:
+                    return transition_pairwise_topk_native(
+                        route_fn=self.route_fn,
+                        sender_strength=sender_strength,
+                        src_val=src_layer.val,
+                        dst_val=dst_layer.val,
+                        projected_state=projected_state,
+                        projected_val=projected_val,
+                        topk=self.topk,
+                        src_block_size=self.src_block_size or src_layer.num_nodes,
+                        dst_block_size=self.dst_block_size or dst_layer.num_nodes,
+                        route_compress_name=self.route_compress_name,
+                    )
+                except TypeError:
+                    if self.route_compress_name != "softmax":
+                        return self._compute_delta_streaming(src_layer, dst_layer)
+                    raise
             if (
+                self.route_compress_name == "softmax"
+                and
                 not _route_uses_pairwise_inputs(self.route_fn)
                 and supports_route_kernel(self.route_fn)
                 and native_supports("transition_topk")

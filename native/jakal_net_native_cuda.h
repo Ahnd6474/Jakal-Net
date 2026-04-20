@@ -30,7 +30,8 @@ jakal_net_low_rank_pairwise_topk_forward_cuda(
     const torch::Tensor& projected_target,
     const torch::Tensor& weighted_projected_state,
     const torch::Tensor& weighted_projected_val,
-    int64_t topk);
+    int64_t topk,
+    bool signed_abs_softmax);
 
 std::tuple<torch::Tensor, torch::Tensor>
 jakal_net_low_rank_propagation_topk_forward_cuda(
