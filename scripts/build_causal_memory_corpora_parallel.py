@@ -6,10 +6,9 @@ import os
 import subprocess
 import sys
 import time
-from concurrent.futures import FIRST_COMPLETED, Future, wait
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Iterator, Sequence
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,20 +19,46 @@ class TaskSpec:
     output: Path
 
 
+def _nonempty_jsonl_lines(path: Path) -> Iterator[str]:
+    if not path.exists():
+        return
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if line:
+                yield line
+
+
 def _merge_jsonl_files(*, inputs: Sequence[Path], output: Path) -> int:
     output.parent.mkdir(parents=True, exist_ok=True)
     total_lines = 0
     with output.open("w", encoding="utf-8") as out_handle:
         for path in inputs:
-            if not path.exists():
-                continue
-            with path.open("r", encoding="utf-8", errors="replace") as in_handle:
-                for line in in_handle:
-                    if not line.strip():
-                        continue
-                    out_handle.write(line)
-                    total_lines += 1
+            for line in _nonempty_jsonl_lines(path):
+                out_handle.write(line)
+                out_handle.write("\n")
+                total_lines += 1
     return total_lines
+
+
+def _interleave_balanced_jsonl(*, pure_path: Path, conditioned_path: Path, output: Path) -> int:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
+    pure_iter = _nonempty_jsonl_lines(pure_path)
+    conditioned_iter = _nonempty_jsonl_lines(conditioned_path)
+    with output.open("w", encoding="utf-8") as handle:
+        while True:
+            try:
+                pure_line = next(pure_iter)
+                conditioned_line = next(conditioned_iter)
+            except StopIteration:
+                break
+            handle.write(pure_line)
+            handle.write("\n")
+            handle.write(conditioned_line)
+            handle.write("\n")
+            written += 2
+    return written
 
 
 def _task_output(base_dir: Path, corpus_key: str, task_name: str) -> Path:
@@ -69,13 +94,52 @@ def build_task_specs(*, python_exe: str, scripts_dir: Path, output_dir: Path) ->
             )
         )
 
-    for label in ("python_code", "codeact", "metamath", "code", "math", "wiki"):
-        for shard_index in range(2):
-            name = f"segmented_{label}_s{shard_index:02d}"
-            output = _task_output(output_dir, "segmented_mixed_docs", name)
+    pure_doc_labels = (
+        ("code", 2, "500000"),
+        ("math", 2, "500000"),
+        ("wiki", 2, "500000"),
+        ("arxiv", 2, "300000"),
+        ("pubmed", 2, "300000"),
+    )
+    for label, num_shards, max_records in pure_doc_labels:
+        for shard_index in range(num_shards):
+            name = f"pure_{label}_s{shard_index:02d}"
+            output = _task_output(output_dir, "pure_docs", name)
             tasks.append(
                 TaskSpec(
-                    corpus_key="segmented_mixed_docs",
+                    corpus_key="pure_docs",
+                    name=name,
+                    output=output,
+                    command=[
+                        python_exe,
+                        str(scripts_dir / "build_segmented_dialogue_corpus.py"),
+                        "--output",
+                        str(output),
+                        "--source-label",
+                        label,
+                        "--max-records-per-source",
+                        max_records,
+                        "--num-shards",
+                        str(num_shards),
+                        "--shard-index",
+                        str(shard_index),
+                        "--skip-failed-sources",
+                    ],
+                )
+            )
+
+    mixed_dialogue_labels = (
+        ("python_code", 2),
+        ("codeact", 2),
+        ("metamath", 2),
+    )
+    for label, num_shards in mixed_dialogue_labels:
+        for shard_index in range(num_shards):
+            name = f"mixed_{label}_s{shard_index:02d}"
+            output = _task_output(output_dir, "mixed_dialogue", name)
+            tasks.append(
+                TaskSpec(
+                    corpus_key="mixed_dialogue",
                     name=name,
                     output=output,
                     command=[
@@ -88,7 +152,7 @@ def build_task_specs(*, python_exe: str, scripts_dir: Path, output_dir: Path) ->
                         "--max-records-per-source",
                         "500000",
                         "--num-shards",
-                        "2",
+                        str(num_shards),
                         "--shard-index",
                         str(shard_index),
                         "--skip-failed-sources",
@@ -110,7 +174,7 @@ def build_task_specs(*, python_exe: str, scripts_dir: Path, output_dir: Path) ->
                     "--output",
                     str(output),
                     "--max-records-per-source",
-                    "100000",
+                    "150000",
                     "--num-shards",
                     "2",
                     "--shard-index",
@@ -148,7 +212,7 @@ def build_task_specs(*, python_exe: str, scripts_dir: Path, output_dir: Path) ->
                         "--source-label",
                         label,
                         "--max-records-per-source",
-                        "100000",
+                        "150000",
                         "--num-shards",
                         str(num_shards),
                         "--shard-index",
@@ -163,7 +227,7 @@ def build_task_specs(*, python_exe: str, scripts_dir: Path, output_dir: Path) ->
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Parallel shard-aware corpus builder for causal memory training.")
-    parser.add_argument("--output-dir", default="artifacts/data_parallel")
+    parser.add_argument("--output-dir", default="artifacts/data_parallel_v2")
     parser.add_argument("--max-parallel", type=int, default=16)
     parser.add_argument("--python-exe", default=sys.executable)
     args = parser.parse_args()
@@ -185,7 +249,7 @@ def main() -> None:
 
     started = time.perf_counter()
     pending = list(tasks)
-    running: dict[Future[int], tuple[TaskSpec, subprocess.Popen[str], object]] = {}
+    running: list[tuple[TaskSpec, subprocess.Popen[str], object]] = []
     results: list[dict[str, object]] = []
 
     while pending or running:
@@ -202,20 +266,17 @@ def main() -> None:
                 stderr=subprocess.STDOUT,
                 text=True,
             )
-            future: Future[int] = Future()
-            future.set_running_or_notify_cancel()
-            running[future] = (task, process, log_handle)
+            running.append((task, process, log_handle))
         if not running:
             continue
         time.sleep(1.0)
-        completed: list[Future[int]] = []
-        for future, (task, process, log_handle) in list(running.items()):
+        remaining: list[tuple[TaskSpec, subprocess.Popen[str], object]] = []
+        for task, process, log_handle in running:
             returncode = process.poll()
             if returncode is None:
+                remaining.append((task, process, log_handle))
                 continue
             log_handle.close()
-            future.set_result(returncode)
-            completed.append(future)
             results.append(
                 {
                     "task": task.name,
@@ -224,12 +285,12 @@ def main() -> None:
                     "returncode": returncode,
                 }
             )
-        for future in completed:
-            running.pop(future, None)
+        running = remaining
 
     corpus_outputs: dict[str, list[Path]] = {
         "plain_dialogue": [],
-        "segmented_mixed_docs": [],
+        "pure_docs": [],
+        "mixed_dialogue": [],
         "math_qa": [],
         "reasoning_dialogue": [],
     }
@@ -237,14 +298,52 @@ def main() -> None:
         corpus_outputs[task.corpus_key].append(task.output)
 
     merged_info: dict[str, dict[str, object]] = {}
+    merged_paths: dict[str, Path] = {}
     for corpus_key, paths in corpus_outputs.items():
         final_output = output_dir / f"{corpus_key}.jsonl"
         line_count = _merge_jsonl_files(inputs=paths, output=final_output)
+        merged_paths[corpus_key] = final_output
         merged_info[corpus_key] = {
             "output": str(final_output),
             "lines": line_count,
             "shards": [str(path) for path in paths],
         }
+
+    pure_path = output_dir / "pure_corpus.jsonl"
+    pure_count = _merge_jsonl_files(
+        inputs=(merged_paths["plain_dialogue"], merged_paths["pure_docs"]),
+        output=pure_path,
+    )
+    conditioned_path = output_dir / "conditioned_corpus.jsonl"
+    conditioned_count = _merge_jsonl_files(
+        inputs=(merged_paths["mixed_dialogue"], merged_paths["math_qa"], merged_paths["reasoning_dialogue"]),
+        output=conditioned_path,
+    )
+    balanced_path = output_dir / "balanced_corpus.jsonl"
+    balanced_count = _interleave_balanced_jsonl(
+        pure_path=pure_path,
+        conditioned_path=conditioned_path,
+        output=balanced_path,
+    )
+
+    merged_info["pure_corpus"] = {
+        "output": str(pure_path),
+        "lines": pure_count,
+        "components": ["plain_dialogue", "pure_docs"],
+    }
+    merged_info["conditioned_corpus"] = {
+        "output": str(conditioned_path),
+        "lines": conditioned_count,
+        "components": ["mixed_dialogue", "math_qa", "reasoning_dialogue"],
+    }
+    merged_info["balanced_corpus"] = {
+        "output": str(balanced_path),
+        "lines": balanced_count,
+        "pairs": balanced_count // 2,
+        "pure_lines_used": balanced_count // 2,
+        "conditioned_lines_used": balanced_count // 2,
+        "composition": {"pure_fraction": 0.5, "conditioned_fraction": 0.5},
+    }
 
     meta = {
         "output_dir": str(output_dir),

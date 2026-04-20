@@ -33,6 +33,8 @@ DEFAULT_DOCUMENT_SOURCES = (
     "code=codeparrot/codeparrot-clean||train|content|code",
     "math=HuggingFaceTB/finemath|finemath-4plus|train|text|math",
     "wiki=wikimedia/wikipedia|20231101.en|train|text|wiki",
+    "arxiv=ccdv/arxiv-classification||train|text|text",
+    "pubmed=MedRAG/pubmed||train|contents|text",
 )
 
 
