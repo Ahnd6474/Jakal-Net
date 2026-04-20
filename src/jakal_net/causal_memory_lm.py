@@ -23,6 +23,8 @@ from jakal_net.propagation import SparsePropagation
 from jakal_net.transition import SparseTransition
 
 _STATE_LIMIT = 12.0
+_PARAM_INIT_STD = 0.02
+_LOW_RANK_SCALE_INIT = 0.1
 
 
 def _make_pairwise(
@@ -75,6 +77,52 @@ def _clone_layer(layer: Layer) -> Layer:
         state=layer.state.clone(),
         val=layer.val.clone(),
     )
+
+
+def _init_linear(linear: nn.Linear, *, std: float = _PARAM_INIT_STD) -> None:
+    nn.init.normal_(linear.weight, mean=0.0, std=std)
+    if linear.bias is not None:
+        nn.init.zeros_(linear.bias)
+
+
+def _init_pairwise_or_route_scales(module: nn.Module) -> None:
+    if isinstance(module, (LowRankBilinearPairwise, LowRankBilinearRoute)):
+        module.weight.data.fill_(_LOW_RANK_SCALE_INIT)
+        _init_linear(module.source_proj)
+        _init_linear(module.target_proj)
+        if getattr(module, "bias", None) is not None:
+            nn.init.zeros_(module.bias)
+        return
+    if isinstance(module, (DiagonalBilinearPairwise, DiagonalBilinearRoute)):
+        module.weight.data.fill_(_LOW_RANK_SCALE_INIT)
+        if getattr(module, "bias", None) is not None:
+            nn.init.zeros_(module.bias)
+        return
+    if isinstance(module, BilinearPairwise):
+        nn.init.normal_(module.weight, mean=0.0, std=_PARAM_INIT_STD)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+        return
+    if isinstance(module, BilinearPairwiseRoute):
+        _init_linear(module.source_proj)
+        _init_linear(module.target_proj)
+        nn.init.normal_(module.weight, mean=0.0, std=_PARAM_INIT_STD)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+        return
+    if isinstance(module, AdditiveLowRankPairwise):
+        _init_linear(module.target_proj)
+        _init_linear(module.source_proj)
+        _init_linear(module.target_out)
+        _init_linear(module.source_out)
+        nn.init.normal_(module.interaction_weight, mean=0.0, std=_PARAM_INIT_STD)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+        return
+    if isinstance(module, AdditiveLowRankRoute):
+        for layer in module.modules():
+            if isinstance(layer, nn.Linear):
+                _init_linear(layer)
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,6 +312,21 @@ class CausalHierarchicalMemoryLM(nn.Module):
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
         if tie_embedding_head:
             self.lm_head.weight = self.token_embedding.weight
+        self._reset_parameters(tie_embedding_head=tie_embedding_head)
+
+    def _reset_parameters(self, *, tie_embedding_head: bool) -> None:
+        nn.init.normal_(self.token_embedding.weight, mean=0.0, std=_PARAM_INIT_STD)
+        nn.init.normal_(self.anchor_val, mean=0.0, std=_PARAM_INIT_STD)
+        nn.init.normal_(self.read_template_val, mean=0.0, std=_PARAM_INIT_STD)
+        nn.init.zeros_(self.anchor_state)
+        _init_linear(self.value_to_state)
+        _init_linear(self.s_prediction_proj)
+        for projection in self.read_projections:
+            _init_linear(projection)
+        if not tie_embedding_head:
+            nn.init.normal_(self.lm_head.weight, mean=0.0, std=_PARAM_INIT_STD)
+        for module in self.modules():
+            _init_pairwise_or_route_scales(module)
 
     def initialize_memory_state(
         self,
