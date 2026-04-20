@@ -25,6 +25,8 @@ BUILDER_SCRIPTS = {
     "build_reasoning_dialogue_corpus.py",
 }
 
+PRETOKENIZE_SCRIPT = "pretokenize_causal_memory_shards.py"
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Pretokenize completed shard outputs while corpus build is still running.")
@@ -83,6 +85,25 @@ def any_builders_running(shard_root: Path) -> bool:
         if any(shard_root_str in part for part in cmd):
             return True
     return False
+
+
+def _is_pretokenize_process(cmd: list[str]) -> bool:
+    return any(PRETOKENIZE_SCRIPT in part for part in cmd)
+
+
+def active_pretokenize_targets() -> tuple[set[Path], set[Path]]:
+    raw_paths: set[Path] = set()
+    bundle_paths: set[Path] = set()
+    for process in psutil.process_iter(["pid"]):
+        cmd = _cmdline(process)
+        if not cmd or not _is_pretokenize_process(cmd):
+            continue
+        for index, token in enumerate(cmd[:-1]):
+            if token == "--raw-shard-path":
+                raw_paths.add(Path(cmd[index + 1]).resolve())
+            elif token == "--bundle-path":
+                bundle_paths.add(Path(cmd[index + 1]).resolve())
+    return raw_paths, bundle_paths
 
 
 def completed_shard_paths(shard_root: Path) -> list[Path]:
@@ -202,6 +223,7 @@ def main() -> None:
             min_completed_shards=args.min_completed_shards_for_tokenizer,
             log_prefix=args.log_prefix,
         )
+        active_raw_paths, active_bundle_paths = active_pretokenize_targets()
 
         next_running: dict[Path, subprocess.Popen[str]] = {}
         for shard_path, proc in running.items():
@@ -220,6 +242,9 @@ def main() -> None:
                     continue
                 bundle_path = bundle_dir / shard_path.relative_to(shard_root)
                 bundle_path = bundle_path.with_suffix(".pt")
+                bundle_path = bundle_path.resolve()
+                if shard_path.resolve() in active_raw_paths or bundle_path in active_bundle_paths:
+                    continue
                 if bundle_path.exists():
                     scheduled.add(shard_path)
                     continue
