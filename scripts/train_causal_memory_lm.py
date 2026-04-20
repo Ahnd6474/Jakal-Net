@@ -241,6 +241,25 @@ def _normalize_dialogue_body(messages: Sequence[dict[str, Any]]) -> str | None:
     return "\n".join(parts)
 
 
+def _record_source(record: dict[str, Any], *, fallback: str) -> str:
+    value = record.get("source")
+    if isinstance(value, str) and value.strip():
+        source = value.strip()
+        return source if source == fallback else f"{source} ({fallback})"
+    return fallback
+
+
+def _record_kind(record: dict[str, Any], *, text: str, source: str) -> str:
+    value = record.get("kind")
+    if isinstance(value, str):
+        kind = value.strip().lower()
+        if kind in MODE_TOKEN_BY_KIND:
+            return kind
+        if kind in {"math", "mixed", "wiki"}:
+            return "text"
+    return "code" if _is_probably_code(text, source=source) else "text"
+
+
 def _record_to_document(record: Any, *, source: str) -> SerializedDocument | None:
     if isinstance(record, str):
         text = record.strip()
@@ -254,12 +273,13 @@ def _record_to_document(record: Any, *, source: str) -> SerializedDocument | Non
     if not isinstance(record, dict):
         return None
 
+    record_source = _record_source(record, fallback=source)
     messages = record.get("messages") or record.get("conversations")
     if isinstance(messages, list):
         normalized = [message for message in messages if isinstance(message, dict)]
         dialogue_body = _normalize_dialogue_body(normalized)
         if dialogue_body:
-            return SerializedDocument(kind="dialogue", source=source, body=dialogue_body)
+            return SerializedDocument(kind="dialogue", source=record_source, body=dialogue_body)
 
     prompt = None
     for key in ("prompt", "instruction", "question", "input"):
@@ -276,7 +296,7 @@ def _record_to_document(record: Any, *, source: str) -> SerializedDocument | Non
     if prompt and response:
         return SerializedDocument(
             kind="instruction",
-            source=source,
+            source=record_source,
             body=f"{prompt}\n{RESPONSE_TOKEN}\n{response}",
         )
 
@@ -287,8 +307,9 @@ def _record_to_document(record: Any, *, source: str) -> SerializedDocument | Non
             text = transcript.strip()
     if text is None or not text.strip():
         return None
-    kind = "code" if _is_probably_code(text, source=source) else "text"
-    return SerializedDocument(kind=kind, source=source, body=text.strip())
+    body = text.strip()
+    kind = _record_kind(record, text=body, source=record_source)
+    return SerializedDocument(kind=kind, source=record_source, body=body)
 
 
 def load_serialized_documents(
