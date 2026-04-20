@@ -31,6 +31,7 @@ from train_progressive_b_lm import (
     EOS_TOKEN,
     PAD_TOKEN,
     USER_TOKEN,
+    _encode_byte_bpe_text_batch_worker,
     _encode_byte_bpe_text_worker,
     _chat_stream_from_record,
     _init_byte_bpe_encode_worker,
@@ -42,6 +43,7 @@ from train_progressive_b_lm import (
     count_parameters,
     encode_text_in_chunks,
     resolve_autocast_dtype,
+    resolve_tokenizer_prefix,
 )
 
 from jakal_net import describe_device, resolve_device
@@ -157,6 +159,20 @@ class DocumentBatch:
     target: torch.Tensor
     loss_mask: torch.Tensor
     reset_mask: torch.Tensor
+
+
+SCHEDULED_BUCKET_ORDER = (
+    "mixed_dialogue",
+    "arxiv",
+    "dialogue",
+    "wiki",
+    "code",
+    "math",
+    "pubmed",
+    "docs",
+    "math_qa",
+    "reasoning",
+)
 
 
 _DISPLAY_MATH_PATTERN = re.compile(r"(?s)\$\$.*?\$\$")
@@ -313,6 +329,107 @@ def _tokenize_document_payload_worker(payload: tuple[str, str, str]) -> tuple[st
     return kind, source, token_ids
 
 
+def _tokenize_document_payload_batch_worker(
+    payloads: Sequence[tuple[str, str, str]],
+) -> list[tuple[str, str, list[int]]]:
+    encoded_payloads: list[tuple[str, str, list[int]]] = []
+    for kind, source, body in payloads:
+        token_ids: list[int] = []
+        chunks = list(_iter_nonempty_text_chunks(body, chunk_chars=8_000_000))
+        if chunks:
+            for encoded_chunk in _encode_byte_bpe_text_batch_worker(chunks):
+                token_ids.extend(encoded_chunk)
+        encoded_payloads.append((kind, source, token_ids))
+    return encoded_payloads
+
+
+def document_sampling_bucket(document: SerializedDocument | TokenizedDocument) -> str:
+    source = document.source.lower()
+    kind = document.kind.lower()
+    if source.startswith("mixed_dialogue:"):
+        return "mixed_dialogue"
+    if source.startswith("math_qa:"):
+        return "math_qa"
+    if source.startswith("reasoning_qa:"):
+        return "reasoning"
+    if "ccdv/arxiv-classification" in source or source.startswith("arxiv:"):
+        return "arxiv"
+    if "medrag/pubmed" in source or source.startswith("pubmed:"):
+        return "pubmed"
+    if kind == "dialogue":
+        return "dialogue"
+    if kind == "code":
+        return "code"
+    if kind == "math":
+        return "math"
+    if "wikipedia" in source or source.startswith("wiki:"):
+        return "wiki"
+    return "docs"
+
+
+def summarize_document_buckets(documents: Sequence[SerializedDocument | TokenizedDocument]) -> dict[str, int]:
+    summary: dict[str, int] = {}
+    for document in documents:
+        bucket = document_sampling_bucket(document)
+        summary[bucket] = summary.get(bucket, 0) + 1
+    return {bucket: summary[bucket] for bucket in SCHEDULED_BUCKET_ORDER if bucket in summary}
+
+
+def resolve_bucket_weights(*, step: int, total_steps: int) -> dict[str, float]:
+    if total_steps <= 1:
+        progress = 1.0
+    else:
+        progress = max(0.0, min(1.0, (step - 1) / (total_steps - 1)))
+    conditioned_progress = 0.0 if progress <= 0.20 else (progress - 0.20) / 0.80
+    pure_front = 0.20 + 0.80 * ((1.0 - progress) ** 1.5)
+    conditioned_late = conditioned_progress ** 1.5
+    return {
+        "mixed_dialogue": 1.0,
+        "arxiv": 1.0,
+        "pubmed": 1.0,
+        "dialogue": pure_front,
+        "wiki": pure_front,
+        "code": pure_front,
+        "math": pure_front,
+        "docs": pure_front,
+        "math_qa": conditioned_late,
+        "reasoning": conditioned_late,
+    }
+
+
+def sample_documents_uniform_by_bucket(
+    documents: Sequence[TokenizedDocument],
+    *,
+    sample_count: int,
+) -> list[TokenizedDocument]:
+    if sample_count <= 0 or not documents:
+        return []
+    bucket_to_documents: dict[str, list[TokenizedDocument]] = {}
+    for document in documents:
+        bucket_to_documents.setdefault(document_sampling_bucket(document), []).append(document)
+    if not bucket_to_documents:
+        return random.sample(list(documents), k=min(sample_count, len(documents)))
+    ordered_buckets = [bucket for bucket in SCHEDULED_BUCKET_ORDER if bucket_to_documents.get(bucket)]
+    bucket_queues = {
+        bucket: random.sample(bucket_to_documents[bucket], k=len(bucket_to_documents[bucket]))
+        for bucket in ordered_buckets
+    }
+    selected: list[TokenizedDocument] = []
+    while ordered_buckets and len(selected) < sample_count:
+        next_buckets: list[str] = []
+        for bucket in ordered_buckets:
+            queue = bucket_queues[bucket]
+            if not queue:
+                continue
+            selected.append(queue.pop())
+            if queue:
+                next_buckets.append(bucket)
+            if len(selected) >= sample_count:
+                break
+        ordered_buckets = next_buckets
+    return selected[:sample_count]
+
+
 class DocumentChunkBatcher:
     def __init__(
         self,
@@ -329,9 +446,35 @@ class DocumentChunkBatcher:
         self.current_doc = [-1] * batch_size
         self.current_chunk = [0] * batch_size
         self.needs_reset = [True] * batch_size
+        self.bucket_to_indices: dict[str, tuple[int, ...]] = {}
+        for index, document in enumerate(self.documents):
+            bucket = document_sampling_bucket(document)
+            self.bucket_to_indices.setdefault(bucket, []).append(index)
+        self.bucket_to_indices = {
+            bucket: tuple(indices)
+            for bucket, indices in self.bucket_to_indices.items()
+            if indices
+        }
+        self.active_buckets = tuple(self.bucket_to_indices)
+        self.active_bucket_weights = tuple(1.0 for _ in self.active_buckets)
 
     def _sample_document_index(self) -> int:
-        return random.randrange(len(self.documents))
+        if not self.active_buckets:
+            return random.randrange(len(self.documents))
+        bucket = random.choices(self.active_buckets, weights=self.active_bucket_weights, k=1)[0]
+        return random.choice(self.bucket_to_indices[bucket])
+
+    def set_bucket_weights(self, weights: dict[str, float]) -> None:
+        active = [
+            (bucket, max(0.0, float(weights.get(bucket, 0.0))))
+            for bucket in SCHEDULED_BUCKET_ORDER
+            if bucket in self.bucket_to_indices
+        ]
+        active = [(bucket, weight) for bucket, weight in active if weight > 0.0]
+        if not active:
+            active = [(bucket, 1.0) for bucket in self.bucket_to_indices]
+        self.active_buckets = tuple(bucket for bucket, _ in active)
+        self.active_bucket_weights = tuple(weight for _, weight in active)
 
     def next_batch(self) -> DocumentBatch:
         contexts: list[torch.Tensor] = []
@@ -573,6 +716,25 @@ def build_training_text(documents: Sequence[SerializedDocument]) -> str:
     return "\n\n".join(render_document_for_tokenizer(document) for document in documents)
 
 
+def byte_bpe_tokenizer_cache_exists(
+    *,
+    tokenizer_prefix: str | None,
+    vocab_size: int,
+) -> bool:
+    if not tokenizer_prefix:
+        return False
+    prefix_path = resolve_tokenizer_prefix(
+        text="",
+        tokenizer="byte_bpe",
+        model_type="byte_level",
+        vocab_size=vocab_size,
+        prefix=tokenizer_prefix,
+    )
+    vocab_path = prefix_path.parent / f"{prefix_path.name}-vocab.json"
+    merges_path = prefix_path.parent / f"{prefix_path.name}-merges.txt"
+    return vocab_path.exists() and merges_path.exists()
+
+
 def build_special_token_id_map(vocab: object) -> dict[str, int]:
     if not hasattr(vocab, "token_id"):
         raise ValueError("The causal-memory path requires a tokenizer with explicit special-token ids.")
@@ -715,23 +877,30 @@ def tokenize_documents(
 
     if workers > 1 and isinstance(vocab, ByteBPEVocab):
         payload_count = len(documents)
-        payloads = ((document.kind, document.source, document.body) for document in documents)
-        chunksize = max(8, min(512, payload_count // max(1, workers * 32) or 8))
+        payload_batch_size = max(8, min(128, payload_count // max(1, workers * 16) or 32))
+        payload_batches = [
+            [
+                (document.kind, document.source, document.body)
+                for document in documents[index : index + payload_batch_size]
+            ]
+            for index in range(0, payload_count, payload_batch_size)
+        ]
+        chunksize = max(1, min(16, len(payload_batches) // max(1, workers * 4) or 1))
         with ProcessPoolExecutor(
             max_workers=workers,
             initializer=_init_byte_bpe_encode_worker,
-            initargs=(str(vocab.vocab_path), str(vocab.merges_path)),
+            initargs=(str(vocab.vocab_path), str(vocab.merges_path), vocab.special_tokens),
         ) as executor:
-            for index, (kind, source, token_ids) in enumerate(
-                executor.map(_tokenize_document_payload_worker, payloads, chunksize=chunksize),
-                start=1,
-            ):
-                if token_ids:
-                    content_ids = torch.tensor(token_ids, dtype=torch.long)
-                else:
-                    content_ids = torch.empty(0, dtype=torch.long)
-                document = documents[index - 1]
-                append_document(kind, source, content_ids, loss_mode=document.loss_mode, index=index)
+            index = 0
+            for encoded_batch in executor.map(_tokenize_document_payload_batch_worker, payload_batches, chunksize=chunksize):
+                for kind, source, token_ids in encoded_batch:
+                    index += 1
+                    if token_ids:
+                        content_ids = torch.tensor(token_ids, dtype=torch.long)
+                    else:
+                        content_ids = torch.empty(0, dtype=torch.long)
+                    document = documents[index - 1]
+                    append_document(kind, source, content_ids, loss_mode=document.loss_mode, index=index)
         return tokenized_documents
 
     for index, document in enumerate(documents, start=1):
@@ -1003,15 +1172,7 @@ def log_eval_samples_to_tensorboard(
 ) -> None:
     if writer is None or vocab is None or not documents:
         return
-    seen_sources: set[str] = set()
-    selected: list[TokenizedDocument] = []
-    for document in sorted(documents, key=_eval_sample_priority):
-        if document.source in seen_sources:
-            continue
-        seen_sources.add(document.source)
-        selected.append(document)
-        if len(selected) >= max_samples:
-            break
+    selected = sample_documents_uniform_by_bucket(documents, sample_count=max_samples)
     if not selected:
         return
 
@@ -1100,7 +1261,7 @@ def estimate_eval_loss(
         raise ValueError("documents must not be empty.")
     model_was_training = model.training
     model.eval()
-    sampled_documents = random.sample(list(documents), k=min(eval_documents, len(documents)))
+    sampled_documents = sample_documents_uniform_by_bucket(documents, sample_count=min(eval_documents, len(documents)))
     total_loss = 0.0
     total_weight = 0.0
     for document in sampled_documents:
@@ -1316,7 +1477,21 @@ def main() -> None:
             f"documents={len(serialized_documents):,} | kinds={document_summary}",
             flush=True,
         )
-        training_text = build_training_text(serialized_documents)
+        tokenizer_cache_ready = (
+            args.tokenizer == "byte_bpe"
+            and byte_bpe_tokenizer_cache_exists(
+                tokenizer_prefix=args.tokenizer_prefix,
+                vocab_size=args.subword_vocab_size,
+            )
+        )
+        if tokenizer_cache_ready:
+            training_text = ""
+            print(
+                f"tokenizer_cache_hit | prefix={args.tokenizer_prefix}",
+                flush=True,
+            )
+        else:
+            training_text = build_training_text(serialized_documents)
         vocab, tokenizer_label, tokenizer_path = build_tokenizer(
             training_text,
             text_path=None,
@@ -1361,6 +1536,8 @@ def main() -> None:
             print(f"saved_pretokenized | path={args.pretokenized_path}", flush=True)
 
     train_documents, val_documents = split_train_val_documents(documents, train_fraction=args.train_fraction)
+    train_bucket_summary = summarize_document_buckets(train_documents)
+    val_bucket_summary = summarize_document_buckets(val_documents)
     decode_vocab = load_decode_vocab(
         tokenizer_label=tokenizer_label,
         tokenizer_model_path=tokenizer_model_path,
@@ -1392,6 +1569,10 @@ def main() -> None:
         f"model=causal_memory_doc | params={parameter_count:,} | dim={args.dim} | seq_len={args.seq_len} | "
         f"s_window={args.s_window} | s_microbatch_size={args.s_microbatch_size} | "
         f"scan_backend={args.scan_backend} | scan_checkpoint_chunk_size={args.scan_checkpoint_chunk_size} | memory_slots={args.memory_slots}",
+        flush=True,
+    )
+    print(
+        f"bucket_summary | train={train_bucket_summary} | val={val_bucket_summary}",
         flush=True,
     )
 
@@ -1450,13 +1631,16 @@ def main() -> None:
             stage2_span=args.curriculum_stage2_span,
             stage3_span=args.curriculum_stage3_span,
         )
+        bucket_weights = resolve_bucket_weights(step=step, total_steps=total_steps)
+        batcher.set_bucket_weights(bucket_weights)
         if stage.name != active_stage_name:
             apply_training_curriculum(model, stage)
             train_memory_state = None
             active_stage_name = stage.name
             print(
                 f"curriculum | step={step} | stage={stage.name} | span={stage.document_span} | "
-                f"freeze_memory={stage.freeze_memory} | freeze_propagation={stage.freeze_propagation} | freeze_skip={stage.freeze_skip}",
+                f"freeze_memory={stage.freeze_memory} | freeze_propagation={stage.freeze_propagation} | freeze_skip={stage.freeze_skip} | "
+                f"bucket_weights={{{', '.join(f'{key}:{value:.3f}' for key, value in bucket_weights.items() if value > 0.0)}}}",
                 flush=True,
             )
 
@@ -1546,6 +1730,8 @@ def main() -> None:
             writer.add_scalar("train/document_span", stage.document_span, step)
             if not math.isnan(grad_norm):
                 writer.add_scalar("train/grad_norm", grad_norm, step)
+            for bucket_name, bucket_weight in bucket_weights.items():
+                writer.add_scalar(f"train_bucket_weight/{bucket_name}", bucket_weight, step)
 
         if step == 1 or step % 25 == 0:
             elapsed = time.time() - start_time

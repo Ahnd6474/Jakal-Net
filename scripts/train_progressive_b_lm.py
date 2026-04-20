@@ -145,6 +145,7 @@ except ImportError:
 _SUBWORD_WORKER_PROCESSOR: Any | None = None
 _BYTE_BPE_WORKER_TOKENIZER: Any | None = None
 _BYTE_BPE_WORKER_SPECIAL_TOKENS: tuple[str, ...] = ()
+_BYTE_BPE_WORKER_SPECIAL_PATTERN: re.Pattern[str] | None = None
 
 
 DEFAULT_TEXT = """
@@ -225,6 +226,8 @@ class ByteBPEVocab:
     tokenizer: object
     vocab_path: Path
     merges_path: Path
+    special_tokens: tuple[str, ...] = ()
+    special_pattern: re.Pattern[str] | None = None
 
     @property
     def size(self) -> int:
@@ -442,7 +445,14 @@ def build_byte_bpe_vocab(
         tokenizer.save_model(str(prefix_path.parent), prefix_path.name)
 
     tokenizer = ByteLevelBPETokenizer(str(vocab_path), str(merges_path))
-    return ByteBPEVocab(tokenizer=tokenizer, vocab_path=vocab_path, merges_path=merges_path)
+    special_tokens = _ensure_byte_bpe_special_tokens(tokenizer, user_defined_symbols)
+    return ByteBPEVocab(
+        tokenizer=tokenizer,
+        vocab_path=vocab_path,
+        merges_path=merges_path,
+        special_tokens=special_tokens,
+        special_pattern=_byte_bpe_special_pattern(special_tokens),
+    )
 
 
 def build_tokenizer(
@@ -852,32 +862,75 @@ def _byte_bpe_special_tokens(tokenizer: Any) -> tuple[str, ...]:
     return tuple(sorted(specials, key=len, reverse=True))
 
 
-def _encode_byte_bpe_preserving_specials(tokenizer: Any, text: str, *, special_tokens: Sequence[str]) -> list[int]:
+def _byte_bpe_special_pattern(special_tokens: Sequence[str]) -> re.Pattern[str] | None:
+    if not special_tokens:
+        return None
+    return re.compile("|".join(re.escape(token) for token in special_tokens))
+
+
+def _ensure_byte_bpe_special_tokens(tokenizer: Any, required_special_tokens: Sequence[str]) -> tuple[str, ...]:
+    missing_special_tokens = [
+        token for token in required_special_tokens
+        if tokenizer.token_to_id(token) is None
+    ]
+    if missing_special_tokens:
+        tokenizer.add_special_tokens(list(missing_special_tokens))
+    return _byte_bpe_special_tokens(tokenizer)
+
+
+def _encode_byte_bpe_preserving_specials(
+    tokenizer: Any,
+    text: str,
+    *,
+    special_tokens: Sequence[str],
+    special_pattern: re.Pattern[str] | None = None,
+) -> list[int]:
     if not special_tokens:
         return list(map(int, tokenizer.encode(text).ids))
-    pattern = "|".join(re.escape(token) for token in special_tokens)
-    token_ids: list[int] = []
+    pattern = special_pattern or _byte_bpe_special_pattern(special_tokens)
+    if pattern is None:
+        return list(map(int, tokenizer.encode(text).ids))
+    operations: list[tuple[str, int | str]] = []
+    plain_spans: list[str] = []
     cursor = 0
-    for match in re.finditer(pattern, text):
+    for match in pattern.finditer(text):
         if match.start() > cursor:
-            token_ids.extend(map(int, tokenizer.encode(text[cursor : match.start()]).ids))
+            operations.append(("plain", len(plain_spans)))
+            plain_spans.append(text[cursor : match.start()])
         token_id = tokenizer.token_to_id(match.group(0))
         if token_id is None:
-            token_ids.extend(map(int, tokenizer.encode(match.group(0)).ids))
+            operations.append(("plain", len(plain_spans)))
+            plain_spans.append(match.group(0))
         else:
-            token_ids.append(int(token_id))
+            operations.append(("special", int(token_id)))
         cursor = match.end()
     if cursor < len(text):
-        token_ids.extend(map(int, tokenizer.encode(text[cursor:]).ids))
+        operations.append(("plain", len(plain_spans)))
+        plain_spans.append(text[cursor:])
+    token_ids: list[int] = []
+    encoded_spans = (
+        [list(map(int, encoded.ids)) for encoded in tokenizer.encode_batch(plain_spans)]
+        if plain_spans
+        else []
+    )
+    for op_kind, payload in operations:
+        if op_kind == "plain":
+            token_ids.extend(encoded_spans[int(payload)])
+        else:
+            token_ids.append(int(payload))
     return token_ids
 
 
-def _init_byte_bpe_encode_worker(vocab_path: str, merges_path: str) -> None:
-    global _BYTE_BPE_WORKER_TOKENIZER, _BYTE_BPE_WORKER_SPECIAL_TOKENS
+def _init_byte_bpe_encode_worker(vocab_path: str, merges_path: str, required_special_tokens: Sequence[str] = ()) -> None:
+    global _BYTE_BPE_WORKER_TOKENIZER, _BYTE_BPE_WORKER_SPECIAL_TOKENS, _BYTE_BPE_WORKER_SPECIAL_PATTERN
     if ByteLevelBPETokenizer is None:
         raise ImportError("tokenizers is required for parallel byte BPE encoding.")
     _BYTE_BPE_WORKER_TOKENIZER = ByteLevelBPETokenizer(vocab_path, merges_path)
-    _BYTE_BPE_WORKER_SPECIAL_TOKENS = _byte_bpe_special_tokens(_BYTE_BPE_WORKER_TOKENIZER)
+    _BYTE_BPE_WORKER_SPECIAL_TOKENS = _ensure_byte_bpe_special_tokens(
+        _BYTE_BPE_WORKER_TOKENIZER,
+        required_special_tokens,
+    )
+    _BYTE_BPE_WORKER_SPECIAL_PATTERN = _byte_bpe_special_pattern(_BYTE_BPE_WORKER_SPECIAL_TOKENS)
 
 
 def _encode_byte_bpe_text_worker(text: str) -> list[int]:
@@ -887,7 +940,22 @@ def _encode_byte_bpe_text_worker(text: str) -> list[int]:
         _BYTE_BPE_WORKER_TOKENIZER,
         text,
         special_tokens=_BYTE_BPE_WORKER_SPECIAL_TOKENS,
+        special_pattern=_BYTE_BPE_WORKER_SPECIAL_PATTERN,
     )
+
+
+def _encode_byte_bpe_text_batch_worker(texts: Sequence[str]) -> list[list[int]]:
+    if _BYTE_BPE_WORKER_TOKENIZER is None:
+        raise RuntimeError("Byte BPE worker was not initialized.")
+    return [
+        _encode_byte_bpe_preserving_specials(
+            _BYTE_BPE_WORKER_TOKENIZER,
+            text,
+            special_tokens=_BYTE_BPE_WORKER_SPECIAL_TOKENS,
+            special_pattern=_BYTE_BPE_WORKER_SPECIAL_PATTERN,
+        )
+        for text in texts
+    ]
 
 
 def _encode_byte_bpe_dialogue_pair_worker(pair: tuple[str, str]) -> tuple[list[int], list[int]]:
@@ -899,11 +967,13 @@ def _encode_byte_bpe_dialogue_pair_worker(pair: tuple[str, str]) -> tuple[list[i
             _BYTE_BPE_WORKER_TOKENIZER,
             prefix,
             special_tokens=_BYTE_BPE_WORKER_SPECIAL_TOKENS,
+            special_pattern=_BYTE_BPE_WORKER_SPECIAL_PATTERN,
         ),
         _encode_byte_bpe_preserving_specials(
             _BYTE_BPE_WORKER_TOKENIZER,
             response,
             special_tokens=_BYTE_BPE_WORKER_SPECIAL_TOKENS,
+            special_pattern=_BYTE_BPE_WORKER_SPECIAL_PATTERN,
         ),
     )
 
@@ -919,15 +989,20 @@ def encode_text_in_chunks(
         raise ValueError("chunk_chars must be positive.")
     if workers > 1 and isinstance(vocab, ByteBPEVocab):
         token_parts: list[torch.Tensor] = []
-        chunks = _iter_nonempty_text_chunks(text, chunk_chars=chunk_chars)
+        chunks = list(_iter_nonempty_text_chunks(text, chunk_chars=chunk_chars))
+        if not chunks:
+            return torch.empty(0, dtype=torch.long)
+        batch_size = max(1, min(64, len(chunks)))
+        chunk_batches = [chunks[index : index + batch_size] for index in range(0, len(chunks), batch_size)]
         with ProcessPoolExecutor(
             max_workers=workers,
             initializer=_init_byte_bpe_encode_worker,
-            initargs=(str(vocab.vocab_path), str(vocab.merges_path)),
+            initargs=(str(vocab.vocab_path), str(vocab.merges_path), vocab.special_tokens),
         ) as executor:
-            for token_ids in executor.map(_encode_byte_bpe_text_worker, chunks, chunksize=1):
-                if token_ids:
-                    token_parts.append(torch.tensor(token_ids, dtype=torch.long))
+            for token_id_batch in executor.map(_encode_byte_bpe_text_batch_worker, chunk_batches, chunksize=1):
+                for token_ids in token_id_batch:
+                    if token_ids:
+                        token_parts.append(torch.tensor(token_ids, dtype=torch.long))
         if not token_parts:
             return torch.empty(0, dtype=torch.long)
         return torch.cat(token_parts)
@@ -939,7 +1014,8 @@ def encode_text_in_chunks(
                 _encode_byte_bpe_preserving_specials(
                     vocab.tokenizer,
                     chunk,
-                    special_tokens=_byte_bpe_special_tokens(vocab.tokenizer),
+                    special_tokens=vocab.special_tokens or _byte_bpe_special_tokens(vocab.tokenizer),
+                    special_pattern=vocab.special_pattern,
                 ),
                 dtype=torch.long,
             )
@@ -1324,7 +1400,7 @@ def encode_dialogue_pairs(
         with ProcessPoolExecutor(
             max_workers=workers,
             initializer=_init_byte_bpe_encode_worker,
-            initargs=(str(vocab.vocab_path), str(vocab.merges_path)),
+            initargs=(str(vocab.vocab_path), str(vocab.merges_path), vocab.special_tokens),
         ) as executor:
             for prefix_ids, response_ids in executor.map(
                 _encode_byte_bpe_dialogue_pair_worker,
