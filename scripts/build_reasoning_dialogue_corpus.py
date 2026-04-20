@@ -17,6 +17,7 @@ DEFAULT_REASONING_SOURCES = (
     "anli_r3=anli||train_r3|anli",
     "proofwriter=tasksource/proofwriter||train|proofwriter",
     "logicnli=tasksource/logicnli||train|logicnli",
+    "boardgameqa=tasksource/Boardgame-QA||train|boardgameqa",
     "defeasible_atomic=tasksource/defeasible-nli|atomic|train|defeasible_nli",
     "defeasible_snli=tasksource/defeasible-nli|snli|train|defeasible_nli",
     "defeasible_social=tasksource/defeasible-nli|social|train|defeasible_nli",
@@ -159,6 +160,36 @@ def _build_logicnli_prompt(row: dict[str, Any], *, label_names: dict[int, str]) 
     return prompt, label
 
 
+def _build_boardgameqa_prompt(row: dict[str, Any]) -> tuple[str, str] | None:
+    example = row.get("example")
+    goal = row.get("goal")
+    label = _normalize_label_text(row.get("label"))
+    if not isinstance(example, str) or not example.strip():
+        return None
+    if not isinstance(goal, str) or not goal.strip():
+        return None
+    if label is None:
+        return None
+    parts = [
+        "Boardgame reasoning task.",
+        f"Scenario: {example.strip()}",
+        f"Goal: {goal.strip()}",
+        "Answer with one of: proved, disproved, unknown.",
+    ]
+    rules = row.get("rules")
+    preferences = row.get("preferences")
+    if isinstance(rules, str) and rules.strip():
+        parts.insert(2, f"Rules: {rules.strip()}")
+    if isinstance(preferences, str) and preferences.strip():
+        parts.insert(3, f"Preferences: {preferences.strip()}")
+    prompt = "\n".join(parts)
+    proof = row.get("proof")
+    answer = label
+    if isinstance(proof, str) and proof.strip():
+        answer = f"{answer}\nproof: {proof.strip()}"
+    return prompt, answer
+
+
 def _build_defeasible_nli_prompt(row: dict[str, Any]) -> tuple[str, str] | None:
     hypothesis = row.get("Hypothesis")
     update = row.get("Update")
@@ -186,6 +217,8 @@ def _row_to_dialogue(row: dict[str, Any], *, template: str, label_names: dict[in
         return _build_proofwriter_prompt(row)
     if template == "logicnli":
         return _build_logicnli_prompt(row, label_names=label_names)
+    if template == "boardgameqa":
+        return _build_boardgameqa_prompt(row)
     if template == "defeasible_nli":
         return _build_defeasible_nli_prompt(row)
     raise ValueError(f"Unsupported reasoning template: {template}")
