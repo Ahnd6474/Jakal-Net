@@ -640,9 +640,9 @@ def make_document_chunks(
         target = torch.empty_like(context)
         target[:-1] = context[1:]
         target[-1] = eos_token_id if cursor + take >= content_ids.numel() else cont_token_id
-        prefix_visibility = torch.tensor([0.0], dtype=torch.float32)
-        terminal_visibility = torch.tensor([0.0], dtype=torch.float32)
-        loss_mask = torch.cat((prefix_visibility, content_visibility_slice, terminal_visibility), dim=0)
+        loss_mask = torch.zeros(target.shape[0], dtype=torch.float32)
+        if content_visibility_slice.numel() > 0:
+            loss_mask[1 : 1 + content_visibility_slice.shape[0]] = content_visibility_slice
         pad = seq_len - context.shape[0]
         chunks.append(
             DocumentChunk(
@@ -976,8 +976,8 @@ def _decode_visible_tokens(vocab: object, token_ids: torch.Tensor, loss_mask: to
         return ""
     ids = token_ids.detach().cpu().to(dtype=torch.long)
     if loss_mask is not None:
-        visible = int(loss_mask.detach().cpu().sum().item())
-        ids = ids[:visible]
+        mask = loss_mask.detach().cpu() > 0
+        ids = ids[mask]
     return str(vocab.decode(ids.tolist()))
 
 
@@ -1043,7 +1043,7 @@ def log_eval_samples_to_tensorboard(
                 f"## sample {index:02d}\n\n"
                 f"kind: {document.kind}\n\n"
                 f"source: {document.source}\n\n"
-                f"### context\n{_decode_visible_tokens(vocab, chunk.context, chunk.loss_mask)}\n\n"
+                f"### context\n{_decode_visible_tokens(vocab, chunk.context, None)}\n\n"
                 f"### target\n{_decode_visible_tokens(vocab, chunk.target, chunk.loss_mask)}\n\n"
                 f"### prediction\n{_decode_visible_tokens(vocab, predicted, chunk.loss_mask)}"
             )

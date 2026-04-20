@@ -144,6 +144,7 @@ except ImportError:
 
 _SUBWORD_WORKER_PROCESSOR: Any | None = None
 _BYTE_BPE_WORKER_TOKENIZER: Any | None = None
+_BYTE_BPE_WORKER_SPECIAL_TOKENS: tuple[str, ...] = ()
 
 
 DEFAULT_TEXT = """
@@ -840,17 +841,53 @@ def _iter_nonempty_text_chunks(text: str, *, chunk_chars: int) -> Iterable[str]:
             yield chunk
 
 
+def _byte_bpe_special_tokens(tokenizer: Any) -> tuple[str, ...]:
+    get_vocab = getattr(tokenizer, "get_vocab", None)
+    if get_vocab is None:
+        return ()
+    vocab = get_vocab()
+    if not isinstance(vocab, dict):
+        return ()
+    specials = [token for token in vocab.keys() if isinstance(token, str) and re.fullmatch(r"<\|[^|\n]+\|>", token)]
+    return tuple(sorted(specials, key=len, reverse=True))
+
+
+def _encode_byte_bpe_preserving_specials(tokenizer: Any, text: str, *, special_tokens: Sequence[str]) -> list[int]:
+    if not special_tokens:
+        return list(map(int, tokenizer.encode(text).ids))
+    pattern = "|".join(re.escape(token) for token in special_tokens)
+    token_ids: list[int] = []
+    cursor = 0
+    for match in re.finditer(pattern, text):
+        if match.start() > cursor:
+            token_ids.extend(map(int, tokenizer.encode(text[cursor : match.start()]).ids))
+        token_id = tokenizer.token_to_id(match.group(0))
+        if token_id is None:
+            token_ids.extend(map(int, tokenizer.encode(match.group(0)).ids))
+        else:
+            token_ids.append(int(token_id))
+        cursor = match.end()
+    if cursor < len(text):
+        token_ids.extend(map(int, tokenizer.encode(text[cursor:]).ids))
+    return token_ids
+
+
 def _init_byte_bpe_encode_worker(vocab_path: str, merges_path: str) -> None:
-    global _BYTE_BPE_WORKER_TOKENIZER
+    global _BYTE_BPE_WORKER_TOKENIZER, _BYTE_BPE_WORKER_SPECIAL_TOKENS
     if ByteLevelBPETokenizer is None:
         raise ImportError("tokenizers is required for parallel byte BPE encoding.")
     _BYTE_BPE_WORKER_TOKENIZER = ByteLevelBPETokenizer(vocab_path, merges_path)
+    _BYTE_BPE_WORKER_SPECIAL_TOKENS = _byte_bpe_special_tokens(_BYTE_BPE_WORKER_TOKENIZER)
 
 
 def _encode_byte_bpe_text_worker(text: str) -> list[int]:
     if _BYTE_BPE_WORKER_TOKENIZER is None:
         raise RuntimeError("Byte BPE worker was not initialized.")
-    return list(map(int, _BYTE_BPE_WORKER_TOKENIZER.encode(text).ids))
+    return _encode_byte_bpe_preserving_specials(
+        _BYTE_BPE_WORKER_TOKENIZER,
+        text,
+        special_tokens=_BYTE_BPE_WORKER_SPECIAL_TOKENS,
+    )
 
 
 def _encode_byte_bpe_dialogue_pair_worker(pair: tuple[str, str]) -> tuple[list[int], list[int]]:
@@ -858,8 +895,16 @@ def _encode_byte_bpe_dialogue_pair_worker(pair: tuple[str, str]) -> tuple[list[i
         raise RuntimeError("Byte BPE worker was not initialized.")
     prefix, response = pair
     return (
-        list(map(int, _BYTE_BPE_WORKER_TOKENIZER.encode(prefix).ids)),
-        list(map(int, _BYTE_BPE_WORKER_TOKENIZER.encode(response).ids)),
+        _encode_byte_bpe_preserving_specials(
+            _BYTE_BPE_WORKER_TOKENIZER,
+            prefix,
+            special_tokens=_BYTE_BPE_WORKER_SPECIAL_TOKENS,
+        ),
+        _encode_byte_bpe_preserving_specials(
+            _BYTE_BPE_WORKER_TOKENIZER,
+            response,
+            special_tokens=_BYTE_BPE_WORKER_SPECIAL_TOKENS,
+        ),
     )
 
 
@@ -889,7 +934,17 @@ def encode_text_in_chunks(
 
     token_parts: list[torch.Tensor] = []
     for chunk in _iter_nonempty_text_chunks(text, chunk_chars=chunk_chars):
-        encoded = vocab.encode(chunk)
+        if isinstance(vocab, ByteBPEVocab):
+            encoded = torch.tensor(
+                _encode_byte_bpe_preserving_specials(
+                    vocab.tokenizer,
+                    chunk,
+                    special_tokens=_byte_bpe_special_tokens(vocab.tokenizer),
+                ),
+                dtype=torch.long,
+            )
+        else:
+            encoded = vocab.encode(chunk)
         if encoded.numel() > 0:
             token_parts.append(encoded)
     if not token_parts:
