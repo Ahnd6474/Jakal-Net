@@ -936,7 +936,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr-min-ratio", type=float, default=0.1)
     parser.add_argument("--epochs", type=float, default=1.0)
     parser.add_argument("--train-fraction", type=float, default=0.9)
-    parser.add_argument("--grad-clip", type=float, default=0.1)
+    parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--eval-interval", type=int, default=200)
     parser.add_argument("--eval-documents", type=int, default=8)
 
