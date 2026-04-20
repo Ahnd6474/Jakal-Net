@@ -676,6 +676,15 @@ def detach_memory_state(memory_state: Sequence[Any] | None) -> tuple[Any, ...] |
     )
 
 
+def memory_state_is_finite(memory_state: Sequence[Any] | None) -> bool:
+    if memory_state is None:
+        return True
+    return all(
+        bool(torch.isfinite(layer.state).all().item()) and bool(torch.isfinite(layer.val).all().item())
+        for layer in memory_state
+    )
+
+
 def load_decode_vocab(*, tokenizer_label: str, tokenizer_model_path: str | None) -> object | None:
     if tokenizer_label != "byte_bpe" or tokenizer_model_path is None or ByteLevelBPETokenizer is None:
         return None
@@ -716,28 +725,14 @@ def log_eval_samples_to_tensorboard(
 ) -> None:
     if writer is None or vocab is None or not documents:
         return
-    documents_by_kind: dict[str, list[TokenizedDocument]] = {}
     seen_sources: set[str] = set()
+    selected: list[TokenizedDocument] = []
     for document in documents:
         if document.source in seen_sources:
             continue
         seen_sources.add(document.source)
-        documents_by_kind.setdefault(document.kind, []).append(document)
-    if not documents_by_kind:
-        return
-    ordered_kinds = sorted(documents_by_kind)
-    selected: list[TokenizedDocument] = []
-    while len(selected) < max_samples:
-        added = False
-        for kind in ordered_kinds:
-            bucket = documents_by_kind[kind]
-            if not bucket:
-                continue
-            selected.append(bucket.pop(0))
-            added = True
-            if len(selected) >= max_samples:
-                break
-        if not added:
+        selected.append(document)
+        if len(selected) >= max_samples:
             break
     if not selected:
         return
@@ -756,6 +751,7 @@ def log_eval_samples_to_tensorboard(
     )
 
     with autocast_context:
+        sample_sections: list[str] = []
         for index, document in enumerate(selected, start=1):
             chunk = document.chunks[0]
             output = model(
@@ -765,15 +761,15 @@ def log_eval_samples_to_tensorboard(
             )
             assert isinstance(output, torch.Tensor)
             predicted = output.argmax(dim=-1).squeeze(0).detach().cpu().to(dtype=torch.long)
-            tag = f"sample_{index:02d}_{document.kind}"
-            text = (
-                f"kind: {document.kind}\n"
+            sample_sections.append(
+                f"## sample {index:02d}\n\n"
+                f"kind: {document.kind}\n\n"
                 f"source: {document.source}\n\n"
-                f"context:\n{_decode_visible_tokens(vocab, chunk.context, chunk.loss_mask)}\n\n"
-                f"target:\n{_decode_visible_tokens(vocab, chunk.target, chunk.loss_mask)}\n\n"
-                f"prediction:\n{_decode_visible_tokens(vocab, predicted, chunk.loss_mask)}"
+                f"### context\n{_decode_visible_tokens(vocab, chunk.context, chunk.loss_mask)}\n\n"
+                f"### target\n{_decode_visible_tokens(vocab, chunk.target, chunk.loss_mask)}\n\n"
+                f"### prediction\n{_decode_visible_tokens(vocab, predicted, chunk.loss_mask)}"
             )
-            writer.add_text(f"eval_samples/{tag}", text, step)
+        writer.add_text("eval_samples/mixed_corpus", "\n\n---\n\n".join(sample_sections), step)
     if model_was_training:
         model.train()
 
@@ -940,7 +936,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr-min-ratio", type=float, default=0.1)
     parser.add_argument("--epochs", type=float, default=1.0)
     parser.add_argument("--train-fraction", type=float, default=0.9)
-    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--grad-clip", type=float, default=0.1)
     parser.add_argument("--eval-interval", type=int, default=200)
     parser.add_argument("--eval-documents", type=int, default=8)
 
@@ -1147,7 +1143,6 @@ def main() -> None:
                 assert isinstance(output, MemoryScanOutput)
                 loss = compute_masked_loss(output.logits, batch.target, batch.loss_mask)
                 scaled_loss = loss / args.grad_accum_steps
-            scaler.scale(scaled_loss).backward()
             current_memory_state = output.memory_state
         else:
             loss, current_memory_state = run_model(
@@ -1157,21 +1152,47 @@ def main() -> None:
                 precision=args.precision,
                 grad_enabled=True,
             )
-            (loss / args.grad_accum_steps).backward()
 
-        train_memory_state = detach_memory_state(current_memory_state)
+        loss_is_finite = bool(torch.isfinite(loss.detach()).item())
+        if loss_is_finite:
+            if scaler is not None:
+                scaler.scale(scaled_loss).backward()
+            else:
+                (loss / args.grad_accum_steps).backward()
+
+            train_memory_state = detach_memory_state(current_memory_state)
+            if not memory_state_is_finite(train_memory_state):
+                print(f"warning | step={step} | non-finite memory state; resetting memory", flush=True)
+                train_memory_state = None
+        else:
+            print(f"warning | step={step} | non-finite loss; skipping optimizer step", flush=True)
+            optimizer.zero_grad(set_to_none=True)
+            train_memory_state = None
 
         should_step_optimizer = step % args.grad_accum_steps == 0 or step == total_steps
-        if should_step_optimizer:
+        if loss_is_finite and should_step_optimizer:
             if scaler is not None:
                 scaler.unscale_(optimizer)
-            grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip).item())
-            if scaler is not None:
-                scaler.step(optimizer)
-                scaler.update()
+            try:
+                grad_norm = float(
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(),
+                        args.grad_clip,
+                        error_if_nonfinite=True,
+                    ).item()
+                )
+            except RuntimeError as exc:
+                grad_norm = float("nan")
+                print(f"warning | step={step} | non-finite grad norm; skipping optimizer step | {exc}", flush=True)
+                optimizer.zero_grad(set_to_none=True)
+                train_memory_state = None
             else:
-                optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+                if scaler is not None:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
         else:
             grad_norm = float("nan")
 

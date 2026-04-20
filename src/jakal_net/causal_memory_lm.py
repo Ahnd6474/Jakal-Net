@@ -23,6 +23,7 @@ from jakal_net.propagation import SparsePropagation
 from jakal_net.transition import SparseTransition
 
 _STATE_LIMIT = 12.0
+_VAL_LIMIT = 8.0
 _PARAM_INIT_STD = 0.02
 _LOW_RANK_SCALE_INIT = 0.1
 
@@ -67,7 +68,10 @@ def _layer_with_val_norm(layer: Layer, norm: nn.LayerNorm) -> Layer:
 
 def _apply_delta(layer: Layer, delta: LayerDelta, *, residual: bool = True) -> Layer:
     updated = layer.apply_delta(delta, merge_mode="add" if residual else "replace")
-    return updated.with_tensors(state=updated.state.tanh() * _STATE_LIMIT)
+    return updated.with_tensors(
+        state=torch.nan_to_num(updated.state).tanh() * _STATE_LIMIT,
+        val=torch.nan_to_num(updated.val).clamp(min=-_VAL_LIMIT, max=_VAL_LIMIT),
+    )
 
 
 def _clone_layer(layer: Layer) -> Layer:
