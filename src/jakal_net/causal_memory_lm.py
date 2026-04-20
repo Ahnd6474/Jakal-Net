@@ -5,7 +5,6 @@ from typing import Sequence
 
 import torch
 from torch import Tensor, nn
-from torch.nn import functional as F
 
 from jakal_net.core import Layer, LayerDelta
 from jakal_net.modules import (
@@ -22,8 +21,7 @@ from jakal_net.modules import (
 from jakal_net.propagation import SparsePropagation
 from jakal_net.transition import SparseTransition
 
-_STATE_LIMIT = 12.0
-_VAL_LIMIT = 8.0
+_STATE_MASS = 4.0
 _PARAM_INIT_STD = 0.02
 _LOW_RANK_SCALE_INIT = 0.1
 
@@ -66,12 +64,32 @@ def _layer_with_val_norm(layer: Layer, norm: nn.LayerNorm) -> Layer:
     return layer.with_tensors(val=norm(layer.val))
 
 
-def _apply_delta(layer: Layer, delta: LayerDelta, *, residual: bool = True) -> Layer:
+def _signed_softmax_state(state: Tensor) -> Tensor:
+    clean_state = torch.nan_to_num(state)
+    magnitude = torch.softmax(clean_state.abs(), dim=-1)
+    return torch.sign(clean_state) * magnitude * _STATE_MASS
+
+
+def _signed_abs_softmax_edges(scores: Tensor) -> Tensor:
+    clean_scores = torch.nan_to_num(scores)
+    return torch.sign(clean_scores) * torch.softmax(clean_scores.abs(), dim=-1)
+
+
+def _identity_state_activation(state: Tensor) -> Tensor:
+    return state
+
+
+def _apply_delta(
+    layer: Layer,
+    delta: LayerDelta,
+    *,
+    residual: bool = True,
+    val_norm: nn.LayerNorm | None = None,
+) -> Layer:
     updated = layer.apply_delta(delta, merge_mode="add" if residual else "replace")
-    return updated.with_tensors(
-        state=torch.nan_to_num(updated.state).tanh() * _STATE_LIMIT,
-        val=torch.nan_to_num(updated.val).clamp(min=-_VAL_LIMIT, max=_VAL_LIMIT),
-    )
+    state = _signed_softmax_state(updated.state)
+    val = updated.val if val_norm is None else val_norm(updated.val)
+    return updated.with_tensors(state=state, val=val)
 
 
 def _clone_layer(layer: Layer) -> Layer:
@@ -160,6 +178,8 @@ class _MemoryLevel(nn.Module):
         self.write = SparseTransition(
             route_fn=_make_route(route_kind, dim=dim, rank=route_rank),
             topk=min(memory_topk, num_slots),
+            state_activation_fn=_identity_state_activation,
+            route_compress_name="signed_abs_softmax",
             implementation=implementation,
             merge_mode="add",
         )
@@ -167,6 +187,8 @@ class _MemoryLevel(nn.Module):
             pairwise_fn=_make_pairwise(pairwise_kind, dim=dim, rank=pairwise_rank),
             sparse_type="topk",
             topk=min(memory_topk, num_slots),
+            edge_compress_fn=_signed_abs_softmax_edges,
+            state_weight_edges=True,
             implementation=implementation,
             residual=True,
         )
@@ -181,7 +203,12 @@ class _MemoryLevel(nn.Module):
     ) -> Layer:
         state = self.init_state.unsqueeze(0).expand(batch_size, -1).to(device=device, dtype=dtype)
         val = self.init_val.unsqueeze(0).expand(batch_size, -1, -1).to(device=device, dtype=dtype)
-        return Layer(dim=self.dim, num_nodes=self.num_slots, state=state.clone(), val=val.clone())
+        return Layer(
+            dim=self.dim,
+            num_nodes=self.num_slots,
+            state=_signed_softmax_state(state.clone()),
+            val=self.val_norm(val.clone()),
+        )
 
 
 class CausalHierarchicalMemoryLM(nn.Module):
@@ -244,6 +271,8 @@ class CausalHierarchicalMemoryLM(nn.Module):
                 pairwise_fn=_make_pairwise(pairwise_kind, dim=dim, rank=pairwise_rank),
                 sparse_type="window",
                 window=max_seq_len if s_window is None else max(1, s_window),
+                edge_compress_fn=_signed_abs_softmax_edges,
+                state_weight_edges=True,
                 implementation=implementation,
                 residual=True,
             )
@@ -267,6 +296,8 @@ class CausalHierarchicalMemoryLM(nn.Module):
             SparseTransition(
                 route_fn=_make_route(route_kind, dim=dim, rank=route_rank),
                 topk=min(memory_topk, self.memory_slots[index + 1]),
+                state_activation_fn=_identity_state_activation,
+                route_compress_name="signed_abs_softmax",
                 implementation=implementation,
                 merge_mode="add",
             )
@@ -280,6 +311,8 @@ class CausalHierarchicalMemoryLM(nn.Module):
             self.skip_transitions["token_to_1"] = SparseTransition(
                 route_fn=_make_route(route_kind, dim=dim, rank=route_rank),
                 topk=min(memory_topk, self.memory_slots[1]),
+                state_activation_fn=_identity_state_activation,
+                route_compress_name="signed_abs_softmax",
                 implementation=implementation,
                 merge_mode="add",
             )
@@ -289,6 +322,8 @@ class CausalHierarchicalMemoryLM(nn.Module):
             self.skip_transitions[key] = SparseTransition(
                 route_fn=_make_route(route_kind, dim=dim, rank=route_rank),
                 topk=min(memory_topk, self.memory_slots[level_index]),
+                state_activation_fn=_identity_state_activation,
+                route_compress_name="signed_abs_softmax",
                 implementation=implementation,
                 merge_mode="add",
             )
@@ -307,6 +342,8 @@ class CausalHierarchicalMemoryLM(nn.Module):
                 pairwise_fn=_make_pairwise(pairwise_kind, dim=dim, rank=pairwise_rank),
                 sparse_type="window",
                 window=max(1, prediction_window),
+                edge_compress_fn=_signed_abs_softmax_edges,
+                state_weight_edges=True,
                 implementation=implementation,
                 residual=True,
             )
@@ -408,6 +445,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
                 layer,
                 propagation.compute_delta(_layer_with_val_norm(layer, norm)),
                 residual=True,
+                val_norm=norm,
             )
         return layer
 
@@ -441,6 +479,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
                 _layer_with_val_norm(level, first_level_module.val_norm),
             ),
             residual=True,
+            val_norm=first_level_module.val_norm,
         )
         level = _apply_delta(
             level,
@@ -448,6 +487,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
                 _layer_with_val_norm(level, first_level_module.val_norm)
             ),
             residual=True,
+            val_norm=first_level_module.val_norm,
         )
         next_levels.append(level)
 
@@ -464,6 +504,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
                     normalized_level,
                 ),
                 residual=True,
+                val_norm=level_module.val_norm,
             )
             if level_index == 1 and "token_to_1" in self.skip_transitions:
                 gate = torch.sigmoid(self.skip_gates["token_to_1"])
@@ -478,6 +519,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
                         delta_val=skip_delta.delta_val * gate,
                     ),
                     residual=True,
+                    val_norm=level_module.val_norm,
                 )
             key = f"{level_index - 2}_to_{level_index}"
             if key in self.skip_transitions:
@@ -497,6 +539,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
                         delta_val=skip_delta.delta_val * gate,
                     ),
                     residual=True,
+                    val_norm=level_module.val_norm,
                 )
             level = _apply_delta(
                 level,
@@ -504,19 +547,22 @@ class CausalHierarchicalMemoryLM(nn.Module):
                     _layer_with_val_norm(level, level_module.val_norm)
                 ),
                 residual=True,
+                val_norm=level_module.val_norm,
             )
             next_levels.append(level)
         return tuple(next_levels)
 
     def _read_memory(self, memory_state: Sequence[Layer]) -> Tensor:
         read_terms: list[Tensor] = []
-        for level, projection, gate in zip(
+        for level, level_module, projection, gate in zip(
             memory_state,
+            self.memory_levels,
             self.read_projections,
             self.read_gates,
         ):
-            sender_strength = F.softplus(level.state.clamp(min=-_STATE_LIMIT, max=_STATE_LIMIT)).unsqueeze(-1)
-            read_summary = (sender_strength * level.val).sum(dim=-2)
+            read_layer = _layer_with_val_norm(level, level_module.val_norm)
+            sender_strength = read_layer.state.unsqueeze(-1)
+            read_summary = (sender_strength * read_layer.val).sum(dim=-2)
             read_summary = read_summary + self.read_template_val.to(
                 device=level.val.device,
                 dtype=level.val.dtype,
@@ -587,6 +633,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
                 query_layer,
                 propagation.compute_delta(_layer_with_val_norm(query_layer, norm)),
                 residual=True,
+                val_norm=norm,
             )
 
         logits = self.lm_head(self.output_norm(query_layer.val))

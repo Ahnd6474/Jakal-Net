@@ -39,6 +39,23 @@ from jakal_net.native_backend import (
 )
 
 
+def signed_abs_softmax(
+    logits: Tensor,
+    *,
+    dim: int = -1,
+    mask: Tensor | None = None,
+) -> Tensor:
+    clean_logits = torch.nan_to_num(logits)
+    signs = torch.sign(clean_logits)
+    magnitudes = clean_logits.abs()
+    if mask is not None:
+        bool_mask = mask.to(dtype=torch.bool)
+        signs = signs * bool_mask.to(dtype=signs.dtype)
+        magnitudes = magnitudes.masked_fill(~bool_mask, -torch.inf)
+    routes = signs * torch.softmax(magnitudes, dim=dim)
+    return torch.nan_to_num(routes)
+
+
 def _route_uses_pairwise_inputs(route_fn: object) -> bool:
     if getattr(route_fn, "expects_pairwise_inputs", False):
         return True
@@ -91,6 +108,7 @@ class Transition(nn.Module):
         *,
         norm_fn: Callable[[Layer], Layer] | None = None,
         state_activation_fn: Callable[[Tensor], Tensor] = F.softplus,
+        route_compress_name: str = "softmax",
         val_proj_fn: Callable[[Tensor], Tensor] | nn.Module | None = None,
         state_proj_fn: Callable[[Tensor], Tensor] | nn.Module | None = None,
         merge_mode: MergeMode = "add",
@@ -105,6 +123,9 @@ class Transition(nn.Module):
         self.route_fn = route_fn
         self.norm_fn = norm_fn
         self.state_activation_fn = state_activation_fn
+        if route_compress_name not in {"softmax", "signed_abs_softmax"}:
+            raise ValueError(f"Unsupported route_compress_name: {route_compress_name!r}.")
+        self.route_compress_name = route_compress_name
         self.val_proj_fn = nn.Identity() if val_proj_fn is None else val_proj_fn
         self.state_proj_fn = nn.Identity() if state_proj_fn is None else state_proj_fn
         self.merge_mode = merge_mode
@@ -127,6 +148,13 @@ class Transition(nn.Module):
 
     def compute_routes(self, src_layer: Layer, dst_layer: Layer) -> Tensor:
         logits = self.compute_route_logits(src_layer, dst_layer)
+        return self._compress_routes(logits)
+
+    def _compress_routes(self, logits: Tensor, mask: Tensor | None = None) -> Tensor:
+        if self.route_compress_name == "signed_abs_softmax":
+            return signed_abs_softmax(logits, dim=-1, mask=mask)
+        if mask is not None:
+            return masked_softmax(logits, mask, dim=-1)
         return torch.softmax(logits, dim=-1)
 
     def _project_inputs(
@@ -244,8 +272,12 @@ class Transition(nn.Module):
     def compute_delta(self, src_layer: Layer, dst_layer: Layer) -> LayerDelta:
         if self.track_stats:
             logits = self.compute_route_logits(src_layer, dst_layer)
-            routes = torch.softmax(logits, dim=-1)
+            routes = self._compress_routes(logits)
             self.last_stats = _summarize_routes(routes)
+        if self.route_compress_name != "softmax":
+            if self.implementation == "reference" or src_layer.val.device.type == "privateuseone":
+                return self._compute_delta_reference(src_layer, dst_layer)
+            return self._compute_delta_streaming(src_layer, dst_layer)
         if self.implementation == "native":
             if (
                 supports_pairwise_route_kernel(self.route_fn)
@@ -305,6 +337,7 @@ class SparseTransition(Transition):
         topk: int,
         norm_fn: Callable[[Layer], Layer] | None = None,
         state_activation_fn: Callable[[Tensor], Tensor] = F.softplus,
+        route_compress_name: str = "softmax",
         val_proj_fn: Callable[[Tensor], Tensor] | nn.Module | None = None,
         state_proj_fn: Callable[[Tensor], Tensor] | nn.Module | None = None,
         merge_mode: MergeMode = "add",
@@ -317,6 +350,7 @@ class SparseTransition(Transition):
             route_fn=route_fn,
             norm_fn=norm_fn,
             state_activation_fn=state_activation_fn,
+            route_compress_name=route_compress_name,
             val_proj_fn=val_proj_fn,
             state_proj_fn=state_proj_fn,
             merge_mode=merge_mode,
@@ -333,10 +367,10 @@ class SparseTransition(Transition):
         logits = self.compute_route_logits(src_layer, dst_layer)
         k = min(self.topk, dst_layer.num_nodes)
         if k == dst_layer.num_nodes:
-            routes = torch.softmax(logits, dim=-1)
+            routes = self.compute_routes(src_layer, dst_layer)
         else:
             mask = build_topk_mask(logits, k, dim=-1)
-            routes = masked_softmax(logits, mask, dim=-1)
+            routes = self._compress_routes(logits, mask=mask)
 
         projected_val, projected_state, sender_strength = self._project_inputs(
             src_layer, dst_layer
@@ -352,7 +386,7 @@ class SparseTransition(Transition):
         logits = self.compute_route_logits(src_layer, dst_layer)
         k = min(self.topk, dst_layer.num_nodes)
         if k == dst_layer.num_nodes:
-            routes = torch.softmax(logits, dim=-1)
+            routes = self._compress_routes(logits)
         else:
             topk_indices = select_topk(logits, k, dim=-1).indices
             dst_index = torch.arange(
@@ -360,7 +394,7 @@ class SparseTransition(Transition):
             )
             dst_index = dst_index.view((1,) * topk_indices.ndim + (dst_layer.num_nodes,))
             mask = (topk_indices.unsqueeze(-1) == dst_index).any(dim=-2)
-            routes = masked_softmax(logits, mask, dim=-1)
+            routes = self._compress_routes(logits, mask=mask)
 
         projected_val, projected_state, sender_strength = self._project_inputs(
             src_layer, dst_layer
@@ -442,7 +476,7 @@ class SparseTransition(Transition):
                 topk_values = topk_selected.values
                 topk_indices = topk_selected.indices
 
-            routes = torch.softmax(topk_values, dim=-1)
+            routes = self._compress_routes(topk_values)
             weighted_routes = routes * sender_strength[..., src_start:src_end].unsqueeze(-1)
 
             state_contrib = (
@@ -525,16 +559,20 @@ class SparseTransition(Transition):
             logits = self.compute_route_logits(src_layer, dst_layer)
             k = min(self.topk, dst_layer.num_nodes)
             if k == dst_layer.num_nodes:
-                routes = torch.softmax(logits, dim=-1)
+                routes = self._compress_routes(logits)
                 topk_indices = None
             else:
                 topk_selected = select_topk(logits, k, dim=-1)
                 topk_indices = topk_selected.indices
-                routes = torch.softmax(topk_selected.values, dim=-1)
+                routes = self._compress_routes(topk_selected.values)
                 dense_routes = torch.zeros_like(logits)
                 dense_routes.scatter_(-1, topk_indices, routes)
                 routes = dense_routes
             self.last_stats = _summarize_routes(routes, topk_indices=topk_indices)
+        if self.route_compress_name != "softmax":
+            if self.implementation == "reference" or src_layer.val.device.type == "privateuseone":
+                return self._compute_delta_reference(src_layer, dst_layer)
+            return self._compute_delta_streaming(src_layer, dst_layer)
         if self.implementation == "native":
             if (
                 supports_pairwise_route_kernel(self.route_fn)

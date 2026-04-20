@@ -60,6 +60,7 @@ class Propagation(nn.Module):
         norm_fn: Callable[[Layer], Layer] | None = None,
         residual: bool = True,
         return_delta: bool = True,
+        state_weight_edges: bool = False,
         implementation: ImplementationMode = "streaming",
         target_block_size: int | None = 128,
         source_block_size: int | None = 128,
@@ -74,6 +75,7 @@ class Propagation(nn.Module):
         self.norm_fn = norm_fn
         self.residual = residual
         self.return_delta = return_delta
+        self.state_weight_edges = state_weight_edges
         self.implementation = implementation
         self.target_block_size = target_block_size
         self.source_block_size = source_block_size
@@ -86,6 +88,11 @@ class Propagation(nn.Module):
 
     def compute_edges(self, layer: Layer) -> Tensor:
         return self.edge_compress_fn(self.compute_scores(layer))
+
+    def _weight_edges(self, edges: Tensor, source_state: Tensor) -> Tensor:
+        if not self.state_weight_edges:
+            return edges
+        return edges * source_state.unsqueeze(-2)
 
     def _project_inputs(self, layer: Layer) -> tuple[Tensor, Tensor]:
         projected_state = self.state_proj_fn(layer.state)
@@ -113,6 +120,7 @@ class Propagation(nn.Module):
 
     def _compute_delta_reference(self, layer: Layer) -> LayerDelta:
         edges = self.compute_edges(layer)
+        edges = self._weight_edges(edges, layer.state)
         projected_state, projected_val = self._project_inputs(layer)
 
         delta_state = torch.einsum("...ij,...j->...i", edges, projected_state)
@@ -142,7 +150,10 @@ class Propagation(nn.Module):
                     target_nodes=target_end - target_start,
                     source_nodes=source_end - source_start,
                 )
-                edges = self.edge_compress_fn(scores)
+                edges = self._weight_edges(
+                    self.edge_compress_fn(scores),
+                    layer.state[..., source_start:source_end],
+                )
                 state_edges = edges.to(dtype=state_acc_dtype)
                 val_edges = edges.to(dtype=val_acc_dtype)
 
@@ -165,7 +176,8 @@ class Propagation(nn.Module):
     def _compute_delta_kernel_preferred(self, layer: Layer) -> LayerDelta:
         edge_compress_name = _native_edge_compress_name(self.edge_compress_fn)
         if (
-            edge_compress_name is not None
+            not self.state_weight_edges
+            and edge_compress_name is not None
             and supports_pairwise_kernel(self.pairwise_fn)
             and native_supports("propagation_dense")
             and native_supports_device(layer.val.device.type)
@@ -213,7 +225,8 @@ class Propagation(nn.Module):
         if self.implementation == "native":
             edge_compress_name = _native_edge_compress_name(self.edge_compress_fn)
             if (
-                edge_compress_name is not None
+                not self.state_weight_edges
+                and edge_compress_name is not None
                 and supports_pairwise_kernel(self.pairwise_fn)
                 and native_supports("propagation_dense")
                 and native_supports_device(layer.val.device.type)
@@ -261,6 +274,7 @@ class SparsePropagation(Propagation):
         norm_fn: Callable[[Layer], Layer] | None = None,
         residual: bool = True,
         return_delta: bool = True,
+        state_weight_edges: bool = False,
         implementation: ImplementationMode = "streaming",
         target_block_size: int | None = 128,
         source_block_size: int | None = 128,
@@ -274,6 +288,7 @@ class SparsePropagation(Propagation):
             norm_fn=norm_fn,
             residual=residual,
             return_delta=return_delta,
+            state_weight_edges=state_weight_edges,
             implementation=implementation,
             target_block_size=target_block_size,
             source_block_size=source_block_size,
@@ -309,6 +324,7 @@ class SparsePropagation(Propagation):
             mask = build_topk_mask(scores, self.topk or layer.num_nodes)
 
         masked_edges = edges * mask.to(dtype=edges.dtype)
+        masked_edges = self._weight_edges(masked_edges, layer.state)
         delta_state = torch.einsum("...ij,...j->...i", masked_edges, projected_state)
         delta_val = torch.einsum("...ij,...jd->...id", masked_edges, projected_val)
         return LayerDelta(delta_state=delta_state, delta_val=delta_val)
@@ -354,6 +370,10 @@ class SparsePropagation(Propagation):
                 )
                 mask = mask_2d.view((1,) * len(layer.batch_shape) + mask_2d.shape)
                 edges = self.edge_compress_fn(scores) * mask.to(dtype=scores.dtype)
+                edges = self._weight_edges(
+                    edges,
+                    layer.state[..., global_source_start:global_source_end],
+                )
 
                 delta_state[..., target_start:target_end] += torch.einsum(
                     "...ij,...j->...i",
@@ -439,6 +459,9 @@ class SparsePropagation(Propagation):
                 continue
 
             compressed_edges = self.edge_compress_fn(best_scores)
+            if self.state_weight_edges:
+                selected_source_state = gather_state_by_indices(layer.state, best_indices)
+                compressed_edges = compressed_edges * selected_source_state
             selected_state = gather_state_by_indices(projected_state, best_indices)
             selected_val = gather_val_by_indices(projected_val, best_indices)
 
@@ -464,7 +487,8 @@ class SparsePropagation(Propagation):
     def _compute_delta_kernel_preferred(self, layer: Layer) -> LayerDelta:
         edge_compress_name = _native_edge_compress_name(self.edge_compress_fn)
         if (
-            edge_compress_name is not None
+            not self.state_weight_edges
+            and edge_compress_name is not None
             and supports_pairwise_kernel(self.pairwise_fn)
             and native_supports_device(layer.val.device.type)
         ):
@@ -549,7 +573,8 @@ class SparsePropagation(Propagation):
         if self.implementation == "native":
             edge_compress_name = _native_edge_compress_name(self.edge_compress_fn)
             if (
-                edge_compress_name is not None
+                not self.state_weight_edges
+                and edge_compress_name is not None
                 and supports_pairwise_kernel(self.pairwise_fn)
                 and native_supports_device(layer.val.device.type)
             ):
