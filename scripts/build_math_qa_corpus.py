@@ -16,6 +16,23 @@ DEFAULT_MATH_QA_SOURCES = (
 )
 
 
+def _apply_shard(dataset: Any, *, num_shards: int, shard_index: int) -> Any:
+    if num_shards <= 1:
+        return dataset
+    if not hasattr(dataset, "shard"):
+        raise ValueError("This dataset object does not support sharding.")
+    try:
+        return dataset.shard(num_shards=num_shards, index=shard_index, contiguous=True)
+    except TypeError:
+        return dataset.shard(num_shards, shard_index)
+
+
+def _shard_suffix(*, num_shards: int, shard_index: int) -> str:
+    if num_shards <= 1:
+        return ""
+    return f":shard{shard_index + 1:02d}of{num_shards:02d}"
+
+
 @dataclass(frozen=True, slots=True)
 class MathQaSource:
     label: str
@@ -77,6 +94,8 @@ def add_hf_math_qa_source(
     source: MathQaSource,
     streaming: bool,
     max_records: int | None,
+    num_shards: int,
+    shard_index: int,
 ) -> int:
     try:
         from datasets import load_dataset
@@ -84,6 +103,7 @@ def add_hf_math_qa_source(
         raise ImportError("Install datasets to build the math QA corpus.") from exc
 
     dataset = load_dataset(source.dataset, source.config, split=source.split, streaming=streaming)
+    dataset = _apply_shard(dataset, num_shards=num_shards, shard_index=shard_index)
     written = 0
     for record_index, row in enumerate(dataset, start=1):
         if max_records is not None and written >= max_records:
@@ -96,7 +116,7 @@ def add_hf_math_qa_source(
             continue
         write_math_qa_document(
             output_handle,
-            source=f"{source.label}:{record_index}",
+            source=f"{source.label}{_shard_suffix(num_shards=num_shards, shard_index=shard_index)}:{record_index}",
             problem=problem.strip(),
             solution=solution.strip(),
         )
@@ -108,28 +128,40 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Build a math QA corpus as user/assistant math dialogue.")
     parser.add_argument("--output", required=True)
     parser.add_argument("--hf-math-qa-source", action="append", default=[])
+    parser.add_argument("--source-label", action="append", default=[])
     parser.add_argument("--no-default-sources", action="store_true")
     parser.add_argument("--hf-streaming", action="store_true", default=True)
     parser.add_argument("--no-hf-streaming", dest="hf_streaming", action="store_false")
     parser.add_argument("--max-records-per-source", type=int, default=50000)
     parser.add_argument("--skip-failed-sources", action="store_true")
+    parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=0)
     args = parser.parse_args()
+    if args.num_shards <= 0:
+        raise ValueError("--num-shards must be positive.")
+    if args.shard_index < 0 or args.shard_index >= args.num_shards:
+        raise ValueError("--shard-index must be in [0, num_shards).")
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     source_specs = ([] if args.no_default_sources else list(DEFAULT_MATH_QA_SOURCES)) + args.hf_math_qa_source
     sources = [parse_math_qa_source(spec) for spec in source_specs]
+    selected_labels = {label.strip() for label in args.source_label if label.strip()}
     source_counts: dict[str, int] = {}
     started = time.perf_counter()
 
     with output.open("w", encoding="utf-8") as handle:
         for source in sources:
+            if selected_labels and source.label not in selected_labels:
+                continue
             try:
                 count = add_hf_math_qa_source(
                     output_handle=handle,
                     source=source,
                     streaming=args.hf_streaming,
                     max_records=args.max_records_per_source,
+                    num_shards=args.num_shards,
+                    shard_index=args.shard_index,
                 )
             except Exception as exc:
                 if not args.skip_failed_sources:
@@ -146,6 +178,9 @@ def main() -> None:
         "source_counts": source_counts,
         "math_qa_sources": [asdict(source) for source in sources],
         "elapsed_seconds": time.perf_counter() - started,
+        "selected_labels": sorted(selected_labels),
+        "num_shards": args.num_shards,
+        "shard_index": args.shard_index,
     }
     write_json(output.with_suffix(output.suffix + ".meta.json"), meta)
     print(f"output={output} total_documents={meta['total_documents']:,}", flush=True)

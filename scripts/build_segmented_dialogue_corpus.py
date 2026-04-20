@@ -36,6 +36,23 @@ DEFAULT_DOCUMENT_SOURCES = (
 )
 
 
+def _apply_shard(dataset: Any, *, num_shards: int, shard_index: int) -> Any:
+    if num_shards <= 1:
+        return dataset
+    if not hasattr(dataset, "shard"):
+        raise ValueError("This dataset object does not support sharding.")
+    try:
+        return dataset.shard(num_shards=num_shards, index=shard_index, contiguous=True)
+    except TypeError:
+        return dataset.shard(num_shards, shard_index)
+
+
+def _shard_suffix(*, num_shards: int, shard_index: int) -> str:
+    if num_shards <= 1:
+        return ""
+    return f":shard{shard_index + 1:02d}of{num_shards:02d}"
+
+
 @dataclass(frozen=True, slots=True)
 class DialogueSource:
     label: str
@@ -242,6 +259,8 @@ def add_hf_dialogue_source(
     streaming: bool,
     max_records: int | None,
     require_mixed_dialogue: bool,
+    num_shards: int,
+    shard_index: int,
 ) -> int:
     try:
         from datasets import load_dataset
@@ -254,6 +273,7 @@ def add_hf_dialogue_source(
         split=source.split,
         streaming=streaming,
     )
+    dataset = _apply_shard(dataset, num_shards=num_shards, shard_index=shard_index)
     written = 0
     for record_index, row in enumerate(dataset, start=1):
         if max_records is not None and written >= max_records:
@@ -273,7 +293,10 @@ def add_hf_dialogue_source(
         write_document(
             output_handle,
             kind="dialogue",
-            source=f"{'mixed_dialogue' if require_mixed_dialogue else 'dialogue'}:{source.label}:{record_index}",
+            source=(
+                f"{'mixed_dialogue' if require_mixed_dialogue else 'dialogue'}:"
+                f"{source.label}{_shard_suffix(num_shards=num_shards, shard_index=shard_index)}:{record_index}"
+            ),
             messages=normalized,
         )
         written += 1
@@ -286,6 +309,8 @@ def add_hf_document_source(
     source: DocumentSource,
     streaming: bool,
     max_records: int | None,
+    num_shards: int,
+    shard_index: int,
 ) -> int:
     try:
         from datasets import load_dataset
@@ -298,6 +323,7 @@ def add_hf_document_source(
         split=source.split,
         streaming=streaming,
     )
+    dataset = _apply_shard(dataset, num_shards=num_shards, shard_index=shard_index)
     written = 0
     for record_index, row in enumerate(dataset, start=1):
         if max_records is not None and written >= max_records:
@@ -308,7 +334,7 @@ def add_hf_document_source(
         write_segment_document(
             output_handle,
             kind=source.kind,
-            source=f"{source.label}:{record_index}",
+            source=f"{source.label}{_shard_suffix(num_shards=num_shards, shard_index=shard_index)}:{record_index}",
             text=text,
         )
         written += 1
@@ -322,9 +348,13 @@ def add_dialogue_jsonl(
     source_label: str,
     max_records: int | None,
     require_mixed_dialogue: bool,
+    num_shards: int,
+    shard_index: int,
 ) -> int:
     written = 0
     for record_index, record in enumerate(iter_jsonl_records(path), start=1):
+        if num_shards > 1 and (record_index - 1) % num_shards != shard_index:
+            continue
         if max_records is not None and written >= max_records:
             break
         messages = record.get("messages") or record.get("conversations")
@@ -342,7 +372,10 @@ def add_dialogue_jsonl(
         write_document(
             output_handle,
             kind="dialogue",
-            source=f"{'mixed_dialogue' if require_mixed_dialogue else 'dialogue'}:{source_label}:{record_index}",
+            source=(
+                f"{'mixed_dialogue' if require_mixed_dialogue else 'dialogue'}:"
+                f"{source_label}{_shard_suffix(num_shards=num_shards, shard_index=shard_index)}:{record_index}"
+            ),
             messages=normalized,
         )
         written += 1
@@ -355,6 +388,7 @@ def main() -> None:
     parser.add_argument("--dialogue-jsonl", action="append", default=[])
     parser.add_argument("--hf-dialogue-source", action="append", default=[])
     parser.add_argument("--hf-document-source", action="append", default=[])
+    parser.add_argument("--source-label", action="append", default=[])
     parser.add_argument("--no-default-mixed-dialogue-sources", action="store_true")
     parser.add_argument("--no-default-document-sources", action="store_true")
     parser.add_argument("--hf-streaming", action="store_true", default=True)
@@ -362,7 +396,13 @@ def main() -> None:
     parser.add_argument("--max-records-per-source", type=int, default=50000)
     parser.add_argument("--skip-failed-sources", action="store_true")
     parser.add_argument("--allow-non-mixed-dialogue", action="store_true")
+    parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=0)
     args = parser.parse_args()
+    if args.num_shards <= 0:
+        raise ValueError("--num-shards must be positive.")
+    if args.shard_index < 0 or args.shard_index >= args.num_shards:
+        raise ValueError("--shard-index must be in [0, num_shards).")
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -370,6 +410,7 @@ def main() -> None:
     document_specs = ([] if args.no_default_document_sources else list(DEFAULT_DOCUMENT_SOURCES)) + args.hf_document_source
     hf_sources = [parse_dialogue_source(spec) for spec in dialogue_specs]
     document_sources = [parse_document_source(spec) for spec in document_specs]
+    selected_labels = {label.strip() for label in args.source_label if label.strip()}
     source_counts: dict[str, int] = {}
     started = time.perf_counter()
 
@@ -383,11 +424,15 @@ def main() -> None:
                 source_label=label,
                 max_records=args.max_records_per_source,
                 require_mixed_dialogue=not args.allow_non_mixed_dialogue,
+                num_shards=args.num_shards,
+                shard_index=args.shard_index,
             )
             source_counts[label] = count
             print(f"source={label} documents={count:,}", flush=True)
 
         for source in hf_sources:
+            if selected_labels and source.label not in selected_labels:
+                continue
             try:
                 count = add_hf_dialogue_source(
                     output_handle=handle,
@@ -395,6 +440,8 @@ def main() -> None:
                     streaming=args.hf_streaming,
                     max_records=args.max_records_per_source,
                     require_mixed_dialogue=not args.allow_non_mixed_dialogue,
+                    num_shards=args.num_shards,
+                    shard_index=args.shard_index,
                 )
             except Exception as exc:
                 if not args.skip_failed_sources:
@@ -406,12 +453,16 @@ def main() -> None:
             print(f"source={source.label} documents={count:,}", flush=True)
 
         for source in document_sources:
+            if selected_labels and source.label not in selected_labels:
+                continue
             try:
                 count = add_hf_document_source(
                     output_handle=handle,
                     source=source,
                     streaming=args.hf_streaming,
                     max_records=args.max_records_per_source,
+                    num_shards=args.num_shards,
+                    shard_index=args.shard_index,
                 )
             except Exception as exc:
                 if not args.skip_failed_sources:
@@ -432,6 +483,9 @@ def main() -> None:
         "dialogue_jsonl": args.dialogue_jsonl,
         "require_mixed_dialogue": not args.allow_non_mixed_dialogue,
         "elapsed_seconds": time.perf_counter() - started,
+        "selected_labels": sorted(selected_labels),
+        "num_shards": args.num_shards,
+        "shard_index": args.shard_index,
     }
     write_json(output.with_suffix(output.suffix + ".meta.json"), meta)
     print(f"output={output} total_documents={total_documents:,}", flush=True)

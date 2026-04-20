@@ -16,6 +16,23 @@ DEFAULT_DIALOGUE_SOURCES = (
 )
 
 
+def _apply_shard(dataset: Any, *, num_shards: int, shard_index: int) -> Any:
+    if num_shards <= 1:
+        return dataset
+    if not hasattr(dataset, "shard"):
+        raise ValueError("This dataset object does not support sharding.")
+    try:
+        return dataset.shard(num_shards=num_shards, index=shard_index, contiguous=True)
+    except TypeError:
+        return dataset.shard(num_shards, shard_index)
+
+
+def _shard_suffix(*, num_shards: int, shard_index: int) -> str:
+    if num_shards <= 1:
+        return ""
+    return f":shard{shard_index + 1:02d}of{num_shards:02d}"
+
+
 def parse_hf_source(spec: str) -> tuple[str, str, str, str, str, str]:
     try:
         label, remainder = spec.split("=", maxsplit=1)
@@ -84,11 +101,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Build a plain text-only dialogue corpus from HF chat datasets.")
     parser.add_argument("--output", required=True)
     parser.add_argument("--hf-dialogue-source", action="append", default=[])
+    parser.add_argument("--source-label", action="append", default=[])
     parser.add_argument("--no-default-sources", action="store_true")
     parser.add_argument("--max-records-per-source", type=int, default=50000)
     parser.add_argument("--hf-streaming", action="store_true", default=True)
     parser.add_argument("--skip-failed-sources", action="store_true")
+    parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=0)
     args = parser.parse_args()
+    if args.num_shards <= 0:
+        raise ValueError("--num-shards must be positive.")
+    if args.shard_index < 0 or args.shard_index >= args.num_shards:
+        raise ValueError("--shard-index must be in [0, num_shards).")
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -97,6 +121,7 @@ def main() -> None:
     source_specs = list(args.hf_dialogue_source)
     if not args.no_default_sources:
         source_specs.extend(spec for spec in DEFAULT_DIALOGUE_SOURCES if spec not in source_specs)
+    selected_labels = {label.strip() for label in args.source_label if label.strip()}
 
     source_counts: dict[str, int] = {}
     source_scanned: dict[str, int] = {}
@@ -105,6 +130,8 @@ def main() -> None:
     with output_path.open("w", encoding="utf-8") as handle:
         for spec in source_specs:
             label, dataset_name, config, split, messages_key, role_key, content_key = parse_hf_source(spec)
+            if selected_labels and label not in selected_labels:
+                continue
             try:
                 dataset = load_dataset(
                     dataset_name,
@@ -112,6 +139,7 @@ def main() -> None:
                     split=split,
                     streaming=args.hf_streaming,
                 )
+                dataset = _apply_shard(dataset, num_shards=args.num_shards, shard_index=args.shard_index)
             except Exception:
                 if args.skip_failed_sources:
                     continue
@@ -137,7 +165,7 @@ def main() -> None:
                 if not messages:
                     continue
                 record = build_plain_dialogue_record(
-                    source=f"plain_dialogue:{label}:{count + 1}",
+                    source=f"plain_dialogue:{label}{_shard_suffix(num_shards=args.num_shards, shard_index=args.shard_index)}:{count + 1}",
                     messages=messages,
                 )
                 if record is None:
@@ -158,6 +186,9 @@ def main() -> None:
         "source_scanned": source_scanned,
         "sources": source_specs,
         "filter": "exact_text_only_dialogue",
+        "selected_labels": sorted(selected_labels),
+        "num_shards": args.num_shards,
+        "shard_index": args.shard_index,
     }
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(meta, ensure_ascii=False, indent=2), flush=True)
