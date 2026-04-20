@@ -1,19 +1,21 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="760" viewBox="0 0 1280 760" role="img" aria-labelledby="title desc">
-  <title id="title">Jakal-Net Progressive-B Architecture</title>
-  <desc id="desc">Architecture diagram showing token-aligned S workspace, expanded and compressed B memory, and the separate query prediction path used by the Progressive-B language model.</desc>
+  <title id="title">Jakal-Net Causal Memory Architecture</title>
+  <desc id="desc">Architecture diagram showing document chunks flowing through a causal S backbone, sequential hierarchical B memory scan, signed normalized routing and propagation, softplus memory readout, and a causal prediction stack.</desc>
   <defs>
     <style>
       .bg { fill: #f4efe6; }
       .panel { fill: #fffaf2; stroke: #22313f; stroke-width: 2.2; rx: 20; }
       .box { fill: #ffffff; stroke: #22313f; stroke-width: 2; rx: 14; }
+      .data { fill: #f8d9cf; stroke: #22313f; stroke-width: 2; rx: 14; }
       .sbox { fill: #dff4ea; stroke: #22313f; stroke-width: 2; rx: 14; }
       .bbox { fill: #ffe6c7; stroke: #22313f; stroke-width: 2; rx: 14; }
-      .qbox { fill: #dfe9fb; stroke: #22313f; stroke-width: 2; rx: 14; }
-      .note { fill: #f3f4f6; stroke: #64748b; stroke-width: 1.8; rx: 12; }
+      .pbox { fill: #dfe9fb; stroke: #22313f; stroke-width: 2; rx: 14; }
+      .rule { fill: #eef1f4; stroke: #64748b; stroke-width: 1.8; rx: 12; }
       .title { font: 800 30px Verdana, sans-serif; fill: #111827; }
       .subtitle { font: 500 16px Verdana, sans-serif; fill: #475569; }
       .label { font: 700 19px Verdana, sans-serif; fill: #111827; }
       .small { font: 500 15px Verdana, sans-serif; fill: #334155; }
+      .tiny { font: 500 13px Verdana, sans-serif; fill: #475569; }
       .mono { font: 600 14px Consolas, monospace; fill: #1f2937; }
       .arrow { stroke: #22313f; stroke-width: 2.7; fill: none; marker-end: url(#arrow); }
       .soft { stroke: #64748b; stroke-width: 2.1; fill: none; stroke-dasharray: 7 6; marker-end: url(#arrowSoft); }
@@ -27,109 +29,89 @@
   </defs>
 
   <rect class="bg" x="0" y="0" width="1280" height="760"/>
-  <text class="title" x="48" y="56">Jakal-Net Progressive-B Architecture</text>
-  <text class="subtitle" x="48" y="84">Architecture view only: token-aligned sequence workspace, latent memory workspaces, and separate query prediction path.</text>
+  <text class="title" x="48" y="56">Jakal-Net Causal Memory Architecture</text>
+  <text class="subtitle" x="48" y="84">Document chunks are encoded by a causal S backbone, scanned through persistent B memory, then decoded by a separate causal prediction stack.</text>
 
-  <rect class="panel" x="44" y="120" width="268" height="242"/>
-  <text class="label" x="68" y="154">Input representation</text>
-  <rect class="box" x="68" y="180" width="220" height="48"/>
-  <text class="small" x="90" y="209">prefix token ids</text>
-  <rect class="box" x="68" y="246" width="220" height="48"/>
-  <text class="small" x="90" y="275">token embedding</text>
-  <rect class="box" x="68" y="312" width="220" height="48"/>
-  <text class="small" x="90" y="341">learned position encoding</text>
+  <rect class="panel" x="44" y="120" width="272" height="252"/>
+  <text class="label" x="68" y="154">Document stream</text>
+  <rect class="data" x="68" y="180" width="224" height="48"/>
+  <text class="small" x="90" y="209">mixed manifest corpus</text>
+  <rect class="data" x="68" y="246" width="224" height="48"/>
+  <text class="small" x="90" y="275">kind/source preserved</text>
+  <rect class="data" x="68" y="312" width="224" height="48"/>
+  <text class="small" x="90" y="341">BOS/CONT + mode token</text>
 
-  <rect class="panel" x="350" y="120" width="552" height="524"/>
-  <text class="label" x="378" y="154">Sequence and latent memory core</text>
-  <text class="subtitle" x="378" y="179">`S` is token-aligned.</text>
-  <text class="subtitle" x="378" y="199">`B` is latent memory carried across joint blocks.</text>
+  <rect class="panel" x="356" y="120" width="274" height="252"/>
+  <text class="label" x="382" y="154">Causal S backbone</text>
+  <rect class="sbox" x="382" y="180" width="222" height="54"/>
+  <text class="label" x="430" y="213">Token slots</text>
+  <rect class="sbox" x="382" y="252" width="222" height="54"/>
+  <text class="small" x="410" y="284">window sparse propagation</text>
+  <rect class="sbox" x="382" y="324" width="222" height="38"/>
+  <text class="mono" x="423" y="348">causal S[t]</text>
 
-  <rect class="sbox" x="382" y="214" width="214" height="64"/>
-  <text class="label" x="426" y="245">S init</text>
-  <text class="small" x="410" y="267">state + value per token slot</text>
+  <rect class="panel" x="670" y="120" width="318" height="252"/>
+  <text class="label" x="696" y="154">Sequential B scan</text>
+  <text class="subtitle" x="696" y="178">Persistent across chunks in a document.</text>
+  <rect class="bbox" x="696" y="198" width="112" height="54"/>
+  <text class="mono" x="733" y="231">B^0</text>
+  <rect class="bbox" x="842" y="198" width="112" height="54"/>
+  <text class="mono" x="879" y="231">B^1</text>
+  <rect class="bbox" x="770" y="292" width="112" height="54"/>
+  <text class="mono" x="807" y="325">B^2</text>
+  <text class="small" x="704" y="276">write, propagate, transition, skip</text>
+  <text class="tiny" x="718" y="365">detach between chunks; reset only at document boundary</text>
 
-  <rect class="sbox" x="652" y="214" width="214" height="64"/>
-  <text class="label" x="685" y="245">S warmup</text>
-  <text class="small" x="678" y="267">same-layer propagation</text>
+  <rect class="panel" x="1028" y="120" width="206" height="252"/>
+  <text class="label" x="1054" y="154">Readout</text>
+  <rect class="pbox" x="1054" y="184" width="154" height="58"/>
+  <text class="small" x="1076" y="209">softplus(state)</text>
+  <text class="small" x="1082" y="229">weighted read</text>
+  <rect class="pbox" x="1054" y="270" width="154" height="58"/>
+  <text class="small" x="1082" y="295">B read + S</text>
+  <text class="small" x="1084" y="315">residual mix</text>
 
-  <rect class="bbox" x="392" y="328" width="478" height="214"/>
-  <text class="label" x="422" y="360">Progressive-B joint block</text>
-  <text class="small" x="422" y="385">The same operator pattern repeats through</text>
-  <text class="small" x="422" y="405">lite / mid / full stages.</text>
+  <path class="arrow" d="M316 246 L356 246"/>
+  <path class="arrow" d="M630 246 L670 246"/>
+  <path class="arrow" d="M808 225 L842 225"/>
+  <path class="arrow" d="M898 252 C900 280 882 292 838 314"/>
+  <path class="soft" d="M770 314 C722 308 700 284 722 252"/>
+  <path class="arrow" d="M988 246 L1028 246"/>
 
-  <rect class="box" x="422" y="414" width="128" height="40"/>
-  <text class="mono" x="455" y="439">S prop</text>
+  <rect class="panel" x="356" y="412" width="442" height="220"/>
+  <text class="label" x="382" y="446">Signed stability rules</text>
+  <rect class="rule" x="382" y="472" width="390" height="36"/>
+  <text class="mono" x="402" y="495">state := sign(state) * softmax(abs(state)) * mass</text>
+  <rect class="rule" x="382" y="524" width="390" height="36"/>
+  <text class="mono" x="402" y="547">edge := sign(edge) * softmax(abs(edge)) * state</text>
+  <rect class="rule" x="382" y="576" width="390" height="36"/>
+  <text class="mono" x="402" y="599">route := sign(route) * softmax(abs(route)) * state</text>
 
-  <rect class="box" x="570" y="414" width="128" height="40"/>
-  <text class="mono" x="593" y="439">S -&gt; B expand</text>
+  <rect class="panel" x="838" y="412" width="396" height="220"/>
+  <text class="label" x="864" y="446">Prediction stack</text>
+  <rect class="pbox" x="864" y="472" width="156" height="50"/>
+  <text class="small" x="889" y="503">val post norm</text>
+  <rect class="pbox" x="1052" y="472" width="156" height="50"/>
+  <text class="small" x="1077" y="503">aligned S residual</text>
+  <rect class="pbox" x="864" y="556" width="156" height="50"/>
+  <text class="small" x="890" y="587">causal pred prop</text>
+  <rect class="pbox" x="1052" y="556" width="156" height="50"/>
+  <text class="small" x="1098" y="587">LM head</text>
+  <path class="arrow" d="M1131 328 C1131 386 1000 428 942 472"/>
+  <path class="arrow" d="M1020 497 L1052 497"/>
+  <path class="arrow" d="M942 522 L942 556"/>
+  <path class="arrow" d="M1020 581 L1052 581"/>
 
-  <rect class="box" x="718" y="414" width="128" height="40"/>
-  <text class="mono" x="738" y="439">expanded B</text>
+  <rect class="rule" x="44" y="412" width="272" height="220"/>
+  <text class="label" x="68" y="446">Training view</text>
+  <text class="small" x="68" y="476">TensorBoard samples show a</text>
+  <text class="small" x="68" y="498">single mixed example with all</text>
+  <text class="small" x="68" y="520">present kind/source labels.</text>
+  <text class="small" x="68" y="552">The current long-document run</text>
+  <text class="small" x="68" y="574">uses batch-size search and keeps</text>
+  <text class="mono" x="82" y="600">lr = 1e-4, warmup = 200</text>
 
-  <rect class="box" x="422" y="480" width="128" height="40"/>
-  <text class="mono" x="446" y="505">B -&gt; S route</text>
-
-  <rect class="box" x="570" y="480" width="128" height="40"/>
-  <text class="mono" x="590" y="505">compress B</text>
-
-  <rect class="box" x="718" y="480" width="128" height="40"/>
-  <text class="mono" x="733" y="505">compressed B</text>
-
-  <rect class="sbox" x="494" y="570" width="262" height="46"/>
-  <text class="label" x="542" y="600">Final S refinement</text>
-
-  <path class="arrow" d="M312 204 C336 204 352 217 382 246"/>
-  <path class="arrow" d="M596 246 L652 246"/>
-  <path class="arrow" d="M760 278 C760 307 722 316 660 328"/>
-  <path class="soft" d="M550 434 C560 434 562 434 570 434"/>
-  <path class="soft" d="M698 434 C708 434 710 434 718 434"/>
-  <path class="soft" d="M782 454 C762 468 742 475 698 489"/>
-  <path class="soft" d="M570 500 C560 500 558 500 550 500"/>
-  <path class="soft" d="M698 500 C708 500 710 500 718 500"/>
-  <path class="arrow" d="M631 542 L631 570"/>
-
-  <rect class="panel" x="942" y="120" width="292" height="452"/>
-  <text class="label" x="970" y="154">Query prediction path</text>
-  <text class="subtitle" x="970" y="178">Prediction uses a dedicated</text>
-  <text class="subtitle" x="970" y="198">query workspace, not the</text>
-  <text class="subtitle" x="970" y="218">last token slot directly.</text>
-
-  <rect class="qbox" x="972" y="230" width="232" height="72"/>
-  <text class="label" x="1010" y="260">Query slots</text>
-  <text class="small" x="1002" y="282">one slot per</text>
-  <text class="small" x="1002" y="300">future position</text>
-
-  <rect class="qbox" x="972" y="336" width="232" height="72"/>
-  <text class="label" x="994" y="366">Query transition</text>
-  <text class="small" x="1001" y="388">route encoded `S`</text>
-  <text class="small" x="1001" y="406">into queries</text>
-
-  <rect class="qbox" x="972" y="442" width="232" height="72"/>
-  <text class="label" x="987" y="472">Query propagation</text>
-  <text class="small" x="997" y="494">left-to-right</text>
-  <text class="small" x="997" y="512">causal updates</text>
-
-  <rect class="qbox" x="972" y="548" width="232" height="50"/>
-  <text class="label" x="1014" y="579">Query head</text>
-
-  <path class="arrow" d="M756 594 C870 594 908 266 972 266"/>
-  <path class="arrow" d="M1088 302 L1088 336"/>
-  <path class="arrow" d="M1088 408 L1088 442"/>
-  <path class="arrow" d="M1088 514 L1088 548"/>
-
-  <rect class="note" x="50" y="412" width="262" height="168"/>
-  <text class="label" x="74" y="446">Key idea</text>
-  <text class="small" x="74" y="476">A standard decoder-only LM</text>
-  <text class="small" x="74" y="498">keeps one token stream and</text>
-  <text class="small" x="74" y="520">predicts from that stream.</text>
-  <text class="small" x="74" y="548">Progressive-B separates:</text>
-  <text class="mono" x="88" y="574">encode in `S`</text>
-  <text class="mono" x="88" y="596">exchange through `B`</text>
-  <text class="mono" x="88" y="618">predict through query slots</text>
-
-  <rect class="note" x="942" y="618" width="292" height="102"/>
-  <text class="label" x="970" y="650">Execution backends</text>
-  <text class="mono" x="970" y="678">reference / streaming / kernel / native</text>
-  <text class="small" x="970" y="698">Same high-level graph,</text>
-  <text class="small" x="970" y="716">different execution strategy.</text>
+  <rect class="rule" x="44" y="666" width="1190" height="54"/>
+  <text class="label" x="68" y="700">Execution note</text>
+  <text class="small" x="218" y="700">The same Layer / Propagation / Transition API remains, but signed state-weighted sparse paths use the reference/streaming implementations when native kernels do not support the new rule.</text>
 </svg>

@@ -14,7 +14,11 @@ The codebase is split into two layers:
 
 ## Architecture
 
-![Jakal-Net Progressive-B architecture](docs/architecture.svg)
+![Jakal-Net causal memory architecture](docs/architecture.svg)
+
+The diagram highlights the current causal-memory training path. The older
+Progressive-B/query-block path remains below because it uses the same
+`Layer` / `Propagation` / `Transition` operator family.
 
 Progressive-B is not a standard decoder-only LM stack. It encodes a fixed
 prefix into a sequence workspace `S`, repeatedly exchanges information with a
