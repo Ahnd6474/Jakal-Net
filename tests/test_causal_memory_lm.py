@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -10,7 +11,9 @@ from train_causal_memory_lm import (  # noqa: E402
     DocumentChunk,
     DocumentChunkBatcher,
     TokenizedDocument,
+    load_pretokenized_bundle,
     make_document_chunks,
+    save_pretokenized_bundle,
 )
 
 from jakal_net.causal_memory_lm import CausalHierarchicalMemoryLM, MemoryScanOutput  # noqa: E402
@@ -207,6 +210,73 @@ class CausalMemoryLMTests(unittest.TestCase):
         self.assertTrue(torch.equal(batch1.context[0], doc1.chunks[0].context))
         self.assertTrue(torch.equal(batch2.context[0], doc1.chunks[1].context))
         self.assertTrue(torch.equal(batch3.reset_mask, torch.tensor([True])))
+
+    def test_pretokenized_bundle_roundtrip_uses_flat_storage(self) -> None:
+        documents = (
+            TokenizedDocument(
+                kind="dialogue",
+                source="doc1",
+                token_count=6,
+                chunks=(
+                    DocumentChunk(
+                        context=torch.tensor([1, 2, 10, 11, 0, 0], dtype=torch.long),
+                        target=torch.tensor([2, 10, 11, 3, 0, 0], dtype=torch.long),
+                        loss_mask=torch.tensor([0.0, 1.0, 1.0, 1.0, 0.0, 0.0], dtype=torch.float32),
+                        is_continuation=False,
+                    ),
+                    DocumentChunk(
+                        context=torch.tensor([3, 2, 12, 13, 14, 0], dtype=torch.long),
+                        target=torch.tensor([2, 12, 13, 14, 4, 0], dtype=torch.long),
+                        loss_mask=torch.tensor([0.0, 0.0, 1.0, 1.0, 1.0, 0.0], dtype=torch.float32),
+                        is_continuation=True,
+                    ),
+                ),
+            ),
+            TokenizedDocument(
+                kind="text",
+                source="doc2",
+                token_count=2,
+                chunks=(
+                    DocumentChunk(
+                        context=torch.tensor([1, 5, 20, 0, 0, 0], dtype=torch.long),
+                        target=torch.tensor([5, 20, 4, 0, 0, 0], dtype=torch.long),
+                        loss_mask=torch.tensor([0.0, 1.0, 1.0, 0.0, 0.0, 0.0], dtype=torch.float32),
+                        is_continuation=False,
+                    ),
+                ),
+            ),
+        )
+        corpus_info = {
+            "special_tokens": {"pad": 0, "eos": 4, "cont": 3},
+            "tokenized_summary": {"documents": 2, "chunks": 3, "tokens": 8},
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle_path = Path(tmpdir) / "bundle.pt"
+            save_pretokenized_bundle(
+                bundle_path,
+                documents=documents,
+                vocab_size=16384,
+                tokenizer_label="test",
+                tokenizer_model_path=None,
+                corpus_info=corpus_info,
+            )
+            raw_bundle = torch.load(bundle_path, map_location="cpu")
+            self.assertEqual(raw_bundle["storage_format"], "flat_v2")
+            self.assertEqual(int(raw_bundle["seq_len"]), 6)
+            self.assertNotIn("target", str(raw_bundle))
+            restored = load_pretokenized_bundle(bundle_path)
+
+        self.assertEqual(len(restored["documents"]), len(documents))
+        for restored_document, original_document in zip(restored["documents"], documents):
+            self.assertEqual(restored_document.kind, original_document.kind)
+            self.assertEqual(restored_document.source, original_document.source)
+            self.assertEqual(restored_document.token_count, original_document.token_count)
+            self.assertEqual(len(restored_document.chunks), len(original_document.chunks))
+            for restored_chunk, original_chunk in zip(restored_document.chunks, original_document.chunks):
+                self.assertTrue(torch.equal(restored_chunk.context, original_chunk.context))
+                self.assertTrue(torch.equal(restored_chunk.target, original_chunk.target))
+                self.assertTrue(torch.equal(restored_chunk.loss_mask, original_chunk.loss_mask))
+                self.assertEqual(restored_chunk.is_continuation, original_chunk.is_continuation)
 
 
 if __name__ == "__main__":

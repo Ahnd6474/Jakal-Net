@@ -920,24 +920,76 @@ def save_pretokenized_bundle(
     corpus_info: dict[str, Any],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    special_tokens = dict(corpus_info.get("special_tokens") or {})
+    pad_token_id = special_tokens.get("pad")
+    eos_token_id = special_tokens.get("eos")
+    cont_token_id = special_tokens.get("cont")
+    if pad_token_id is None or eos_token_id is None or cont_token_id is None:
+        raise ValueError("Pretokenized bundle save requires pad/eos/cont special token ids in corpus_info.")
+    token_dtype = torch.int16 if vocab_size <= int(torch.iinfo(torch.int16).max) else torch.int32
+    chunk_offsets: list[int] = [0]
+    document_offsets: list[int] = [0]
+    flat_context_parts: list[torch.Tensor] = []
+    flat_loss_mask_parts: list[torch.Tensor] = []
+    chunk_is_continuation: list[bool] = []
+    document_kinds: list[str] = []
+    document_sources: list[str] = []
+    document_token_counts: list[int] = []
+    binary_loss_mask = True
+
+    for document in documents:
+        document_kinds.append(document.kind)
+        document_sources.append(document.source)
+        document_token_counts.append(int(document.token_count))
+        for chunk in document.chunks:
+            context = chunk.context.detach().cpu().to(dtype=torch.long)
+            loss_mask = chunk.loss_mask.detach().cpu().to(dtype=torch.float32)
+            nonpad = torch.nonzero(context != int(pad_token_id), as_tuple=False)
+            active_length = int(nonpad[-1].item() + 1) if nonpad.numel() > 0 else 0
+            active_context = context[:active_length].to(dtype=token_dtype)
+            active_loss_mask = loss_mask[:active_length]
+            if binary_loss_mask and not torch.all((active_loss_mask == 0.0) | (active_loss_mask == 1.0)).item():
+                binary_loss_mask = False
+            flat_context_parts.append(active_context)
+            flat_loss_mask_parts.append(active_loss_mask)
+            chunk_is_continuation.append(bool(chunk.is_continuation))
+            chunk_offsets.append(chunk_offsets[-1] + active_length)
+        document_offsets.append(document_offsets[-1] + len(document.chunks))
+
+    flat_context = (
+        torch.cat(flat_context_parts, dim=0)
+        if flat_context_parts
+        else torch.empty(0, dtype=token_dtype)
+    )
+    seq_len = int(documents[0].chunks[0].context.shape[0]) if documents and documents[0].chunks else 0
+    if binary_loss_mask:
+        flat_loss_mask = (
+            torch.cat([part.to(dtype=torch.uint8) for part in flat_loss_mask_parts], dim=0)
+            if flat_loss_mask_parts
+            else torch.empty(0, dtype=torch.uint8)
+        )
+    else:
+        flat_loss_mask = (
+            torch.cat([part.to(dtype=torch.float16) for part in flat_loss_mask_parts], dim=0)
+            if flat_loss_mask_parts
+            else torch.empty(0, dtype=torch.float16)
+        )
+
     payload = {
-        "documents": [
-            {
-                "kind": document.kind,
-                "source": document.source,
-                "token_count": document.token_count,
-                "chunks": [
-                    {
-                        "context": chunk.context,
-                        "target": chunk.target,
-                        "loss_mask": chunk.loss_mask,
-                        "is_continuation": chunk.is_continuation,
-                    }
-                    for chunk in document.chunks
-                ],
-            }
-            for document in documents
-        ],
+        "storage_format": "flat_v2",
+        "documents": {
+            "kind": document_kinds,
+            "source": document_sources,
+            "token_count": torch.tensor(document_token_counts, dtype=torch.int32),
+            "chunk_offsets": torch.tensor(document_offsets, dtype=torch.int64),
+        },
+        "chunks": {
+            "token_offsets": torch.tensor(chunk_offsets, dtype=torch.int64),
+            "context_flat": flat_context,
+            "loss_mask_flat": flat_loss_mask,
+            "is_continuation": torch.tensor(chunk_is_continuation, dtype=torch.bool),
+        },
+        "seq_len": seq_len,
         "vocab_size": vocab_size,
         "tokenizer_label": tokenizer_label,
         "tokenizer_model_path": tokenizer_model_path,
@@ -950,23 +1002,85 @@ def load_pretokenized_bundle(path: Path) -> dict[str, Any]:
     bundle = torch.load(path, map_location="cpu")
     if not isinstance(bundle, dict) or "documents" not in bundle:
         raise ValueError(f"Invalid pretokenized bundle: {path}")
-    documents = [
-        TokenizedDocument(
-            kind=item["kind"],
-            source=item["source"],
-            token_count=int(item["token_count"]),
-            chunks=tuple(
-                DocumentChunk(
-                    context=chunk["context"].detach().cpu().to(dtype=torch.long),
-                    target=chunk["target"].detach().cpu().to(dtype=torch.long),
-                    loss_mask=chunk["loss_mask"].detach().cpu().to(dtype=torch.float32),
-                    is_continuation=bool(chunk["is_continuation"]),
+    storage_format = bundle.get("storage_format")
+    if storage_format == "flat_v2":
+        corpus_info = bundle.get("corpus_info") or {}
+        special_tokens = dict(corpus_info.get("special_tokens") or {})
+        pad_token_id = special_tokens.get("pad")
+        eos_token_id = special_tokens.get("eos")
+        cont_token_id = special_tokens.get("cont")
+        if pad_token_id is None or eos_token_id is None or cont_token_id is None:
+            raise ValueError(f"Flat pretokenized bundle is missing pad/eos/cont special token ids: {path}")
+        document_meta = bundle["documents"]
+        chunk_meta = bundle["chunks"]
+        document_kinds = list(document_meta["kind"])
+        document_sources = list(document_meta["source"])
+        document_token_counts = document_meta["token_count"].detach().cpu().to(dtype=torch.int64)
+        document_chunk_offsets = document_meta["chunk_offsets"].detach().cpu().to(dtype=torch.int64)
+        chunk_token_offsets = chunk_meta["token_offsets"].detach().cpu().to(dtype=torch.int64)
+        flat_context = chunk_meta["context_flat"].detach().cpu().to(dtype=torch.long)
+        loss_mask_flat = chunk_meta["loss_mask_flat"].detach().cpu()
+        chunk_is_continuation = chunk_meta["is_continuation"].detach().cpu().to(dtype=torch.bool)
+        seq_len = int(bundle.get("seq_len") or 0)
+        if seq_len <= 0:
+            raise ValueError(f"Flat pretokenized bundle is missing seq_len: {path}")
+        documents: list[TokenizedDocument] = []
+        for document_index, kind in enumerate(document_kinds):
+            chunk_start = int(document_chunk_offsets[document_index].item())
+            chunk_end = int(document_chunk_offsets[document_index + 1].item())
+            restored_chunks: list[DocumentChunk] = []
+            for chunk_index in range(chunk_start, chunk_end):
+                token_start = int(chunk_token_offsets[chunk_index].item())
+                token_end = int(chunk_token_offsets[chunk_index + 1].item())
+                active_context = flat_context[token_start:token_end]
+                active_length = int(active_context.shape[0])
+                context = torch.full((seq_len,), int(pad_token_id), dtype=torch.long)
+                if active_length > 0:
+                    context[:active_length] = active_context
+                target = torch.full((seq_len,), int(pad_token_id), dtype=torch.long)
+                if active_length > 1:
+                    target[: active_length - 1] = active_context[1:]
+                if active_length > 0:
+                    terminal_token = int(eos_token_id) if chunk_index == chunk_end - 1 else int(cont_token_id)
+                    target[active_length - 1] = terminal_token
+                loss_mask = torch.zeros(seq_len, dtype=torch.float32)
+                if active_length > 0:
+                    active_loss_mask = loss_mask_flat[token_start:token_end].to(dtype=torch.float32)
+                    loss_mask[:active_length] = active_loss_mask
+                restored_chunks.append(
+                    DocumentChunk(
+                        context=context,
+                        target=target,
+                        loss_mask=loss_mask,
+                        is_continuation=bool(chunk_is_continuation[chunk_index].item()),
+                    )
                 )
-                for chunk in item["chunks"]
-            ),
-        )
-        for item in bundle["documents"]
-    ]
+            documents.append(
+                TokenizedDocument(
+                    kind=kind,
+                    source=document_sources[document_index],
+                    token_count=int(document_token_counts[document_index].item()),
+                    chunks=tuple(restored_chunks),
+                )
+            )
+    else:
+        documents = [
+            TokenizedDocument(
+                kind=item["kind"],
+                source=item["source"],
+                token_count=int(item["token_count"]),
+                chunks=tuple(
+                    DocumentChunk(
+                        context=chunk["context"].detach().cpu().to(dtype=torch.long),
+                        target=chunk["target"].detach().cpu().to(dtype=torch.long),
+                        loss_mask=chunk["loss_mask"].detach().cpu().to(dtype=torch.float32),
+                        is_continuation=bool(chunk["is_continuation"]),
+                    )
+                    for chunk in item["chunks"]
+                ),
+            )
+            for item in bundle["documents"]
+        ]
     return {
         "documents": documents,
         "vocab_size": int(bundle["vocab_size"]),
