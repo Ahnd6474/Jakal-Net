@@ -5,6 +5,7 @@ from typing import Sequence
 
 import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
 
 from jakal_net.core import Layer, LayerDelta
 from jakal_net.modules import (
@@ -561,7 +562,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
             self.read_gates,
         ):
             read_layer = _layer_with_val_norm(level, level_module.val_norm)
-            sender_strength = read_layer.state.unsqueeze(-1)
+            sender_strength = F.softplus(read_layer.state).unsqueeze(-1)
             read_summary = (sender_strength * read_layer.val).sum(dim=-2)
             read_summary = read_summary + self.read_template_val.to(
                 device=level.val.device,
