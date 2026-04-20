@@ -29,11 +29,20 @@ from train_progressive_b_lm import (  # noqa: E402
     generate_next_tokens_with_sampling,
 )
 from train_causal_memory_lm import (  # noqa: E402
+    BOS_TOKEN,
     CODE_TOKEN,
+    CONT_TOKEN,
+    DIALOGUE_TOKEN,
+    EOT_TOKEN,
+    INSTRUCTION_TOKEN,
     MATH_TOKEN,
+    RESPONSE_TOKEN,
     TEXT_TOKEN,
     TrainingCurriculumStage,
+    _content_target_visibility,
     _normalize_dialogue_body,
+    build_special_token_id_map,
+    make_document_chunks,
     apply_training_curriculum,
     resolve_curriculum_stage,
 )
@@ -106,6 +115,40 @@ class TrainingTests(unittest.TestCase):
                 ]
             )
         )
+
+    def test_assistant_only_visibility_marks_assistant_span(self) -> None:
+        special = {
+            "assistant": 10,
+            "response": 11,
+            "user": 12,
+            "eot": 13,
+        }
+        token_ids = torch.tensor([12, 20, 21, 13, 10, 30, 31, 13], dtype=torch.long)
+
+        visible = _content_target_visibility(token_ids, loss_mode="assistant_only", special_token_ids=special)
+
+        torch.testing.assert_close(
+            visible,
+            torch.tensor([0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0], dtype=torch.float32),
+        )
+
+    def test_make_document_chunks_respects_assistant_only_mask(self) -> None:
+        token_ids = torch.tensor([12, 20, 21, 13, 10, 30, 31, 13], dtype=torch.long)
+        visible = torch.tensor([0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0], dtype=torch.float32)
+        chunks = make_document_chunks(
+            content_ids=token_ids,
+            content_target_visibility=visible,
+            mode_token_id=2,
+            seq_len=16,
+            bos_token_id=1,
+            cont_token_id=3,
+            eos_token_id=4,
+            pad_token_id=0,
+        )
+        self.assertEqual(len(chunks), 1)
+        self.assertGreater(float(chunks[0].loss_mask.sum().item()), 0.0)
+        self.assertEqual(float(chunks[0].loss_mask[1].item()), 0.0)
+        self.assertEqual(float(chunks[0].loss_mask[5].item()), 1.0)
 
     def test_curriculum_stage_resolution(self) -> None:
         stage1 = resolve_curriculum_stage(

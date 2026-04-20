@@ -123,6 +123,7 @@ class SerializedDocument:
     kind: str
     source: str
     body: str
+    loss_mode: str = "all"
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,6 +273,38 @@ def _message_segments(message: dict[str, Any]) -> list[dict[str, str]]:
     return _segment_message_content_exact(content)
 
 
+def _content_target_visibility(
+    content_ids: torch.Tensor,
+    *,
+    loss_mode: str,
+    special_token_ids: dict[str, int],
+) -> torch.Tensor:
+    content_ids = content_ids.detach().cpu().to(dtype=torch.long)
+    if loss_mode == "all":
+        return torch.ones(content_ids.shape[0], dtype=torch.float32)
+    if loss_mode != "assistant_only":
+        raise ValueError(f"Unsupported loss_mode: {loss_mode!r}")
+    visible = torch.zeros(content_ids.shape[0], dtype=torch.float32)
+    assistant_start_ids = {
+        int(special_token_ids["assistant"]),
+        int(special_token_ids["response"]),
+    }
+    assistant_stop_ids = {
+        int(special_token_ids["eot"]),
+    }
+    active = False
+    for index, token_id in enumerate(content_ids.tolist()):
+        if token_id in assistant_start_ids:
+            active = True
+            visible[index] = 1.0
+            continue
+        if active:
+            visible[index] = 1.0
+            if token_id in assistant_stop_ids:
+                active = False
+    return visible
+
+
 def _tokenize_document_payload_worker(payload: tuple[str, str, str]) -> tuple[str, str, list[int]]:
     kind, source, body = payload
     token_ids: list[int] = []
@@ -399,6 +432,7 @@ def _record_to_document(record: Any, *, source: str) -> SerializedDocument | Non
             kind="code" if _is_probably_code(text, source=source) else "text",
             source=source,
             body=text,
+            loss_mode="all",
         )
     if not isinstance(record, dict):
         return None
@@ -409,7 +443,7 @@ def _record_to_document(record: Any, *, source: str) -> SerializedDocument | Non
         normalized = [message for message in messages if isinstance(message, dict)]
         dialogue_body = _normalize_dialogue_body(normalized)
         if dialogue_body:
-            return SerializedDocument(kind="dialogue", source=record_source, body=dialogue_body)
+            return SerializedDocument(kind="dialogue", source=record_source, body=dialogue_body, loss_mode="assistant_only")
 
     prompt = None
     for key in ("prompt", "instruction", "question", "input"):
@@ -428,6 +462,7 @@ def _record_to_document(record: Any, *, source: str) -> SerializedDocument | Non
             kind="instruction",
             source=record_source,
             body=f"{TEXT_TOKEN}\n{prompt}\n{RESPONSE_TOKEN}\n{TEXT_TOKEN}\n{response}",
+            loss_mode="assistant_only",
         )
 
     segments = record.get("segments")
@@ -439,6 +474,7 @@ def _record_to_document(record: Any, *, source: str) -> SerializedDocument | Non
                 kind=top_kind if top_kind in MODE_TOKEN_BY_KIND else "text",
                 source=record_source,
                 body=serialized_segments,
+                loss_mode="assistant_only" if top_kind in {"dialogue", "instruction"} else "all",
             )
 
     text = _text_from_record_keys(record, ("text", "content", "body", "code", "document"))
@@ -450,7 +486,7 @@ def _record_to_document(record: Any, *, source: str) -> SerializedDocument | Non
         return None
     body = text.strip()
     kind = _record_kind(record, text=body, source=record_source)
-    return SerializedDocument(kind=kind, source=record_source, body=body)
+    return SerializedDocument(kind=kind, source=record_source, body=body, loss_mode="all")
 
 
 def load_serialized_documents(
@@ -479,6 +515,7 @@ def load_serialized_documents(
                     kind="code" if _is_probably_code(text, source=str(path)) else "text",
                     source=str(path),
                     body=text.strip(),
+                    loss_mode="all",
                 )
             )
             seen += 1
@@ -514,13 +551,14 @@ def load_serialized_documents(
         for index, text in enumerate(hf_texts):
             if not text.strip():
                 continue
-            documents.append(SerializedDocument(kind="text", source=f"{hf_dataset}:{index}", body=text.strip()))
+            documents.append(SerializedDocument(kind="text", source=f"{hf_dataset}:{index}", body=text.strip(), loss_mode="all"))
     if not documents:
         documents.append(
             SerializedDocument(
                 kind="text",
                 source="default_text",
                 body="Jakal-Net causal memory training sample document.",
+                loss_mode="all",
             )
         )
     return documents
@@ -558,6 +596,7 @@ def build_special_token_id_map(vocab: object) -> dict[str, int]:
 def make_document_chunks(
     *,
     content_ids: torch.Tensor,
+    content_target_visibility: torch.Tensor | None = None,
     mode_token_id: int,
     seq_len: int,
     bos_token_id: int,
@@ -569,13 +608,19 @@ def make_document_chunks(
         raise ValueError("seq_len must be larger than 2 to fit boundary tokens.")
     payload_capacity = seq_len - 2
     content_ids = content_ids.detach().cpu().to(dtype=torch.long)
+    if content_target_visibility is None:
+        content_target_visibility = torch.ones(content_ids.shape[0], dtype=torch.float32)
+    else:
+        content_target_visibility = content_target_visibility.detach().cpu().to(dtype=torch.float32)
+        if content_target_visibility.shape != content_ids.shape:
+            raise ValueError("content_target_visibility must have the same shape as content_ids.")
     chunks: list[DocumentChunk] = []
     cursor = 0
     first = True
     if content_ids.numel() == 0:
         context = torch.tensor([bos_token_id, mode_token_id], dtype=torch.long)
         target = torch.tensor([mode_token_id, eos_token_id], dtype=torch.long)
-        loss_mask = torch.ones(2, dtype=torch.float32)
+        loss_mask = torch.zeros(2, dtype=torch.float32)
         return (
             DocumentChunk(
                 context=F.pad(context, (0, seq_len - 2), value=pad_token_id),
@@ -588,13 +633,16 @@ def make_document_chunks(
         prefix = [bos_token_id, mode_token_id] if first else [cont_token_id, mode_token_id]
         take = min(payload_capacity, content_ids.numel() - cursor)
         content_slice = content_ids[cursor : cursor + take]
+        content_visibility_slice = content_target_visibility[cursor : cursor + take]
         context = torch.tensor(prefix, dtype=torch.long)
         if content_slice.numel() > 0:
             context = torch.cat((context, content_slice), dim=0)
         target = torch.empty_like(context)
         target[:-1] = context[1:]
         target[-1] = eos_token_id if cursor + take >= content_ids.numel() else cont_token_id
-        loss_mask = torch.ones(context.shape[0], dtype=torch.float32)
+        prefix_visibility = torch.tensor([0.0], dtype=torch.float32)
+        terminal_visibility = torch.tensor([0.0], dtype=torch.float32)
+        loss_mask = torch.cat((prefix_visibility, content_visibility_slice, terminal_visibility), dim=0)
         pad = seq_len - context.shape[0]
         chunks.append(
             DocumentChunk(
@@ -629,10 +677,16 @@ def tokenize_documents(
     chunk_total = 0
     progress_interval = 2_000
 
-    def append_document(kind: str, source: str, content_ids: torch.Tensor, index: int) -> None:
+    def append_document(kind: str, source: str, content_ids: torch.Tensor, *, loss_mode: str, index: int) -> None:
         nonlocal token_total, chunk_total
+        target_visibility = _content_target_visibility(
+            content_ids,
+            loss_mode=loss_mode,
+            special_token_ids=special_token_ids,
+        )
         chunks = make_document_chunks(
             content_ids=content_ids,
+            content_target_visibility=target_visibility,
             mode_token_id=mode_token_id_map[kind],
             seq_len=seq_len,
             bos_token_id=special_token_ids["bos"],
@@ -676,12 +730,13 @@ def tokenize_documents(
                     content_ids = torch.tensor(token_ids, dtype=torch.long)
                 else:
                     content_ids = torch.empty(0, dtype=torch.long)
-                append_document(kind, source, content_ids, index)
+                document = documents[index - 1]
+                append_document(kind, source, content_ids, loss_mode=document.loss_mode, index=index)
         return tokenized_documents
 
     for index, document in enumerate(documents, start=1):
         content_ids = encode_text_in_chunks(vocab, document.body, workers=workers)
-        append_document(document.kind, document.source, content_ids, index)
+        append_document(document.kind, document.source, content_ids, loss_mode=document.loss_mode, index=index)
     return tokenized_documents
 
 
