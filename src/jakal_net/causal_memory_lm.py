@@ -22,7 +22,7 @@ from jakal_net.modules import (
 from jakal_net.propagation import SparsePropagation
 from jakal_net.transition import SparseTransition
 
-_STATE_MASS = 4.0
+_STATE_MASS_PER_NODE = 1.0
 _PARAM_INIT_STD = 0.02
 _LOW_RANK_SCALE_INIT = 0.1
 
@@ -68,7 +68,8 @@ def _layer_with_val_norm(layer: Layer, norm: nn.LayerNorm) -> Layer:
 def _signed_softmax_state(state: Tensor) -> Tensor:
     clean_state = torch.nan_to_num(state)
     magnitude = torch.softmax(clean_state.abs(), dim=-1)
-    return torch.sign(clean_state) * magnitude * _STATE_MASS
+    state_mass = float(state.size(-1)) * _STATE_MASS_PER_NODE
+    return torch.sign(clean_state) * magnitude * state_mass
 
 
 def _signed_abs_softmax_edges(scores: Tensor) -> Tensor:
