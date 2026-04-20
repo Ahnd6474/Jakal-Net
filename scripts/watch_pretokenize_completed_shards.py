@@ -88,7 +88,11 @@ def any_builders_running(shard_root: Path) -> bool:
 def completed_shard_paths(shard_root: Path) -> list[Path]:
     completed: list[Path] = []
     for path in sorted(shard_root.rglob("*.jsonl")):
-        if path.stat().st_size <= 0:
+        try:
+            size = path.stat().st_size
+        except FileNotFoundError:
+            continue
+        if size <= 0:
             continue
         if builder_is_running_for_path(path):
             continue
@@ -221,6 +225,14 @@ def main() -> None:
                     continue
                 if len(running) >= args.parallel_jobs:
                     break
+                try:
+                    shard_size = shard_path.stat().st_size
+                except FileNotFoundError:
+                    continue
+                if shard_size <= 0:
+                    scheduled.add(shard_path)
+                    log(args.log_prefix, f"bundle_skip_empty | shard={shard_path.name}")
+                    continue
                 proc = launch_pretokenize_job(
                     python_exe=python_exe,
                     shard_path=shard_path,
