@@ -28,8 +28,107 @@ from train_progressive_b_lm import (  # noqa: E402
     build_tokenizer,
     generate_next_tokens_with_sampling,
 )
+from train_causal_memory_lm import (  # noqa: E402
+    CODE_TOKEN,
+    MATH_TOKEN,
+    TEXT_TOKEN,
+    TrainingCurriculumStage,
+    _normalize_dialogue_body,
+    apply_training_curriculum,
+    resolve_curriculum_stage,
+)
+from build_segmented_dialogue_corpus import segment_message_content_exact  # noqa: E402
+from jakal_net.causal_memory_lm import CausalHierarchicalMemoryLM  # noqa: E402
 
 class TrainingTests(unittest.TestCase):
+    def test_segment_message_content_exact_marks_code_and_math(self) -> None:
+        content = "Explain this:\n```python\nprint(1)\n```\nThen solve $$x^2 + 1 = 0$$ please."
+
+        segments = segment_message_content_exact(content)
+
+        self.assertEqual([segment["kind"] for segment in segments], ["text", "code", "text", "math", "text"])
+        self.assertIn("```python", segments[1]["text"])
+        self.assertIn("$$x^2 + 1 = 0$$", segments[3]["text"])
+
+    def test_normalize_dialogue_body_inserts_text_segments(self) -> None:
+        body = _normalize_dialogue_body(
+            [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "world"},
+            ]
+        )
+
+        assert body is not None
+        self.assertIn(USER_TOKEN, body)
+        self.assertIn(ASSISTANT_TOKEN, body)
+        self.assertEqual(body.count(TEXT_TOKEN), 2)
+
+    def test_normalize_dialogue_body_uses_explicit_segments(self) -> None:
+        body = _normalize_dialogue_body(
+            [
+                {
+                    "role": "assistant",
+                    "segments": [
+                        {"kind": "text", "text": "Let's derive it."},
+                        {"kind": "math", "text": "$$E = mc^2$$"},
+                        {"kind": "code", "text": "```python\nprint(1)\n```"},
+                    ],
+                }
+            ]
+        )
+
+        assert body is not None
+        self.assertIn(TEXT_TOKEN, body)
+        self.assertIn(MATH_TOKEN, body)
+        self.assertIn(CODE_TOKEN, body)
+
+    def test_curriculum_stage_resolution(self) -> None:
+        stage1 = resolve_curriculum_stage(
+            step=1,
+            total_steps=100,
+            stage1_ratio=0.1,
+            stage2_ratio=0.4,
+            stage2_span=4,
+            stage3_span=8,
+        )
+        stage2 = resolve_curriculum_stage(
+            step=20,
+            total_steps=100,
+            stage1_ratio=0.1,
+            stage2_ratio=0.4,
+            stage2_span=4,
+            stage3_span=8,
+        )
+        stage3 = resolve_curriculum_stage(
+            step=80,
+            total_steps=100,
+            stage1_ratio=0.1,
+            stage2_ratio=0.4,
+            stage2_span=4,
+            stage3_span=8,
+        )
+
+        self.assertEqual(stage1, TrainingCurriculumStage("stage1", 1, True, True, True))
+        self.assertEqual(stage2, TrainingCurriculumStage("stage2", 4, False, True, True))
+        self.assertEqual(stage3, TrainingCurriculumStage("stage3", 8, False, False, False))
+
+    def test_apply_training_curriculum_freezes_memory_paths(self) -> None:
+        model = CausalHierarchicalMemoryLM(vocab_size=64, dim=16, max_seq_len=16, memory_slots=(8, 4))
+
+        apply_training_curriculum(model, TrainingCurriculumStage("stage1", 1, True, True, True))
+
+        self.assertFalse(model.memory_levels[0].init_state.requires_grad)
+        self.assertFalse(next(model.memory_levels[0].write.parameters()).requires_grad)
+        self.assertFalse(next(model.read_projections[0].parameters()).requires_grad)
+        self.assertFalse(model.skip_gates["token_to_1"].requires_grad)
+
+        apply_training_curriculum(model, TrainingCurriculumStage("stage2", 4, False, True, True))
+
+        self.assertTrue(model.memory_levels[0].init_state.requires_grad)
+        self.assertTrue(next(model.memory_levels[0].write.parameters()).requires_grad)
+        self.assertFalse(next(model.memory_levels[0].propagation.parameters()).requires_grad)
+        self.assertFalse(model.skip_gates["token_to_1"].requires_grad)
+
     def test_build_tokenizer_byte_bpe_with_special_tokens(self) -> None:
         text = (
             f"{USER_TOKEN}\nhello\n{ASSISTANT_TOKEN}\nworld\n{EOS_TOKEN}\n"

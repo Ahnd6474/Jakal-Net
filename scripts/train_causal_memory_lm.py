@@ -6,6 +6,7 @@ from contextlib import nullcontext
 import json
 import math
 import random
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,6 +56,7 @@ except ImportError:
 BOS_TOKEN = "<|bos|>"
 TEXT_TOKEN = "<|text|>"
 CODE_TOKEN = "<|code|>"
+MATH_TOKEN = "<|math|>"
 CONT_TOKEN = "<|cont|>"
 DIALOGUE_TOKEN = "<|dialogue|>"
 INSTRUCTION_TOKEN = "<|instruction|>"
@@ -67,6 +69,7 @@ CAUSAL_DOC_SPECIAL_TOKENS = (
     PAD_TOKEN,
     TEXT_TOKEN,
     CODE_TOKEN,
+    MATH_TOKEN,
     CONT_TOKEN,
     DIALOGUE_TOKEN,
     INSTRUCTION_TOKEN,
@@ -79,6 +82,7 @@ CAUSAL_DOC_SPECIAL_TOKENS = (
 MODE_TOKEN_BY_KIND = {
     "text": TEXT_TOKEN,
     "code": CODE_TOKEN,
+    "math": MATH_TOKEN,
     "dialogue": DIALOGUE_TOKEN,
     "instruction": INSTRUCTION_TOKEN,
 }
@@ -122,6 +126,15 @@ class SerializedDocument:
 
 
 @dataclass(frozen=True, slots=True)
+class TrainingCurriculumStage:
+    name: str
+    document_span: int
+    freeze_memory: bool
+    freeze_propagation: bool
+    freeze_skip: bool
+
+
+@dataclass(frozen=True, slots=True)
 class TokenizedDocument:
     kind: str
     source: str
@@ -143,6 +156,116 @@ class DocumentBatch:
     target: torch.Tensor
     loss_mask: torch.Tensor
     reset_mask: torch.Tensor
+
+
+_DISPLAY_MATH_PATTERN = re.compile(r"(?s)\$\$.*?\$\$")
+_BRACKET_MATH_PATTERN = re.compile(r"(?s)\\\[.*?\\\]")
+_INLINE_PAREN_MATH_PATTERN = re.compile(r"(?s)\\\(.*?\\\)")
+_MATH_ENV_PATTERN = re.compile(
+    r"(?s)\\begin\{(?P<env>equation\*?|align\*?|gather\*?|multline\*?)\}.*?\\end\{(?P=env)\}"
+)
+_CODE_FENCE_PATTERN = re.compile(
+    r"(?ms)(?:(?<=\A)|(?<=\n))(?P<fence>`{3,}|~{3,})[^\n]*\n.*?(?:\n(?P=fence)[ \t]*(?=\n|$)|\Z)"
+)
+
+
+def _coerce_text(value: object) -> str | None:
+    if isinstance(value, str):
+        return value
+    return None
+
+
+def _segment_token(kind: str) -> str:
+    if kind not in MODE_TOKEN_BY_KIND:
+        raise ValueError(f"Unsupported segment kind: {kind!r}")
+    return MODE_TOKEN_BY_KIND[kind]
+
+
+def _merge_segment_records(segments: Sequence[dict[str, str]]) -> list[dict[str, str]]:
+    merged: list[dict[str, str]] = []
+    for segment in segments:
+        kind = segment["kind"]
+        text = segment["text"]
+        if not text:
+            continue
+        if merged and merged[-1]["kind"] == kind:
+            merged[-1]["text"] += text
+        else:
+            merged.append({"kind": kind, "text": text})
+    return merged
+
+
+def _segment_message_content_exact(content: str) -> list[dict[str, str]]:
+    segments: list[dict[str, str]] = []
+    cursor = 0
+    patterns = (
+        ("code", _CODE_FENCE_PATTERN),
+        ("math", _DISPLAY_MATH_PATTERN),
+        ("math", _BRACKET_MATH_PATTERN),
+        ("math", _INLINE_PAREN_MATH_PATTERN),
+        ("math", _MATH_ENV_PATTERN),
+    )
+    while cursor < len(content):
+        best_kind: str | None = None
+        best_match: re.Match[str] | None = None
+        for kind, pattern in patterns:
+            match = pattern.search(content, cursor)
+            if match is None:
+                continue
+            if best_match is None or match.start() < best_match.start():
+                best_kind = kind
+                best_match = match
+        if best_match is None:
+            tail = content[cursor:]
+            if tail:
+                segments.append({"kind": "text", "text": tail})
+            break
+        if best_match.start() > cursor:
+            segments.append({"kind": "text", "text": content[cursor : best_match.start()]})
+        assert best_kind is not None
+        segments.append({"kind": best_kind, "text": best_match.group(0)})
+        cursor = best_match.end()
+    return _merge_segment_records(segments)
+
+
+def _normalize_segment_records(segments: Sequence[object]) -> list[dict[str, str]]:
+    normalized: list[dict[str, str]] = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        kind_value = segment.get("kind")
+        text_value = _coerce_text(segment.get("text"))
+        if text_value is None:
+            continue
+        kind = str(kind_value).strip().lower() if isinstance(kind_value, str) else "text"
+        if kind not in MODE_TOKEN_BY_KIND:
+            kind = "text"
+        normalized.append({"kind": kind, "text": text_value})
+    return _merge_segment_records(normalized)
+
+
+def _serialize_segments(segments: Sequence[dict[str, str]]) -> str | None:
+    parts: list[str] = []
+    for segment in segments:
+        text = segment["text"]
+        if not text.strip():
+            continue
+        parts.append(f"{_segment_token(segment['kind'])}\n{text}")
+    if not parts:
+        return None
+    return "\n".join(parts)
+
+
+def _message_segments(message: dict[str, Any]) -> list[dict[str, str]]:
+    segments = message.get("segments")
+    if isinstance(segments, list):
+        normalized = _normalize_segment_records(segments)
+        if normalized:
+            return normalized
+    content = _message_content(message)
+    if not content:
+        return []
+    return _segment_message_content_exact(content)
 
 
 def _tokenize_document_payload_worker(payload: tuple[str, str, str]) -> tuple[str, str, list[int]]:
@@ -229,13 +352,16 @@ def _normalize_dialogue_body(messages: Sequence[dict[str, Any]]) -> str | None:
     parts: list[str] = []
     for message in messages:
         role = _message_role(message)
-        content = _message_content(message)
-        if not content:
+        segments = _message_segments(message)
+        serialized_segments = _serialize_segments(segments)
+        if serialized_segments is None:
             continue
         if role == "user":
-            parts.append(f"{USER_TOKEN}\n{content}\n{EOT_TOKEN}")
+            parts.append(f"{USER_TOKEN}\n{serialized_segments}\n{EOT_TOKEN}")
         elif role == "assistant":
-            parts.append(f"{ASSISTANT_TOKEN}\n{content}\n{EOT_TOKEN}")
+            parts.append(f"{ASSISTANT_TOKEN}\n{serialized_segments}\n{EOT_TOKEN}")
+        elif role in {"system", "developer"}:
+            parts.append(f"{INSTRUCTION_TOKEN}\n{serialized_segments}\n{EOT_TOKEN}")
     if not parts:
         return None
     return "\n".join(parts)
@@ -255,7 +381,7 @@ def _record_kind(record: dict[str, Any], *, text: str, source: str) -> str:
         kind = value.strip().lower()
         if kind in MODE_TOKEN_BY_KIND:
             return kind
-        if kind in {"math", "mixed", "wiki"}:
+        if kind in {"mixed", "wiki"}:
             return "text"
     return "code" if _is_probably_code(text, source=source) else "text"
 
@@ -297,8 +423,19 @@ def _record_to_document(record: Any, *, source: str) -> SerializedDocument | Non
         return SerializedDocument(
             kind="instruction",
             source=record_source,
-            body=f"{prompt}\n{RESPONSE_TOKEN}\n{response}",
+            body=f"{TEXT_TOKEN}\n{prompt}\n{RESPONSE_TOKEN}\n{TEXT_TOKEN}\n{response}",
         )
+
+    segments = record.get("segments")
+    if isinstance(segments, list):
+        serialized_segments = _serialize_segments(_normalize_segment_records(segments))
+        if serialized_segments is not None:
+            top_kind = str(record.get("kind") or "text").strip().lower()
+            return SerializedDocument(
+                kind=top_kind if top_kind in MODE_TOKEN_BY_KIND else "text",
+                source=record_source,
+                body=serialized_segments,
+            )
 
     text = _text_from_record_keys(record, ("text", "content", "body", "code", "document"))
     if text is None:
@@ -403,6 +540,7 @@ def build_special_token_id_map(vocab: object) -> dict[str, int]:
         "pad": vocab.token_id(PAD_TOKEN),
         "text": vocab.token_id(TEXT_TOKEN),
         "code": vocab.token_id(CODE_TOKEN),
+        "math": vocab.token_id(MATH_TOKEN),
         "cont": vocab.token_id(CONT_TOKEN),
         "dialogue": vocab.token_id(DIALOGUE_TOKEN),
         "instruction": vocab.token_id(INSTRUCTION_TOKEN),
@@ -479,6 +617,7 @@ def tokenize_documents(
     mode_token_id_map = {
         "text": special_token_ids["text"],
         "code": special_token_ids["code"],
+        "math": special_token_ids["math"],
         "dialogue": special_token_ids["dialogue"],
         "instruction": special_token_ids["instruction"],
     }
@@ -629,6 +768,78 @@ def compute_masked_loss(logits: torch.Tensor, target: torch.Tensor, loss_mask: t
     mask = loss_mask.reshape(-1).float()
     denom = mask.sum().clamp_min(1.0)
     return (flat_loss * mask).sum() / denom
+
+
+def _set_module_requires_grad(module: torch.nn.Module, enabled: bool) -> None:
+    for parameter in module.parameters():
+        parameter.requires_grad_(enabled)
+
+
+def _set_parameter_collection_requires_grad(parameters: Sequence[torch.nn.Parameter], enabled: bool) -> None:
+    for parameter in parameters:
+        parameter.requires_grad_(enabled)
+
+
+def resolve_curriculum_stage(
+    *,
+    step: int,
+    total_steps: int,
+    stage1_ratio: float,
+    stage2_ratio: float,
+    stage2_span: int,
+    stage3_span: int,
+) -> TrainingCurriculumStage:
+    stage1_end = int(total_steps * stage1_ratio)
+    stage2_end = int(total_steps * stage2_ratio)
+    if stage1_end > 0 and step <= stage1_end:
+        return TrainingCurriculumStage(
+            name="stage1",
+            document_span=1,
+            freeze_memory=True,
+            freeze_propagation=True,
+            freeze_skip=True,
+        )
+    if stage2_end > 0 and step <= stage2_end:
+        return TrainingCurriculumStage(
+            name="stage2",
+            document_span=max(1, stage2_span),
+            freeze_memory=False,
+            freeze_propagation=True,
+            freeze_skip=True,
+        )
+    return TrainingCurriculumStage(
+        name="stage3",
+        document_span=max(1, stage3_span),
+        freeze_memory=False,
+        freeze_propagation=False,
+        freeze_skip=False,
+    )
+
+
+def apply_training_curriculum(model: CausalHierarchicalMemoryLM, stage: TrainingCurriculumStage) -> None:
+    _set_module_requires_grad(model.memory_levels, not stage.freeze_memory)
+    _set_module_requires_grad(model.level_transitions, not stage.freeze_memory)
+    _set_module_requires_grad(model.level_norms, not stage.freeze_memory)
+    _set_module_requires_grad(model.read_projections, not stage.freeze_memory)
+    _set_parameter_collection_requires_grad(model.read_gates, not stage.freeze_memory)
+    model.read_template_val.requires_grad_(not stage.freeze_memory)
+
+    for level in model.memory_levels:
+        _set_module_requires_grad(level.propagation, not stage.freeze_propagation)
+
+    _set_module_requires_grad(model.skip_transitions, not stage.freeze_skip)
+    _set_parameter_collection_requires_grad(tuple(model.skip_gates.values()), not stage.freeze_skip)
+
+
+def override_batch_reset(batch: DocumentBatch, *, reset_all: bool) -> DocumentBatch:
+    if not reset_all:
+        return batch
+    return DocumentBatch(
+        context=batch.context,
+        target=batch.target,
+        loss_mask=batch.loss_mask,
+        reset_mask=torch.ones_like(batch.reset_mask, dtype=torch.bool),
+    )
 
 
 def build_run_name(args: argparse.Namespace) -> str:
@@ -924,6 +1135,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--s-microbatch-size", type=int, default=0)
     parser.add_argument("--prediction-window", type=int, default=64)
     parser.add_argument("--memory-topk", type=int, default=16)
+    parser.add_argument("--scan-checkpoint-chunk-size", type=int, default=0)
+    parser.add_argument("--scan-backend", choices=("auto", "python", "native"), default="auto")
     parser.add_argument(
         "--pairwise-kind",
         choices=("low_rank_bilinear", "diagonal_bilinear", "bilinear", "additive_low_rank"),
@@ -949,6 +1162,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--eval-interval", type=int, default=200)
     parser.add_argument("--eval-documents", type=int, default=8)
+    parser.add_argument("--curriculum-stage1-ratio", type=float, default=0.1)
+    parser.add_argument("--curriculum-stage2-ratio", type=float, default=0.4)
+    parser.add_argument("--curriculum-stage2-span", type=int, default=4)
+    parser.add_argument("--curriculum-stage3-span", type=int, default=8)
 
     parser.add_argument("--output-root", default="artifacts/training_runs")
     parser.add_argument("--run-name")
@@ -984,6 +1201,14 @@ def main() -> None:
         raise ValueError("seq-len must be larger than 2.")
     if args.epochs <= 0.0:
         raise ValueError("epochs must be positive.")
+    if not 0.0 <= args.curriculum_stage1_ratio <= 1.0:
+        raise ValueError("curriculum-stage1-ratio must be between 0 and 1.")
+    if not 0.0 <= args.curriculum_stage2_ratio <= 1.0:
+        raise ValueError("curriculum-stage2-ratio must be between 0 and 1.")
+    if args.curriculum_stage2_ratio < args.curriculum_stage1_ratio:
+        raise ValueError("curriculum-stage2-ratio must be greater than or equal to curriculum-stage1-ratio.")
+    if args.curriculum_stage2_span <= 0 or args.curriculum_stage3_span <= 0:
+        raise ValueError("curriculum-stage spans must be positive.")
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -1087,6 +1312,8 @@ def main() -> None:
         s_microbatch_size=None if args.s_microbatch_size <= 0 else args.s_microbatch_size,
         prediction_window=args.prediction_window,
         memory_topk=args.memory_topk,
+        scan_checkpoint_chunk_size=None if args.scan_checkpoint_chunk_size <= 0 else args.scan_checkpoint_chunk_size,
+        scan_backend=args.scan_backend,
         pairwise_kind=args.pairwise_kind,
         route_kind=args.route_kind,
         pairwise_rank=args.pairwise_rank,
@@ -1096,7 +1323,8 @@ def main() -> None:
     parameter_count = count_parameters(model)
     print(
         f"model=causal_memory_doc | params={parameter_count:,} | dim={args.dim} | seq_len={args.seq_len} | "
-        f"s_window={args.s_window} | s_microbatch_size={args.s_microbatch_size} | memory_slots={args.memory_slots}",
+        f"s_window={args.s_window} | s_microbatch_size={args.s_microbatch_size} | "
+        f"scan_backend={args.scan_backend} | scan_checkpoint_chunk_size={args.scan_checkpoint_chunk_size} | memory_slots={args.memory_slots}",
         flush=True,
     )
 
@@ -1126,6 +1354,7 @@ def main() -> None:
 
     history_rows: list[dict[str, Any]] = []
     train_memory_state: tuple[Any, ...] | None = None
+    active_stage_name: str | None = None
     start_step = 0
     best_val_loss = float("inf")
     if args.resume_checkpoint:
@@ -1146,6 +1375,24 @@ def main() -> None:
     start_time = time.time()
 
     for step in range(start_step + 1, total_steps + 1):
+        stage = resolve_curriculum_stage(
+            step=step,
+            total_steps=total_steps,
+            stage1_ratio=args.curriculum_stage1_ratio,
+            stage2_ratio=args.curriculum_stage2_ratio,
+            stage2_span=args.curriculum_stage2_span,
+            stage3_span=args.curriculum_stage3_span,
+        )
+        if stage.name != active_stage_name:
+            apply_training_curriculum(model, stage)
+            train_memory_state = None
+            active_stage_name = stage.name
+            print(
+                f"curriculum | step={step} | stage={stage.name} | span={stage.document_span} | "
+                f"freeze_memory={stage.freeze_memory} | freeze_propagation={stage.freeze_propagation} | freeze_skip={stage.freeze_skip}",
+                flush=True,
+            )
+
         lr = compute_learning_rate(
             step=step,
             total_steps=total_steps,
@@ -1156,42 +1403,42 @@ def main() -> None:
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
-        batch = batcher.next_batch()
-        if scaler is not None:
-            autocast_dtype = resolve_autocast_dtype(args.precision)
-            with torch.autocast(device_type=device.type, dtype=autocast_dtype):
-                output = model(
-                    batch.context,
-                    memory_state=train_memory_state,
-                    reset_mask=batch.reset_mask,
-                    return_memory_state=True,
-                )
-                assert isinstance(output, MemoryScanOutput)
-                loss = compute_masked_loss(output.logits, batch.target, batch.loss_mask)
-                scaled_loss = loss / args.grad_accum_steps
-            current_memory_state = output.memory_state
-        else:
-            loss, current_memory_state = run_model(
+        current_memory_state = None if stage.freeze_memory else train_memory_state
+        span_losses: list[float] = []
+        loss_is_finite = True
+        for span_index in range(stage.document_span):
+            batch = override_batch_reset(
+                batcher.next_batch(),
+                reset_all=stage.freeze_memory,
+            )
+            loss, next_memory_state = run_model(
                 model,
                 batch,
-                memory_state=train_memory_state,
+                memory_state=current_memory_state,
                 precision=args.precision,
                 grad_enabled=True,
             )
-
-        loss_is_finite = bool(torch.isfinite(loss.detach()).item())
-        if loss_is_finite:
+            loss_is_finite = bool(torch.isfinite(loss.detach()).item())
+            if not loss_is_finite:
+                print(
+                    f"warning | step={step} | span_index={span_index} | non-finite loss; skipping optimizer step",
+                    flush=True,
+                )
+                break
+            span_losses.append(float(loss.item()))
+            scaled_loss = loss / (args.grad_accum_steps * stage.document_span)
             if scaler is not None:
                 scaler.scale(scaled_loss).backward()
             else:
-                (loss / args.grad_accum_steps).backward()
+                scaled_loss.backward()
+            current_memory_state = None if stage.freeze_memory else next_memory_state
 
-            train_memory_state = detach_memory_state(current_memory_state)
+        if loss_is_finite:
+            train_memory_state = None if stage.freeze_memory else detach_memory_state(current_memory_state)
             if not memory_state_is_finite(train_memory_state):
                 print(f"warning | step={step} | non-finite memory state; resetting memory", flush=True)
                 train_memory_state = None
         else:
-            print(f"warning | step={step} | non-finite loss; skipping optimizer step", flush=True)
             optimizer.zero_grad(set_to_none=True)
             train_memory_state = None
 
@@ -1222,17 +1469,19 @@ def main() -> None:
         else:
             grad_norm = float("nan")
 
-        train_loss = float(loss.item())
+        train_loss = float(sum(span_losses) / max(1, len(span_losses)))
         if writer is not None:
             writer.add_scalar("train/loss", train_loss, step)
             writer.add_scalar("train/lr", lr, step)
+            writer.add_scalar("train/document_span", stage.document_span, step)
             if not math.isnan(grad_norm):
                 writer.add_scalar("train/grad_norm", grad_norm, step)
 
         if step == 1 or step % 25 == 0:
             elapsed = time.time() - start_time
             print(
-                f"progress | step={step:5d}/{total_steps} | train_loss={train_loss:.4f} | lr={lr:.6g} | elapsed={elapsed:.1f}s",
+                f"progress | step={step:5d}/{total_steps} | stage={stage.name} | span={stage.document_span} | "
+                f"train_loss={train_loss:.4f} | lr={lr:.6g} | elapsed={elapsed:.1f}s",
                 flush=True,
             )
 
@@ -1299,6 +1548,8 @@ def main() -> None:
 
         row = {
             "step": step,
+            "stage": stage.name,
+            "document_span": stage.document_span,
             "train_loss": train_loss,
             "grad_norm": grad_norm,
             "lr": lr,
