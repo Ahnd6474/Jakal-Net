@@ -26,6 +26,7 @@ from lm_experiment_utils import (
 from train_progressive_b_lm import (
     ASSISTANT_TOKEN,
     ByteBPEVocab,
+    ByteLevelBPETokenizer,
     EOS_TOKEN,
     PAD_TOKEN,
     USER_TOKEN,
@@ -654,6 +655,108 @@ def detach_memory_state(memory_state: Sequence[Any] | None) -> tuple[Any, ...] |
     )
 
 
+def load_decode_vocab(*, tokenizer_label: str, tokenizer_model_path: str | None) -> object | None:
+    if tokenizer_label != "byte_bpe" or tokenizer_model_path is None or ByteLevelBPETokenizer is None:
+        return None
+    vocab_path = Path(tokenizer_model_path)
+    if not vocab_path.exists():
+        return None
+    if vocab_path.name.endswith("-vocab.json"):
+        merges_path = vocab_path.with_name(vocab_path.name.replace("-vocab.json", "-merges.txt"))
+    else:
+        merges_path = vocab_path.with_suffix(".txt")
+    if not merges_path.exists():
+        return None
+    tokenizer = ByteLevelBPETokenizer(str(vocab_path), str(merges_path))
+    return ByteBPEVocab(tokenizer=tokenizer, vocab_path=vocab_path, merges_path=merges_path)
+
+
+def _decode_visible_tokens(vocab: object, token_ids: torch.Tensor, loss_mask: torch.Tensor | None = None) -> str:
+    if not hasattr(vocab, "decode"):
+        return ""
+    ids = token_ids.detach().cpu().to(dtype=torch.long)
+    if loss_mask is not None:
+        visible = int(loss_mask.detach().cpu().sum().item())
+        ids = ids[:visible]
+    return str(vocab.decode(ids.tolist()))
+
+
+@torch.no_grad()
+def log_eval_samples_to_tensorboard(
+    writer: SummaryWriter | None,
+    model: CausalHierarchicalMemoryLM,
+    documents: Sequence[TokenizedDocument],
+    *,
+    vocab: object | None,
+    device: torch.device,
+    precision: str,
+    step: int,
+    max_samples: int = 6,
+) -> None:
+    if writer is None or vocab is None or not documents:
+        return
+    documents_by_kind: dict[str, list[TokenizedDocument]] = {}
+    seen_sources: set[str] = set()
+    for document in documents:
+        if document.source in seen_sources:
+            continue
+        seen_sources.add(document.source)
+        documents_by_kind.setdefault(document.kind, []).append(document)
+    if not documents_by_kind:
+        return
+    ordered_kinds = sorted(documents_by_kind)
+    selected: list[TokenizedDocument] = []
+    while len(selected) < max_samples:
+        added = False
+        for kind in ordered_kinds:
+            bucket = documents_by_kind[kind]
+            if not bucket:
+                continue
+            selected.append(bucket.pop(0))
+            added = True
+            if len(selected) >= max_samples:
+                break
+        if not added:
+            break
+    if not selected:
+        return
+
+    model_was_training = model.training
+    model.eval()
+    autocast_dtype = resolve_autocast_dtype(precision)
+    autocast_supported = (
+        autocast_dtype is not None
+        and (device.type == "cuda" or (device.type == "cpu" and autocast_dtype == torch.bfloat16))
+    )
+    autocast_context = (
+        torch.autocast(device_type=device.type, dtype=autocast_dtype)
+        if autocast_supported
+        else nullcontext()
+    )
+
+    with autocast_context:
+        for index, document in enumerate(selected, start=1):
+            chunk = document.chunks[0]
+            output = model(
+                chunk.context.unsqueeze(0).to(device),
+                reset_mask=torch.tensor([True], device=device, dtype=torch.bool),
+                return_memory_state=False,
+            )
+            assert isinstance(output, torch.Tensor)
+            predicted = output.argmax(dim=-1).squeeze(0).detach().cpu().to(dtype=torch.long)
+            tag = f"sample_{index:02d}_{document.kind}"
+            text = (
+                f"kind: {document.kind}\n"
+                f"source: {document.source}\n\n"
+                f"context:\n{_decode_visible_tokens(vocab, chunk.context, chunk.loss_mask)}\n\n"
+                f"target:\n{_decode_visible_tokens(vocab, chunk.target, chunk.loss_mask)}\n\n"
+                f"prediction:\n{_decode_visible_tokens(vocab, predicted, chunk.loss_mask)}"
+            )
+            writer.add_text(f"eval_samples/{tag}", text, step)
+    if model_was_training:
+        model.train()
+
+
 def run_model(
     model: CausalHierarchicalMemoryLM,
     batch: DocumentBatch,
@@ -938,6 +1041,10 @@ def main() -> None:
             print(f"saved_pretokenized | path={args.pretokenized_path}", flush=True)
 
     train_documents, val_documents = split_train_val_documents(documents, train_fraction=args.train_fraction)
+    decode_vocab = load_decode_vocab(
+        tokenizer_label=tokenizer_label,
+        tokenizer_model_path=tokenizer_model_path,
+    )
     steps_per_epoch = estimate_steps_per_epoch(documents=train_documents, batch_size=args.batch_size)
     total_steps = max(1, int(math.ceil(steps_per_epoch * args.epochs)))
 
@@ -1078,6 +1185,15 @@ def main() -> None:
             if writer is not None:
                 writer.add_scalar("eval/val_loss", val_loss, step)
                 writer.add_scalar("eval/val_ppl", val_ppl, step)
+                log_eval_samples_to_tensorboard(
+                    writer,
+                    model,
+                    val_documents,
+                    vocab=decode_vocab,
+                    device=device,
+                    precision=args.precision,
+                    step=step,
+                )
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 save_checkpoint(
