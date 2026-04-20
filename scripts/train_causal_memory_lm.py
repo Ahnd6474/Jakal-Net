@@ -31,6 +31,7 @@ from train_progressive_b_lm import (
     EOS_TOKEN,
     PAD_TOKEN,
     USER_TOKEN,
+    _encode_byte_bpe_preserving_specials,
     _encode_byte_bpe_text_batch_worker,
     _encode_byte_bpe_text_worker,
     _chat_stream_from_record,
@@ -188,6 +189,7 @@ _CODE_FENCE_PATTERN = re.compile(
 )
 
 
+
 def _coerce_text(value: object) -> str | None:
     if isinstance(value, str):
         return value
@@ -295,30 +297,18 @@ def _content_target_visibility(
     loss_mode: str,
     special_token_ids: dict[str, int],
 ) -> torch.Tensor:
-    content_ids = content_ids.detach().cpu().to(dtype=torch.long)
+    content_ids = content_ids.detach().to(dtype=torch.long)
     if loss_mode == "all":
-        return torch.ones(content_ids.shape[0], dtype=torch.float32)
+        return torch.ones(content_ids.shape[0], dtype=torch.float32, device=content_ids.device)
     if loss_mode != "assistant_only":
         raise ValueError(f"Unsupported loss_mode: {loss_mode!r}")
-    visible = torch.zeros(content_ids.shape[0], dtype=torch.float32)
-    assistant_start_ids = {
-        int(special_token_ids["assistant"]),
-        int(special_token_ids["response"]),
-    }
-    assistant_stop_ids = {
-        int(special_token_ids["eot"]),
-    }
-    active = False
-    for index, token_id in enumerate(content_ids.tolist()):
-        if token_id in assistant_start_ids:
-            active = True
-            visible[index] = 1.0
-            continue
-        if active:
-            visible[index] = 1.0
-            if token_id in assistant_stop_ids:
-                active = False
-    return visible
+    assistant_start_mask = (content_ids == int(special_token_ids["assistant"])) | (
+        content_ids == int(special_token_ids["response"])
+    )
+    assistant_stop_mask = content_ids == int(special_token_ids["eot"])
+    prefix_starts = assistant_start_mask.to(torch.int32).cumsum(dim=0)
+    stops_before = assistant_stop_mask.to(torch.int32).cumsum(dim=0) - assistant_stop_mask.to(torch.int32)
+    return (prefix_starts > stops_before).to(torch.float32)
 
 
 def _tokenize_document_payload_worker(payload: tuple[str, str, str]) -> tuple[str, str, list[int]]:
@@ -826,6 +816,7 @@ def tokenize_documents(
     seq_len: int,
     special_token_ids: dict[str, int],
     workers: int,
+    processing_device: torch.device | str | None = None,
 ) -> list[TokenizedDocument]:
     tokenized_documents: list[TokenizedDocument] = []
     mode_token_id_map = {
@@ -841,8 +832,13 @@ def tokenize_documents(
 
     def append_document(kind: str, source: str, content_ids: torch.Tensor, *, loss_mode: str, index: int) -> None:
         nonlocal token_total, chunk_total
+        visibility_input = (
+            content_ids.to(device=processing_device, dtype=torch.long)
+            if processing_device is not None and content_ids.numel() > 0
+            else content_ids
+        )
         target_visibility = _content_target_visibility(
-            content_ids,
+            visibility_input,
             loss_mode=loss_mode,
             special_token_ids=special_token_ids,
         )
@@ -877,22 +873,27 @@ def tokenize_documents(
 
     if workers > 1 and isinstance(vocab, ByteBPEVocab):
         payload_count = len(documents)
-        payload_batch_size = max(8, min(128, payload_count // max(1, workers * 16) or 32))
+        payload_batch_size = max(32, min(512, payload_count // max(1, workers * 8) or 128))
         payload_batches = [
             [
                 (document.kind, document.source, document.body)
-                for document in documents[index : index + payload_batch_size]
+                for document in documents[batch_start : batch_start + payload_batch_size]
             ]
-            for index in range(0, payload_count, payload_batch_size)
+            for batch_start in range(0, payload_count, payload_batch_size)
         ]
-        chunksize = max(1, min(16, len(payload_batches) // max(1, workers * 4) or 1))
+        total_payload_batches = len(payload_batches)
+        chunksize = max(1, min(32, total_payload_batches // max(1, workers * 2) or 1))
         with ProcessPoolExecutor(
             max_workers=workers,
             initializer=_init_byte_bpe_encode_worker,
             initargs=(str(vocab.vocab_path), str(vocab.merges_path), vocab.special_tokens),
         ) as executor:
             index = 0
-            for encoded_batch in executor.map(_tokenize_document_payload_batch_worker, payload_batches, chunksize=chunksize):
+            for encoded_batch in executor.map(
+                _tokenize_document_payload_batch_worker,
+                payload_batches,
+                chunksize=chunksize,
+            ):
                 for kind, source, token_ids in encoded_batch:
                     index += 1
                     if token_ids:
@@ -900,7 +901,7 @@ def tokenize_documents(
                     else:
                         content_ids = torch.empty(0, dtype=torch.long)
                     document = documents[index - 1]
-                    append_document(kind, source, content_ids, loss_mode=document.loss_mode, index=index)
+                    append_document(document.kind, document.source, content_ids, loss_mode=document.loss_mode, index=index)
         return tokenized_documents
 
     for index, document in enumerate(documents, start=1):
@@ -972,6 +973,40 @@ def load_pretokenized_bundle(path: Path) -> dict[str, Any]:
         "tokenizer_label": bundle.get("tokenizer_label"),
         "tokenizer_model_path": bundle.get("tokenizer_model_path"),
         "corpus_info": bundle.get("corpus_info") or {},
+    }
+
+
+def load_pretokenized_directory(path: Path) -> dict[str, Any]:
+    shard_paths = sorted(candidate for candidate in path.glob("*.pt") if candidate.is_file())
+    if not shard_paths:
+        raise ValueError(f"No pretokenized shard files found in {path}")
+    merged_documents: list[TokenizedDocument] = []
+    tokenizer_label: str | None = None
+    tokenizer_model_path: str | None = None
+    vocab_size: int | None = None
+    shard_summaries: list[dict[str, Any]] = []
+    for shard_path in shard_paths:
+        bundle = load_pretokenized_bundle(shard_path)
+        merged_documents.extend(bundle["documents"])
+        if tokenizer_label is None:
+            tokenizer_label = bundle.get("tokenizer_label")
+            tokenizer_model_path = bundle.get("tokenizer_model_path")
+            vocab_size = int(bundle["vocab_size"])
+        shard_summaries.append(
+            {
+                "path": str(shard_path),
+                "documents": len(bundle["documents"]),
+                "corpus_info": bundle.get("corpus_info") or {},
+            }
+        )
+    if vocab_size is None:
+        raise ValueError(f"Invalid pretokenized shard directory: {path}")
+    return {
+        "documents": merged_documents,
+        "vocab_size": vocab_size,
+        "tokenizer_label": tokenizer_label,
+        "tokenizer_model_path": tokenizer_model_path,
+        "corpus_info": {"shards": shard_summaries, "directory": str(path)},
     }
 
 
@@ -1348,6 +1383,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--subword-num-threads", type=int, default=0)
     parser.add_argument("--pretokenize-workers", type=int, default=8)
     parser.add_argument("--pretokenized-path")
+    parser.add_argument("--pretokenized-dir")
     parser.add_argument("--save-pretokenized", action="store_true")
 
     parser.add_argument("--device", default="auto")
@@ -1449,7 +1485,18 @@ def main() -> None:
     corpus_metadata: dict[str, Any]
     documents: list[TokenizedDocument]
 
-    if args.pretokenized_path and Path(args.pretokenized_path).exists():
+    if args.pretokenized_dir and Path(args.pretokenized_dir).exists():
+        bundle = load_pretokenized_directory(Path(args.pretokenized_dir))
+        documents = list(bundle["documents"])
+        tokenizer_label = str(bundle.get("tokenizer_label") or "unknown")
+        tokenizer_model_path = bundle.get("tokenizer_model_path")
+        vocab_size = int(bundle["vocab_size"])
+        corpus_metadata = dict(bundle.get("corpus_info") or {})
+        print(
+            f"loaded_pretokenized_dir | path={args.pretokenized_dir} | documents={len(documents):,} | tokenizer={tokenizer_label}",
+            flush=True,
+        )
+    elif args.pretokenized_path and Path(args.pretokenized_path).exists():
         bundle = load_pretokenized_bundle(Path(args.pretokenized_path))
         documents = list(bundle["documents"])
         tokenizer_label = str(bundle.get("tokenizer_label") or "unknown")
