@@ -37,7 +37,7 @@ from train_causal_memory_lm import (  # noqa: E402
     apply_training_curriculum,
     resolve_curriculum_stage,
 )
-from build_segmented_dialogue_corpus import segment_message_content_exact  # noqa: E402
+from build_segmented_dialogue_corpus import dialogue_has_mixed_segments, segment_message_content_exact  # noqa: E402
 from jakal_net.causal_memory_lm import CausalHierarchicalMemoryLM  # noqa: E402
 
 class TrainingTests(unittest.TestCase):
@@ -49,6 +49,15 @@ class TrainingTests(unittest.TestCase):
         self.assertEqual([segment["kind"] for segment in segments], ["text", "code", "text", "math", "text"])
         self.assertIn("```python", segments[1]["text"])
         self.assertIn("$$x^2 + 1 = 0$$", segments[3]["text"])
+
+    def test_segment_message_content_exact_marks_inline_dollar_math_and_execute_blocks(self) -> None:
+        content = "Use <execute>print(1)</execute> and solve $x+1=2$."
+
+        segments = segment_message_content_exact(content)
+
+        self.assertEqual([segment["kind"] for segment in segments], ["text", "code", "text", "math", "text"])
+        self.assertEqual(segments[1]["text"], "<execute>print(1)</execute>")
+        self.assertEqual(segments[3]["text"], "$x+1=2$")
 
     def test_normalize_dialogue_body_inserts_text_segments(self) -> None:
         body = _normalize_dialogue_body(
@@ -81,6 +90,22 @@ class TrainingTests(unittest.TestCase):
         self.assertIn(TEXT_TOKEN, body)
         self.assertIn(MATH_TOKEN, body)
         self.assertIn(CODE_TOKEN, body)
+
+    def test_dialogue_has_mixed_segments_requires_text_and_code_or_math(self) -> None:
+        self.assertTrue(
+            dialogue_has_mixed_segments(
+                [
+                    {"role": "assistant", "segments": [{"kind": "text", "text": "Explain"}, {"kind": "code", "text": "```python\nprint(1)\n```"}]}
+                ]
+            )
+        )
+        self.assertFalse(
+            dialogue_has_mixed_segments(
+                [
+                    {"role": "assistant", "segments": [{"kind": "code", "text": "```python\nprint(1)\n```"}]}
+                ]
+            )
+        )
 
     def test_curriculum_stage_resolution(self) -> None:
         stage1 = resolve_curriculum_stage(

@@ -159,11 +159,13 @@ class DocumentBatch:
 
 
 _DISPLAY_MATH_PATTERN = re.compile(r"(?s)\$\$.*?\$\$")
+_INLINE_DOLLAR_MATH_PATTERN = re.compile(r"(?s)(?<!\$)\$(?!\$)(?:\\.|[^$\\\n])+\$(?!\$)")
 _BRACKET_MATH_PATTERN = re.compile(r"(?s)\\\[.*?\\\]")
 _INLINE_PAREN_MATH_PATTERN = re.compile(r"(?s)\\\(.*?\\\)")
 _MATH_ENV_PATTERN = re.compile(
     r"(?s)\\begin\{(?P<env>equation\*?|align\*?|gather\*?|multline\*?)\}.*?\\end\{(?P=env)\}"
 )
+_EXECUTE_BLOCK_PATTERN = re.compile(r"(?s)<execute>.*?</execute>")
 _CODE_FENCE_PATTERN = re.compile(
     r"(?ms)(?:(?<=\A)|(?<=\n))(?P<fence>`{3,}|~{3,})[^\n]*\n.*?(?:\n(?P=fence)[ \t]*(?=\n|$)|\Z)"
 )
@@ -200,7 +202,9 @@ def _segment_message_content_exact(content: str) -> list[dict[str, str]]:
     cursor = 0
     patterns = (
         ("code", _CODE_FENCE_PATTERN),
+        ("code", _EXECUTE_BLOCK_PATTERN),
         ("math", _DISPLAY_MATH_PATTERN),
+        ("math", _INLINE_DOLLAR_MATH_PATTERN),
         ("math", _BRACKET_MATH_PATTERN),
         ("math", _INLINE_PAREN_MATH_PATTERN),
         ("math", _MATH_ENV_PATTERN),
@@ -922,6 +926,14 @@ def _decode_visible_tokens(vocab: object, token_ids: torch.Tensor, loss_mask: to
     return str(vocab.decode(ids.tolist()))
 
 
+def _eval_sample_priority(document: TokenizedDocument) -> tuple[int, str]:
+    if document.source.startswith("mixed_dialogue:"):
+        return (0, document.source)
+    if document.kind == "dialogue":
+        return (1, document.source)
+    return (2, document.source)
+
+
 @torch.no_grad()
 def log_eval_samples_to_tensorboard(
     writer: SummaryWriter | None,
@@ -938,7 +950,7 @@ def log_eval_samples_to_tensorboard(
         return
     seen_sources: set[str] = set()
     selected: list[TokenizedDocument] = []
-    for document in documents:
+    for document in sorted(documents, key=_eval_sample_priority):
         if document.source in seen_sources:
             continue
         seen_sources.add(document.source)

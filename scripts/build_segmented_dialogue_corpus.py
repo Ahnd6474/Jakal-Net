@@ -12,13 +12,27 @@ from lm_experiment_utils import write_json
 
 
 _DISPLAY_MATH_PATTERN = re.compile(r"(?s)\$\$.*?\$\$")
+_INLINE_DOLLAR_MATH_PATTERN = re.compile(r"(?s)(?<!\$)\$(?!\$)(?:\\.|[^$\\\n])+\$(?!\$)")
 _BRACKET_MATH_PATTERN = re.compile(r"(?s)\\\[.*?\\\]")
 _INLINE_PAREN_MATH_PATTERN = re.compile(r"(?s)\\\(.*?\\\)")
 _MATH_ENV_PATTERN = re.compile(
     r"(?s)\\begin\{(?P<env>equation\*?|align\*?|gather\*?|multline\*?)\}.*?\\end\{(?P=env)\}"
 )
+_EXECUTE_BLOCK_PATTERN = re.compile(r"(?s)<execute>.*?</execute>")
 _CODE_FENCE_PATTERN = re.compile(
     r"(?ms)(?:(?<=\A)|(?<=\n))(?P<fence>`{3,}|~{3,})[^\n]*\n.*?(?:\n(?P=fence)[ \t]*(?=\n|$)|\Z)"
+)
+
+DEFAULT_MIXED_DIALOGUE_SOURCES = (
+    "python_code=ajibawa-2023/Python-Code-23k-ShareGPT||train|conversations|from|value",
+    "codeact=theblackcat102/codeact-sharegpt||train|conversations|from|value",
+    "metamath=pbatra/MetaMathQA-ShareGPT||train|conversations|from|value",
+)
+
+DEFAULT_DOCUMENT_SOURCES = (
+    "code=codeparrot/codeparrot-clean||train|content|code",
+    "math=HuggingFaceTB/finemath|finemath-4plus|train|text|math",
+    "wiki=wikimedia/wikipedia|20231101.en|train|text|wiki",
 )
 
 
@@ -142,7 +156,9 @@ def segment_message_content_exact(content: str) -> list[dict[str, str]]:
     cursor = 0
     patterns = (
         ("code", _CODE_FENCE_PATTERN),
+        ("code", _EXECUTE_BLOCK_PATTERN),
         ("math", _DISPLAY_MATH_PATTERN),
+        ("math", _INLINE_DOLLAR_MATH_PATTERN),
         ("math", _BRACKET_MATH_PATTERN),
         ("math", _INLINE_PAREN_MATH_PATTERN),
         ("math", _MATH_ENV_PATTERN),
@@ -189,6 +205,11 @@ def normalize_dialogue_messages(
     return normalized
 
 
+def dialogue_has_mixed_segments(messages: list[dict[str, Any]]) -> bool:
+    kinds = {segment["kind"] for message in messages for segment in message.get("segments", [])}
+    return "text" in kinds and ("code" in kinds or "math" in kinds)
+
+
 def write_document(handle: Any, *, kind: str, source: str, messages: list[dict[str, Any]]) -> None:
     handle.write(
         json.dumps(
@@ -220,6 +241,7 @@ def add_hf_dialogue_source(
     source: DialogueSource,
     streaming: bool,
     max_records: int | None,
+    require_mixed_dialogue: bool,
 ) -> int:
     try:
         from datasets import load_dataset
@@ -234,7 +256,7 @@ def add_hf_dialogue_source(
     )
     written = 0
     for record_index, row in enumerate(dataset, start=1):
-        if max_records is not None and record_index > max_records:
+        if max_records is not None and written >= max_records:
             break
         messages = _nested_get(row, source.messages_key)
         if not isinstance(messages, list):
@@ -246,10 +268,12 @@ def add_hf_dialogue_source(
         )
         if not normalized:
             continue
+        if require_mixed_dialogue and not dialogue_has_mixed_segments(normalized):
+            continue
         write_document(
             output_handle,
             kind="dialogue",
-            source=f"{source.label}:{record_index}",
+            source=f"{'mixed_dialogue' if require_mixed_dialogue else 'dialogue'}:{source.label}:{record_index}",
             messages=normalized,
         )
         written += 1
@@ -276,7 +300,7 @@ def add_hf_document_source(
     )
     written = 0
     for record_index, row in enumerate(dataset, start=1):
-        if max_records is not None and record_index > max_records:
+        if max_records is not None and written >= max_records:
             break
         text = _nested_get(row, source.text_key)
         if not isinstance(text, str) or not text.strip():
@@ -297,10 +321,11 @@ def add_dialogue_jsonl(
     path: Path,
     source_label: str,
     max_records: int | None,
+    require_mixed_dialogue: bool,
 ) -> int:
     written = 0
     for record_index, record in enumerate(iter_jsonl_records(path), start=1):
-        if max_records is not None and record_index > max_records:
+        if max_records is not None and written >= max_records:
             break
         messages = record.get("messages") or record.get("conversations")
         if not isinstance(messages, list):
@@ -312,10 +337,12 @@ def add_dialogue_jsonl(
         )
         if not normalized:
             continue
+        if require_mixed_dialogue and not dialogue_has_mixed_segments(normalized):
+            continue
         write_document(
             output_handle,
             kind="dialogue",
-            source=f"{source_label}:{record_index}",
+            source=f"{'mixed_dialogue' if require_mixed_dialogue else 'dialogue'}:{source_label}:{record_index}",
             messages=normalized,
         )
         written += 1
@@ -328,16 +355,21 @@ def main() -> None:
     parser.add_argument("--dialogue-jsonl", action="append", default=[])
     parser.add_argument("--hf-dialogue-source", action="append", default=[])
     parser.add_argument("--hf-document-source", action="append", default=[])
+    parser.add_argument("--no-default-mixed-dialogue-sources", action="store_true")
+    parser.add_argument("--no-default-document-sources", action="store_true")
     parser.add_argument("--hf-streaming", action="store_true", default=True)
     parser.add_argument("--no-hf-streaming", dest="hf_streaming", action="store_false")
     parser.add_argument("--max-records-per-source", type=int, default=50000)
     parser.add_argument("--skip-failed-sources", action="store_true")
+    parser.add_argument("--allow-non-mixed-dialogue", action="store_true")
     args = parser.parse_args()
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    hf_sources = [parse_dialogue_source(spec) for spec in args.hf_dialogue_source]
-    document_sources = [parse_document_source(spec) for spec in args.hf_document_source]
+    dialogue_specs = ([] if args.no_default_mixed_dialogue_sources else list(DEFAULT_MIXED_DIALOGUE_SOURCES)) + args.hf_dialogue_source
+    document_specs = ([] if args.no_default_document_sources else list(DEFAULT_DOCUMENT_SOURCES)) + args.hf_document_source
+    hf_sources = [parse_dialogue_source(spec) for spec in dialogue_specs]
+    document_sources = [parse_document_source(spec) for spec in document_specs]
     source_counts: dict[str, int] = {}
     started = time.perf_counter()
 
@@ -350,6 +382,7 @@ def main() -> None:
                 path=path,
                 source_label=label,
                 max_records=args.max_records_per_source,
+                require_mixed_dialogue=not args.allow_non_mixed_dialogue,
             )
             source_counts[label] = count
             print(f"source={label} documents={count:,}", flush=True)
@@ -361,6 +394,7 @@ def main() -> None:
                     source=source,
                     streaming=args.hf_streaming,
                     max_records=args.max_records_per_source,
+                    require_mixed_dialogue=not args.allow_non_mixed_dialogue,
                 )
             except Exception as exc:
                 if not args.skip_failed_sources:
@@ -396,6 +430,7 @@ def main() -> None:
         "hf_dialogue_sources": [asdict(source) for source in hf_sources],
         "hf_document_sources": [asdict(source) for source in document_sources],
         "dialogue_jsonl": args.dialogue_jsonl,
+        "require_mixed_dialogue": not args.allow_non_mixed_dialogue,
         "elapsed_seconds": time.perf_counter() - started,
     }
     write_json(output.with_suffix(output.suffix + ".meta.json"), meta)
