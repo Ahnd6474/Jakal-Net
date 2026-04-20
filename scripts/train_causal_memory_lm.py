@@ -1472,6 +1472,7 @@ def main() -> None:
 
         current_memory_state = None if stage.freeze_memory else train_memory_state
         span_losses: list[float] = []
+        span_loss_tensors: list[torch.Tensor] = []
         loss_is_finite = True
         for span_index in range(stage.document_span):
             batch = override_batch_reset(
@@ -1493,14 +1494,16 @@ def main() -> None:
                 )
                 break
             span_losses.append(float(loss.item()))
-            scaled_loss = loss / (args.grad_accum_steps * stage.document_span)
-            if scaler is not None:
-                scaler.scale(scaled_loss).backward()
-            else:
-                scaled_loss.backward()
+            span_loss_tensors.append(loss)
             current_memory_state = None if stage.freeze_memory else next_memory_state
 
-        if loss_is_finite:
+        if loss_is_finite and span_loss_tensors:
+            total_span_loss = sum(span_loss_tensors) / (args.grad_accum_steps * len(span_loss_tensors))
+            if scaler is not None:
+                scaler.scale(total_span_loss).backward()
+            else:
+                total_span_loss.backward()
+            del total_span_loss
             train_memory_state = None if stage.freeze_memory else detach_memory_state(current_memory_state)
             if not memory_state_is_finite(train_memory_state):
                 print(f"warning | step={step} | non-finite memory state; resetting memory", flush=True)
