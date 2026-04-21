@@ -2322,6 +2322,33 @@ def _decode_visible_tokens(
     return str(vocab.decode(ids.tolist()))
 
 
+def _format_visible_text(
+    vocab: object,
+    token_ids: torch.Tensor,
+    loss_mask: torch.Tensor | None = None,
+    *,
+    ignore_token_ids: set[int] | None = None,
+    empty_label: str,
+) -> str:
+    decoded = _decode_visible_tokens(
+        vocab,
+        token_ids,
+        loss_mask,
+        ignore_token_ids=ignore_token_ids,
+    )
+    if decoded.strip():
+        return decoded
+    ids = token_ids.detach().cpu().to(dtype=torch.long)
+    if loss_mask is not None:
+        ids = ids[loss_mask.detach().cpu() > 0]
+    if ignore_token_ids:
+        ids = torch.tensor(
+            [int(token_id) for token_id in ids.tolist() if int(token_id) not in ignore_token_ids],
+            dtype=torch.long,
+        )
+    return f"[{empty_label}] ids={ids[:32].tolist()}"
+
+
 def _format_prediction_text(
     vocab: object,
     token_ids: torch.Tensor,
@@ -2359,14 +2386,10 @@ def log_eval_samples_to_tensorboard(
     device: torch.device,
     precision: str,
     step: int,
-    max_samples: int = 6,
+    max_samples: int = 1,
 ) -> None:
     if writer is None or vocab is None or not documents:
         return
-    selected = sample_documents_uniform_by_bucket(documents, sample_count=max_samples)
-    if not selected:
-        return
-
     model_was_training = model.training
     model.eval()
     autocast_dtype = resolve_autocast_dtype(precision)
@@ -2382,8 +2405,9 @@ def log_eval_samples_to_tensorboard(
 
     with autocast_context:
         sample_sections: list[str] = []
-        for index, document in enumerate(selected, start=1):
+        for index, document in enumerate(documents[:max_samples], start=1):
             chunk = document.chunks[0]
+            ignored_token_ids = set()
             output = model(
                 chunk.context.unsqueeze(0).to(device),
                 reset_mask=torch.tensor([True], device=device, dtype=torch.bool),
@@ -2395,9 +2419,9 @@ def log_eval_samples_to_tensorboard(
                 f"## sample {index:02d}\n\n"
                 f"kind: {document.kind}\n\n"
                 f"source: {document.source}\n\n"
-                f"### context\n{_decode_visible_tokens(vocab, chunk.context, None)}\n\n"
-                f"### target\n{_decode_visible_tokens(vocab, chunk.target, chunk.loss_mask)}\n\n"
-                f"### prediction\n{_decode_visible_tokens(vocab, predicted, chunk.loss_mask)}"
+                f"### context\n{_format_visible_text(vocab, chunk.context, None, ignore_token_ids=ignored_token_ids, empty_label='no visible context')}\n\n"
+                f"### target\n{_format_visible_text(vocab, chunk.target, chunk.loss_mask, ignore_token_ids=ignored_token_ids, empty_label='no visible target')}\n\n"
+                f"### prediction\n{_format_prediction_text(vocab, predicted, chunk.loss_mask, ignore_token_ids=ignored_token_ids)}"
             )
         writer.add_text("eval_samples/mixed_corpus", "\n\n---\n\n".join(sample_sections), step)
     if model_was_training:
@@ -2415,12 +2439,9 @@ def log_eval_samples_to_tensorboard_flat(
     device: torch.device,
     precision: str,
     step: int,
-    max_samples: int = 6,
+    max_samples: int = 1,
 ) -> None:
     if writer is None or vocab is None or not documents:
-        return
-    selected = sample_flat_documents_for_logging(collection, documents, sample_count=max_samples)
-    if not selected:
         return
 
     model_was_training = model.training
@@ -2438,7 +2459,7 @@ def log_eval_samples_to_tensorboard_flat(
 
     with autocast_context:
         sample_sections: list[str] = []
-        for index, reference in enumerate(selected, start=1):
+        for index, reference in enumerate(documents[:max_samples], start=1):
             shard = collection.get_shard(reference.shard_index)
             chunk_start, _ = shard.document_chunk_range(reference.document_index)
             context, target, loss_mask, _ = shard.build_chunk_tensors(
@@ -2463,8 +2484,8 @@ def log_eval_samples_to_tensorboard_flat(
                 f"## sample {index:02d}\n\n"
                 f"kind: {shard.kind[reference.document_index]}\n\n"
                 f"source: {shard.source[reference.document_index]}\n\n"
-                f"### context\n{_decode_visible_tokens(vocab, context, None)}\n\n"
-                f"### target\n{_decode_visible_tokens(vocab, target, loss_mask)}\n\n"
+                f"### context\n{_format_visible_text(vocab, context, None, ignore_token_ids=ignored_token_ids, empty_label='no visible context')}\n\n"
+                f"### target\n{_format_visible_text(vocab, target, loss_mask, ignore_token_ids=ignored_token_ids, empty_label='no visible target')}\n\n"
                 f"### prediction\n{_format_prediction_text(vocab, predicted, loss_mask, ignore_token_ids=ignored_token_ids)}"
             )
         writer.add_text("eval_samples/mixed_corpus", "\n\n---\n\n".join(sample_sections), step)
@@ -2530,10 +2551,9 @@ def estimate_eval_loss(
         raise ValueError("documents must not be empty.")
     model_was_training = model.training
     model.eval()
-    sampled_documents = sample_documents_uniform_by_bucket(documents, sample_count=min(eval_documents, len(documents)))
     total_loss = 0.0
     total_weight = 0.0
-    for document in sampled_documents:
+    for document in documents[: min(eval_documents, len(documents))]:
         memory_state: tuple[Any, ...] | None = None
         for chunk_index, chunk in enumerate(document.chunks):
             batch = DocumentBatch(
@@ -2572,14 +2592,9 @@ def estimate_eval_loss_flat(
         raise ValueError("documents must not be empty.")
     model_was_training = model.training
     model.eval()
-    sampled_documents = sample_flat_documents_uniform_by_bucket(
-        collection,
-        documents,
-        sample_count=min(eval_documents, len(documents)),
-    )
     total_loss = 0.0
     total_weight = 0.0
-    for reference in sampled_documents:
+    for reference in documents[: min(eval_documents, len(documents))]:
         shard = collection.get_shard(reference.shard_index)
         chunk_start, chunk_end = shard.document_chunk_range(reference.document_index)
         memory_state: tuple[Any, ...] | None = None
@@ -2791,6 +2806,26 @@ def summarize_flat_documents(
         "chunks": chunk_total,
         "tokens": token_total,
     }
+
+
+def serialize_flat_document_refs(documents: Sequence[FlatDocumentRef]) -> list[dict[str, int]]:
+    return [
+        {
+            "shard_index": int(reference.shard_index),
+            "document_index": int(reference.document_index),
+        }
+        for reference in documents
+    ]
+
+
+def serialize_tokenized_document_refs(documents: Sequence[TokenizedDocument]) -> list[dict[str, str]]:
+    return [
+        {
+            "kind": document.kind,
+            "source": document.source,
+        }
+        for document in documents
+    ]
 
 
 def configure_native_runtime_flags(args: argparse.Namespace) -> None:
@@ -3106,6 +3141,16 @@ def main() -> None:
             stage2_batch_size=stage2_batch_size,
             stage3_batch_size=stage3_batch_size,
         )
+        fixed_eval_documents_flat = sample_flat_documents_uniform_by_bucket(
+            flat_collection,
+            val_documents_flat,
+            sample_count=min(args.eval_documents, len(val_documents_flat)),
+        )
+        fixed_eval_sample_documents_flat = sample_flat_documents_for_logging(
+            flat_collection,
+            val_documents_flat,
+            sample_count=1,
+        )
     else:
         assert documents is not None
         train_documents, val_documents = split_train_val_documents(documents, train_fraction=args.train_fraction)
@@ -3118,6 +3163,14 @@ def main() -> None:
             stage1_batch_size=stage1_batch_size,
             stage2_batch_size=stage2_batch_size,
             stage3_batch_size=stage3_batch_size,
+        )
+        fixed_eval_documents = sample_documents_uniform_by_bucket(
+            val_documents,
+            sample_count=min(args.eval_documents, len(val_documents)),
+        )
+        fixed_eval_sample_documents = sample_documents_uniform_by_bucket(
+            val_documents,
+            sample_count=1,
         )
     decode_vocab = load_decode_vocab(
         tokenizer_label=tokenizer_label,
@@ -3211,6 +3264,16 @@ def main() -> None:
             "parameter_count": parameter_count,
             "rnn_aux_parameter_count": rnn_aux_parameter_count,
             "corpus_metadata": corpus_metadata,
+            "fixed_eval_documents": (
+                serialize_flat_document_refs(fixed_eval_documents_flat)
+                if flat_collection is not None
+                else serialize_tokenized_document_refs(fixed_eval_documents)
+            ),
+            "fixed_eval_sample_documents": (
+                serialize_flat_document_refs(fixed_eval_sample_documents_flat)
+                if flat_collection is not None
+                else serialize_tokenized_document_refs(fixed_eval_sample_documents)
+            ),
         },
     )
 
@@ -3463,16 +3526,16 @@ def main() -> None:
                 val_loss = estimate_eval_loss_flat(
                     model,
                     flat_collection,
-                    val_documents_flat,
-                    eval_documents=args.eval_documents,
+                    fixed_eval_documents_flat,
+                    eval_documents=len(fixed_eval_documents_flat),
                     device=device,
                     precision=args.precision,
                 )
             else:
                 val_loss = estimate_eval_loss(
                     model,
-                    val_documents,
-                    eval_documents=args.eval_documents,
+                    fixed_eval_documents,
+                    eval_documents=len(fixed_eval_documents),
                     device=device,
                     precision=args.precision,
                 )
@@ -3489,21 +3552,23 @@ def main() -> None:
                         writer,
                         model,
                         flat_collection,
-                        val_documents_flat,
+                        fixed_eval_sample_documents_flat,
                         vocab=decode_vocab,
                         device=device,
                         precision=args.precision,
                         step=step,
+                        max_samples=1,
                     )
                 else:
                     log_eval_samples_to_tensorboard(
                         writer,
                         model,
-                        val_documents,
+                        fixed_eval_sample_documents,
                         vocab=decode_vocab,
                         device=device,
                         precision=args.precision,
                         step=step,
+                        max_samples=1,
                     )
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
