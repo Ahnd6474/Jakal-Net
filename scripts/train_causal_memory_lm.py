@@ -618,6 +618,40 @@ def sample_flat_documents_uniform_by_bucket(
     return selected[:sample_count]
 
 
+def sample_flat_documents_for_logging(
+    collection: FlatPretokenizedDirectory,
+    documents: Sequence[FlatDocumentRef],
+    *,
+    sample_count: int,
+) -> list[FlatDocumentRef]:
+    if sample_count <= 0 or not documents:
+        return []
+    mixed_dialogue = [
+        reference
+        for reference in documents
+        if collection.shards[reference.shard_index].source[reference.document_index].startswith("mixed_dialogue:")
+    ]
+    selected: list[FlatDocumentRef] = []
+    if mixed_dialogue:
+        selected.extend(random.sample(mixed_dialogue, k=min(sample_count, len(mixed_dialogue))))
+    if len(selected) >= sample_count:
+        return selected[:sample_count]
+    selected_keys = {(reference.shard_index, reference.document_index) for reference in selected}
+    for reference in sample_flat_documents_uniform_by_bucket(
+        collection,
+        documents,
+        sample_count=max(sample_count * 2, sample_count),
+    ):
+        key = (reference.shard_index, reference.document_index)
+        if key in selected_keys:
+            continue
+        selected.append(reference)
+        selected_keys.add(key)
+        if len(selected) >= sample_count:
+            break
+    return selected[:sample_count]
+
+
 class DocumentChunkBatcher:
     def __init__(
         self,
@@ -2012,14 +2046,44 @@ def load_decode_vocab(*, tokenizer_label: str, tokenizer_model_path: str | None)
     return ByteBPEVocab(tokenizer=tokenizer, vocab_path=vocab_path, merges_path=merges_path)
 
 
-def _decode_visible_tokens(vocab: object, token_ids: torch.Tensor, loss_mask: torch.Tensor | None = None) -> str:
+def _decode_visible_tokens(
+    vocab: object,
+    token_ids: torch.Tensor,
+    loss_mask: torch.Tensor | None = None,
+    *,
+    ignore_token_ids: set[int] | None = None,
+) -> str:
     if not hasattr(vocab, "decode"):
         return ""
     ids = token_ids.detach().cpu().to(dtype=torch.long)
     if loss_mask is not None:
         mask = loss_mask.detach().cpu() > 0
         ids = ids[mask]
+    if ignore_token_ids:
+        ids = torch.tensor(
+            [int(token_id) for token_id in ids.tolist() if int(token_id) not in ignore_token_ids],
+            dtype=torch.long,
+        )
     return str(vocab.decode(ids.tolist()))
+
+
+def _format_prediction_text(
+    vocab: object,
+    token_ids: torch.Tensor,
+    loss_mask: torch.Tensor,
+    *,
+    ignore_token_ids: set[int],
+) -> str:
+    decoded = _decode_visible_tokens(
+        vocab,
+        token_ids,
+        loss_mask,
+        ignore_token_ids=ignore_token_ids,
+    )
+    if decoded.strip():
+        return decoded
+    masked_ids = token_ids.detach().cpu().to(dtype=torch.long)[loss_mask.detach().cpu() > 0]
+    return f"[no visible decoded text] ids={masked_ids[:32].tolist()}"
 
 
 def _eval_sample_priority(document: TokenizedDocument) -> tuple[int, str]:
@@ -2100,7 +2164,7 @@ def log_eval_samples_to_tensorboard_flat(
 ) -> None:
     if writer is None or vocab is None or not documents:
         return
-    selected = sample_flat_documents_uniform_by_bucket(collection, documents, sample_count=max_samples)
+    selected = sample_flat_documents_for_logging(collection, documents, sample_count=max_samples)
     if not selected:
         return
 
@@ -2127,6 +2191,12 @@ def log_eval_samples_to_tensorboard_flat(
                 document_index=reference.document_index,
                 is_last_chunk=shard.chunk_count(reference.document_index) == 1,
             )
+            ignored_token_ids = {
+                int(shard.pad_token_id),
+                int(shard.eos_token_id),
+                int(shard.cont_token_id),
+                *[int(token_id) for token_id in shard.special_token_ids.values()],
+            }
             output = model(
                 context.unsqueeze(0).to(device),
                 reset_mask=torch.tensor([True], device=device, dtype=torch.bool),
@@ -2140,7 +2210,7 @@ def log_eval_samples_to_tensorboard_flat(
                 f"source: {shard.source[reference.document_index]}\n\n"
                 f"### context\n{_decode_visible_tokens(vocab, context, None)}\n\n"
                 f"### target\n{_decode_visible_tokens(vocab, target, loss_mask)}\n\n"
-                f"### prediction\n{_decode_visible_tokens(vocab, predicted, loss_mask)}"
+                f"### prediction\n{_format_prediction_text(vocab, predicted, loss_mask, ignore_token_ids=ignored_token_ids)}"
             )
         writer.add_text("eval_samples/mixed_corpus", "\n\n---\n\n".join(sample_sections), step)
     if model_was_training:
