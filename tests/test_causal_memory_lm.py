@@ -16,7 +16,8 @@ from train_causal_memory_lm import (  # noqa: E402
     save_pretokenized_bundle,
 )
 
-from jakal_net.causal_memory_lm import CausalHierarchicalMemoryLM, MemoryScanOutput  # noqa: E402
+from jakal_net.causal_memory_lm import CausalHierarchicalMemoryLM, MemoryScanOutput, ModelRecurrentState  # noqa: E402
+from jakal_net.latent_graph import KModule  # noqa: E402
 
 
 class CausalMemoryLMTests(unittest.TestCase):
@@ -142,6 +143,91 @@ class CausalMemoryLMTests(unittest.TestCase):
         logits = model(token_ids)
 
         self.assertTrue(torch.isfinite(logits).all().item())
+
+    def test_constructor_accepts_scan_backend_compatibility_args(self) -> None:
+        model = CausalHierarchicalMemoryLM(
+            vocab_size=64,
+            dim=16,
+            max_seq_len=16,
+            s_layers=1,
+            memory_slots=(8, 4, 2),
+            prediction_layers=1,
+            memory_topk=2,
+            pairwise_rank=8,
+            route_rank=8,
+            scan_backend="native",
+            scan_checkpoint_chunk_size=32,
+        )
+
+        self.assertEqual(model.scan_backend, "native")
+        self.assertEqual(model.scan_checkpoint_chunk_size, 32)
+
+    def test_forward_supports_optional_knowledge_module(self) -> None:
+        torch.manual_seed(11)
+        knowledge_module = KModule(
+            dim=8,
+            num_nodes=10,
+            route_rank=4,
+            pairwise_rank=4,
+            route_topk=4,
+            propagation_topk=3,
+            implementation="reference",
+        )
+        model = CausalHierarchicalMemoryLM(
+            vocab_size=32,
+            dim=8,
+            max_seq_len=12,
+            s_layers=1,
+            memory_slots=(6, 4, 2),
+            prediction_layers=1,
+            s_window=12,
+            prediction_window=4,
+            memory_topk=2,
+            pairwise_rank=4,
+            route_rank=4,
+            knowledge_module=knowledge_module,
+        )
+        token_ids = torch.randint(0, 32, (2, 5))
+
+        output = model(token_ids, return_memory_state=True, return_layers=True)
+
+        self.assertIsInstance(output, MemoryScanOutput)
+        self.assertEqual(output.logits.shape, (2, 5, 32))
+        self.assertIsNotNone(output.knowledge_state)
+        assert output.knowledge_state is not None
+        self.assertEqual(output.knowledge_state.val.shape, (2, 10, 8))
+        recurrent_state = output.recurrent_state
+        self.assertIsInstance(recurrent_state, ModelRecurrentState)
+        self.assertEqual(recurrent_state.memory_state[0].val.shape, (2, 6, 8))
+        assert recurrent_state.knowledge_state is not None
+        self.assertEqual(recurrent_state.knowledge_state.val.shape, (2, 10, 8))
+
+    def test_model_can_build_internal_knowledge_module(self) -> None:
+        torch.manual_seed(12)
+        model = CausalHierarchicalMemoryLM(
+            vocab_size=32,
+            dim=8,
+            max_seq_len=12,
+            s_layers=1,
+            memory_slots=(6, 4, 2),
+            prediction_layers=1,
+            s_window=12,
+            prediction_window=4,
+            memory_topk=2,
+            pairwise_rank=4,
+            route_rank=4,
+            knowledge_nodes=9,
+            knowledge_route_topk=3,
+            knowledge_propagation_topk=3,
+            knowledge_propagation_layers=2,
+        )
+        token_ids = torch.randint(0, 32, (2, 5))
+
+        output = model(token_ids, return_memory_state=True)
+
+        self.assertIsNotNone(model.knowledge_module)
+        self.assertIsInstance(output, MemoryScanOutput)
+        self.assertIsNotNone(output.knowledge_state)
 
     def test_document_chunks_insert_continuation_prefix(self) -> None:
         chunks = make_document_chunks(

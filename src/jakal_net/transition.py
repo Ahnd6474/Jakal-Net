@@ -28,7 +28,7 @@ from jakal_net.kernel_common import (
     supports_pairwise_route_kernel,
     supports_route_kernel,
 )
-from jakal_net.kernels import transition_dense_kernel, transition_topk_kernel
+from jakal_net.kernels import signed_entmax15, transition_dense_kernel, transition_topk_kernel
 from jakal_net.native_backend import (
     native_supports,
     native_supports_device,
@@ -54,6 +54,15 @@ def signed_abs_softmax(
         magnitudes = magnitudes.masked_fill(~bool_mask, -torch.inf)
     routes = signs * torch.softmax(magnitudes, dim=dim)
     return torch.nan_to_num(routes)
+
+
+def signed_entmax15_routes(
+    logits: Tensor,
+    *,
+    dim: int = -1,
+    mask: Tensor | None = None,
+) -> Tensor:
+    return signed_entmax15(logits, dim=dim, mask=mask)
 
 
 def _route_uses_pairwise_inputs(route_fn: object) -> bool:

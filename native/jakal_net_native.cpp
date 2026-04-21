@@ -8,6 +8,9 @@
 #include <vector>
 
 #include <torch/extension.h>
+#include <torch/library.h>
+#include <torch/csrc/autograd/autograd.h>
+#include <c10/core/GradMode.h>
 
 #if __has_include(<torch/cuda.h>)
 #include <torch/cuda.h>
@@ -82,6 +85,14 @@ bool supports_cuda_runtime() {
 #endif
 }
 
+bool experimental_cuda_scan_fastpath_enabled() {
+  if (const char* raw = std::getenv("JAKAL_NET_ENABLE_EXPERIMENTAL_CUDA_SCAN_FASTPATH")) {
+    return std::string(raw) == "1" || std::string(raw) == "true" ||
+           std::string(raw) == "TRUE" || std::string(raw) == "yes";
+  }
+  return false;
+}
+
 std::tuple<torch::Tensor, torch::Tensor> query_topk_reduce_cuda_wrapper(
     const torch::Tensor& edges,
     const torch::Tensor& indices,
@@ -116,7 +127,8 @@ low_rank_pairwise_topk_forward_cuda_wrapper(
     const torch::Tensor& weighted_projected_state,
     const torch::Tensor& weighted_projected_val,
     int64_t topk,
-    bool signed_abs_softmax) {
+    double score_bias,
+    int64_t compress_kind) {
 #ifdef WITH_CUDA
   return jakal_net_low_rank_pairwise_topk_forward_cuda(
       weighted_projected_source,
@@ -124,7 +136,8 @@ low_rank_pairwise_topk_forward_cuda_wrapper(
       weighted_projected_state,
       weighted_projected_val,
       topk,
-      signed_abs_softmax);
+      score_bias,
+      compress_kind);
 #else
   throw std::runtime_error(
       "low_rank_pairwise_topk_forward_cuda requires a CUDA-enabled build.");
@@ -138,7 +151,8 @@ low_rank_propagation_topk_forward_cuda_wrapper(
     const torch::Tensor& projected_state,
     const torch::Tensor& projected_val,
     int64_t topk,
-    double score_bias) {
+    double score_bias,
+    int64_t compress_kind) {
 #ifdef WITH_CUDA
   return jakal_net_low_rank_propagation_topk_forward_cuda(
       weighted_projected_source,
@@ -146,7 +160,8 @@ low_rank_propagation_topk_forward_cuda_wrapper(
       projected_state,
       projected_val,
       topk,
-      score_bias);
+      score_bias,
+      compress_kind);
 #else
   throw std::runtime_error(
       "low_rank_propagation_topk_forward_cuda requires a CUDA-enabled build.");
@@ -172,6 +187,28 @@ low_rank_propagation_window_forward_cuda_wrapper(
 #else
   throw std::runtime_error(
       "low_rank_propagation_window_forward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor>
+low_rank_propagation_window_entmax15_forward_cuda_wrapper(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    int64_t window,
+    double score_bias) {
+#ifdef WITH_CUDA
+  return jakal_net_low_rank_propagation_window_entmax15_forward_cuda(
+      weighted_projected_source,
+      projected_target,
+      projected_state,
+      projected_val,
+      window,
+      score_bias);
+#else
+  throw std::runtime_error(
+      "low_rank_propagation_window_entmax15_forward_cuda requires a CUDA-enabled build.");
 #endif
 }
 
@@ -281,9 +318,16 @@ void require_query_source_shapes(
 }
 
 void require_known_edge_compress(const std::string& edge_compress_name) {
-  if (edge_compress_name != "softsign") {
+  if (edge_compress_name != "softsign" && edge_compress_name != "signed_entmax15") {
     throw std::runtime_error(
-        "Only edge_compress_name='softsign' is supported by the CPU native backend.");
+        "Only edge_compress_name in {'softsign', 'signed_entmax15'} is supported by the CPU native backend.");
+  }
+}
+
+void require_known_route_compress(const std::string& route_compress_name) {
+  if (route_compress_name != "softmax" && route_compress_name != "signed_entmax15") {
+    throw std::runtime_error(
+        "Only route_compress_name in {'softmax', 'signed_entmax15'} is supported by the CPU native backend.");
   }
 }
 
@@ -555,6 +599,1860 @@ std::tuple<torch::Tensor, torch::Tensor> gather_by_indices(
   return {gathered_state, gathered_val};
 }
 
+struct NativeLayerState {
+  torch::Tensor state;
+  torch::Tensor val;
+};
+
+c10::optional<torch::Tensor> packed_optional_tensor(const torch::Tensor& tensor) {
+  if (!tensor.defined() || tensor.numel() == 0) {
+    return c10::nullopt;
+  }
+  return tensor;
+}
+
+torch::Tensor cast_tensor_like(const torch::Tensor& tensor, const torch::Tensor& reference) {
+  if (tensor.scalar_type() == reference.scalar_type()) {
+    return tensor;
+  }
+  return tensor.to(reference.scalar_type());
+}
+
+c10::optional<torch::Tensor> cast_optional_like(
+    const c10::optional<torch::Tensor>& tensor,
+    const torch::Tensor& reference) {
+  if (!tensor.has_value()) {
+    return c10::nullopt;
+  }
+  return cast_tensor_like(tensor.value(), reference);
+}
+
+c10::optional<torch::Tensor> cast_packed_optional_like(
+    const torch::Tensor& tensor,
+    const torch::Tensor& reference) {
+  auto optional = packed_optional_tensor(tensor);
+  if (!optional.has_value()) {
+    return c10::nullopt;
+  }
+  return cast_tensor_like(optional.value(), reference);
+}
+
+torch::Tensor linear2d(
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    const c10::optional<torch::Tensor>& bias) {
+  auto output = torch::matmul(input, cast_tensor_like(weight, input).transpose(0, 1));
+  if (bias.has_value()) {
+    output = output + cast_tensor_like(bias.value(), input);
+  }
+  return output;
+}
+
+torch::Tensor layer_norm_last_dim(
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    const c10::optional<torch::Tensor>& bias) {
+  return torch::layer_norm(
+      input,
+      {input.size(-1)},
+      cast_tensor_like(weight, input),
+      cast_optional_like(bias, input),
+      1e-5,
+      false);
+}
+
+torch::Tensor signed_softmax_state(const torch::Tensor& state) {
+  auto clean_state = torch::nan_to_num(state);
+  auto magnitude = torch::softmax(clean_state.abs(), -1);
+  const auto state_mass = static_cast<double>(state.size(-1));
+  return torch::sign(clean_state) * magnitude * state_mass;
+}
+
+torch::Tensor signed_abs_softmax_scores(const torch::Tensor& scores) {
+  auto clean_scores = torch::nan_to_num(scores);
+  return torch::nan_to_num(torch::sign(clean_scores) * torch::softmax(clean_scores.abs(), -1));
+}
+
+torch::Tensor entmax15_scores(
+    const torch::Tensor& scores,
+    const c10::optional<torch::Tensor>& mask = c10::nullopt) {
+  auto clean_scores = torch::nan_to_num(scores);
+  if (mask.has_value()) {
+    auto bool_mask = mask.value().to(torch::kBool);
+    clean_scores = clean_scores.masked_fill(~bool_mask, -1e4);
+  }
+  auto shifted = clean_scores - std::get<0>(clean_scores.max(-1, true));
+  shifted = shifted / 2;
+  auto sorted = std::get<0>(shifted.sort(-1, true));
+  auto cumulative = sorted.cumsum(-1);
+  auto cumulative_sq = (sorted * sorted).cumsum(-1);
+  auto rho = torch::arange(
+      1,
+      sorted.size(-1) + 1,
+      sorted.options().dtype(sorted.scalar_type()));
+  std::vector<int64_t> rho_shape(sorted.dim(), 1);
+  rho_shape.back() = sorted.size(-1);
+  rho = rho.view(rho_shape);
+  auto mean = cumulative / rho;
+  auto mean_sq = cumulative_sq / rho;
+  auto support_var = rho * (mean_sq - mean * mean);
+  auto delta = torch::clamp((1 - support_var) / rho, 0);
+  auto tau = mean - torch::sqrt(delta);
+  auto support = (tau <= sorted).sum(-1, true).clamp_min(1);
+  auto tau_star = tau.gather(-1, support - 1);
+  auto probs = torch::pow(torch::clamp(shifted - tau_star, 0), 2);
+  if (mask.has_value()) {
+    probs = probs * mask.value().to(probs.scalar_type());
+  }
+  auto denom = probs.sum(-1, true);
+  return torch::where(
+      denom > 0,
+      probs / denom.clamp_min(std::numeric_limits<double>::epsilon()),
+      torch::zeros_like(probs));
+}
+
+torch::Tensor signed_entmax15_scores(
+    const torch::Tensor& scores,
+    const c10::optional<torch::Tensor>& mask = c10::nullopt) {
+  auto clean_scores = torch::nan_to_num(scores);
+  auto probs = entmax15_scores(clean_scores.abs(), mask);
+  auto signed_routes = torch::sign(clean_scores) * probs;
+  if (mask.has_value()) {
+    signed_routes = signed_routes * mask.value().to(signed_routes.scalar_type());
+  }
+  return torch::nan_to_num(signed_routes);
+}
+
+torch::Tensor signed_entmax15_backward_scores(
+    const torch::Tensor& scores,
+    const torch::Tensor& routes,
+    const torch::Tensor& grad_routes,
+    const c10::optional<torch::Tensor>& mask = c10::nullopt) {
+  auto clean_scores = torch::nan_to_num(scores);
+  auto signs = torch::sign(clean_scores);
+  auto grad_probs = grad_routes * signs;
+  auto probs = routes.abs();
+  auto gppr = torch::sqrt(torch::clamp(probs, 0));
+  auto grad_input = grad_probs * gppr;
+  auto gppr_sum = gppr.sum(-1, true);
+  auto correction = torch::where(
+      gppr_sum > 0,
+      grad_input.sum(-1, true) / gppr_sum.clamp_min(std::numeric_limits<double>::epsilon()),
+      torch::zeros_like(gppr_sum));
+  auto grad_scores = (grad_input - correction * gppr) * signs;
+  if (mask.has_value()) {
+    grad_scores = grad_scores * mask.value().to(grad_scores.scalar_type());
+  }
+  return torch::nan_to_num(grad_scores);
+}
+
+torch::Tensor compress_scores(
+    const std::string& compress_name,
+    const torch::Tensor& scores,
+    const c10::optional<torch::Tensor>& mask = c10::nullopt) {
+  if (compress_name == "softmax") {
+    auto clean_scores = torch::nan_to_num(scores);
+    if (mask.has_value()) {
+      auto bool_mask = mask.value().to(torch::kBool);
+      auto masked_scores = clean_scores.masked_fill(~bool_mask, -1e4);
+      auto routes = torch::softmax(masked_scores, -1);
+      return torch::where(bool_mask, routes, torch::zeros_like(routes));
+    }
+    return torch::softmax(clean_scores, -1);
+  }
+  if (compress_name == "signed_abs_softmax") {
+    auto routes = signed_abs_softmax_scores(scores);
+    if (mask.has_value()) {
+      routes = routes * mask.value().to(routes.scalar_type());
+    }
+    return routes;
+  }
+  if (compress_name == "softsign") {
+    auto edges = softsign(scores);
+    if (mask.has_value()) {
+      edges = edges * mask.value().to(edges.scalar_type());
+    }
+    return edges;
+  }
+  if (compress_name == "signed_entmax15") {
+    return signed_entmax15_scores(scores, mask);
+  }
+  throw std::runtime_error("Unsupported compress_name: " + compress_name);
+}
+
+NativeLayerState layer_with_val_norm(
+    const NativeLayerState& layer,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias) {
+  return {layer.state, layer_norm_last_dim(layer.val, weight, bias)};
+}
+
+NativeLayerState apply_delta_to_layer(
+    const NativeLayerState& layer,
+    const torch::Tensor& delta_state,
+    const torch::Tensor& delta_val,
+    const torch::Tensor& val_norm_weight,
+    const torch::Tensor& val_norm_bias) {
+  auto updated_state = signed_softmax_state(layer.state + delta_state);
+  auto updated_val = layer_norm_last_dim(layer.val + delta_val, val_norm_weight, val_norm_bias);
+  return {updated_state, updated_val};
+}
+
+torch::Tensor full_topk_indices(const torch::Tensor& scores) {
+  const auto batch = scores.size(0);
+  const auto left = scores.size(1);
+  const auto right = scores.size(2);
+  return torch::arange(right, scores.options().dtype(torch::kLong))
+      .view({1, 1, right})
+      .expand({batch, left, right});
+}
+
+std::tuple<torch::Tensor, torch::Tensor> low_rank_transition_pairwise_topk_signed_abs(
+    const torch::Tensor& sender_strength,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    const torch::Tensor& src_val,
+    const torch::Tensor& dst_val,
+    const torch::Tensor& source_weight,
+    const torch::Tensor& target_weight,
+    const torch::Tensor& core_weight,
+    const torch::Tensor& bias,
+    int64_t topk,
+    const std::string& compress_name) {
+#ifdef WITH_CUDA
+  if (src_val.is_cuda() &&
+      sender_strength.is_cuda() &&
+      projected_state.is_cuda() &&
+      projected_val.is_cuda() &&
+      compress_name == "signed_abs_softmax" &&
+      !c10::GradMode::is_enabled() &&
+      experimental_cuda_scan_fastpath_enabled() &&
+      jakal_net_low_rank_pairwise_topk_forward_cuda_available() &&
+      topk > 0 && topk <= 32) {
+    auto projected_source = torch::matmul(src_val, cast_tensor_like(source_weight, src_val).transpose(0, 1)).contiguous();
+    auto weighted_projected_source = projected_source * cast_tensor_like(core_weight, projected_source).view({1, 1, -1});
+    auto projected_target = torch::matmul(dst_val, cast_tensor_like(target_weight, dst_val).transpose(0, 1)).contiguous();
+    auto weighted_projected_state =
+        (sender_strength.to(torch::kFloat32) * projected_state.to(torch::kFloat32)).contiguous();
+    auto weighted_projected_val =
+        (sender_strength.to(torch::kFloat32).unsqueeze(-1) * projected_val.to(torch::kFloat32)).contiguous();
+    auto fused = low_rank_pairwise_topk_forward_cuda_wrapper(
+        weighted_projected_source,
+        projected_target,
+        weighted_projected_state,
+        weighted_projected_val,
+        topk,
+        (bias.defined() && bias.numel() != 0) ? bias.item<double>() : 0.0,
+        1);
+    return {
+        std::get<0>(fused).to(projected_state.scalar_type()),
+        std::get<1>(fused).to(projected_val.scalar_type()),
+    };
+  }
+#endif
+  auto cast_source_weight = cast_tensor_like(source_weight, src_val);
+  auto cast_target_weight = cast_tensor_like(target_weight, src_val);
+  auto cast_core_weight = cast_tensor_like(core_weight, src_val);
+  auto cast_bias = cast_packed_optional_like(bias, src_val);
+  auto logits = pairwise_route_block_logits(
+      "low_rank_bilinear_route",
+      src_val,
+      dst_val,
+      cast_source_weight,
+      c10::nullopt,
+      cast_target_weight,
+      c10::nullopt,
+      cast_core_weight,
+      cast_bias,
+      c10::nullopt,
+      c10::nullopt,
+      c10::nullopt,
+      c10::nullopt,
+      1.0);
+  const auto dst_nodes = dst_val.size(1);
+  const auto k = std::min<int64_t>(std::max<int64_t>(1, topk), dst_nodes);
+
+  torch::Tensor selected_scores;
+  torch::Tensor selected_indices;
+  if (k == dst_nodes) {
+    selected_scores = logits;
+    selected_indices = full_topk_indices(logits);
+  } else {
+    auto topk_result = logits.topk(k, -1, true, true);
+    selected_scores = std::get<0>(topk_result);
+    selected_indices = std::get<1>(topk_result);
+  }
+
+  auto routes = compress_scores(compress_name, selected_scores);
+  auto weighted_routes = routes * sender_strength.unsqueeze(-1);
+  const auto state_acc_dtype = accumulator_dtype(projected_state.scalar_type());
+  const auto val_acc_dtype = accumulator_dtype(projected_val.scalar_type());
+  auto delta_state = torch::zeros(
+      {projected_state.size(0), dst_nodes},
+      projected_state.options().dtype(state_acc_dtype));
+  auto delta_val = torch::zeros(
+      {projected_val.size(0), dst_nodes, projected_val.size(2)},
+      projected_val.options().dtype(val_acc_dtype));
+
+  auto flat_indices = selected_indices.reshape({selected_indices.size(0), -1});
+  auto state_contrib =
+      (weighted_routes.to(state_acc_dtype) * projected_state.to(state_acc_dtype).unsqueeze(-1))
+          .reshape({projected_state.size(0), -1});
+  delta_state.scatter_add_(1, flat_indices, state_contrib);
+
+  auto val_contrib =
+      (weighted_routes.to(val_acc_dtype).unsqueeze(-1) *
+       projected_val.to(val_acc_dtype).unsqueeze(-2))
+          .reshape({projected_val.size(0), -1, projected_val.size(2)});
+  auto scatter_index =
+      flat_indices.unsqueeze(-1).expand({flat_indices.size(0), flat_indices.size(1), projected_val.size(2)});
+  delta_val.scatter_add_(1, scatter_index, val_contrib);
+
+  return {
+      delta_state.to(projected_state.scalar_type()),
+      delta_val.to(projected_val.scalar_type()),
+  };
+}
+
+std::tuple<torch::Tensor, torch::Tensor> low_rank_propagation_topk_signed_abs(
+    const torch::Tensor& layer_state,
+    const torch::Tensor& layer_val,
+    const torch::Tensor& source_weight,
+    const torch::Tensor& target_weight,
+    const torch::Tensor& core_weight,
+    const torch::Tensor& bias,
+    int64_t topk,
+    const std::string& compress_name) {
+#ifdef WITH_CUDA
+  if (layer_val.is_cuda() &&
+      layer_state.is_cuda() &&
+      compress_name == "signed_abs_softmax" &&
+      !c10::GradMode::is_enabled() &&
+      experimental_cuda_scan_fastpath_enabled() &&
+      jakal_net_low_rank_propagation_topk_forward_cuda_available() &&
+      topk > 0 && topk <= 32) {
+    auto projected_target = torch::matmul(layer_val, cast_tensor_like(target_weight, layer_val).transpose(0, 1)).contiguous();
+    auto projected_source = torch::matmul(layer_val, cast_tensor_like(source_weight, layer_val).transpose(0, 1)).contiguous();
+    auto weighted_projected_source = projected_source * cast_tensor_like(core_weight, projected_source).view({1, 1, -1});
+    auto weighted_projected_state = (layer_state.to(torch::kFloat32) * layer_state.to(torch::kFloat32)).contiguous();
+    auto weighted_projected_val =
+        (layer_state.to(torch::kFloat32).unsqueeze(-1) * layer_val.to(torch::kFloat32)).contiguous();
+    const auto score_bias = packed_optional_tensor(bias).has_value() ? packed_optional_tensor(bias).value().item<double>() : 0.0;
+    auto fused = low_rank_propagation_topk_forward_cuda_wrapper(
+        weighted_projected_source,
+        projected_target,
+        weighted_projected_state,
+        weighted_projected_val,
+        topk,
+        score_bias,
+        true);
+    return {
+        std::get<0>(fused).to(layer_state.scalar_type()),
+        std::get<1>(fused).to(layer_val.scalar_type()),
+    };
+  }
+#endif
+  auto cast_source_weight = cast_tensor_like(source_weight, layer_val);
+  auto cast_target_weight = cast_tensor_like(target_weight, layer_val);
+  auto cast_core_weight = cast_tensor_like(core_weight, layer_val);
+  auto cast_bias = cast_packed_optional_like(bias, layer_val);
+  auto scores = pairwise_scores(
+      "low_rank_bilinear",
+      layer_val,
+      layer_val,
+      cast_core_weight,
+      cast_bias,
+      cast_source_weight,
+      c10::nullopt,
+      cast_target_weight,
+      c10::nullopt);
+  const auto nodes = layer_val.size(1);
+  const auto k = std::min<int64_t>(std::max<int64_t>(1, topk), nodes);
+
+  torch::Tensor selected_scores;
+  torch::Tensor selected_indices;
+  if (k == nodes) {
+    selected_scores = scores;
+    selected_indices = full_topk_indices(scores);
+  } else {
+    auto topk_result = scores.topk(k, -1, true, true);
+    selected_scores = std::get<0>(topk_result);
+    selected_indices = std::get<1>(topk_result);
+  }
+
+  auto gathered = gather_by_indices(layer_state, layer_val, selected_indices);
+  auto selected_state = std::get<0>(gathered);
+  auto selected_val = std::get<1>(gathered);
+  auto edges = compress_scores(compress_name, selected_scores);
+  auto weighted_edges = edges * selected_state;
+  const auto state_acc_dtype = accumulator_dtype(layer_state.scalar_type());
+  const auto val_acc_dtype = accumulator_dtype(layer_val.scalar_type());
+  auto delta_state =
+      (weighted_edges.to(state_acc_dtype) * selected_state.to(state_acc_dtype)).sum(-1);
+  auto delta_val =
+      (weighted_edges.to(val_acc_dtype).unsqueeze(-1) * selected_val.to(val_acc_dtype)).sum(-2);
+  return {
+      delta_state.to(layer_state.scalar_type()),
+      delta_val.to(layer_val.scalar_type()),
+  };
+}
+
+torch::Tensor read_memory_vector(
+    const std::vector<NativeLayerState>& memory_state,
+    const std::vector<torch::Tensor>& val_norm_weights,
+    const std::vector<torch::Tensor>& val_norm_biases,
+    const torch::Tensor& read_template_val,
+    const std::vector<torch::Tensor>& read_projection_weights,
+    const std::vector<torch::Tensor>& read_gates) {
+  std::vector<torch::Tensor> read_terms;
+  read_terms.reserve(memory_state.size());
+  for (size_t index = 0; index < memory_state.size(); ++index) {
+    auto read_layer = layer_with_val_norm(memory_state[index], val_norm_weights[index], val_norm_biases[index]);
+    auto sender_strength = torch::softplus(read_layer.state).unsqueeze(-1);
+    auto read_summary = (sender_strength * read_layer.val).sum(1);
+    read_summary = read_summary + cast_tensor_like(read_template_val, read_summary).unsqueeze(0);
+    auto projected = linear2d(read_summary, read_projection_weights[index], c10::nullopt);
+    auto gate = torch::sigmoid(cast_tensor_like(read_gates[index], read_summary));
+    read_terms.push_back(gate * projected);
+  }
+  return torch::stack(read_terms, 0).sum(0);
+}
+
+void require_vector_size(
+    const std::vector<torch::Tensor>& tensors,
+    size_t expected,
+    const std::string& name) {
+  if (tensors.size() != expected) {
+    throw std::runtime_error(
+        name + " has unexpected length: got " + std::to_string(tensors.size()) +
+        ", expected " + std::to_string(expected) + ".");
+  }
+}
+
+void require_int_vector_size(
+    const std::vector<int64_t>& values,
+    size_t expected,
+    const std::string& name) {
+  if (values.size() != expected) {
+    throw std::runtime_error(
+        name + " has unexpected length: got " + std::to_string(values.size()) +
+        ", expected " + std::to_string(expected) + ".");
+  }
+}
+
+std::tuple<torch::Tensor, std::vector<torch::Tensor>> causal_memory_scan_fused(
+    const torch::Tensor& aligned_s,
+    const std::vector<torch::Tensor>& flat_memory,
+    const torch::Tensor& value_to_state_weight,
+    const c10::optional<torch::Tensor>& value_to_state_bias,
+    const torch::Tensor& s_prediction_weight,
+    const torch::Tensor& prediction_input_norm_weight,
+    const c10::optional<torch::Tensor>& prediction_input_norm_bias,
+    const torch::Tensor& read_template_val,
+    const std::vector<torch::Tensor>& read_projection_weights,
+    const std::vector<torch::Tensor>& read_gates,
+    const std::vector<torch::Tensor>& write_source_weights,
+    const std::vector<torch::Tensor>& write_target_weights,
+    const std::vector<torch::Tensor>& write_core_weights,
+    const std::vector<torch::Tensor>& write_biases,
+    const std::vector<int64_t>& write_topks,
+    const std::string& transition_compress_name,
+    const std::vector<torch::Tensor>& propagation_source_weights,
+    const std::vector<torch::Tensor>& propagation_target_weights,
+    const std::vector<torch::Tensor>& propagation_core_weights,
+    const std::vector<torch::Tensor>& propagation_biases,
+    const std::vector<int64_t>& propagation_topks,
+    const std::string& propagation_compress_name,
+    const std::vector<torch::Tensor>& val_norm_weights,
+    const std::vector<torch::Tensor>& val_norm_biases,
+    const std::vector<torch::Tensor>& level_transition_source_weights,
+    const std::vector<torch::Tensor>& level_transition_target_weights,
+    const std::vector<torch::Tensor>& level_transition_core_weights,
+    const std::vector<torch::Tensor>& level_transition_biases,
+    const std::vector<int64_t>& level_transition_topks,
+    const std::vector<torch::Tensor>& level_norm_weights,
+    const std::vector<torch::Tensor>& level_norm_biases,
+    const std::vector<torch::Tensor>& skip_source_weights,
+    const std::vector<torch::Tensor>& skip_target_weights,
+    const std::vector<torch::Tensor>& skip_core_weights,
+    const std::vector<torch::Tensor>& skip_biases,
+    const std::vector<torch::Tensor>& skip_gates,
+    const std::vector<int64_t>& skip_topks) {
+  require_supported_device(aligned_s, "aligned_s");
+#ifdef WITH_CUDA
+  if (aligned_s.is_cuda()) {
+    auto packed_value_to_state_bias =
+        value_to_state_bias.has_value() ? value_to_state_bias.value() : aligned_s.new_empty({0});
+    auto packed_prediction_input_norm_bias =
+        prediction_input_norm_bias.has_value()
+            ? prediction_input_norm_bias.value()
+            : aligned_s.new_empty({0});
+    return jakal_net_causal_memory_scan_fused_forward_cuda(
+        aligned_s,
+        flat_memory,
+        value_to_state_weight,
+        packed_value_to_state_bias,
+        s_prediction_weight,
+        prediction_input_norm_weight,
+        packed_prediction_input_norm_bias,
+        read_template_val,
+        read_projection_weights,
+        read_gates,
+        write_source_weights,
+        write_target_weights,
+        write_core_weights,
+        write_biases,
+        write_topks,
+        transition_compress_name,
+        propagation_source_weights,
+        propagation_target_weights,
+        propagation_core_weights,
+        propagation_biases,
+        propagation_topks,
+        propagation_compress_name,
+        val_norm_weights,
+        val_norm_biases,
+        level_transition_source_weights,
+        level_transition_target_weights,
+        level_transition_core_weights,
+        level_transition_biases,
+        level_transition_topks,
+        level_norm_weights,
+        level_norm_biases,
+        skip_source_weights,
+        skip_target_weights,
+        skip_core_weights,
+        skip_biases,
+        skip_gates,
+        skip_topks);
+  }
+#endif
+  if (aligned_s.dim() != 3) {
+    throw std::runtime_error("aligned_s must have shape [batch, seq_len, dim].");
+  }
+  if (flat_memory.size() % 2 != 0) {
+    throw std::runtime_error("flat_memory must contain alternating state/val tensors.");
+  }
+  const auto num_levels = flat_memory.size() / 2;
+  const auto expected_skip_count = num_levels > 1 ? num_levels - 1 : 0;
+  require_vector_size(read_projection_weights, num_levels, "read_projection_weights");
+  require_vector_size(read_gates, num_levels, "read_gates");
+  require_vector_size(write_source_weights, num_levels, "write_source_weights");
+  require_vector_size(write_target_weights, num_levels, "write_target_weights");
+  require_vector_size(write_core_weights, num_levels, "write_core_weights");
+  require_vector_size(write_biases, num_levels, "write_biases");
+  require_int_vector_size(write_topks, num_levels, "write_topks");
+  require_vector_size(propagation_source_weights, num_levels, "propagation_source_weights");
+  require_vector_size(propagation_target_weights, num_levels, "propagation_target_weights");
+  require_vector_size(propagation_core_weights, num_levels, "propagation_core_weights");
+  require_vector_size(propagation_biases, num_levels, "propagation_biases");
+  require_int_vector_size(propagation_topks, num_levels, "propagation_topks");
+  require_vector_size(val_norm_weights, num_levels, "val_norm_weights");
+  require_vector_size(val_norm_biases, num_levels, "val_norm_biases");
+  require_vector_size(level_transition_source_weights, num_levels > 0 ? num_levels - 1 : 0, "level_transition_source_weights");
+  require_vector_size(level_transition_target_weights, num_levels > 0 ? num_levels - 1 : 0, "level_transition_target_weights");
+  require_vector_size(level_transition_core_weights, num_levels > 0 ? num_levels - 1 : 0, "level_transition_core_weights");
+  require_vector_size(level_transition_biases, num_levels > 0 ? num_levels - 1 : 0, "level_transition_biases");
+  require_int_vector_size(level_transition_topks, num_levels > 0 ? num_levels - 1 : 0, "level_transition_topks");
+  require_vector_size(level_norm_weights, num_levels, "level_norm_weights");
+  require_vector_size(level_norm_biases, num_levels, "level_norm_biases");
+  require_vector_size(skip_source_weights, expected_skip_count, "skip_source_weights");
+  require_vector_size(skip_target_weights, expected_skip_count, "skip_target_weights");
+  require_vector_size(skip_core_weights, expected_skip_count, "skip_core_weights");
+  require_vector_size(skip_biases, expected_skip_count, "skip_biases");
+  require_vector_size(skip_gates, expected_skip_count, "skip_gates");
+  require_int_vector_size(skip_topks, expected_skip_count, "skip_topks");
+
+  std::vector<NativeLayerState> current_memory;
+  current_memory.reserve(num_levels);
+  for (size_t index = 0; index < num_levels; ++index) {
+    current_memory.push_back({flat_memory[index * 2], flat_memory[index * 2 + 1]});
+  }
+
+  auto projected_s = linear3d(aligned_s, s_prediction_weight, c10::nullopt);
+  std::vector<torch::Tensor> query_steps;
+  query_steps.reserve(aligned_s.size(1));
+
+  for (int64_t time_index = 0; time_index < aligned_s.size(1); ++time_index) {
+    auto token_val = aligned_s.slice(1, time_index, time_index + 1);
+    auto token_state = linear3d(token_val, value_to_state_weight, cast_optional_like(value_to_state_bias, token_val)).squeeze(-1);
+    NativeLayerState token_layer{token_state, token_val};
+
+    std::vector<NativeLayerState> next_memory;
+    next_memory.reserve(num_levels);
+
+    auto first_level_normed = layer_with_val_norm(current_memory[0], val_norm_weights[0], val_norm_biases[0]);
+    auto first_write_delta = low_rank_transition_pairwise_topk_signed_abs(
+        torch::softplus(token_layer.state),
+        token_layer.state,
+        token_layer.val,
+        token_layer.val,
+        first_level_normed.val,
+        write_source_weights[0],
+        write_target_weights[0],
+        write_core_weights[0],
+        write_biases[0],
+        write_topks[0],
+        transition_compress_name);
+    auto level = apply_delta_to_layer(
+        current_memory[0],
+        std::get<0>(first_write_delta),
+        std::get<1>(first_write_delta),
+        val_norm_weights[0],
+        val_norm_biases[0]);
+    auto level_for_propagation = layer_with_val_norm(level, val_norm_weights[0], val_norm_biases[0]);
+    auto first_prop_delta = low_rank_propagation_topk_signed_abs(
+        level_for_propagation.state,
+        level_for_propagation.val,
+        propagation_source_weights[0],
+        propagation_target_weights[0],
+        propagation_core_weights[0],
+        propagation_biases[0],
+        propagation_topks[0],
+        propagation_compress_name);
+    level = apply_delta_to_layer(
+        level,
+        std::get<0>(first_prop_delta),
+        std::get<1>(first_prop_delta),
+        val_norm_weights[0],
+        val_norm_biases[0]);
+    next_memory.push_back(level);
+
+    for (size_t level_index = 1; level_index < num_levels; ++level_index) {
+      auto current_level = current_memory[level_index];
+      auto normalized_level = layer_with_val_norm(
+          current_level,
+          val_norm_weights[level_index],
+          val_norm_biases[level_index]);
+      auto normalized_parent = layer_with_val_norm(
+          next_memory[level_index - 1],
+          level_norm_weights[level_index - 1],
+          level_norm_biases[level_index - 1]);
+      auto parent_delta = low_rank_transition_pairwise_topk_signed_abs(
+          torch::softplus(normalized_parent.state),
+          normalized_parent.state,
+          normalized_parent.val,
+          normalized_parent.val,
+          normalized_level.val,
+          level_transition_source_weights[level_index - 1],
+          level_transition_target_weights[level_index - 1],
+          level_transition_core_weights[level_index - 1],
+          level_transition_biases[level_index - 1],
+          level_transition_topks[level_index - 1],
+          transition_compress_name);
+      auto updated_level = apply_delta_to_layer(
+          current_level,
+          std::get<0>(parent_delta),
+          std::get<1>(parent_delta),
+          val_norm_weights[level_index],
+          val_norm_biases[level_index]);
+
+      if (level_index == 1 && expected_skip_count > 0) {
+        auto skip_gate = torch::sigmoid(cast_tensor_like(skip_gates[0], token_val));
+        auto skip_delta = low_rank_transition_pairwise_topk_signed_abs(
+            torch::softplus(token_layer.state),
+            token_layer.state,
+            token_layer.val,
+            token_layer.val,
+            normalized_level.val,
+            skip_source_weights[0],
+            skip_target_weights[0],
+            skip_core_weights[0],
+            skip_biases[0],
+            skip_topks[0],
+            transition_compress_name);
+        updated_level = apply_delta_to_layer(
+            updated_level,
+            std::get<0>(skip_delta) * skip_gate,
+            std::get<1>(skip_delta) * skip_gate,
+            val_norm_weights[level_index],
+            val_norm_biases[level_index]);
+      }
+
+      if (level_index >= 2) {
+        const auto skip_index = level_index - 1;
+        auto normalized_skip_source = layer_with_val_norm(
+            next_memory[level_index - 2],
+            level_norm_weights[level_index - 2],
+            level_norm_biases[level_index - 2]);
+        auto skip_gate = torch::sigmoid(cast_tensor_like(skip_gates[skip_index], normalized_skip_source.val));
+        auto skip_delta = low_rank_transition_pairwise_topk_signed_abs(
+            torch::softplus(normalized_skip_source.state),
+            normalized_skip_source.state,
+            normalized_skip_source.val,
+            normalized_skip_source.val,
+            normalized_level.val,
+            skip_source_weights[skip_index],
+            skip_target_weights[skip_index],
+            skip_core_weights[skip_index],
+            skip_biases[skip_index],
+            skip_topks[skip_index],
+            transition_compress_name);
+        updated_level = apply_delta_to_layer(
+            updated_level,
+            std::get<0>(skip_delta) * skip_gate,
+            std::get<1>(skip_delta) * skip_gate,
+            val_norm_weights[level_index],
+            val_norm_biases[level_index]);
+      }
+
+      auto updated_level_for_prop = layer_with_val_norm(
+          updated_level,
+          val_norm_weights[level_index],
+          val_norm_biases[level_index]);
+      auto propagation_delta = low_rank_propagation_topk_signed_abs(
+          updated_level_for_prop.state,
+          updated_level_for_prop.val,
+          propagation_source_weights[level_index],
+          propagation_target_weights[level_index],
+          propagation_core_weights[level_index],
+          propagation_biases[level_index],
+          propagation_topks[level_index],
+          propagation_compress_name);
+      updated_level = apply_delta_to_layer(
+          updated_level,
+          std::get<0>(propagation_delta),
+          std::get<1>(propagation_delta),
+          val_norm_weights[level_index],
+          val_norm_biases[level_index]);
+      next_memory.push_back(updated_level);
+    }
+
+    current_memory = next_memory;
+    auto read_vector = read_memory_vector(
+        current_memory,
+        val_norm_weights,
+        val_norm_biases,
+        read_template_val,
+        read_projection_weights,
+        read_gates);
+    auto query_input = projected_s.select(1, time_index) + read_vector;
+    query_steps.push_back(layer_norm_last_dim(
+        query_input,
+        prediction_input_norm_weight,
+        cast_optional_like(prediction_input_norm_bias, query_input))
+        .unsqueeze(1));
+  }
+
+  torch::Tensor query_val;
+  if (query_steps.empty()) {
+    query_val = aligned_s.new_empty({aligned_s.size(0), 0, aligned_s.size(2)});
+  } else {
+    query_val = torch::cat(query_steps, 1);
+  }
+
+  std::vector<torch::Tensor> next_memory_flat;
+  next_memory_flat.reserve(current_memory.size() * 2);
+  for (const auto& layer : current_memory) {
+    next_memory_flat.push_back(layer.state);
+    next_memory_flat.push_back(layer.val);
+  }
+  return {query_val, next_memory_flat};
+}
+
+std::tuple<torch::Tensor, std::vector<torch::Tensor>, std::vector<torch::Tensor>> causal_memory_scan_fused_trace(
+    const torch::Tensor& aligned_s,
+    const std::vector<torch::Tensor>& flat_memory,
+    const torch::Tensor& value_to_state_weight,
+    const c10::optional<torch::Tensor>& value_to_state_bias,
+    const torch::Tensor& s_prediction_weight,
+    const torch::Tensor& prediction_input_norm_weight,
+    const c10::optional<torch::Tensor>& prediction_input_norm_bias,
+    const torch::Tensor& read_template_val,
+    const std::vector<torch::Tensor>& read_projection_weights,
+    const std::vector<torch::Tensor>& read_gates,
+    const std::vector<torch::Tensor>& write_source_weights,
+    const std::vector<torch::Tensor>& write_target_weights,
+    const std::vector<torch::Tensor>& write_core_weights,
+    const std::vector<torch::Tensor>& write_biases,
+    const std::vector<int64_t>& write_topks,
+    const std::string& transition_compress_name,
+    const std::vector<torch::Tensor>& propagation_source_weights,
+    const std::vector<torch::Tensor>& propagation_target_weights,
+    const std::vector<torch::Tensor>& propagation_core_weights,
+    const std::vector<torch::Tensor>& propagation_biases,
+    const std::vector<int64_t>& propagation_topks,
+    const std::string& propagation_compress_name,
+    const std::vector<torch::Tensor>& val_norm_weights,
+    const std::vector<torch::Tensor>& val_norm_biases,
+    const std::vector<torch::Tensor>& level_transition_source_weights,
+    const std::vector<torch::Tensor>& level_transition_target_weights,
+    const std::vector<torch::Tensor>& level_transition_core_weights,
+    const std::vector<torch::Tensor>& level_transition_biases,
+    const std::vector<int64_t>& level_transition_topks,
+    const std::vector<torch::Tensor>& level_norm_weights,
+    const std::vector<torch::Tensor>& level_norm_biases,
+    const std::vector<torch::Tensor>& skip_source_weights,
+    const std::vector<torch::Tensor>& skip_target_weights,
+    const std::vector<torch::Tensor>& skip_core_weights,
+    const std::vector<torch::Tensor>& skip_biases,
+    const std::vector<torch::Tensor>& skip_gates,
+    const std::vector<int64_t>& skip_topks) {
+  require_supported_device(aligned_s, "aligned_s");
+#ifdef WITH_CUDA
+  if (aligned_s.is_cuda()) {
+    auto packed_value_to_state_bias =
+        value_to_state_bias.has_value() ? value_to_state_bias.value() : aligned_s.new_empty({0});
+    auto packed_prediction_input_norm_bias =
+        prediction_input_norm_bias.has_value()
+            ? prediction_input_norm_bias.value()
+            : aligned_s.new_empty({0});
+    return jakal_net_causal_memory_scan_fused_trace_cuda(
+        aligned_s,
+        flat_memory,
+        value_to_state_weight,
+        packed_value_to_state_bias,
+        s_prediction_weight,
+        prediction_input_norm_weight,
+        packed_prediction_input_norm_bias,
+        read_template_val,
+        read_projection_weights,
+        read_gates,
+        write_source_weights,
+        write_target_weights,
+        write_core_weights,
+        write_biases,
+        write_topks,
+        transition_compress_name,
+        propagation_source_weights,
+        propagation_target_weights,
+        propagation_core_weights,
+        propagation_biases,
+        propagation_topks,
+        propagation_compress_name,
+        val_norm_weights,
+        val_norm_biases,
+        level_transition_source_weights,
+        level_transition_target_weights,
+        level_transition_core_weights,
+        level_transition_biases,
+        level_transition_topks,
+        level_norm_weights,
+        level_norm_biases,
+        skip_source_weights,
+        skip_target_weights,
+        skip_core_weights,
+        skip_biases,
+        skip_gates,
+        skip_topks);
+  }
+#endif
+  if (aligned_s.dim() != 3) {
+    throw std::runtime_error("aligned_s must have shape [batch, seq_len, dim].");
+  }
+  if (flat_memory.size() % 2 != 0) {
+    throw std::runtime_error("flat_memory must contain alternating state/val tensors.");
+  }
+  const auto num_levels = flat_memory.size() / 2;
+  const auto expected_skip_count = num_levels > 1 ? num_levels - 1 : 0;
+  require_vector_size(read_projection_weights, num_levels, "read_projection_weights");
+  require_vector_size(read_gates, num_levels, "read_gates");
+  require_vector_size(write_source_weights, num_levels, "write_source_weights");
+  require_vector_size(write_target_weights, num_levels, "write_target_weights");
+  require_vector_size(write_core_weights, num_levels, "write_core_weights");
+  require_vector_size(write_biases, num_levels, "write_biases");
+  require_int_vector_size(write_topks, num_levels, "write_topks");
+  require_vector_size(propagation_source_weights, num_levels, "propagation_source_weights");
+  require_vector_size(propagation_target_weights, num_levels, "propagation_target_weights");
+  require_vector_size(propagation_core_weights, num_levels, "propagation_core_weights");
+  require_vector_size(propagation_biases, num_levels, "propagation_biases");
+  require_int_vector_size(propagation_topks, num_levels, "propagation_topks");
+  require_vector_size(val_norm_weights, num_levels, "val_norm_weights");
+  require_vector_size(val_norm_biases, num_levels, "val_norm_biases");
+  require_vector_size(level_transition_source_weights, num_levels > 0 ? num_levels - 1 : 0, "level_transition_source_weights");
+  require_vector_size(level_transition_target_weights, num_levels > 0 ? num_levels - 1 : 0, "level_transition_target_weights");
+  require_vector_size(level_transition_core_weights, num_levels > 0 ? num_levels - 1 : 0, "level_transition_core_weights");
+  require_vector_size(level_transition_biases, num_levels > 0 ? num_levels - 1 : 0, "level_transition_biases");
+  require_int_vector_size(level_transition_topks, num_levels > 0 ? num_levels - 1 : 0, "level_transition_topks");
+  require_vector_size(level_norm_weights, num_levels, "level_norm_weights");
+  require_vector_size(level_norm_biases, num_levels, "level_norm_biases");
+  require_vector_size(skip_source_weights, expected_skip_count, "skip_source_weights");
+  require_vector_size(skip_target_weights, expected_skip_count, "skip_target_weights");
+  require_vector_size(skip_core_weights, expected_skip_count, "skip_core_weights");
+  require_vector_size(skip_biases, expected_skip_count, "skip_biases");
+  require_vector_size(skip_gates, expected_skip_count, "skip_gates");
+  require_int_vector_size(skip_topks, expected_skip_count, "skip_topks");
+
+  std::vector<NativeLayerState> current_memory;
+  current_memory.reserve(num_levels);
+  for (size_t index = 0; index < num_levels; ++index) {
+    current_memory.push_back({flat_memory[index * 2], flat_memory[index * 2 + 1]});
+  }
+
+  std::vector<std::vector<torch::Tensor>> trace_states(num_levels);
+  std::vector<std::vector<torch::Tensor>> trace_vals(num_levels);
+
+  auto projected_s = linear3d(aligned_s, s_prediction_weight, c10::nullopt);
+  std::vector<torch::Tensor> query_steps;
+  query_steps.reserve(aligned_s.size(1));
+
+  for (int64_t time_index = 0; time_index < aligned_s.size(1); ++time_index) {
+    for (size_t trace_index = 0; trace_index < num_levels; ++trace_index) {
+      trace_states[trace_index].push_back(current_memory[trace_index].state);
+      trace_vals[trace_index].push_back(current_memory[trace_index].val);
+    }
+    auto token_val = aligned_s.slice(1, time_index, time_index + 1);
+    auto token_state = linear3d(token_val, value_to_state_weight, cast_optional_like(value_to_state_bias, token_val)).squeeze(-1);
+    NativeLayerState token_layer{token_state, token_val};
+
+    std::vector<NativeLayerState> next_memory;
+    next_memory.reserve(num_levels);
+
+    auto first_level_normed = layer_with_val_norm(current_memory[0], val_norm_weights[0], val_norm_biases[0]);
+    auto first_write_delta = low_rank_transition_pairwise_topk_signed_abs(
+        torch::softplus(token_layer.state),
+        token_layer.state,
+        token_layer.val,
+        token_layer.val,
+        first_level_normed.val,
+        write_source_weights[0],
+        write_target_weights[0],
+        write_core_weights[0],
+        write_biases[0],
+        write_topks[0],
+        transition_compress_name);
+    auto level = apply_delta_to_layer(
+        current_memory[0],
+        std::get<0>(first_write_delta),
+        std::get<1>(first_write_delta),
+        val_norm_weights[0],
+        val_norm_biases[0]);
+    auto level_for_propagation = layer_with_val_norm(level, val_norm_weights[0], val_norm_biases[0]);
+    auto first_prop_delta = low_rank_propagation_topk_signed_abs(
+        level_for_propagation.state,
+        level_for_propagation.val,
+        propagation_source_weights[0],
+        propagation_target_weights[0],
+        propagation_core_weights[0],
+        propagation_biases[0],
+        propagation_topks[0],
+        propagation_compress_name);
+    level = apply_delta_to_layer(
+        level,
+        std::get<0>(first_prop_delta),
+        std::get<1>(first_prop_delta),
+        val_norm_weights[0],
+        val_norm_biases[0]);
+    next_memory.push_back(level);
+
+    for (size_t level_index = 1; level_index < num_levels; ++level_index) {
+      auto current_level = current_memory[level_index];
+      auto normalized_level = layer_with_val_norm(
+          current_level,
+          val_norm_weights[level_index],
+          val_norm_biases[level_index]);
+      auto normalized_parent = layer_with_val_norm(
+          next_memory[level_index - 1],
+          level_norm_weights[level_index - 1],
+          level_norm_biases[level_index - 1]);
+      auto parent_delta = low_rank_transition_pairwise_topk_signed_abs(
+          torch::softplus(normalized_parent.state),
+          normalized_parent.state,
+          normalized_parent.val,
+          normalized_parent.val,
+          normalized_level.val,
+          level_transition_source_weights[level_index - 1],
+          level_transition_target_weights[level_index - 1],
+          level_transition_core_weights[level_index - 1],
+          level_transition_biases[level_index - 1],
+          level_transition_topks[level_index - 1],
+          transition_compress_name);
+      auto updated_level = apply_delta_to_layer(
+          current_level,
+          std::get<0>(parent_delta),
+          std::get<1>(parent_delta),
+          val_norm_weights[level_index],
+          val_norm_biases[level_index]);
+
+      if (level_index == 1 && expected_skip_count > 0) {
+        auto skip_gate = torch::sigmoid(cast_tensor_like(skip_gates[0], token_val));
+        auto skip_delta = low_rank_transition_pairwise_topk_signed_abs(
+            torch::softplus(token_layer.state),
+            token_layer.state,
+            token_layer.val,
+            token_layer.val,
+            normalized_level.val,
+            skip_source_weights[0],
+            skip_target_weights[0],
+            skip_core_weights[0],
+            skip_biases[0],
+            skip_topks[0],
+            transition_compress_name);
+        updated_level = apply_delta_to_layer(
+            updated_level,
+            std::get<0>(skip_delta) * skip_gate,
+            std::get<1>(skip_delta) * skip_gate,
+            val_norm_weights[level_index],
+            val_norm_biases[level_index]);
+      }
+
+      if (level_index >= 2) {
+        const auto skip_index = level_index - 1;
+        auto normalized_skip_source = layer_with_val_norm(
+            next_memory[level_index - 2],
+            level_norm_weights[level_index - 2],
+            level_norm_biases[level_index - 2]);
+        auto skip_gate = torch::sigmoid(cast_tensor_like(skip_gates[skip_index], normalized_skip_source.val));
+        auto skip_delta = low_rank_transition_pairwise_topk_signed_abs(
+            torch::softplus(normalized_skip_source.state),
+            normalized_skip_source.state,
+            normalized_skip_source.val,
+            normalized_skip_source.val,
+            normalized_level.val,
+            skip_source_weights[skip_index],
+            skip_target_weights[skip_index],
+            skip_core_weights[skip_index],
+            skip_biases[skip_index],
+            skip_topks[skip_index],
+            transition_compress_name);
+        updated_level = apply_delta_to_layer(
+            updated_level,
+            std::get<0>(skip_delta) * skip_gate,
+            std::get<1>(skip_delta) * skip_gate,
+            val_norm_weights[level_index],
+            val_norm_biases[level_index]);
+      }
+
+      auto updated_level_for_prop = layer_with_val_norm(
+          updated_level,
+          val_norm_weights[level_index],
+          val_norm_biases[level_index]);
+      auto propagation_delta = low_rank_propagation_topk_signed_abs(
+          updated_level_for_prop.state,
+          updated_level_for_prop.val,
+          propagation_source_weights[level_index],
+          propagation_target_weights[level_index],
+          propagation_core_weights[level_index],
+          propagation_biases[level_index],
+          propagation_topks[level_index],
+          propagation_compress_name);
+      updated_level = apply_delta_to_layer(
+          updated_level,
+          std::get<0>(propagation_delta),
+          std::get<1>(propagation_delta),
+          val_norm_weights[level_index],
+          val_norm_biases[level_index]);
+      next_memory.push_back(updated_level);
+    }
+
+    current_memory = next_memory;
+    auto read_vector = read_memory_vector(
+        current_memory,
+        val_norm_weights,
+        val_norm_biases,
+        read_template_val,
+        read_projection_weights,
+        read_gates);
+    auto query_input = projected_s.select(1, time_index) + read_vector;
+    query_steps.push_back(layer_norm_last_dim(
+        query_input,
+        prediction_input_norm_weight,
+        cast_optional_like(prediction_input_norm_bias, query_input))
+        .unsqueeze(1));
+  }
+
+  torch::Tensor query_val;
+  if (query_steps.empty()) {
+    query_val = aligned_s.new_empty({aligned_s.size(0), 0, aligned_s.size(2)});
+  } else {
+    query_val = torch::cat(query_steps, 1);
+  }
+
+  std::vector<torch::Tensor> next_memory_flat;
+  next_memory_flat.reserve(current_memory.size() * 2);
+  for (const auto& layer : current_memory) {
+    next_memory_flat.push_back(layer.state);
+    next_memory_flat.push_back(layer.val);
+  }
+
+  std::vector<torch::Tensor> trace_flat;
+  trace_flat.reserve(num_levels * 2);
+  for (size_t trace_index = 0; trace_index < num_levels; ++trace_index) {
+    trace_flat.push_back(torch::stack(trace_states[trace_index], 0));
+    trace_flat.push_back(torch::stack(trace_vals[trace_index], 0));
+  }
+  return {query_val, next_memory_flat, trace_flat};
+}
+
+std::tuple<torch::Tensor, std::vector<torch::Tensor>, std::vector<torch::Tensor>>
+causal_memory_scan_fused_checkpoints(
+    const torch::Tensor& aligned_s,
+    const std::vector<torch::Tensor>& flat_memory,
+    const torch::Tensor& value_to_state_weight,
+    const c10::optional<torch::Tensor>& value_to_state_bias,
+    const torch::Tensor& s_prediction_weight,
+    const torch::Tensor& prediction_input_norm_weight,
+    const c10::optional<torch::Tensor>& prediction_input_norm_bias,
+    const torch::Tensor& read_template_val,
+    const std::vector<torch::Tensor>& read_projection_weights,
+    const std::vector<torch::Tensor>& read_gates,
+    const std::vector<torch::Tensor>& write_source_weights,
+    const std::vector<torch::Tensor>& write_target_weights,
+    const std::vector<torch::Tensor>& write_core_weights,
+    const std::vector<torch::Tensor>& write_biases,
+    const std::vector<int64_t>& write_topks,
+    const std::string& transition_compress_name,
+    const std::vector<torch::Tensor>& propagation_source_weights,
+    const std::vector<torch::Tensor>& propagation_target_weights,
+    const std::vector<torch::Tensor>& propagation_core_weights,
+    const std::vector<torch::Tensor>& propagation_biases,
+    const std::vector<int64_t>& propagation_topks,
+    const std::string& propagation_compress_name,
+    const std::vector<torch::Tensor>& val_norm_weights,
+    const std::vector<torch::Tensor>& val_norm_biases,
+    const std::vector<torch::Tensor>& level_transition_source_weights,
+    const std::vector<torch::Tensor>& level_transition_target_weights,
+    const std::vector<torch::Tensor>& level_transition_core_weights,
+    const std::vector<torch::Tensor>& level_transition_biases,
+    const std::vector<int64_t>& level_transition_topks,
+    const std::vector<torch::Tensor>& level_norm_weights,
+    const std::vector<torch::Tensor>& level_norm_biases,
+    const std::vector<torch::Tensor>& skip_source_weights,
+    const std::vector<torch::Tensor>& skip_target_weights,
+    const std::vector<torch::Tensor>& skip_core_weights,
+    const std::vector<torch::Tensor>& skip_biases,
+    const std::vector<torch::Tensor>& skip_gates,
+    const std::vector<int64_t>& skip_topks,
+    int64_t checkpoint_stride) {
+  if (checkpoint_stride <= 0) {
+    throw std::runtime_error("checkpoint_stride must be positive.");
+  }
+  require_supported_device(aligned_s, "aligned_s");
+  if (aligned_s.dim() != 3) {
+    throw std::runtime_error("aligned_s must have shape [batch, seq_len, dim].");
+  }
+  if (flat_memory.size() % 2 != 0) {
+    throw std::runtime_error("flat_memory must contain alternating state/val tensors.");
+  }
+  const auto num_levels = flat_memory.size() / 2;
+  const auto expected_skip_count = num_levels > 1 ? num_levels - 1 : 0;
+  require_vector_size(read_projection_weights, num_levels, "read_projection_weights");
+  require_vector_size(read_gates, num_levels, "read_gates");
+  require_vector_size(write_source_weights, num_levels, "write_source_weights");
+  require_vector_size(write_target_weights, num_levels, "write_target_weights");
+  require_vector_size(write_core_weights, num_levels, "write_core_weights");
+  require_vector_size(write_biases, num_levels, "write_biases");
+  require_int_vector_size(write_topks, num_levels, "write_topks");
+  require_vector_size(propagation_source_weights, num_levels, "propagation_source_weights");
+  require_vector_size(propagation_target_weights, num_levels, "propagation_target_weights");
+  require_vector_size(propagation_core_weights, num_levels, "propagation_core_weights");
+  require_vector_size(propagation_biases, num_levels, "propagation_biases");
+  require_int_vector_size(propagation_topks, num_levels, "propagation_topks");
+  require_vector_size(val_norm_weights, num_levels, "val_norm_weights");
+  require_vector_size(val_norm_biases, num_levels, "val_norm_biases");
+  require_vector_size(level_transition_source_weights, num_levels > 0 ? num_levels - 1 : 0, "level_transition_source_weights");
+  require_vector_size(level_transition_target_weights, num_levels > 0 ? num_levels - 1 : 0, "level_transition_target_weights");
+  require_vector_size(level_transition_core_weights, num_levels > 0 ? num_levels - 1 : 0, "level_transition_core_weights");
+  require_vector_size(level_transition_biases, num_levels > 0 ? num_levels - 1 : 0, "level_transition_biases");
+  require_int_vector_size(level_transition_topks, num_levels > 0 ? num_levels - 1 : 0, "level_transition_topks");
+  require_vector_size(level_norm_weights, num_levels, "level_norm_weights");
+  require_vector_size(level_norm_biases, num_levels, "level_norm_biases");
+  require_vector_size(skip_source_weights, expected_skip_count, "skip_source_weights");
+  require_vector_size(skip_target_weights, expected_skip_count, "skip_target_weights");
+  require_vector_size(skip_core_weights, expected_skip_count, "skip_core_weights");
+  require_vector_size(skip_biases, expected_skip_count, "skip_biases");
+  require_vector_size(skip_gates, expected_skip_count, "skip_gates");
+  require_int_vector_size(skip_topks, expected_skip_count, "skip_topks");
+
+  std::vector<NativeLayerState> current_memory;
+  current_memory.reserve(num_levels);
+  for (size_t index = 0; index < num_levels; ++index) {
+    current_memory.push_back({flat_memory[index * 2], flat_memory[index * 2 + 1]});
+  }
+
+  std::vector<std::vector<torch::Tensor>> checkpoint_states(num_levels);
+  std::vector<std::vector<torch::Tensor>> checkpoint_vals(num_levels);
+
+  auto projected_s = linear3d(aligned_s, s_prediction_weight, c10::nullopt);
+  std::vector<torch::Tensor> query_steps;
+  query_steps.reserve(aligned_s.size(1));
+
+  for (int64_t time_index = 0; time_index < aligned_s.size(1); ++time_index) {
+    if (time_index % checkpoint_stride == 0) {
+      for (size_t checkpoint_index = 0; checkpoint_index < num_levels; ++checkpoint_index) {
+        checkpoint_states[checkpoint_index].push_back(current_memory[checkpoint_index].state);
+        checkpoint_vals[checkpoint_index].push_back(current_memory[checkpoint_index].val);
+      }
+    }
+
+    auto token_val = aligned_s.slice(1, time_index, time_index + 1);
+    auto token_state = linear3d(token_val, value_to_state_weight, cast_optional_like(value_to_state_bias, token_val)).squeeze(-1);
+    NativeLayerState token_layer{token_state, token_val};
+
+    std::vector<NativeLayerState> next_memory;
+    next_memory.reserve(num_levels);
+
+    auto first_level_normed = layer_with_val_norm(current_memory[0], val_norm_weights[0], val_norm_biases[0]);
+    auto first_write_delta = low_rank_transition_pairwise_topk_signed_abs(
+        torch::softplus(token_layer.state),
+        token_layer.state,
+        token_layer.val,
+        token_layer.val,
+        first_level_normed.val,
+        write_source_weights[0],
+        write_target_weights[0],
+        write_core_weights[0],
+        write_biases[0],
+        write_topks[0],
+        transition_compress_name);
+    auto level = apply_delta_to_layer(
+        current_memory[0],
+        std::get<0>(first_write_delta),
+        std::get<1>(first_write_delta),
+        val_norm_weights[0],
+        val_norm_biases[0]);
+    auto level_for_propagation = layer_with_val_norm(level, val_norm_weights[0], val_norm_biases[0]);
+    auto first_prop_delta = low_rank_propagation_topk_signed_abs(
+        level_for_propagation.state,
+        level_for_propagation.val,
+        propagation_source_weights[0],
+        propagation_target_weights[0],
+        propagation_core_weights[0],
+        propagation_biases[0],
+        propagation_topks[0],
+        propagation_compress_name);
+    level = apply_delta_to_layer(
+        level,
+        std::get<0>(first_prop_delta),
+        std::get<1>(first_prop_delta),
+        val_norm_weights[0],
+        val_norm_biases[0]);
+    next_memory.push_back(level);
+
+    for (size_t level_index = 1; level_index < num_levels; ++level_index) {
+      auto current_level = current_memory[level_index];
+      auto normalized_level = layer_with_val_norm(
+          current_level,
+          val_norm_weights[level_index],
+          val_norm_biases[level_index]);
+      auto normalized_parent = layer_with_val_norm(
+          next_memory[level_index - 1],
+          level_norm_weights[level_index - 1],
+          level_norm_biases[level_index - 1]);
+      auto parent_delta = low_rank_transition_pairwise_topk_signed_abs(
+          torch::softplus(normalized_parent.state),
+          normalized_parent.state,
+          normalized_parent.val,
+          normalized_parent.val,
+          normalized_level.val,
+          level_transition_source_weights[level_index - 1],
+          level_transition_target_weights[level_index - 1],
+          level_transition_core_weights[level_index - 1],
+          level_transition_biases[level_index - 1],
+          level_transition_topks[level_index - 1],
+          transition_compress_name);
+      auto updated_level = apply_delta_to_layer(
+          current_level,
+          std::get<0>(parent_delta),
+          std::get<1>(parent_delta),
+          val_norm_weights[level_index],
+          val_norm_biases[level_index]);
+
+      if (level_index == 1 && expected_skip_count > 0) {
+        auto skip_gate = torch::sigmoid(cast_tensor_like(skip_gates[0], token_val));
+        auto skip_delta = low_rank_transition_pairwise_topk_signed_abs(
+            torch::softplus(token_layer.state),
+            token_layer.state,
+            token_layer.val,
+            token_layer.val,
+            normalized_level.val,
+            skip_source_weights[0],
+            skip_target_weights[0],
+            skip_core_weights[0],
+            skip_biases[0],
+            skip_topks[0],
+            transition_compress_name);
+        updated_level = apply_delta_to_layer(
+            updated_level,
+            std::get<0>(skip_delta) * skip_gate,
+            std::get<1>(skip_delta) * skip_gate,
+            val_norm_weights[level_index],
+            val_norm_biases[level_index]);
+      }
+
+      if (level_index >= 2) {
+        const auto skip_index = level_index - 1;
+        auto normalized_skip_source = layer_with_val_norm(
+            next_memory[level_index - 2],
+            level_norm_weights[level_index - 2],
+            level_norm_biases[level_index - 2]);
+        auto skip_gate = torch::sigmoid(cast_tensor_like(skip_gates[skip_index], normalized_skip_source.val));
+        auto skip_delta = low_rank_transition_pairwise_topk_signed_abs(
+            torch::softplus(normalized_skip_source.state),
+            normalized_skip_source.state,
+            normalized_skip_source.val,
+            normalized_skip_source.val,
+            normalized_level.val,
+            skip_source_weights[skip_index],
+            skip_target_weights[skip_index],
+            skip_core_weights[skip_index],
+            skip_biases[skip_index],
+            skip_topks[skip_index],
+            transition_compress_name);
+        updated_level = apply_delta_to_layer(
+            updated_level,
+            std::get<0>(skip_delta) * skip_gate,
+            std::get<1>(skip_delta) * skip_gate,
+            val_norm_weights[level_index],
+            val_norm_biases[level_index]);
+      }
+
+      auto updated_level_for_prop = layer_with_val_norm(
+          updated_level,
+          val_norm_weights[level_index],
+          val_norm_biases[level_index]);
+      auto propagation_delta = low_rank_propagation_topk_signed_abs(
+          updated_level_for_prop.state,
+          updated_level_for_prop.val,
+          propagation_source_weights[level_index],
+          propagation_target_weights[level_index],
+          propagation_core_weights[level_index],
+          propagation_biases[level_index],
+          propagation_topks[level_index],
+          propagation_compress_name);
+      updated_level = apply_delta_to_layer(
+          updated_level,
+          std::get<0>(propagation_delta),
+          std::get<1>(propagation_delta),
+          val_norm_weights[level_index],
+          val_norm_biases[level_index]);
+      next_memory.push_back(updated_level);
+    }
+
+    current_memory = next_memory;
+    auto read_vector = read_memory_vector(
+        current_memory,
+        val_norm_weights,
+        val_norm_biases,
+        read_template_val,
+        read_projection_weights,
+        read_gates);
+    auto query_input = projected_s.select(1, time_index) + read_vector;
+    query_steps.push_back(layer_norm_last_dim(
+        query_input,
+        prediction_input_norm_weight,
+        cast_optional_like(prediction_input_norm_bias, query_input))
+        .unsqueeze(1));
+  }
+
+  torch::Tensor query_val;
+  if (query_steps.empty()) {
+    query_val = aligned_s.new_empty({aligned_s.size(0), 0, aligned_s.size(2)});
+  } else {
+    query_val = torch::cat(query_steps, 1);
+  }
+
+  std::vector<torch::Tensor> next_memory_flat;
+  next_memory_flat.reserve(current_memory.size() * 2);
+  for (const auto& layer : current_memory) {
+    next_memory_flat.push_back(layer.state);
+    next_memory_flat.push_back(layer.val);
+  }
+
+  std::vector<torch::Tensor> checkpoint_flat;
+  checkpoint_flat.reserve(num_levels * 2);
+  for (size_t checkpoint_index = 0; checkpoint_index < num_levels; ++checkpoint_index) {
+    if (checkpoint_states[checkpoint_index].empty()) {
+      checkpoint_flat.push_back(current_memory[checkpoint_index].state.new_empty(
+          {0, current_memory[checkpoint_index].state.size(0), current_memory[checkpoint_index].state.size(1)}));
+      checkpoint_flat.push_back(current_memory[checkpoint_index].val.new_empty(
+          {0, current_memory[checkpoint_index].val.size(0), current_memory[checkpoint_index].val.size(1), current_memory[checkpoint_index].val.size(2)}));
+      continue;
+    }
+    checkpoint_flat.push_back(torch::stack(checkpoint_states[checkpoint_index], 0));
+    checkpoint_flat.push_back(torch::stack(checkpoint_vals[checkpoint_index], 0));
+  }
+  return {query_val, next_memory_flat, checkpoint_flat};
+}
+
+
+
+std::vector<torch::Tensor> causal_memory_scan_fused_backward_cuda(
+    const torch::Tensor& aligned_s,
+    const std::vector<torch::Tensor>& flat_memory,
+    const torch::Tensor& value_to_state_weight,
+    const torch::Tensor& value_to_state_bias,
+    const torch::Tensor& s_prediction_weight,
+    const torch::Tensor& prediction_input_norm_weight,
+    const torch::Tensor& prediction_input_norm_bias,
+    const torch::Tensor& read_template_val,
+    const std::vector<torch::Tensor>& read_projection_weights,
+    const std::vector<torch::Tensor>& read_gates,
+    const std::vector<torch::Tensor>& write_source_weights,
+    const std::vector<torch::Tensor>& write_target_weights,
+    const std::vector<torch::Tensor>& write_core_weights,
+    const std::vector<torch::Tensor>& write_biases,
+    const std::vector<int64_t>& write_topks,
+    const std::string& transition_compress_name,
+    const std::vector<torch::Tensor>& propagation_source_weights,
+    const std::vector<torch::Tensor>& propagation_target_weights,
+    const std::vector<torch::Tensor>& propagation_core_weights,
+    const std::vector<torch::Tensor>& propagation_biases,
+    const std::vector<int64_t>& propagation_topks,
+    const std::string& propagation_compress_name,
+    const std::vector<torch::Tensor>& val_norm_weights,
+    const std::vector<torch::Tensor>& val_norm_biases,
+    const std::vector<torch::Tensor>& level_transition_source_weights,
+    const std::vector<torch::Tensor>& level_transition_target_weights,
+    const std::vector<torch::Tensor>& level_transition_core_weights,
+    const std::vector<torch::Tensor>& level_transition_biases,
+    const std::vector<int64_t>& level_transition_topks,
+    const std::vector<torch::Tensor>& level_norm_weights,
+    const std::vector<torch::Tensor>& level_norm_biases,
+    const std::vector<torch::Tensor>& skip_source_weights,
+    const std::vector<torch::Tensor>& skip_target_weights,
+    const std::vector<torch::Tensor>& skip_core_weights,
+    const std::vector<torch::Tensor>& skip_biases,
+    const std::vector<torch::Tensor>& skip_gates,
+    const std::vector<int64_t>& skip_topks,
+    const std::vector<torch::Tensor>& trace_tensors,
+    const torch::Tensor& grad_query_val,
+    const std::vector<torch::Tensor>& grad_next_memory) {
+#ifdef WITH_CUDA
+  if (!aligned_s.is_cuda()) {
+    throw std::runtime_error("causal_memory_scan_fused_backward_cuda requires CUDA inputs.");
+  }
+  pybind11::gil_scoped_release no_gil;
+  return jakal_net_causal_memory_scan_fused_backward_cuda(
+      aligned_s,
+      flat_memory,
+      value_to_state_weight,
+      value_to_state_bias,
+      s_prediction_weight,
+      prediction_input_norm_weight,
+      prediction_input_norm_bias,
+      read_template_val,
+      read_projection_weights,
+      read_gates,
+      write_source_weights,
+      write_target_weights,
+      write_core_weights,
+      write_biases,
+      write_topks,
+      transition_compress_name,
+      propagation_source_weights,
+      propagation_target_weights,
+      propagation_core_weights,
+      propagation_biases,
+      propagation_topks,
+      propagation_compress_name,
+      val_norm_weights,
+      val_norm_biases,
+      level_transition_source_weights,
+      level_transition_target_weights,
+      level_transition_core_weights,
+      level_transition_biases,
+      level_transition_topks,
+      level_norm_weights,
+      level_norm_biases,
+      skip_source_weights,
+      skip_target_weights,
+      skip_core_weights,
+      skip_biases,
+      skip_gates,
+      skip_topks,
+      trace_tensors,
+      grad_query_val,
+      grad_next_memory);
+  if (grad_next_memory.size() != flat_memory.size()) {
+    throw std::runtime_error("grad_next_memory must match flat_memory length.");
+  }
+  c10::AutoGradMode enable_grad(true);
+
+  auto trace_result = causal_memory_scan_fused_trace(
+      aligned_s,
+      flat_memory,
+      value_to_state_weight,
+      packed_optional_tensor(value_to_state_bias),
+      s_prediction_weight,
+      prediction_input_norm_weight,
+      packed_optional_tensor(prediction_input_norm_bias),
+      read_template_val,
+      read_projection_weights,
+      read_gates,
+      write_source_weights,
+      write_target_weights,
+      write_core_weights,
+      write_biases,
+      write_topks,
+      transition_compress_name,
+      propagation_source_weights,
+      propagation_target_weights,
+      propagation_core_weights,
+      propagation_biases,
+      propagation_topks,
+      propagation_compress_name,
+      val_norm_weights,
+      val_norm_biases,
+      level_transition_source_weights,
+      level_transition_target_weights,
+      level_transition_core_weights,
+      level_transition_biases,
+      level_transition_topks,
+      level_norm_weights,
+      level_norm_biases,
+      skip_source_weights,
+      skip_target_weights,
+      skip_core_weights,
+      skip_biases,
+      skip_gates,
+      skip_topks);
+  auto recomputed_trace_tensors = std::get<2>(trace_result);
+
+  auto make_leaf = [](const torch::Tensor& tensor) {
+    auto leaf = tensor.detach();
+    leaf.set_requires_grad(tensor.requires_grad());
+    return leaf;
+  };
+  auto accumulate = [](torch::Tensor& dst, const torch::Tensor& grad) {
+    if (!grad.defined()) {
+      return;
+    }
+    if (!dst.defined()) {
+      dst = grad;
+    } else {
+      dst = dst + grad;
+    }
+  };
+
+  auto value_to_state_weight_leaf = make_leaf(value_to_state_weight);
+  auto value_to_state_bias_leaf = make_leaf(value_to_state_bias);
+  auto s_prediction_weight_leaf = make_leaf(s_prediction_weight);
+  auto prediction_input_norm_weight_leaf = make_leaf(prediction_input_norm_weight);
+  auto prediction_input_norm_bias_leaf = make_leaf(prediction_input_norm_bias);
+  auto read_template_val_leaf = make_leaf(read_template_val);
+  std::vector<torch::Tensor> read_projection_weights_leaves;
+  std::vector<torch::Tensor> read_gates_leaves;
+  std::vector<torch::Tensor> write_source_weights_leaves;
+  std::vector<torch::Tensor> write_target_weights_leaves;
+  std::vector<torch::Tensor> write_core_weights_leaves;
+  std::vector<torch::Tensor> write_biases_leaves;
+  std::vector<torch::Tensor> propagation_source_weights_leaves;
+  std::vector<torch::Tensor> propagation_target_weights_leaves;
+  std::vector<torch::Tensor> propagation_core_weights_leaves;
+  std::vector<torch::Tensor> propagation_biases_leaves;
+  std::vector<torch::Tensor> val_norm_weights_leaves;
+  std::vector<torch::Tensor> val_norm_biases_leaves;
+  std::vector<torch::Tensor> level_transition_source_weights_leaves;
+  std::vector<torch::Tensor> level_transition_target_weights_leaves;
+  std::vector<torch::Tensor> level_transition_core_weights_leaves;
+  std::vector<torch::Tensor> level_transition_biases_leaves;
+  std::vector<torch::Tensor> level_norm_weights_leaves;
+  std::vector<torch::Tensor> level_norm_biases_leaves;
+  std::vector<torch::Tensor> skip_source_weights_leaves;
+  std::vector<torch::Tensor> skip_target_weights_leaves;
+  std::vector<torch::Tensor> skip_core_weights_leaves;
+  std::vector<torch::Tensor> skip_biases_leaves;
+  std::vector<torch::Tensor> skip_gates_leaves;
+  for (const auto& tensor : read_projection_weights) read_projection_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : read_gates) read_gates_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : write_source_weights) write_source_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : write_target_weights) write_target_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : write_core_weights) write_core_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : write_biases) write_biases_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : propagation_source_weights) propagation_source_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : propagation_target_weights) propagation_target_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : propagation_core_weights) propagation_core_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : propagation_biases) propagation_biases_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : val_norm_weights) val_norm_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : val_norm_biases) val_norm_biases_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : level_transition_source_weights) level_transition_source_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : level_transition_target_weights) level_transition_target_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : level_transition_core_weights) level_transition_core_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : level_transition_biases) level_transition_biases_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : level_norm_weights) level_norm_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : level_norm_biases) level_norm_biases_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : skip_source_weights) skip_source_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : skip_target_weights) skip_target_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : skip_core_weights) skip_core_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : skip_biases) skip_biases_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : skip_gates) skip_gates_leaves.push_back(make_leaf(tensor));
+
+  std::vector<torch::Tensor> carry_memory = grad_next_memory;
+  std::vector<torch::Tensor> shared_grad_accum;
+  shared_grad_accum.reserve(
+      8 + read_projection_weights.size() + read_gates.size() + write_source_weights.size() +
+      write_target_weights.size() + write_core_weights.size() + write_biases.size() +
+      propagation_source_weights.size() + propagation_target_weights.size() +
+      propagation_core_weights.size() + propagation_biases.size() + val_norm_weights.size() +
+      val_norm_biases.size() + level_transition_source_weights.size() +
+      level_transition_target_weights.size() + level_transition_core_weights.size() +
+      level_transition_biases.size() + level_norm_weights.size() + level_norm_biases.size() +
+      skip_source_weights.size() + skip_target_weights.size() + skip_core_weights.size() +
+      skip_biases.size() + skip_gates.size());
+  auto aligned_s_grad = aligned_s.requires_grad() ? torch::zeros_like(aligned_s) : torch::Tensor();
+
+  for (int64_t time_index = aligned_s.size(1) - 1; time_index >= 0; --time_index) {
+    auto token_val_leaf = make_leaf(aligned_s.slice(1, time_index, time_index + 1));
+    std::vector<NativeLayerState> current_memory;
+    std::vector<torch::Tensor> current_memory_leaves;
+    current_memory.reserve(flat_memory.size() / 2);
+    current_memory_leaves.reserve(flat_memory.size());
+    for (size_t level_index = 0; level_index < flat_memory.size() / 2; ++level_index) {
+      auto state_leaf = recomputed_trace_tensors[level_index * 2].select(0, time_index).detach();
+      state_leaf.set_requires_grad(flat_memory[level_index * 2].requires_grad());
+      auto val_leaf = recomputed_trace_tensors[level_index * 2 + 1].select(0, time_index).detach();
+      val_leaf.set_requires_grad(flat_memory[level_index * 2 + 1].requires_grad());
+      current_memory.push_back({state_leaf, val_leaf});
+      current_memory_leaves.push_back(state_leaf);
+      current_memory_leaves.push_back(val_leaf);
+    }
+
+    auto token_state = linear3d(
+        token_val_leaf,
+        value_to_state_weight_leaf,
+        cast_packed_optional_like(value_to_state_bias_leaf, token_val_leaf)).squeeze(-1);
+    auto projected_s_t = linear3d(token_val_leaf, s_prediction_weight_leaf, c10::nullopt).squeeze(1);
+
+    std::vector<NativeLayerState> next_memory;
+    next_memory.reserve(current_memory.size());
+    auto first_level_normed = layer_with_val_norm(current_memory[0], val_norm_weights_leaves[0], val_norm_biases_leaves[0]);
+    auto first_write_delta = low_rank_transition_pairwise_topk_signed_abs(
+        torch::softplus(token_state),
+        token_state,
+        token_val_leaf,
+        token_val_leaf,
+        first_level_normed.val,
+        write_source_weights_leaves[0],
+        write_target_weights_leaves[0],
+        write_core_weights_leaves[0],
+        write_biases_leaves[0],
+        write_topks[0],
+        transition_compress_name);
+    auto level = apply_delta_to_layer(
+        current_memory[0],
+        std::get<0>(first_write_delta),
+        std::get<1>(first_write_delta),
+        val_norm_weights_leaves[0],
+        val_norm_biases_leaves[0]);
+    auto level_for_propagation = layer_with_val_norm(level, val_norm_weights_leaves[0], val_norm_biases_leaves[0]);
+    auto first_prop_delta = low_rank_propagation_topk_signed_abs(
+        level_for_propagation.state,
+        level_for_propagation.val,
+        propagation_source_weights_leaves[0],
+        propagation_target_weights_leaves[0],
+        propagation_core_weights_leaves[0],
+        propagation_biases_leaves[0],
+        propagation_topks[0],
+        propagation_compress_name);
+    level = apply_delta_to_layer(
+        level,
+        std::get<0>(first_prop_delta),
+        std::get<1>(first_prop_delta),
+        val_norm_weights_leaves[0],
+        val_norm_biases_leaves[0]);
+    next_memory.push_back(level);
+
+    for (size_t level_index = 1; level_index < current_memory.size(); ++level_index) {
+      auto current_level = current_memory[level_index];
+      auto normalized_level = layer_with_val_norm(current_level, val_norm_weights_leaves[level_index], val_norm_biases_leaves[level_index]);
+      auto normalized_parent = layer_with_val_norm(next_memory[level_index - 1], level_norm_weights_leaves[level_index - 1], level_norm_biases_leaves[level_index - 1]);
+      auto parent_delta = low_rank_transition_pairwise_topk_signed_abs(
+          torch::softplus(normalized_parent.state),
+          normalized_parent.state,
+          normalized_parent.val,
+          normalized_parent.val,
+          normalized_level.val,
+          level_transition_source_weights_leaves[level_index - 1],
+          level_transition_target_weights_leaves[level_index - 1],
+          level_transition_core_weights_leaves[level_index - 1],
+          level_transition_biases_leaves[level_index - 1],
+          level_transition_topks[level_index - 1],
+          transition_compress_name);
+      auto updated_level = apply_delta_to_layer(
+          current_level,
+          std::get<0>(parent_delta),
+          std::get<1>(parent_delta),
+          val_norm_weights_leaves[level_index],
+          val_norm_biases_leaves[level_index]);
+
+      if (level_index == 1 && !skip_source_weights_leaves.empty()) {
+        auto skip_gate = torch::sigmoid(cast_tensor_like(skip_gates_leaves[0], token_val_leaf));
+        auto skip_delta = low_rank_transition_pairwise_topk_signed_abs(
+            torch::softplus(token_state),
+            token_state,
+            token_val_leaf,
+            token_val_leaf,
+            normalized_level.val,
+            skip_source_weights_leaves[0],
+            skip_target_weights_leaves[0],
+            skip_core_weights_leaves[0],
+            skip_biases_leaves[0],
+            skip_topks[0],
+            transition_compress_name);
+        updated_level = apply_delta_to_layer(
+            updated_level,
+            std::get<0>(skip_delta) * skip_gate,
+            std::get<1>(skip_delta) * skip_gate,
+            val_norm_weights_leaves[level_index],
+            val_norm_biases_leaves[level_index]);
+      }
+
+      if (level_index >= 2) {
+        const auto skip_index = level_index - 1;
+        auto normalized_skip_source = layer_with_val_norm(next_memory[level_index - 2], level_norm_weights_leaves[level_index - 2], level_norm_biases_leaves[level_index - 2]);
+        auto skip_gate = torch::sigmoid(cast_tensor_like(skip_gates_leaves[skip_index], normalized_skip_source.val));
+        auto skip_delta = low_rank_transition_pairwise_topk_signed_abs(
+            torch::softplus(normalized_skip_source.state),
+            normalized_skip_source.state,
+            normalized_skip_source.val,
+            normalized_skip_source.val,
+            normalized_level.val,
+            skip_source_weights_leaves[skip_index],
+            skip_target_weights_leaves[skip_index],
+            skip_core_weights_leaves[skip_index],
+            skip_biases_leaves[skip_index],
+            skip_topks[skip_index],
+            transition_compress_name);
+        updated_level = apply_delta_to_layer(
+            updated_level,
+            std::get<0>(skip_delta) * skip_gate,
+            std::get<1>(skip_delta) * skip_gate,
+            val_norm_weights_leaves[level_index],
+            val_norm_biases_leaves[level_index]);
+      }
+
+      auto updated_level_for_prop = layer_with_val_norm(updated_level, val_norm_weights_leaves[level_index], val_norm_biases_leaves[level_index]);
+      auto propagation_delta = low_rank_propagation_topk_signed_abs(
+          updated_level_for_prop.state,
+          updated_level_for_prop.val,
+          propagation_source_weights_leaves[level_index],
+          propagation_target_weights_leaves[level_index],
+          propagation_core_weights_leaves[level_index],
+          propagation_biases_leaves[level_index],
+          propagation_topks[level_index],
+          propagation_compress_name);
+      updated_level = apply_delta_to_layer(
+          updated_level,
+          std::get<0>(propagation_delta),
+          std::get<1>(propagation_delta),
+          val_norm_weights_leaves[level_index],
+          val_norm_biases_leaves[level_index]);
+      next_memory.push_back(updated_level);
+    }
+
+    auto read_vector = read_memory_vector(
+        next_memory,
+        val_norm_weights_leaves,
+        val_norm_biases_leaves,
+        read_template_val_leaf,
+        read_projection_weights_leaves,
+        read_gates_leaves);
+    auto query_input = projected_s_t + read_vector;
+    auto query_step = layer_norm_last_dim(
+        query_input,
+        prediction_input_norm_weight_leaf,
+        cast_packed_optional_like(prediction_input_norm_bias_leaf, query_input));
+
+    torch::autograd::variable_list outputs;
+    outputs.push_back(query_step);
+    for (const auto& layer : next_memory) {
+      outputs.push_back(layer.state);
+      outputs.push_back(layer.val);
+    }
+    torch::autograd::variable_list local_grad_outputs;
+    local_grad_outputs.push_back(
+        grad_query_val.defined()
+            ? grad_query_val.select(1, time_index)
+            : torch::zeros_like(query_step));
+    for (size_t memory_index = 0; memory_index < carry_memory.size(); ++memory_index) {
+      local_grad_outputs.push_back(
+          carry_memory[memory_index].defined()
+              ? carry_memory[memory_index]
+              : torch::zeros_like(outputs[memory_index + 1]));
+    }
+
+    std::vector<torch::Tensor> all_inputs;
+    all_inputs.push_back(token_val_leaf);
+    for (const auto& tensor : current_memory_leaves) all_inputs.push_back(tensor);
+    all_inputs.push_back(value_to_state_weight_leaf);
+    all_inputs.push_back(value_to_state_bias_leaf);
+    all_inputs.push_back(s_prediction_weight_leaf);
+    all_inputs.push_back(prediction_input_norm_weight_leaf);
+    all_inputs.push_back(prediction_input_norm_bias_leaf);
+    all_inputs.push_back(read_template_val_leaf);
+    for (const auto& tensor : read_projection_weights_leaves) all_inputs.push_back(tensor);
+    for (const auto& tensor : read_gates_leaves) all_inputs.push_back(tensor);
+    for (const auto& tensor : write_source_weights_leaves) all_inputs.push_back(tensor);
+    for (const auto& tensor : write_target_weights_leaves) all_inputs.push_back(tensor);
+    for (const auto& tensor : write_core_weights_leaves) all_inputs.push_back(tensor);
+    for (const auto& tensor : write_biases_leaves) all_inputs.push_back(tensor);
+    for (const auto& tensor : propagation_source_weights_leaves) all_inputs.push_back(tensor);
+    for (const auto& tensor : propagation_target_weights_leaves) all_inputs.push_back(tensor);
+    for (const auto& tensor : propagation_core_weights_leaves) all_inputs.push_back(tensor);
+    for (const auto& tensor : propagation_biases_leaves) all_inputs.push_back(tensor);
+    for (const auto& tensor : val_norm_weights_leaves) all_inputs.push_back(tensor);
+    for (const auto& tensor : val_norm_biases_leaves) all_inputs.push_back(tensor);
+    for (const auto& tensor : level_transition_source_weights_leaves) all_inputs.push_back(tensor);
+    for (const auto& tensor : level_transition_target_weights_leaves) all_inputs.push_back(tensor);
+    for (const auto& tensor : level_transition_core_weights_leaves) all_inputs.push_back(tensor);
+    for (const auto& tensor : level_transition_biases_leaves) all_inputs.push_back(tensor);
+    for (const auto& tensor : level_norm_weights_leaves) all_inputs.push_back(tensor);
+    for (const auto& tensor : level_norm_biases_leaves) all_inputs.push_back(tensor);
+    for (const auto& tensor : skip_source_weights_leaves) all_inputs.push_back(tensor);
+    for (const auto& tensor : skip_target_weights_leaves) all_inputs.push_back(tensor);
+    for (const auto& tensor : skip_core_weights_leaves) all_inputs.push_back(tensor);
+    for (const auto& tensor : skip_biases_leaves) all_inputs.push_back(tensor);
+    for (const auto& tensor : skip_gates_leaves) all_inputs.push_back(tensor);
+
+    torch::autograd::variable_list grad_inputs;
+    std::vector<int64_t> grad_input_map(all_inputs.size(), -1);
+    for (size_t index = 0; index < all_inputs.size(); ++index) {
+      if (all_inputs[index].defined() && all_inputs[index].requires_grad()) {
+        grad_input_map[index] = static_cast<int64_t>(grad_inputs.size());
+        grad_inputs.push_back(all_inputs[index]);
+      }
+    }
+    pybind11::gil_scoped_release no_gil;
+    auto grads = torch::autograd::grad(
+        outputs,
+        grad_inputs,
+        local_grad_outputs,
+        std::nullopt,
+        false,
+        true);
+
+    std::vector<torch::Tensor> all_grads;
+    all_grads.reserve(all_inputs.size());
+    for (size_t index = 0; index < all_inputs.size(); ++index) {
+      if (grad_input_map[index] < 0) {
+        all_grads.push_back(torch::Tensor());
+      } else {
+        all_grads.push_back(grads[static_cast<size_t>(grad_input_map[index])]);
+      }
+    }
+    if (aligned_s_grad.defined() && all_grads[0].defined()) {
+      aligned_s_grad.slice(1, time_index, time_index + 1).add_(all_grads[0]);
+    }
+    std::vector<torch::Tensor> next_carry;
+    next_carry.reserve(current_memory_leaves.size());
+    for (size_t memory_index = 0; memory_index < current_memory_leaves.size(); ++memory_index) {
+      auto& grad = all_grads[1 + memory_index];
+      next_carry.push_back(grad.defined() ? grad : torch::zeros_like(current_memory_leaves[memory_index]));
+    }
+    carry_memory = next_carry;
+
+    size_t shared_offset = 1 + current_memory_leaves.size();
+    if (shared_grad_accum.empty()) {
+      shared_grad_accum.resize(all_inputs.size() - shared_offset);
+    }
+    for (size_t shared_index = 0; shared_index < shared_grad_accum.size(); ++shared_index) {
+      accumulate(shared_grad_accum[shared_index], all_grads[shared_offset + shared_index]);
+    }
+  }
+
+  std::vector<torch::Tensor> result;
+  result.reserve(1 + flat_memory.size() + shared_grad_accum.size());
+  result.push_back(aligned_s_grad);
+  for (const auto& grad : carry_memory) result.push_back(grad);
+  for (const auto& grad : shared_grad_accum) result.push_back(grad);
+  return result;
+#else
+  throw std::runtime_error(
+      "causal_memory_scan_fused_backward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
 std::vector<std::string> supported_ops() {
   auto ops = std::vector<std::string>{
       "propagation_dense",
@@ -567,6 +2465,9 @@ std::vector<std::string> supported_ops() {
       "transition_topk",
       "transition_query_topk",
       "transition_query_topk_select",
+      "causal_memory_scan_fused",
+      "causal_memory_scan_fused_trace",
+      "causal_memory_scan_fused_checkpoints",
   };
   if (jakal_net_compiled_with_cuda_source()) {
     ops.insert(
@@ -577,10 +2478,12 @@ std::vector<std::string> supported_ops() {
             "low_rank_pairwise_topk_forward_cuda",
             "low_rank_propagation_topk_forward_cuda",
             "low_rank_propagation_window_forward_cuda",
+            "low_rank_propagation_window_entmax15_forward_cuda",
             "softsign_backward_cuda",
             "softmax_backward_cuda",
             "diagonal_pairwise_topk_backward_cuda",
             "low_rank_pairwise_topk_backward_cuda",
+            "causal_memory_scan_fused_backward_cuda",
         });
   }
   return ops;
@@ -668,7 +2571,7 @@ std::tuple<torch::Tensor, torch::Tensor> propagation_dense(
       can_use_full_dense_logits(flat_val, batch_flat, num_nodes, num_nodes)) {
     auto scores = pairwise_scores(
         pairwise_kind, flat_val, flat_val, weight, bias, in_weight, in_bias, out_weight, out_bias);
-    auto edges = softsign(scores);
+    auto edges = compress_scores(edge_compress_name, scores);
     auto delta_state =
         torch::bmm(
             edges.to(state_acc_dtype),
@@ -700,7 +2603,7 @@ std::tuple<torch::Tensor, torch::Tensor> propagation_dense(
       auto source_val = flat_val.slice(1, source_start, source_end);
       auto scores = pairwise_scores(
           pairwise_kind, target_val, source_val, weight, bias, in_weight, in_bias, out_weight, out_bias);
-      auto edges = softsign(scores);
+      auto edges = compress_scores(edge_compress_name, scores);
       auto state_edges = edges.to(state_acc_dtype);
       auto val_edges = edges.to(val_acc_dtype);
       auto source_state =
@@ -770,7 +2673,7 @@ std::tuple<torch::Tensor, torch::Tensor> propagation_query_dense(
         in_bias,
         out_weight,
         out_bias);
-    auto edges = softsign(scores);
+    auto edges = compress_scores(edge_compress_name, scores);
     auto delta_state =
         torch::bmm(
             edges.to(state_acc_dtype),
@@ -811,7 +2714,7 @@ std::tuple<torch::Tensor, torch::Tensor> propagation_query_dense(
           in_bias,
           out_weight,
           out_bias);
-      auto edges = softsign(scores);
+      auto edges = compress_scores(edge_compress_name, scores);
       query_state_acc = query_state_acc +
                         torch::bmm(
                             edges.to(state_acc_dtype),
@@ -927,7 +2830,7 @@ std::tuple<torch::Tensor, torch::Tensor> propagation_window(
                       target_start, target_end, source_start, source_end, window, layer_val.device())
                       .unsqueeze(0)
                       .to(scores.scalar_type());
-      auto edges = softsign(scores) * mask;
+      auto edges = compress_scores(edge_compress_name, scores, mask.to(torch::kBool));
       auto state_edges = edges.to(state_acc_dtype);
       auto val_edges = edges.to(val_acc_dtype);
       auto source_state =
@@ -1026,7 +2929,8 @@ std::tuple<torch::Tensor, torch::Tensor> propagation_topk(
         flat_projected_state.to(torch::kFloat32).contiguous(),
         flat_projected_val.to(torch::kFloat32).contiguous(),
         k,
-        score_bias);
+        score_bias,
+        false);
     return {
         reshape_state(std::get<0>(fused).to(projected_state.scalar_type()), batch_sizes, num_nodes),
         reshape_val(std::get<1>(fused).to(projected_val.scalar_type()), batch_sizes, num_nodes, out_dim),
@@ -1075,7 +2979,7 @@ std::tuple<torch::Tensor, torch::Tensor> propagation_topk(
     auto gathered = gather_by_indices(flat_projected_state, flat_projected_val, best_indices);
     auto selected_state = std::get<0>(gathered);
     auto selected_val = std::get<1>(gathered);
-    auto edges = softsign(best_scores);
+    auto edges = compress_scores(edge_compress_name, best_scores);
     auto state_block =
         (edges.to(state_acc_dtype) * selected_state.to(state_acc_dtype)).sum(-1);
     auto val_block =
@@ -1096,6 +3000,7 @@ std::tuple<torch::Tensor, torch::Tensor> transition_dense(
     const c10::optional<torch::Tensor>& in_bias,
     const c10::optional<torch::Tensor>& out_weight,
     const c10::optional<torch::Tensor>& out_bias,
+    const std::string& route_compress_name,
     const torch::Tensor& sender_strength,
     const torch::Tensor& src_val,
     const torch::Tensor& projected_state,
@@ -1103,6 +3008,7 @@ std::tuple<torch::Tensor, torch::Tensor> transition_dense(
     int64_t dst_nodes,
     int64_t src_block_size,
     int64_t dst_block_size) {
+  require_known_route_compress(route_compress_name);
   require_supported_device(sender_strength, "sender_strength");
   require_supported_device(src_val, "src_val");
   require_supported_device(projected_state, "projected_state");
@@ -1125,7 +3031,9 @@ std::tuple<torch::Tensor, torch::Tensor> transition_dense(
     auto route_context = prepare_route_context(route_kind, flat_src_val, in_weight, in_bias);
     auto logits = route_block_logits(
         route_kind, route_context, in_weight, in_bias, out_weight, out_bias, 0, dst_nodes);
-    auto routes = torch::softmax(logits, -1);
+    auto routes = route_compress_name == "signed_entmax15"
+                      ? signed_entmax15_scores(logits)
+                      : torch::softmax(logits, -1);
     auto state_sender =
         (flat_sender_strength.to(state_acc_dtype) * flat_projected_state.to(state_acc_dtype));
     auto val_sender =
@@ -1153,6 +3061,28 @@ std::tuple<torch::Tensor, torch::Tensor> transition_dense(
     auto src_block = flat_src_val.slice(1, src_start, src_end);
     auto route_context = prepare_route_context(route_kind, src_block, in_weight, in_bias);
 
+    auto state_sender =
+        (flat_sender_strength.slice(1, src_start, src_end).to(state_acc_dtype) *
+         flat_projected_state.slice(1, src_start, src_end).to(state_acc_dtype));
+    auto val_sender =
+        (flat_sender_strength.slice(1, src_start, src_end).to(val_acc_dtype).unsqueeze(-1) *
+         flat_projected_val.slice(1, src_start, src_end).to(val_acc_dtype));
+
+    if (route_compress_name == "signed_entmax15") {
+      std::vector<torch::Tensor> logits_blocks;
+      for (int64_t dst_start = 0; dst_start < dst_nodes; dst_start += dst_step) {
+        const auto dst_end = std::min(dst_start + dst_step, dst_nodes);
+        logits_blocks.push_back(route_block_logits(
+            route_kind, route_context, in_weight, in_bias, out_weight, out_bias, dst_start, dst_end));
+      }
+      auto routes = signed_entmax15_scores(torch::cat(logits_blocks, -1));
+      auto transport = routes.transpose(1, 2).contiguous();
+      delta_state = delta_state +
+                    torch::bmm(transport.to(state_acc_dtype), state_sender.unsqueeze(-1)).squeeze(-1);
+      delta_val = delta_val + torch::bmm(transport.to(val_acc_dtype), val_sender);
+      continue;
+    }
+
     torch::Tensor running_max;
     torch::Tensor running_sum;
     bool initialized = false;
@@ -1177,13 +3107,6 @@ std::tuple<torch::Tensor, torch::Tensor> transition_dense(
         running_max = next_max;
       }
     }
-
-    auto state_sender =
-        (flat_sender_strength.slice(1, src_start, src_end).to(state_acc_dtype) *
-         flat_projected_state.slice(1, src_start, src_end).to(state_acc_dtype));
-    auto val_sender =
-        (flat_sender_strength.slice(1, src_start, src_end).to(val_acc_dtype).unsqueeze(-1) *
-         flat_projected_val.slice(1, src_start, src_end).to(val_acc_dtype));
 
     for (int64_t dst_start = 0; dst_start < dst_nodes; dst_start += dst_step) {
       const auto dst_end = std::min(dst_start + dst_step, dst_nodes);
@@ -1236,6 +3159,7 @@ std::tuple<torch::Tensor, torch::Tensor> transition_topk(
         in_bias,
         out_weight,
         out_bias,
+        "softmax",
         sender_strength,
         src_val,
         projected_state,
@@ -1567,7 +3491,10 @@ std::tuple<torch::Tensor, torch::Tensor> transition_pairwise_topk(
         weighted_projected_state,
         weighted_projected_val,
         k,
-        false);
+        (bias.has_value() && bias.value().defined() && bias.value().numel() != 0)
+            ? bias.value().item<double>()
+            : 0.0,
+        0);
     return {
         reshape_state(std::get<0>(fused).to(projected_state.scalar_type()), batch_sizes, dst_nodes),
         reshape_val(std::get<1>(fused).to(projected_val.scalar_type()), batch_sizes, dst_nodes, out_dim),
@@ -1899,6 +3826,47 @@ std::tuple<torch::Tensor, torch::Tensor> transition_query_topk(
 
 }  // namespace
 
+TORCH_LIBRARY(jakal_net, m) {
+  m.def("signed_entmax15(Tensor scores, Tensor mask) -> Tensor");
+  m.def("signed_entmax15_backward(Tensor scores, Tensor routes, Tensor grad_routes, Tensor mask) -> Tensor");
+}
+
+TORCH_LIBRARY_IMPL(jakal_net, CPU, m) {
+  m.impl(
+      "signed_entmax15",
+      [](const torch::Tensor& scores, const torch::Tensor& mask) {
+        auto packed_mask = packed_optional_tensor(mask);
+        return signed_entmax15_scores(scores, packed_mask);
+      });
+  m.impl(
+      "signed_entmax15_backward",
+      [](const torch::Tensor& scores,
+         const torch::Tensor& routes,
+         const torch::Tensor& grad_routes,
+         const torch::Tensor& mask) {
+        auto packed_mask = packed_optional_tensor(mask);
+        return signed_entmax15_backward_scores(scores, routes, grad_routes, packed_mask);
+      });
+}
+
+TORCH_LIBRARY_IMPL(jakal_net, CUDA, m) {
+  m.impl(
+      "signed_entmax15",
+      [](const torch::Tensor& scores, const torch::Tensor& mask) {
+        auto packed_mask = packed_optional_tensor(mask);
+        return signed_entmax15_scores(scores, packed_mask);
+      });
+  m.impl(
+      "signed_entmax15_backward",
+      [](const torch::Tensor& scores,
+         const torch::Tensor& routes,
+         const torch::Tensor& grad_routes,
+         const torch::Tensor& mask) {
+        auto packed_mask = packed_optional_tensor(mask);
+        return signed_entmax15_backward_scores(scores, routes, grad_routes, packed_mask);
+      });
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("supported_ops", &supported_ops, "List supported native ops");
   m.def("supported_devices", &supported_devices, "List supported native devices");
@@ -1924,6 +3892,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "low_rank_propagation_window_forward_cuda",
       &low_rank_propagation_window_forward_cuda_wrapper,
       "CUDA fused low-rank propagation window forward");
+  m.def(
+      "low_rank_propagation_window_entmax15_forward_cuda",
+      &low_rank_propagation_window_entmax15_forward_cuda_wrapper,
+      "CUDA fused low-rank propagation window forward with signed entmax15");
   m.def("softsign_backward_cuda", &softsign_backward_cuda_wrapper, "CUDA softsign backward");
   m.def("softmax_backward_cuda", &softmax_backward_cuda_wrapper, "CUDA softmax backward");
   m.def("transition_dense", &transition_dense, "Native dense transition");
@@ -1943,4 +3915,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "low_rank_pairwise_topk_backward_cuda",
       &low_rank_pairwise_topk_backward_cuda_wrapper,
       "CUDA low-rank pairwise top-k backward");
+  m.def(
+      "causal_memory_scan_fused",
+      &causal_memory_scan_fused,
+      "Native fused causal-memory scan stub");
+  m.def(
+      "causal_memory_scan_fused_trace",
+      &causal_memory_scan_fused_trace,
+      "Native fused causal-memory scan with step trace");
+  m.def(
+      "causal_memory_scan_fused_checkpoints",
+      &causal_memory_scan_fused_checkpoints,
+      "Native fused causal-memory scan with chunk checkpoint trace");
+  m.def(
+      "causal_memory_scan_fused_backward_cuda",
+      &causal_memory_scan_fused_backward_cuda,
+      "CUDA backward for fused causal-memory scan");
 }

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import nullcontext
 import json
 import math
@@ -48,7 +48,7 @@ from train_progressive_b_lm import (
 )
 
 from jakal_net import describe_device, resolve_device
-from jakal_net.causal_memory_lm import CausalHierarchicalMemoryLM, MemoryScanOutput
+from jakal_net.causal_memory_lm import CausalHierarchicalMemoryLM, MemoryScanOutput, ModelRecurrentState
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -133,9 +133,12 @@ class SerializedDocument:
 class TrainingCurriculumStage:
     name: str
     document_span: int
+    batch_size: int
+    grad_accum_steps: int
     freeze_memory: bool
     freeze_propagation: bool
     freeze_skip: bool
+    bucket_weights: dict[str, float]
 
 
 @dataclass(frozen=True, slots=True)
@@ -387,6 +390,47 @@ def resolve_bucket_weights(*, step: int, total_steps: int) -> dict[str, float]:
     }
 
 
+def resolve_stage_bucket_weights(*, stage_name: str) -> dict[str, float]:
+    if stage_name == "stage1":
+        return {
+            "mixed_dialogue": 1.0,
+            "arxiv": 1.0,
+            "pubmed": 1.0,
+            "dialogue": 1.0,
+            "wiki": 1.0,
+            "code": 1.0,
+            "math": 1.0,
+            "docs": 1.0,
+            "math_qa": 0.0,
+            "reasoning": 0.0,
+        }
+    if stage_name == "stage2":
+        return {
+            "mixed_dialogue": 1.0,
+            "arxiv": 1.0,
+            "pubmed": 1.0,
+            "dialogue": 0.6,
+            "wiki": 0.6,
+            "code": 0.6,
+            "math": 0.6,
+            "docs": 0.6,
+            "math_qa": 0.35,
+            "reasoning": 0.35,
+        }
+    return {
+        "mixed_dialogue": 1.0,
+        "arxiv": 1.0,
+        "pubmed": 1.0,
+        "dialogue": 0.2,
+        "wiki": 0.2,
+        "code": 0.2,
+        "math": 0.2,
+        "docs": 0.2,
+        "math_qa": 1.0,
+        "reasoning": 1.0,
+    }
+
+
 def sample_documents_uniform_by_bucket(
     documents: Sequence[TokenizedDocument],
     *,
@@ -447,6 +491,16 @@ class DocumentChunkBatcher:
         }
         self.active_buckets = tuple(self.bucket_to_indices)
         self.active_bucket_weights = tuple(1.0 for _ in self.active_buckets)
+
+    def set_batch_size(self, batch_size: int) -> None:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+        if batch_size == self.batch_size:
+            return
+        self.batch_size = batch_size
+        self.current_doc = [-1] * batch_size
+        self.current_chunk = [0] * batch_size
+        self.needs_reset = [True] * batch_size
 
     def _sample_document_index(self) -> int:
         if not self.active_buckets:
@@ -1090,7 +1144,7 @@ def load_pretokenized_bundle(path: Path) -> dict[str, Any]:
     }
 
 
-def load_pretokenized_directory(path: Path) -> dict[str, Any]:
+def load_pretokenized_directory(path: Path, *, load_workers: int = 1) -> dict[str, Any]:
     shard_paths = sorted(candidate for candidate in path.glob("*.pt") if candidate.is_file())
     if not shard_paths:
         raise ValueError(f"No pretokenized shard files found in {path}")
@@ -1099,20 +1153,32 @@ def load_pretokenized_directory(path: Path) -> dict[str, Any]:
     tokenizer_model_path: str | None = None
     vocab_size: int | None = None
     shard_summaries: list[dict[str, Any]] = []
-    for shard_path in shard_paths:
-        bundle = load_pretokenized_bundle(shard_path)
-        merged_documents.extend(bundle["documents"])
-        if tokenizer_label is None:
-            tokenizer_label = bundle.get("tokenizer_label")
-            tokenizer_model_path = bundle.get("tokenizer_model_path")
-            vocab_size = int(bundle["vocab_size"])
-        shard_summaries.append(
-            {
-                "path": str(shard_path),
-                "documents": len(bundle["documents"]),
-                "corpus_info": bundle.get("corpus_info") or {},
-            }
+    if load_workers <= 1:
+        bundle_iterator = (load_pretokenized_bundle(shard_path) for shard_path in shard_paths)
+        executor: ThreadPoolExecutor | None = None
+    else:
+        executor = ThreadPoolExecutor(
+            max_workers=min(max(1, load_workers), len(shard_paths)),
+            thread_name_prefix="pretok_load",
         )
+        bundle_iterator = executor.map(load_pretokenized_bundle, shard_paths)
+    try:
+        for shard_path, bundle in zip(shard_paths, bundle_iterator):
+            merged_documents.extend(bundle["documents"])
+            if tokenizer_label is None:
+                tokenizer_label = bundle.get("tokenizer_label")
+                tokenizer_model_path = bundle.get("tokenizer_model_path")
+                vocab_size = int(bundle["vocab_size"])
+            shard_summaries.append(
+                {
+                    "path": str(shard_path),
+                    "documents": len(bundle["documents"]),
+                    "corpus_info": bundle.get("corpus_info") or {},
+                }
+            )
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
     if vocab_size is None:
         raise ValueError(f"Invalid pretokenized shard directory: {path}")
     return {
@@ -1165,6 +1231,12 @@ def resolve_curriculum_stage(
     stage2_ratio: float,
     stage2_span: int,
     stage3_span: int,
+    stage1_batch_size: int,
+    stage2_batch_size: int,
+    stage3_batch_size: int,
+    stage1_grad_accum_steps: int,
+    stage2_grad_accum_steps: int,
+    stage3_grad_accum_steps: int,
 ) -> TrainingCurriculumStage:
     stage1_end = int(total_steps * stage1_ratio)
     stage2_end = int(total_steps * stage2_ratio)
@@ -1172,40 +1244,50 @@ def resolve_curriculum_stage(
         return TrainingCurriculumStage(
             name="stage1",
             document_span=1,
+            batch_size=max(1, stage1_batch_size),
+            grad_accum_steps=max(1, stage1_grad_accum_steps),
             freeze_memory=True,
             freeze_propagation=True,
             freeze_skip=True,
+            bucket_weights=resolve_stage_bucket_weights(stage_name="stage1"),
         )
     if stage2_end > 0 and step <= stage2_end:
         return TrainingCurriculumStage(
             name="stage2",
             document_span=max(1, stage2_span),
+            batch_size=max(1, stage2_batch_size),
+            grad_accum_steps=max(1, stage2_grad_accum_steps),
             freeze_memory=False,
             freeze_propagation=True,
             freeze_skip=True,
+            bucket_weights=resolve_stage_bucket_weights(stage_name="stage2"),
         )
     return TrainingCurriculumStage(
         name="stage3",
         document_span=max(1, stage3_span),
+        batch_size=max(1, stage3_batch_size),
+        grad_accum_steps=max(1, stage3_grad_accum_steps),
         freeze_memory=False,
         freeze_propagation=False,
         freeze_skip=False,
+        bucket_weights=resolve_stage_bucket_weights(stage_name="stage3"),
     )
 
 
 def apply_training_curriculum(model: CausalHierarchicalMemoryLM, stage: TrainingCurriculumStage) -> None:
-    _set_module_requires_grad(model.memory_levels, not stage.freeze_memory)
-    _set_module_requires_grad(model.level_transitions, not stage.freeze_memory)
-    _set_module_requires_grad(model.level_norms, not stage.freeze_memory)
-    _set_module_requires_grad(model.read_projections, not stage.freeze_memory)
-    _set_parameter_collection_requires_grad(model.read_gates, not stage.freeze_memory)
-    model.read_template_val.requires_grad_(not stage.freeze_memory)
+    b_module = model.b_module
+    _set_module_requires_grad(b_module.memory_levels, not stage.freeze_memory)
+    _set_module_requires_grad(b_module.level_transitions, not stage.freeze_memory)
+    _set_module_requires_grad(b_module.level_norms, not stage.freeze_memory)
+    _set_module_requires_grad(b_module.read_projections, not stage.freeze_memory)
+    _set_parameter_collection_requires_grad(b_module.read_gates, not stage.freeze_memory)
+    b_module.read_template_val.requires_grad_(not stage.freeze_memory)
 
-    for level in model.memory_levels:
+    for level in b_module.memory_levels:
         _set_module_requires_grad(level.propagation, not stage.freeze_propagation)
 
-    _set_module_requires_grad(model.skip_transitions, not stage.freeze_skip)
-    _set_parameter_collection_requires_grad(tuple(model.skip_gates.values()), not stage.freeze_skip)
+    _set_module_requires_grad(b_module.skip_transitions, not stage.freeze_skip)
+    _set_parameter_collection_requires_grad(tuple(b_module.skip_gates.values()), not stage.freeze_skip)
 
 
 def override_batch_reset(batch: DocumentBatch, *, reset_all: bool) -> DocumentBatch:
@@ -1232,6 +1314,27 @@ def estimate_steps_per_epoch(*, documents: Sequence[TokenizedDocument], batch_si
     return max(1, math.ceil(total_chunks / max(1, batch_size)))
 
 
+def estimate_stage_weighted_steps_per_epoch(
+    *,
+    documents: Sequence[TokenizedDocument],
+    stage1_ratio: float,
+    stage2_ratio: float,
+    stage1_batch_size: int,
+    stage2_batch_size: int,
+    stage3_batch_size: int,
+) -> int:
+    total_chunks = sum(len(document.chunks) for document in documents)
+    stage1_weight = max(0.0, stage1_ratio)
+    stage2_weight = max(0.0, stage2_ratio - stage1_ratio)
+    stage3_weight = max(0.0, 1.0 - stage2_ratio)
+    effective_examples_per_step = (
+        stage1_weight * max(1, stage1_batch_size)
+        + stage2_weight * max(1, stage2_batch_size)
+        + stage3_weight * max(1, stage3_batch_size)
+    )
+    return max(1, math.ceil(total_chunks / max(1.0, effective_examples_per_step)))
+
+
 def perplexity_from_loss(loss_value: float) -> float:
     clamped = min(loss_value, 20.0)
     return float(math.exp(clamped))
@@ -1255,18 +1358,40 @@ def compute_learning_rate(
     return base_lr * (min_ratio + (1.0 - min_ratio) * cosine)
 
 
-def detach_memory_state(memory_state: Sequence[Any] | None) -> tuple[Any, ...] | None:
+def detach_memory_state(memory_state: Any | None) -> Any | None:
     if memory_state is None:
         return None
+    if isinstance(memory_state, ModelRecurrentState):
+        detached_knowledge = None
+        if memory_state.knowledge_state is not None:
+            detached_knowledge = memory_state.knowledge_state.with_tensors(
+                state=memory_state.knowledge_state.state.detach(),
+                val=memory_state.knowledge_state.val.detach(),
+            )
+        return ModelRecurrentState(
+            memory_state=tuple(
+                layer.with_tensors(state=layer.state.detach(), val=layer.val.detach())
+                for layer in memory_state.memory_state
+            ),
+            knowledge_state=detached_knowledge,
+        )
     return tuple(
         layer.with_tensors(state=layer.state.detach(), val=layer.val.detach())
         for layer in memory_state
     )
 
 
-def memory_state_is_finite(memory_state: Sequence[Any] | None) -> bool:
+def memory_state_is_finite(memory_state: Any | None) -> bool:
     if memory_state is None:
         return True
+    if isinstance(memory_state, ModelRecurrentState):
+        memory_layers: list[Any] = list(memory_state.memory_state)
+        if memory_state.knowledge_state is not None:
+            memory_layers.append(memory_state.knowledge_state)
+        return all(
+            bool(torch.isfinite(layer.state).all().item()) and bool(torch.isfinite(layer.val).all().item())
+            for layer in memory_layers
+        )
     return all(
         bool(torch.isfinite(layer.state).all().item()) and bool(torch.isfinite(layer.val).all().item())
         for layer in memory_state
@@ -1366,10 +1491,10 @@ def run_model(
     model: CausalHierarchicalMemoryLM,
     batch: DocumentBatch,
     *,
-    memory_state: Sequence[Any] | None,
+    memory_state: Any | None,
     precision: str,
     grad_enabled: bool,
-) -> tuple[torch.Tensor, tuple[Any, ...] | None]:
+) -> tuple[torch.Tensor, Any | None]:
     autocast_dtype = resolve_autocast_dtype(precision)
     autocast_supported = (
         autocast_dtype is not None
@@ -1394,7 +1519,7 @@ def run_model(
             )
             assert isinstance(output, MemoryScanOutput)
             loss = compute_masked_loss(output.logits, batch.target, batch.loss_mask)
-    return loss, output.memory_state
+    return loss, output.recurrent_state
 
 
 @torch.no_grad()
@@ -1498,6 +1623,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pretokenize-workers", type=int, default=8)
     parser.add_argument("--pretokenized-path")
     parser.add_argument("--pretokenized-dir")
+    parser.add_argument("--pretokenized-load-workers", type=int, default=8)
     parser.add_argument("--save-pretokenized", action="store_true")
 
     parser.add_argument("--device", default="auto")
@@ -1528,9 +1654,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pairwise-rank", type=int, default=64)
     parser.add_argument("--route-rank", type=int, default=64)
     parser.add_argument("--implementation", choices=("reference", "streaming", "kernel", "native"), default="streaming")
+    parser.add_argument("--knowledge-nodes", type=int, default=0)
+    parser.add_argument("--knowledge-route-topk", type=int, default=0)
+    parser.add_argument("--knowledge-propagation-topk", type=int, default=0)
+    parser.add_argument("--knowledge-propagation-layers", type=int, default=1)
 
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
+    parser.add_argument("--stage1-batch-size", type=int, default=0)
+    parser.add_argument("--stage2-batch-size", type=int, default=0)
+    parser.add_argument("--stage3-batch-size", type=int, default=0)
+    parser.add_argument("--stage1-grad-accum-steps", type=int, default=0)
+    parser.add_argument("--stage2-grad-accum-steps", type=int, default=0)
+    parser.add_argument("--stage3-grad-accum-steps", type=int, default=0)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-steps", type=int, default=200)
@@ -1587,11 +1723,30 @@ def main() -> None:
         raise ValueError("curriculum-stage2-ratio must be greater than or equal to curriculum-stage1-ratio.")
     if args.curriculum_stage2_span <= 0 or args.curriculum_stage3_span <= 0:
         raise ValueError("curriculum-stage spans must be positive.")
+    if any(
+        value < 0
+        for value in (
+            args.stage1_batch_size,
+            args.stage2_batch_size,
+            args.stage3_batch_size,
+            args.stage1_grad_accum_steps,
+            args.stage2_grad_accum_steps,
+            args.stage3_grad_accum_steps,
+        )
+    ):
+        raise ValueError("Stage batch sizes and grad accum steps must be non-negative.")
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = resolve_device(args.device)
     print(f"using device: {describe_device(device)}", flush=True)
+
+    stage1_batch_size = args.stage1_batch_size or args.batch_size
+    stage2_batch_size = args.stage2_batch_size or args.batch_size
+    stage3_batch_size = args.stage3_batch_size or args.batch_size
+    stage1_grad_accum_steps = args.stage1_grad_accum_steps or args.grad_accum_steps
+    stage2_grad_accum_steps = args.stage2_grad_accum_steps or args.grad_accum_steps
+    stage3_grad_accum_steps = args.stage3_grad_accum_steps or args.grad_accum_steps
 
     tokenizer_label: str
     tokenizer_model_path: str | None
@@ -1600,7 +1755,10 @@ def main() -> None:
     documents: list[TokenizedDocument]
 
     if args.pretokenized_dir and Path(args.pretokenized_dir).exists():
-        bundle = load_pretokenized_directory(Path(args.pretokenized_dir))
+        bundle = load_pretokenized_directory(
+            Path(args.pretokenized_dir),
+            load_workers=max(1, int(args.pretokenized_load_workers)),
+        )
         documents = list(bundle["documents"])
         tokenizer_label = str(bundle.get("tokenizer_label") or "unknown")
         tokenizer_model_path = bundle.get("tokenizer_model_path")
@@ -1703,7 +1861,14 @@ def main() -> None:
         tokenizer_label=tokenizer_label,
         tokenizer_model_path=tokenizer_model_path,
     )
-    steps_per_epoch = estimate_steps_per_epoch(documents=train_documents, batch_size=args.batch_size)
+    steps_per_epoch = estimate_stage_weighted_steps_per_epoch(
+        documents=train_documents,
+        stage1_ratio=args.curriculum_stage1_ratio,
+        stage2_ratio=args.curriculum_stage2_ratio,
+        stage1_batch_size=stage1_batch_size,
+        stage2_batch_size=stage2_batch_size,
+        stage3_batch_size=stage3_batch_size,
+    )
     total_steps = max(1, int(math.ceil(steps_per_epoch * args.epochs)))
 
     model = CausalHierarchicalMemoryLM(
@@ -1724,12 +1889,23 @@ def main() -> None:
         pairwise_rank=args.pairwise_rank,
         route_rank=args.route_rank,
         implementation=args.implementation,
+        knowledge_nodes=args.knowledge_nodes,
+        knowledge_route_topk=None if args.knowledge_route_topk <= 0 else args.knowledge_route_topk,
+        knowledge_propagation_topk=None if args.knowledge_propagation_topk <= 0 else args.knowledge_propagation_topk,
+        knowledge_propagation_layers=args.knowledge_propagation_layers,
     ).to(device)
     parameter_count = count_parameters(model)
     print(
         f"model=causal_memory_doc | params={parameter_count:,} | dim={args.dim} | seq_len={args.seq_len} | "
         f"s_window={args.s_window} | s_microbatch_size={args.s_microbatch_size} | "
-        f"scan_backend={args.scan_backend} | scan_checkpoint_chunk_size={args.scan_checkpoint_chunk_size} | memory_slots={args.memory_slots}",
+        f"scan_backend={args.scan_backend} | scan_checkpoint_chunk_size={args.scan_checkpoint_chunk_size} | "
+        f"memory_slots={args.memory_slots} | knowledge_nodes={args.knowledge_nodes}",
+        flush=True,
+    )
+    print(
+        f"curriculum_batches | stage1=batch{stage1_batch_size}/ga{stage1_grad_accum_steps} | "
+        f"stage2=batch{stage2_batch_size}/ga{stage2_grad_accum_steps} | "
+        f"stage3=batch{stage3_batch_size}/ga{stage3_grad_accum_steps}",
         flush=True,
     )
     print(
@@ -1759,7 +1935,7 @@ def main() -> None:
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scaler = torch.cuda.amp.GradScaler() if args.precision == "fp16" and device.type == "cuda" else None
-    batcher = DocumentChunkBatcher(train_documents, batch_size=args.batch_size, device=device)
+    batcher = DocumentChunkBatcher(train_documents, batch_size=stage1_batch_size, device=device)
 
     history_rows: list[dict[str, Any]] = []
     train_memory_state: tuple[Any, ...] | None = None
@@ -1791,8 +1967,15 @@ def main() -> None:
             stage2_ratio=args.curriculum_stage2_ratio,
             stage2_span=args.curriculum_stage2_span,
             stage3_span=args.curriculum_stage3_span,
+            stage1_batch_size=stage1_batch_size,
+            stage2_batch_size=stage2_batch_size,
+            stage3_batch_size=stage3_batch_size,
+            stage1_grad_accum_steps=stage1_grad_accum_steps,
+            stage2_grad_accum_steps=stage2_grad_accum_steps,
+            stage3_grad_accum_steps=stage3_grad_accum_steps,
         )
-        bucket_weights = resolve_bucket_weights(step=step, total_steps=total_steps)
+        bucket_weights = stage.bucket_weights
+        batcher.set_batch_size(stage.batch_size)
         batcher.set_bucket_weights(bucket_weights)
         if stage.name != active_stage_name:
             apply_training_curriculum(model, stage)
@@ -1800,6 +1983,7 @@ def main() -> None:
             active_stage_name = stage.name
             print(
                 f"curriculum | step={step} | stage={stage.name} | span={stage.document_span} | "
+                f"batch_size={stage.batch_size} | grad_accum_steps={stage.grad_accum_steps} | "
                 f"freeze_memory={stage.freeze_memory} | freeze_propagation={stage.freeze_propagation} | freeze_skip={stage.freeze_skip} | "
                 f"bucket_weights={{{', '.join(f'{key}:{value:.3f}' for key, value in bucket_weights.items() if value > 0.0)}}}",
                 flush=True,
@@ -1843,7 +2027,7 @@ def main() -> None:
             current_memory_state = None if stage.freeze_memory else next_memory_state
 
         if loss_is_finite and span_loss_tensors:
-            total_span_loss = sum(span_loss_tensors) / (args.grad_accum_steps * len(span_loss_tensors))
+            total_span_loss = sum(span_loss_tensors) / (stage.grad_accum_steps * len(span_loss_tensors))
             if scaler is not None:
                 scaler.scale(total_span_loss).backward()
             else:
@@ -1857,7 +2041,7 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
             train_memory_state = None
 
-        should_step_optimizer = step % args.grad_accum_steps == 0 or step == total_steps
+        should_step_optimizer = step % stage.grad_accum_steps == 0 or step == total_steps
         if loss_is_finite and should_step_optimizer:
             if scaler is not None:
                 scaler.unscale_(optimizer)

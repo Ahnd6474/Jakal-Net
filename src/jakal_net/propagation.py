@@ -31,6 +31,7 @@ from jakal_net.kernels import (
     propagation_dense_kernel,
     propagation_topk_kernel,
     propagation_window_kernel,
+    signed_entmax15,
     supports_pairwise_kernel,
 )
 from jakal_net.native_backend import (
@@ -48,6 +49,8 @@ def _edge_compress_name(edge_compress_fn: Callable[[Tensor], Tensor]) -> str | N
         return "softsign"
     if name in {"signed_abs_softmax", "_signed_abs_softmax_edges"}:
         return "signed_abs_softmax"
+    if name in {"signed_entmax15", "_signed_entmax15_edges"}:
+        return "signed_entmax15"
     return None
 
 
@@ -57,7 +60,8 @@ def _compress_edges(
     *,
     mask: Tensor | None = None,
 ) -> Tensor:
-    if _edge_compress_name(edge_compress_fn) == "signed_abs_softmax":
+    edge_name = _edge_compress_name(edge_compress_fn)
+    if edge_name == "signed_abs_softmax":
         clean_scores = torch.nan_to_num(scores)
         signs = torch.sign(clean_scores)
         magnitudes = clean_scores.abs()
@@ -66,6 +70,8 @@ def _compress_edges(
             signs = signs * bool_mask.to(dtype=signs.dtype)
             magnitudes = magnitudes.masked_fill(~bool_mask, -torch.inf)
         return torch.nan_to_num(signs * torch.softmax(magnitudes, dim=-1))
+    if edge_name == "signed_entmax15":
+        return signed_entmax15(scores, dim=-1, mask=mask)
     edges = edge_compress_fn(scores)
     if mask is not None:
         edges = edges * mask.to(dtype=edges.dtype)
@@ -74,7 +80,7 @@ def _compress_edges(
 
 def _native_edge_compress_name(edge_compress_fn: Callable[[Tensor], Tensor]) -> str | None:
     name = _edge_compress_name(edge_compress_fn)
-    if name == "softsign":
+    if name in {"softsign", "signed_entmax15"}:
         return name
     return None
 

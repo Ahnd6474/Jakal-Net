@@ -34,6 +34,8 @@ DEFAULT_NATIVE_MODULE = "jakal_net_native"
 NATIVE_MODULE_ENV = "JAKAL_NET_NATIVE_MODULE"
 DISABLE_NATIVE_ENV = "JAKAL_NET_DISABLE_NATIVE"
 EXPERIMENTAL_FUSED_TRAINING_ENV = "JAKAL_NET_ENABLE_EXPERIMENTAL_FUSED_TRAINING"
+EXPERIMENTAL_FUSED_TRAINING_CHECKPOINT_STRIDE_ENV = "JAKAL_NET_FUSED_TRAINING_CHECKPOINT_STRIDE"
+EXPERIMENTAL_SCAN_BACKWARD_CUDA_ENV = "JAKAL_NET_ENABLE_EXPERIMENTAL_SCAN_BACKWARD_CUDA"
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +170,274 @@ def native_supports_device(device_type: str) -> bool:
     return status.available and device_type in status.supported_devices
 
 
+def causal_memory_scan_fused_trace_native(
+    *,
+    aligned_s: Tensor,
+    flat_memory: tuple[Tensor, ...],
+    value_to_state_weight: Tensor,
+    value_to_state_bias: Tensor | None,
+    s_prediction_weight: Tensor,
+    prediction_input_norm_weight: Tensor,
+    prediction_input_norm_bias: Tensor | None,
+    read_template_val: Tensor,
+    read_projection_weights: tuple[Tensor, ...],
+    read_gates: tuple[Tensor, ...],
+    write_source_weights: tuple[Tensor, ...],
+    write_target_weights: tuple[Tensor, ...],
+    write_core_weights: tuple[Tensor, ...],
+    write_biases: tuple[Tensor, ...],
+    write_topks: tuple[int, ...],
+    transition_compress_name: str,
+    propagation_source_weights: tuple[Tensor, ...],
+    propagation_target_weights: tuple[Tensor, ...],
+    propagation_core_weights: tuple[Tensor, ...],
+    propagation_biases: tuple[Tensor, ...],
+    propagation_topks: tuple[int, ...],
+    propagation_compress_name: str,
+    val_norm_weights: tuple[Tensor, ...],
+    val_norm_biases: tuple[Tensor, ...],
+    level_transition_source_weights: tuple[Tensor, ...],
+    level_transition_target_weights: tuple[Tensor, ...],
+    level_transition_core_weights: tuple[Tensor, ...],
+    level_transition_biases: tuple[Tensor, ...],
+    level_transition_topks: tuple[int, ...],
+    level_norm_weights: tuple[Tensor, ...],
+    level_norm_biases: tuple[Tensor, ...],
+    skip_source_weights: tuple[Tensor, ...],
+    skip_target_weights: tuple[Tensor, ...],
+    skip_core_weights: tuple[Tensor, ...],
+    skip_biases: tuple[Tensor, ...],
+    skip_gates: tuple[Tensor, ...],
+    skip_topks: tuple[int, ...],
+) -> tuple[Tensor, tuple[Tensor, ...], tuple[Tensor, ...]]:
+    result = _native_module().causal_memory_scan_fused_trace(
+        aligned_s,
+        list(flat_memory),
+        value_to_state_weight,
+        value_to_state_bias,
+        s_prediction_weight,
+        prediction_input_norm_weight,
+        prediction_input_norm_bias,
+        read_template_val,
+        list(read_projection_weights),
+        list(read_gates),
+        list(write_source_weights),
+        list(write_target_weights),
+        list(write_core_weights),
+        list(write_biases),
+        list(write_topks),
+        transition_compress_name,
+        list(propagation_source_weights),
+        list(propagation_target_weights),
+        list(propagation_core_weights),
+        list(propagation_biases),
+        list(propagation_topks),
+        propagation_compress_name,
+        list(val_norm_weights),
+        list(val_norm_biases),
+        list(level_transition_source_weights),
+        list(level_transition_target_weights),
+        list(level_transition_core_weights),
+        list(level_transition_biases),
+        list(level_transition_topks),
+        list(level_norm_weights),
+        list(level_norm_biases),
+        list(skip_source_weights),
+        list(skip_target_weights),
+        list(skip_core_weights),
+        list(skip_biases),
+        list(skip_gates),
+        list(skip_topks),
+    )
+    if not isinstance(result, tuple) or len(result) != 3:
+        raise TypeError("causal_memory_scan_fused_trace must return (query_val, flat_memory_tensors, trace_tensors).")
+    query_val, next_memory, trace_tensors = result
+    return query_val, tuple(next_memory), tuple(trace_tensors)
+
+
+def causal_memory_scan_fused_checkpoints_native(
+    *,
+    checkpoint_stride: int,
+    aligned_s: Tensor,
+    flat_memory: tuple[Tensor, ...],
+    value_to_state_weight: Tensor,
+    value_to_state_bias: Tensor | None,
+    s_prediction_weight: Tensor,
+    prediction_input_norm_weight: Tensor,
+    prediction_input_norm_bias: Tensor | None,
+    read_template_val: Tensor,
+    read_projection_weights: tuple[Tensor, ...],
+    read_gates: tuple[Tensor, ...],
+    write_source_weights: tuple[Tensor, ...],
+    write_target_weights: tuple[Tensor, ...],
+    write_core_weights: tuple[Tensor, ...],
+    write_biases: tuple[Tensor, ...],
+    write_topks: tuple[int, ...],
+    transition_compress_name: str,
+    propagation_source_weights: tuple[Tensor, ...],
+    propagation_target_weights: tuple[Tensor, ...],
+    propagation_core_weights: tuple[Tensor, ...],
+    propagation_biases: tuple[Tensor, ...],
+    propagation_topks: tuple[int, ...],
+    propagation_compress_name: str,
+    val_norm_weights: tuple[Tensor, ...],
+    val_norm_biases: tuple[Tensor, ...],
+    level_transition_source_weights: tuple[Tensor, ...],
+    level_transition_target_weights: tuple[Tensor, ...],
+    level_transition_core_weights: tuple[Tensor, ...],
+    level_transition_biases: tuple[Tensor, ...],
+    level_transition_topks: tuple[int, ...],
+    level_norm_weights: tuple[Tensor, ...],
+    level_norm_biases: tuple[Tensor, ...],
+    skip_source_weights: tuple[Tensor, ...],
+    skip_target_weights: tuple[Tensor, ...],
+    skip_core_weights: tuple[Tensor, ...],
+    skip_biases: tuple[Tensor, ...],
+    skip_gates: tuple[Tensor, ...],
+    skip_topks: tuple[int, ...],
+) -> tuple[Tensor, tuple[Tensor, ...], tuple[Tensor, ...]]:
+    result = _native_module().causal_memory_scan_fused_checkpoints(
+        aligned_s,
+        list(flat_memory),
+        value_to_state_weight,
+        value_to_state_bias,
+        s_prediction_weight,
+        prediction_input_norm_weight,
+        prediction_input_norm_bias,
+        read_template_val,
+        list(read_projection_weights),
+        list(read_gates),
+        list(write_source_weights),
+        list(write_target_weights),
+        list(write_core_weights),
+        list(write_biases),
+        list(write_topks),
+        transition_compress_name,
+        list(propagation_source_weights),
+        list(propagation_target_weights),
+        list(propagation_core_weights),
+        list(propagation_biases),
+        list(propagation_topks),
+        propagation_compress_name,
+        list(val_norm_weights),
+        list(val_norm_biases),
+        list(level_transition_source_weights),
+        list(level_transition_target_weights),
+        list(level_transition_core_weights),
+        list(level_transition_biases),
+        list(level_transition_topks),
+        list(level_norm_weights),
+        list(level_norm_biases),
+        list(skip_source_weights),
+        list(skip_target_weights),
+        list(skip_core_weights),
+        list(skip_biases),
+        list(skip_gates),
+        list(skip_topks),
+        int(checkpoint_stride),
+    )
+    if not isinstance(result, tuple) or len(result) != 3:
+        raise TypeError("causal_memory_scan_fused_checkpoints must return (query_val, flat_memory_tensors, checkpoint_tensors).")
+    query_val, next_memory, checkpoint_tensors = result
+    return query_val, tuple(next_memory), tuple(checkpoint_tensors)
+
+
+def causal_memory_scan_fused_native(
+    *,
+    aligned_s: Tensor,
+    flat_memory: tuple[Tensor, ...],
+    value_to_state_weight: Tensor,
+    value_to_state_bias: Tensor | None,
+    s_prediction_weight: Tensor,
+    prediction_input_norm_weight: Tensor,
+    prediction_input_norm_bias: Tensor | None,
+    read_template_val: Tensor,
+    read_projection_weights: tuple[Tensor, ...],
+    read_gates: tuple[Tensor, ...],
+    write_source_weights: tuple[Tensor, ...],
+    write_target_weights: tuple[Tensor, ...],
+    write_core_weights: tuple[Tensor, ...],
+    write_biases: tuple[Tensor, ...],
+    write_topks: tuple[int, ...],
+    transition_compress_name: str,
+    propagation_source_weights: tuple[Tensor, ...],
+    propagation_target_weights: tuple[Tensor, ...],
+    propagation_core_weights: tuple[Tensor, ...],
+    propagation_biases: tuple[Tensor, ...],
+    propagation_topks: tuple[int, ...],
+    propagation_compress_name: str,
+    val_norm_weights: tuple[Tensor, ...],
+    val_norm_biases: tuple[Tensor, ...],
+    level_transition_source_weights: tuple[Tensor, ...],
+    level_transition_target_weights: tuple[Tensor, ...],
+    level_transition_core_weights: tuple[Tensor, ...],
+    level_transition_biases: tuple[Tensor, ...],
+    level_transition_topks: tuple[int, ...],
+    level_norm_weights: tuple[Tensor, ...],
+    level_norm_biases: tuple[Tensor, ...],
+    skip_source_weights: tuple[Tensor, ...],
+    skip_target_weights: tuple[Tensor, ...],
+    skip_core_weights: tuple[Tensor, ...],
+    skip_biases: tuple[Tensor, ...],
+    skip_gates: tuple[Tensor, ...],
+    skip_topks: tuple[int, ...],
+) -> tuple[Tensor, tuple[Tensor, ...]]:
+    tensor_args, meta_args = _flatten_causal_memory_scan_args(
+        aligned_s=aligned_s,
+        flat_memory=flat_memory,
+        value_to_state_weight=value_to_state_weight,
+        value_to_state_bias=value_to_state_bias,
+        s_prediction_weight=s_prediction_weight,
+        prediction_input_norm_weight=prediction_input_norm_weight,
+        prediction_input_norm_bias=prediction_input_norm_bias,
+        read_template_val=read_template_val,
+        read_projection_weights=read_projection_weights,
+        read_gates=read_gates,
+        write_source_weights=write_source_weights,
+        write_target_weights=write_target_weights,
+        write_core_weights=write_core_weights,
+        write_biases=write_biases,
+        write_topks=write_topks,
+        transition_compress_name=transition_compress_name,
+        propagation_source_weights=propagation_source_weights,
+        propagation_target_weights=propagation_target_weights,
+        propagation_core_weights=propagation_core_weights,
+        propagation_biases=propagation_biases,
+        propagation_topks=propagation_topks,
+        propagation_compress_name=propagation_compress_name,
+        val_norm_weights=val_norm_weights,
+        val_norm_biases=val_norm_biases,
+        level_transition_source_weights=level_transition_source_weights,
+        level_transition_target_weights=level_transition_target_weights,
+        level_transition_core_weights=level_transition_core_weights,
+        level_transition_biases=level_transition_biases,
+        level_transition_topks=level_transition_topks,
+        level_norm_weights=level_norm_weights,
+        level_norm_biases=level_norm_biases,
+        skip_source_weights=skip_source_weights,
+        skip_target_weights=skip_target_weights,
+        skip_core_weights=skip_core_weights,
+        skip_biases=skip_biases,
+        skip_gates=skip_gates,
+        skip_topks=skip_topks,
+    )
+    if torch.is_grad_enabled() and _experimental_fused_training_enabled():
+        outputs = _CausalMemoryScanFusedFunction.apply(*tensor_args, *meta_args)
+        return outputs[0], tuple(outputs[1:])
+
+    query_val, next_memory = _causal_memory_scan_fused_native_forward(
+        *tensor_args,
+        num_levels=meta_args[0],
+        write_topks=meta_args[1],
+        propagation_topks=meta_args[2],
+        level_transition_topks=meta_args[3],
+        skip_topks=meta_args[4],
+        transition_compress_name=meta_args[5],
+        propagation_compress_name=meta_args[6],
+    )
+    return query_val, tuple(next_memory)
+
+
 def _native_module() -> Any:
     status = native_status()
     if not status.available or _NATIVE_MODULE is None:
@@ -207,6 +477,15 @@ def _query_backward_ops_available() -> bool:
     )
 
 
+def _signed_entmax15_ops_available() -> bool:
+    try:
+        getattr(torch.ops.jakal_net, "signed_entmax15")
+        getattr(torch.ops.jakal_net, "signed_entmax15_backward")
+    except (AttributeError, RuntimeError):
+        return False
+    return True
+
+
 def _experimental_fused_training_enabled() -> bool:
     return os.environ.get(EXPERIMENTAL_FUSED_TRAINING_ENV, "").strip().lower() in {
         "1",
@@ -214,6 +493,1052 @@ def _experimental_fused_training_enabled() -> bool:
         "yes",
         "on",
     }
+
+
+def _experimental_fused_training_checkpoint_stride(seq_len: int) -> int | None:
+    raw_value = os.environ.get(EXPERIMENTAL_FUSED_TRAINING_CHECKPOINT_STRIDE_ENV, "").strip()
+    if not raw_value:
+        return None
+    stride = int(raw_value)
+    if stride <= 0:
+        return None
+    return min(seq_len, stride)
+
+
+def _experimental_scan_backward_cuda_enabled() -> bool:
+    return os.environ.get(EXPERIMENTAL_SCAN_BACKWARD_CUDA_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _flatten_causal_memory_scan_args(
+    *,
+    aligned_s: Tensor,
+    flat_memory: tuple[Tensor, ...],
+    value_to_state_weight: Tensor,
+    value_to_state_bias: Tensor | None,
+    s_prediction_weight: Tensor,
+    prediction_input_norm_weight: Tensor,
+    prediction_input_norm_bias: Tensor | None,
+    read_template_val: Tensor,
+    read_projection_weights: tuple[Tensor, ...],
+    read_gates: tuple[Tensor, ...],
+    write_source_weights: tuple[Tensor, ...],
+    write_target_weights: tuple[Tensor, ...],
+    write_core_weights: tuple[Tensor, ...],
+    write_biases: tuple[Tensor, ...],
+    write_topks: tuple[int, ...],
+    transition_compress_name: str,
+    propagation_source_weights: tuple[Tensor, ...],
+    propagation_target_weights: tuple[Tensor, ...],
+    propagation_core_weights: tuple[Tensor, ...],
+    propagation_biases: tuple[Tensor, ...],
+    propagation_topks: tuple[int, ...],
+    propagation_compress_name: str,
+    val_norm_weights: tuple[Tensor, ...],
+    val_norm_biases: tuple[Tensor, ...],
+    level_transition_source_weights: tuple[Tensor, ...],
+    level_transition_target_weights: tuple[Tensor, ...],
+    level_transition_core_weights: tuple[Tensor, ...],
+    level_transition_biases: tuple[Tensor, ...],
+    level_transition_topks: tuple[int, ...],
+    level_norm_weights: tuple[Tensor, ...],
+    level_norm_biases: tuple[Tensor, ...],
+    skip_source_weights: tuple[Tensor, ...],
+    skip_target_weights: tuple[Tensor, ...],
+    skip_core_weights: tuple[Tensor, ...],
+    skip_biases: tuple[Tensor, ...],
+    skip_gates: tuple[Tensor, ...],
+    skip_topks: tuple[int, ...],
+) -> tuple[
+    tuple[Tensor, ...],
+    tuple[int, tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...], str, str],
+]:
+    num_levels = len(read_projection_weights)
+    tensor_args: tuple[Tensor, ...] = (
+        aligned_s,
+        *flat_memory,
+        value_to_state_weight,
+        _save_optional_tensor(value_to_state_bias, aligned_s),
+        s_prediction_weight,
+        prediction_input_norm_weight,
+        _save_optional_tensor(prediction_input_norm_bias, aligned_s),
+        read_template_val,
+        *read_projection_weights,
+        *read_gates,
+        *write_source_weights,
+        *write_target_weights,
+        *write_core_weights,
+        *write_biases,
+        *propagation_source_weights,
+        *propagation_target_weights,
+        *propagation_core_weights,
+        *propagation_biases,
+        *val_norm_weights,
+        *val_norm_biases,
+        *level_transition_source_weights,
+        *level_transition_target_weights,
+        *level_transition_core_weights,
+        *level_transition_biases,
+        *level_norm_weights,
+        *level_norm_biases,
+        *skip_source_weights,
+        *skip_target_weights,
+        *skip_core_weights,
+        *skip_biases,
+        *skip_gates,
+    )
+    meta_args = (
+        num_levels,
+        tuple(int(v) for v in write_topks),
+        tuple(int(v) for v in propagation_topks),
+        tuple(int(v) for v in level_transition_topks),
+        tuple(int(v) for v in skip_topks),
+        str(transition_compress_name),
+        str(propagation_compress_name),
+    )
+    return tensor_args, meta_args
+
+
+def _unpack_causal_memory_scan_tensor_args(
+    tensor_args: tuple[Tensor, ...],
+    num_levels: int,
+) -> dict[str, Any]:
+    idx = 0
+    out: dict[str, Any] = {}
+    out["aligned_s"] = tensor_args[idx]
+    idx += 1
+    out["flat_memory"] = tensor_args[idx: idx + (2 * num_levels)]
+    idx += 2 * num_levels
+    out["value_to_state_weight"] = tensor_args[idx]
+    idx += 1
+    out["value_to_state_bias"] = tensor_args[idx]
+    idx += 1
+    out["s_prediction_weight"] = tensor_args[idx]
+    idx += 1
+    out["prediction_input_norm_weight"] = tensor_args[idx]
+    idx += 1
+    out["prediction_input_norm_bias"] = tensor_args[idx]
+    idx += 1
+    out["read_template_val"] = tensor_args[idx]
+    idx += 1
+
+    for name, count in (
+        ("read_projection_weights", num_levels),
+        ("read_gates", num_levels),
+        ("write_source_weights", num_levels),
+        ("write_target_weights", num_levels),
+        ("write_core_weights", num_levels),
+        ("write_biases", num_levels),
+        ("propagation_source_weights", num_levels),
+        ("propagation_target_weights", num_levels),
+        ("propagation_core_weights", num_levels),
+        ("propagation_biases", num_levels),
+        ("val_norm_weights", num_levels),
+        ("val_norm_biases", num_levels),
+        ("level_transition_source_weights", max(num_levels - 1, 0)),
+        ("level_transition_target_weights", max(num_levels - 1, 0)),
+        ("level_transition_core_weights", max(num_levels - 1, 0)),
+        ("level_transition_biases", max(num_levels - 1, 0)),
+        ("level_norm_weights", num_levels),
+        ("level_norm_biases", num_levels),
+        ("skip_source_weights", max(num_levels - 1, 0)),
+        ("skip_target_weights", max(num_levels - 1, 0)),
+        ("skip_core_weights", max(num_levels - 1, 0)),
+        ("skip_biases", max(num_levels - 1, 0)),
+        ("skip_gates", max(num_levels - 1, 0)),
+    ):
+        out[name] = tensor_args[idx: idx + count]
+        idx += count
+
+    if idx != len(tensor_args):
+        raise RuntimeError("unexpected causal-memory scan tensor arg count")
+    return out
+
+
+def _native_scan_layer_norm(input: Tensor, weight: Tensor, packed_bias: Tensor) -> Tensor:
+    return F.layer_norm(
+        input,
+        (input.shape[-1],),
+        weight.to(dtype=input.dtype),
+        None if packed_bias.numel() == 0 else packed_bias.to(dtype=input.dtype),
+    )
+
+
+def _native_scan_signed_softmax_state(state: Tensor) -> Tensor:
+    clean_state = torch.nan_to_num(state)
+    magnitude = torch.softmax(clean_state.abs(), dim=-1)
+    return torch.sign(clean_state) * magnitude * float(state.shape[-1])
+
+
+def _native_scan_signed_abs_softmax(scores: Tensor) -> Tensor:
+    clean_scores = torch.nan_to_num(scores)
+    return torch.nan_to_num(torch.sign(clean_scores) * torch.softmax(clean_scores.abs(), dim=-1))
+
+
+def _native_scan_pairwise_scores(
+    src_val: Tensor,
+    dst_val: Tensor,
+    source_weight: Tensor,
+    target_weight: Tensor,
+    core_weight: Tensor,
+    packed_bias: Tensor,
+) -> Tensor:
+    projected_source = F.linear(src_val, source_weight.to(dtype=src_val.dtype), None)
+    projected_source = projected_source * core_weight.to(dtype=src_val.dtype)
+    projected_target = F.linear(dst_val, target_weight.to(dtype=dst_val.dtype), None)
+    scores = torch.einsum("...ir,...kr->...ik", projected_source, projected_target)
+    if packed_bias.numel() != 0:
+        scores = scores + packed_bias.to(dtype=scores.dtype)
+    return scores
+
+
+def _native_scan_full_topk_indices(scores: Tensor) -> Tensor:
+    return torch.arange(scores.shape[-1], device=scores.device, dtype=torch.long).view(1, 1, -1).expand(scores.shape[0], scores.shape[1], scores.shape[2])
+
+
+def _native_scan_gather_state(source: Tensor, indices: Tensor) -> Tensor:
+    expanded = source.unsqueeze(1).expand(source.shape[0], indices.shape[1], source.shape[1])
+    return expanded.gather(2, indices)
+
+
+def _native_scan_gather_val(source: Tensor, indices: Tensor) -> Tensor:
+    expanded = source.unsqueeze(1).expand(source.shape[0], indices.shape[1], source.shape[1], source.shape[2])
+    gather_index = indices.unsqueeze(-1).expand(indices.shape[0], indices.shape[1], indices.shape[2], source.shape[2])
+    return expanded.gather(2, gather_index)
+
+
+def _native_scan_transition_pairwise_topk_signed_abs(
+    sender_strength: Tensor,
+    projected_state: Tensor,
+    projected_val: Tensor,
+    src_val: Tensor,
+    dst_val: Tensor,
+    source_weight: Tensor,
+    target_weight: Tensor,
+    core_weight: Tensor,
+    packed_bias: Tensor,
+    topk: int,
+) -> tuple[Tensor, Tensor]:
+    scores = _native_scan_pairwise_scores(src_val, dst_val, source_weight, target_weight, core_weight, packed_bias)
+    k = min(max(1, int(topk)), dst_val.shape[1])
+    if k == dst_val.shape[1]:
+        selected_scores = scores
+        selected_indices = _native_scan_full_topk_indices(scores)
+    else:
+        selected_scores, selected_indices = torch.topk(scores, k, dim=-1)
+    routes = _native_scan_signed_abs_softmax(selected_scores)
+    weighted_routes = routes * sender_strength.unsqueeze(-1)
+    delta_state = torch.zeros(projected_state.shape[0], dst_val.shape[1], device=projected_state.device, dtype=projected_state.dtype)
+    flat_indices = selected_indices.reshape(selected_indices.shape[0], -1)
+    state_contrib = (weighted_routes * projected_state.unsqueeze(-1)).reshape(projected_state.shape[0], -1)
+    delta_state.scatter_add_(1, flat_indices, state_contrib)
+    delta_val = torch.zeros(projected_val.shape[0], dst_val.shape[1], projected_val.shape[2], device=projected_val.device, dtype=projected_val.dtype)
+    val_contrib = (weighted_routes.unsqueeze(-1) * projected_val.unsqueeze(-2)).reshape(projected_val.shape[0], -1, projected_val.shape[2])
+    scatter_index = flat_indices.unsqueeze(-1).expand(flat_indices.shape[0], flat_indices.shape[1], projected_val.shape[2])
+    delta_val.scatter_add_(1, scatter_index, val_contrib)
+    return delta_state, delta_val
+
+
+def _native_scan_propagation_topk_signed_abs(
+    layer_state: Tensor,
+    layer_val: Tensor,
+    source_weight: Tensor,
+    target_weight: Tensor,
+    core_weight: Tensor,
+    packed_bias: Tensor,
+    topk: int,
+) -> tuple[Tensor, Tensor]:
+    scores = _native_scan_pairwise_scores(layer_val, layer_val, source_weight, target_weight, core_weight, packed_bias).transpose(-2, -1)
+    k = min(max(1, int(topk)), layer_val.shape[1])
+    if k == layer_val.shape[1]:
+        selected_scores = scores
+        selected_indices = _native_scan_full_topk_indices(scores)
+    else:
+        selected_scores, selected_indices = torch.topk(scores, k, dim=-1)
+    edges = _native_scan_signed_abs_softmax(selected_scores)
+    selected_state = _native_scan_gather_state(layer_state, selected_indices)
+    weighted_edges = edges * selected_state
+    selected_val = _native_scan_gather_val(layer_val, selected_indices)
+    delta_state = (weighted_edges * selected_state).sum(dim=-1)
+    delta_val = (weighted_edges.unsqueeze(-1) * selected_val).sum(dim=-2)
+    return delta_state, delta_val
+
+
+def _native_scan_apply_delta(
+    layer_state: Tensor,
+    layer_val: Tensor,
+    delta_state: Tensor,
+    delta_val: Tensor,
+    val_norm_weight: Tensor,
+    val_norm_bias: Tensor,
+) -> tuple[Tensor, Tensor]:
+    next_state = _native_scan_signed_softmax_state(layer_state + delta_state)
+    next_val = _native_scan_layer_norm(layer_val + delta_val, val_norm_weight, val_norm_bias)
+    return next_state, next_val
+
+
+def _native_scan_read_memory(
+    memory_state: list[tuple[Tensor, Tensor]],
+    val_norm_weights: tuple[Tensor, ...],
+    val_norm_biases: tuple[Tensor, ...],
+    read_template_val: Tensor,
+    read_projection_weights: tuple[Tensor, ...],
+    read_gates: tuple[Tensor, ...],
+) -> Tensor:
+    read_terms: list[Tensor] = []
+    for index, (state, val) in enumerate(memory_state):
+        read_val = _native_scan_layer_norm(val, val_norm_weights[index], val_norm_biases[index])
+        sender_strength = F.softplus(state).unsqueeze(-1)
+        read_summary = (sender_strength * read_val).sum(dim=-2)
+        read_summary = read_summary + read_template_val.to(dtype=read_summary.dtype).unsqueeze(0)
+        projected = F.linear(read_summary, read_projection_weights[index].to(dtype=read_summary.dtype), None)
+        read_terms.append(torch.sigmoid(read_gates[index].to(dtype=read_summary.dtype)) * projected)
+    return torch.stack(read_terms, dim=0).sum(dim=0)
+
+
+def _causal_memory_scan_fused_reference(
+    tensor_args: tuple[Tensor, ...],
+    num_levels: int,
+    write_topks: tuple[int, ...],
+    propagation_topks: tuple[int, ...],
+    level_transition_topks: tuple[int, ...],
+    skip_topks: tuple[int, ...],
+) -> tuple[Tensor, tuple[Tensor, ...]]:
+    args = _unpack_causal_memory_scan_tensor_args(tensor_args, num_levels)
+    aligned_s = args["aligned_s"]
+    projected_s = F.linear(aligned_s, args["s_prediction_weight"].to(dtype=aligned_s.dtype), None)
+    current_memory = [
+        (args["flat_memory"][index * 2], args["flat_memory"][index * 2 + 1])
+        for index in range(num_levels)
+    ]
+    query_steps: list[Tensor] = []
+
+    value_to_state_bias = _load_optional_tensor(args["value_to_state_bias"])
+    prediction_input_norm_bias = args["prediction_input_norm_bias"]
+
+    for time_index in range(aligned_s.shape[1]):
+        token_val = aligned_s[:, time_index : time_index + 1, :]
+        token_state = F.linear(
+            token_val,
+            args["value_to_state_weight"].to(dtype=token_val.dtype),
+            None if value_to_state_bias is None else value_to_state_bias.to(dtype=token_val.dtype),
+        ).squeeze(-1)
+        next_memory: list[tuple[Tensor, Tensor]] = []
+
+        first_normed_val = _native_scan_layer_norm(
+            current_memory[0][1],
+            args["val_norm_weights"][0],
+            args["val_norm_biases"][0],
+        )
+        first_write_delta = _native_scan_transition_pairwise_topk_signed_abs(
+            F.softplus(token_state),
+            token_state,
+            token_val,
+            token_val,
+            first_normed_val,
+            args["write_source_weights"][0],
+            args["write_target_weights"][0],
+            args["write_core_weights"][0],
+            args["write_biases"][0],
+            write_topks[0],
+        )
+        level_state, level_val = _native_scan_apply_delta(
+            current_memory[0][0],
+            current_memory[0][1],
+            first_write_delta[0],
+            first_write_delta[1],
+            args["val_norm_weights"][0],
+            args["val_norm_biases"][0],
+        )
+        level_for_prop_val = _native_scan_layer_norm(level_val, args["val_norm_weights"][0], args["val_norm_biases"][0])
+        first_prop_delta = _native_scan_propagation_topk_signed_abs(
+            level_state,
+            level_for_prop_val,
+            args["propagation_source_weights"][0],
+            args["propagation_target_weights"][0],
+            args["propagation_core_weights"][0],
+            args["propagation_biases"][0],
+            propagation_topks[0],
+        )
+        level_state, level_val = _native_scan_apply_delta(
+            level_state,
+            level_val,
+            first_prop_delta[0],
+            first_prop_delta[1],
+            args["val_norm_weights"][0],
+            args["val_norm_biases"][0],
+        )
+        next_memory.append((level_state, level_val))
+
+        for level_index in range(1, num_levels):
+            current_state, current_val = current_memory[level_index]
+            normalized_level_val = _native_scan_layer_norm(
+                current_val,
+                args["val_norm_weights"][level_index],
+                args["val_norm_biases"][level_index],
+            )
+            normalized_parent_val = _native_scan_layer_norm(
+                next_memory[level_index - 1][1],
+                args["level_norm_weights"][level_index - 1],
+                args["level_norm_biases"][level_index - 1],
+            )
+            parent_delta = _native_scan_transition_pairwise_topk_signed_abs(
+                F.softplus(next_memory[level_index - 1][0]),
+                next_memory[level_index - 1][0],
+                normalized_parent_val,
+                normalized_parent_val,
+                normalized_level_val,
+                args["level_transition_source_weights"][level_index - 1],
+                args["level_transition_target_weights"][level_index - 1],
+                args["level_transition_core_weights"][level_index - 1],
+                args["level_transition_biases"][level_index - 1],
+                level_transition_topks[level_index - 1],
+            )
+            updated_state, updated_val = _native_scan_apply_delta(
+                current_state,
+                current_val,
+                parent_delta[0],
+                parent_delta[1],
+                args["val_norm_weights"][level_index],
+                args["val_norm_biases"][level_index],
+            )
+
+            if level_index == 1 and num_levels > 1:
+                skip_gate = torch.sigmoid(args["skip_gates"][0].to(dtype=token_val.dtype))
+                skip_delta = _native_scan_transition_pairwise_topk_signed_abs(
+                    F.softplus(token_state),
+                    token_state,
+                    token_val,
+                    token_val,
+                    normalized_level_val,
+                    args["skip_source_weights"][0],
+                    args["skip_target_weights"][0],
+                    args["skip_core_weights"][0],
+                    args["skip_biases"][0],
+                    skip_topks[0],
+                )
+                updated_state, updated_val = _native_scan_apply_delta(
+                    updated_state,
+                    updated_val,
+                    skip_delta[0] * skip_gate,
+                    skip_delta[1] * skip_gate,
+                    args["val_norm_weights"][level_index],
+                    args["val_norm_biases"][level_index],
+                )
+
+            if level_index >= 2:
+                skip_index = level_index - 1
+                normalized_skip_source_val = _native_scan_layer_norm(
+                    next_memory[level_index - 2][1],
+                    args["level_norm_weights"][level_index - 2],
+                    args["level_norm_biases"][level_index - 2],
+                )
+                skip_gate = torch.sigmoid(args["skip_gates"][skip_index].to(dtype=normalized_skip_source_val.dtype))
+                skip_delta = _native_scan_transition_pairwise_topk_signed_abs(
+                    F.softplus(next_memory[level_index - 2][0]),
+                    next_memory[level_index - 2][0],
+                    normalized_skip_source_val,
+                    normalized_skip_source_val,
+                    normalized_level_val,
+                    args["skip_source_weights"][skip_index],
+                    args["skip_target_weights"][skip_index],
+                    args["skip_core_weights"][skip_index],
+                    args["skip_biases"][skip_index],
+                    skip_topks[skip_index],
+                )
+                updated_state, updated_val = _native_scan_apply_delta(
+                    updated_state,
+                    updated_val,
+                    skip_delta[0] * skip_gate,
+                    skip_delta[1] * skip_gate,
+                    args["val_norm_weights"][level_index],
+                    args["val_norm_biases"][level_index],
+                )
+
+            updated_level_for_prop_val = _native_scan_layer_norm(
+                updated_val,
+                args["val_norm_weights"][level_index],
+                args["val_norm_biases"][level_index],
+            )
+            prop_delta = _native_scan_propagation_topk_signed_abs(
+                updated_state,
+                updated_level_for_prop_val,
+                args["propagation_source_weights"][level_index],
+                args["propagation_target_weights"][level_index],
+                args["propagation_core_weights"][level_index],
+                args["propagation_biases"][level_index],
+                propagation_topks[level_index],
+            )
+            updated_state, updated_val = _native_scan_apply_delta(
+                updated_state,
+                updated_val,
+                prop_delta[0],
+                prop_delta[1],
+                args["val_norm_weights"][level_index],
+                args["val_norm_biases"][level_index],
+            )
+            next_memory.append((updated_state, updated_val))
+
+        current_memory = next_memory
+        read_vector = _native_scan_read_memory(
+            current_memory,
+            args["val_norm_weights"],
+            args["val_norm_biases"],
+            args["read_template_val"],
+            args["read_projection_weights"],
+            args["read_gates"],
+        )
+        query_input = projected_s[:, time_index, :] + read_vector
+        query_steps.append(
+            _native_scan_layer_norm(
+                query_input,
+                args["prediction_input_norm_weight"],
+                prediction_input_norm_bias,
+            ).unsqueeze(1)
+        )
+
+    query_val = torch.cat(query_steps, dim=1) if query_steps else aligned_s.new_empty((aligned_s.shape[0], 0, aligned_s.shape[2]))
+    flat_next_memory: list[Tensor] = []
+    for state, val in current_memory:
+        flat_next_memory.extend((state, val))
+    return query_val, tuple(flat_next_memory)
+
+
+def _causal_memory_scan_fused_native_forward(
+    *tensor_args: Tensor,
+    num_levels: int,
+    write_topks: tuple[int, ...],
+    propagation_topks: tuple[int, ...],
+    level_transition_topks: tuple[int, ...],
+    skip_topks: tuple[int, ...],
+    transition_compress_name: str,
+    propagation_compress_name: str,
+) -> tuple[Tensor, tuple[Tensor, ...]]:
+    args = _unpack_causal_memory_scan_tensor_args(tensor_args, num_levels)
+    result = _native_module().causal_memory_scan_fused(
+        args["aligned_s"],
+        list(args["flat_memory"]),
+        args["value_to_state_weight"],
+        _load_optional_tensor(args["value_to_state_bias"]),
+        args["s_prediction_weight"],
+        args["prediction_input_norm_weight"],
+        _load_optional_tensor(args["prediction_input_norm_bias"]),
+        args["read_template_val"],
+        list(args["read_projection_weights"]),
+        list(args["read_gates"]),
+        list(args["write_source_weights"]),
+        list(args["write_target_weights"]),
+        list(args["write_core_weights"]),
+        list(args["write_biases"]),
+        list(write_topks),
+        transition_compress_name,
+        list(args["propagation_source_weights"]),
+        list(args["propagation_target_weights"]),
+        list(args["propagation_core_weights"]),
+        list(args["propagation_biases"]),
+        list(propagation_topks),
+        propagation_compress_name,
+        list(args["val_norm_weights"]),
+        list(args["val_norm_biases"]),
+        list(args["level_transition_source_weights"]),
+        list(args["level_transition_target_weights"]),
+        list(args["level_transition_core_weights"]),
+        list(args["level_transition_biases"]),
+        list(level_transition_topks),
+        list(args["level_norm_weights"]),
+        list(args["level_norm_biases"]),
+        list(args["skip_source_weights"]),
+        list(args["skip_target_weights"]),
+        list(args["skip_core_weights"]),
+        list(args["skip_biases"]),
+        list(args["skip_gates"]),
+        list(skip_topks),
+    )
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise TypeError("causal_memory_scan_fused must return (query_val, flat_memory_tensors).")
+    query_val, next_memory = result
+    if not isinstance(query_val, Tensor):
+        raise TypeError("causal_memory_scan_fused query_val must be a Tensor.")
+    if not isinstance(next_memory, (list, tuple)):
+        raise TypeError("causal_memory_scan_fused flat memory must be a sequence of Tensors.")
+    return query_val, tuple(next_memory)
+
+
+def _causal_memory_scan_fused_native_forward_with_checkpoints(
+    *tensor_args: Tensor,
+    num_levels: int,
+    write_topks: tuple[int, ...],
+    propagation_topks: tuple[int, ...],
+    level_transition_topks: tuple[int, ...],
+    skip_topks: tuple[int, ...],
+    transition_compress_name: str,
+    propagation_compress_name: str,
+    checkpoint_stride: int,
+) -> tuple[Tensor, tuple[Tensor, ...], tuple[Tensor, ...]]:
+    args = _unpack_causal_memory_scan_tensor_args(tensor_args, num_levels)
+    query_val, next_memory, checkpoint_tensors = causal_memory_scan_fused_checkpoints_native(
+        checkpoint_stride=checkpoint_stride,
+        aligned_s=args["aligned_s"],
+        flat_memory=tuple(args["flat_memory"]),
+        value_to_state_weight=args["value_to_state_weight"],
+        value_to_state_bias=_load_optional_tensor(args["value_to_state_bias"]),
+        s_prediction_weight=args["s_prediction_weight"],
+        prediction_input_norm_weight=args["prediction_input_norm_weight"],
+        prediction_input_norm_bias=_load_optional_tensor(args["prediction_input_norm_bias"]),
+        read_template_val=args["read_template_val"],
+        read_projection_weights=tuple(args["read_projection_weights"]),
+        read_gates=tuple(args["read_gates"]),
+        write_source_weights=tuple(args["write_source_weights"]),
+        write_target_weights=tuple(args["write_target_weights"]),
+        write_core_weights=tuple(args["write_core_weights"]),
+        write_biases=tuple(args["write_biases"]),
+        write_topks=write_topks,
+        transition_compress_name=transition_compress_name,
+        propagation_source_weights=tuple(args["propagation_source_weights"]),
+        propagation_target_weights=tuple(args["propagation_target_weights"]),
+        propagation_core_weights=tuple(args["propagation_core_weights"]),
+        propagation_biases=tuple(args["propagation_biases"]),
+        propagation_topks=propagation_topks,
+        propagation_compress_name=propagation_compress_name,
+        val_norm_weights=tuple(args["val_norm_weights"]),
+        val_norm_biases=tuple(args["val_norm_biases"]),
+        level_transition_source_weights=tuple(args["level_transition_source_weights"]),
+        level_transition_target_weights=tuple(args["level_transition_target_weights"]),
+        level_transition_core_weights=tuple(args["level_transition_core_weights"]),
+        level_transition_biases=tuple(args["level_transition_biases"]),
+        level_transition_topks=level_transition_topks,
+        level_norm_weights=tuple(args["level_norm_weights"]),
+        level_norm_biases=tuple(args["level_norm_biases"]),
+        skip_source_weights=tuple(args["skip_source_weights"]),
+        skip_target_weights=tuple(args["skip_target_weights"]),
+        skip_core_weights=tuple(args["skip_core_weights"]),
+        skip_biases=tuple(args["skip_biases"]),
+        skip_gates=tuple(args["skip_gates"]),
+        skip_topks=skip_topks,
+    )
+    return query_val, next_memory, checkpoint_tensors
+
+
+def _repack_causal_memory_scan_chunk_args(
+    args: dict[str, Any],
+    *,
+    aligned_s: Tensor,
+    flat_memory: tuple[Tensor, ...],
+    transition_compress_name: str,
+    propagation_compress_name: str,
+) -> tuple[Tensor, ...]:
+    tensor_args, _ = _flatten_causal_memory_scan_args(
+        aligned_s=aligned_s,
+        flat_memory=flat_memory,
+        value_to_state_weight=args["value_to_state_weight"],
+        value_to_state_bias=_load_optional_tensor(args["value_to_state_bias"]),
+        s_prediction_weight=args["s_prediction_weight"],
+        prediction_input_norm_weight=args["prediction_input_norm_weight"],
+        prediction_input_norm_bias=_load_optional_tensor(args["prediction_input_norm_bias"]),
+        read_template_val=args["read_template_val"],
+        read_projection_weights=tuple(args["read_projection_weights"]),
+        read_gates=tuple(args["read_gates"]),
+        write_source_weights=tuple(args["write_source_weights"]),
+        write_target_weights=tuple(args["write_target_weights"]),
+        write_core_weights=tuple(args["write_core_weights"]),
+        write_biases=tuple(args["write_biases"]),
+        write_topks=(),
+        transition_compress_name=transition_compress_name,
+        propagation_source_weights=tuple(args["propagation_source_weights"]),
+        propagation_target_weights=tuple(args["propagation_target_weights"]),
+        propagation_core_weights=tuple(args["propagation_core_weights"]),
+        propagation_biases=tuple(args["propagation_biases"]),
+        propagation_topks=(),
+        propagation_compress_name=propagation_compress_name,
+        val_norm_weights=tuple(args["val_norm_weights"]),
+        val_norm_biases=tuple(args["val_norm_biases"]),
+        level_transition_source_weights=tuple(args["level_transition_source_weights"]),
+        level_transition_target_weights=tuple(args["level_transition_target_weights"]),
+        level_transition_core_weights=tuple(args["level_transition_core_weights"]),
+        level_transition_biases=tuple(args["level_transition_biases"]),
+        level_transition_topks=(),
+        level_norm_weights=tuple(args["level_norm_weights"]),
+        level_norm_biases=tuple(args["level_norm_biases"]),
+        skip_source_weights=tuple(args["skip_source_weights"]),
+        skip_target_weights=tuple(args["skip_target_weights"]),
+        skip_core_weights=tuple(args["skip_core_weights"]),
+        skip_biases=tuple(args["skip_biases"]),
+        skip_gates=tuple(args["skip_gates"]),
+        skip_topks=(),
+    )
+    return tensor_args
+
+
+def _causal_memory_scan_fused_backward_cuda(
+    tensor_args: tuple[Tensor, ...],
+    *,
+    num_levels: int,
+    write_topks: tuple[int, ...],
+    propagation_topks: tuple[int, ...],
+    level_transition_topks: tuple[int, ...],
+    skip_topks: tuple[int, ...],
+    transition_compress_name: str,
+    propagation_compress_name: str,
+    trace_tensors: tuple[Tensor, ...] = (),
+    grad_query_val: Tensor,
+    grad_next_memory: tuple[Tensor, ...],
+) -> tuple[Tensor | None, ...]:
+    args = _unpack_causal_memory_scan_tensor_args(tensor_args, num_levels)
+    with torch.enable_grad():
+        result = _native_module().causal_memory_scan_fused_backward_cuda(
+        args["aligned_s"],
+        list(args["flat_memory"]),
+        args["value_to_state_weight"],
+        args["value_to_state_bias"],
+        args["s_prediction_weight"],
+        args["prediction_input_norm_weight"],
+        args["prediction_input_norm_bias"],
+        args["read_template_val"],
+        list(args["read_projection_weights"]),
+        list(args["read_gates"]),
+        list(args["write_source_weights"]),
+        list(args["write_target_weights"]),
+        list(args["write_core_weights"]),
+        list(args["write_biases"]),
+        list(write_topks),
+        transition_compress_name,
+        list(args["propagation_source_weights"]),
+        list(args["propagation_target_weights"]),
+        list(args["propagation_core_weights"]),
+        list(args["propagation_biases"]),
+        list(propagation_topks),
+        propagation_compress_name,
+        list(args["val_norm_weights"]),
+        list(args["val_norm_biases"]),
+        list(args["level_transition_source_weights"]),
+        list(args["level_transition_target_weights"]),
+        list(args["level_transition_core_weights"]),
+        list(args["level_transition_biases"]),
+        list(level_transition_topks),
+        list(args["level_norm_weights"]),
+        list(args["level_norm_biases"]),
+        list(args["skip_source_weights"]),
+        list(args["skip_target_weights"]),
+        list(args["skip_core_weights"]),
+        list(args["skip_biases"]),
+        list(args["skip_gates"]),
+        list(skip_topks),
+        list(trace_tensors),
+        grad_query_val,
+        list(grad_next_memory),
+    )
+    if not isinstance(result, (list, tuple)) or len(result) != len(tensor_args):
+        raise TypeError("causal_memory_scan_fused_backward_cuda must return one grad per saved tensor.")
+    return tuple(None if grad is None else grad for grad in result)
+
+
+def _accumulate_optional_grad(current: Tensor | None, update: Tensor | None) -> Tensor | None:
+    if update is None:
+        return current
+    if current is None:
+        return update
+    return current + update
+
+
+def _chunked_causal_memory_scan_backward(
+    ctx: Any,
+    tensor_args: tuple[Tensor, ...],
+    checkpoint_tensors: tuple[Tensor, ...],
+    grad_outputs: tuple[Tensor | None, ...],
+) -> tuple[Any, ...]:
+    detached_tensors = [tensor.detach().requires_grad_(tensor.requires_grad) for tensor in tensor_args]
+    unpacked_args = _unpack_causal_memory_scan_tensor_args(tuple(detached_tensors), ctx.num_levels)
+    grad_accum: list[Tensor | None] = [None] * len(detached_tensors)
+    grad_query = grad_outputs[0]
+    carry_memory_grads = tuple(
+        grad if grad is not None else torch.zeros_like(tensor_args[1 + index])
+        for index, grad in enumerate(grad_outputs[1: 1 + (2 * ctx.num_levels)])
+    )
+    num_chunks = checkpoint_tensors[0].shape[0] if checkpoint_tensors else 1
+    shared_indices = [0, *range(1 + (2 * ctx.num_levels), len(detached_tensors))]
+
+    for chunk_index in range(num_chunks - 1, -1, -1):
+        start = chunk_index * ctx.checkpoint_stride
+        end = min(start + ctx.checkpoint_stride, detached_tensors[0].shape[1])
+        if chunk_index == 0:
+            chunk_memory = tuple(detached_tensors[1: 1 + (2 * ctx.num_levels)])
+            chunk_memory_specs = [
+                ("orig", 1 + memory_index)
+                for memory_index in range(2 * ctx.num_levels)
+                if detached_tensors[1 + memory_index].requires_grad
+            ]
+        else:
+            chunk_memory = tuple(
+                checkpoint_tensors[memory_index][chunk_index].detach().requires_grad_(True)
+                for memory_index in range(2 * ctx.num_levels)
+            )
+            chunk_memory_specs = [
+                ("carry", memory_index) for memory_index in range(2 * ctx.num_levels)
+            ]
+
+        chunk_tensor_args = _repack_causal_memory_scan_chunk_args(
+            unpacked_args,
+            aligned_s=detached_tensors[0][:, start:end, :],
+            flat_memory=chunk_memory,
+            transition_compress_name=ctx.transition_compress_name,
+            propagation_compress_name=ctx.propagation_compress_name,
+        )
+
+        local_inputs: list[Tensor] = []
+        local_specs: list[tuple[str, int]] = []
+        for original_index in shared_indices:
+            leaf = detached_tensors[original_index]
+            if not leaf.requires_grad:
+                continue
+            local_inputs.append(leaf)
+            local_specs.append(("orig", original_index))
+        for spec, memory_tensor in zip(chunk_memory_specs, chunk_memory, strict=False):
+            local_inputs.append(memory_tensor)
+            local_specs.append(spec)
+
+        with torch.enable_grad():
+            query_val, next_memory = _causal_memory_scan_fused_native_forward(
+                *chunk_tensor_args,
+                num_levels=ctx.num_levels,
+                write_topks=ctx.write_topks,
+                propagation_topks=ctx.propagation_topks,
+                level_transition_topks=ctx.level_transition_topks,
+                skip_topks=ctx.skip_topks,
+                transition_compress_name=ctx.transition_compress_name,
+                propagation_compress_name=ctx.propagation_compress_name,
+            )
+            output_tensors = (query_val, *next_memory)
+            grad_tensors = [
+                (
+                    grad_query[:, start:end, :]
+                    if grad_query is not None
+                    else torch.zeros_like(query_val)
+                )
+            ]
+            grad_tensors.extend(
+                grad if grad is not None else torch.zeros_like(output)
+                for grad, output in zip(carry_memory_grads, next_memory, strict=False)
+            )
+            grads = torch.autograd.grad(
+                output_tensors,
+                local_inputs,
+                grad_outputs=grad_tensors,
+                allow_unused=True,
+            )
+
+        next_carry: list[Tensor | None] = [None] * (2 * ctx.num_levels)
+        for spec, grad in zip(local_specs, grads, strict=False):
+            if spec[0] == "orig":
+                grad_accum[spec[1]] = _accumulate_optional_grad(grad_accum[spec[1]], grad)
+            else:
+                next_carry[spec[1]] = grad
+        if chunk_index > 0:
+            carry_memory_grads = tuple(
+                grad if grad is not None else torch.zeros_like(chunk_memory[memory_index])
+                for memory_index, grad in enumerate(next_carry)
+            )
+
+    return (*grad_accum, None, None, None, None, None, None, None)
+
+
+class _CausalMemoryScanFusedFunction(Function):
+    @staticmethod
+    def forward(ctx: Any, *args: Any) -> tuple[Tensor, ...]:
+        num_levels = int(args[-7])
+        write_topks = tuple(int(v) for v in args[-6])
+        propagation_topks = tuple(int(v) for v in args[-5])
+        level_transition_topks = tuple(int(v) for v in args[-4])
+        skip_topks = tuple(int(v) for v in args[-3])
+        transition_compress_name = str(args[-2])
+        propagation_compress_name = str(args[-1])
+        tensor_args = tuple(arg for arg in args[:-7])
+        checkpoint_stride = _experimental_fused_training_checkpoint_stride(tensor_args[0].shape[1])
+        checkpoint_tensors: tuple[Tensor, ...] = ()
+        trace_tensors: tuple[Tensor, ...] = ()
+        if checkpoint_stride is not None and checkpoint_stride < tensor_args[0].shape[1]:
+            query_val, next_memory, checkpoint_tensors = _causal_memory_scan_fused_native_forward_with_checkpoints(
+                *tensor_args,
+                num_levels=num_levels,
+                write_topks=write_topks,
+                propagation_topks=propagation_topks,
+                level_transition_topks=level_transition_topks,
+                skip_topks=skip_topks,
+                transition_compress_name=transition_compress_name,
+                propagation_compress_name=propagation_compress_name,
+                checkpoint_stride=checkpoint_stride,
+            )
+        elif (
+            _experimental_scan_backward_cuda_enabled()
+            and native_supports("causal_memory_scan_fused_backward_cuda")
+            and tensor_args[0].is_cuda
+        ):
+            unpacked = _unpack_causal_memory_scan_tensor_args(tensor_args, num_levels)
+            query_val, next_memory, trace_tensors = causal_memory_scan_fused_trace_native(
+                aligned_s=unpacked["aligned_s"],
+                flat_memory=tuple(unpacked["flat_memory"]),
+                value_to_state_weight=unpacked["value_to_state_weight"],
+                value_to_state_bias=_load_optional_tensor(unpacked["value_to_state_bias"]),
+                s_prediction_weight=unpacked["s_prediction_weight"],
+                prediction_input_norm_weight=unpacked["prediction_input_norm_weight"],
+                prediction_input_norm_bias=_load_optional_tensor(unpacked["prediction_input_norm_bias"]),
+                read_template_val=unpacked["read_template_val"],
+                read_projection_weights=tuple(unpacked["read_projection_weights"]),
+                read_gates=tuple(unpacked["read_gates"]),
+                write_source_weights=tuple(unpacked["write_source_weights"]),
+                write_target_weights=tuple(unpacked["write_target_weights"]),
+                write_core_weights=tuple(unpacked["write_core_weights"]),
+                write_biases=tuple(unpacked["write_biases"]),
+                write_topks=write_topks,
+                transition_compress_name=transition_compress_name,
+                propagation_source_weights=tuple(unpacked["propagation_source_weights"]),
+                propagation_target_weights=tuple(unpacked["propagation_target_weights"]),
+                propagation_core_weights=tuple(unpacked["propagation_core_weights"]),
+                propagation_biases=tuple(unpacked["propagation_biases"]),
+                propagation_topks=propagation_topks,
+                propagation_compress_name=propagation_compress_name,
+                val_norm_weights=tuple(unpacked["val_norm_weights"]),
+                val_norm_biases=tuple(unpacked["val_norm_biases"]),
+                level_transition_source_weights=tuple(unpacked["level_transition_source_weights"]),
+                level_transition_target_weights=tuple(unpacked["level_transition_target_weights"]),
+                level_transition_core_weights=tuple(unpacked["level_transition_core_weights"]),
+                level_transition_biases=tuple(unpacked["level_transition_biases"]),
+                level_transition_topks=level_transition_topks,
+                level_norm_weights=tuple(unpacked["level_norm_weights"]),
+                level_norm_biases=tuple(unpacked["level_norm_biases"]),
+                skip_source_weights=tuple(unpacked["skip_source_weights"]),
+                skip_target_weights=tuple(unpacked["skip_target_weights"]),
+                skip_core_weights=tuple(unpacked["skip_core_weights"]),
+                skip_biases=tuple(unpacked["skip_biases"]),
+                skip_gates=tuple(unpacked["skip_gates"]),
+                skip_topks=skip_topks,
+            )
+        else:
+            query_val, next_memory = _causal_memory_scan_fused_native_forward(
+                *tensor_args,
+                num_levels=num_levels,
+                write_topks=write_topks,
+                propagation_topks=propagation_topks,
+                level_transition_topks=level_transition_topks,
+                skip_topks=skip_topks,
+                transition_compress_name=transition_compress_name,
+                propagation_compress_name=propagation_compress_name,
+            )
+        ctx.num_levels = num_levels
+        ctx.write_topks = write_topks
+        ctx.propagation_topks = propagation_topks
+        ctx.level_transition_topks = level_transition_topks
+        ctx.skip_topks = skip_topks
+        ctx.transition_compress_name = transition_compress_name
+        ctx.propagation_compress_name = propagation_compress_name
+        ctx.tensor_arg_count = len(tensor_args)
+        ctx.checkpoint_tensor_count = len(checkpoint_tensors)
+        ctx.trace_tensor_count = len(trace_tensors)
+        ctx.checkpoint_stride = checkpoint_stride or 0
+        ctx.save_for_backward(*tensor_args, *checkpoint_tensors, *trace_tensors)
+        return (query_val, *next_memory)
+
+    @staticmethod
+    def backward(ctx: Any, *grad_outputs: Tensor | None) -> tuple[Any, ...]:
+        saved_tensors = tuple(ctx.saved_tensors)
+        tensor_args = saved_tensors[: ctx.tensor_arg_count]
+        checkpoint_end = ctx.tensor_arg_count + ctx.checkpoint_tensor_count
+        checkpoint_tensors = saved_tensors[ctx.tensor_arg_count: checkpoint_end]
+        trace_tensors = saved_tensors[checkpoint_end : checkpoint_end + ctx.trace_tensor_count]
+        if checkpoint_tensors and ctx.checkpoint_stride > 0:
+            return _chunked_causal_memory_scan_backward(
+                ctx,
+                tensor_args,
+                checkpoint_tensors,
+                grad_outputs,
+            )
+
+        if (
+            _experimental_scan_backward_cuda_enabled()
+            and native_supports("causal_memory_scan_fused_backward_cuda")
+            and tensor_args[0].is_cuda
+        ):
+            if grad_outputs[0] is None:
+                with torch.no_grad():
+                    zero_query, _ = _causal_memory_scan_fused_native_forward(
+                        *tensor_args,
+                        num_levels=ctx.num_levels,
+                        write_topks=ctx.write_topks,
+                        propagation_topks=ctx.propagation_topks,
+                        level_transition_topks=ctx.level_transition_topks,
+                        skip_topks=ctx.skip_topks,
+                        transition_compress_name=ctx.transition_compress_name,
+                        propagation_compress_name=ctx.propagation_compress_name,
+                    )
+                grad_query_val = torch.zeros_like(zero_query)
+            else:
+                grad_query_val = grad_outputs[0]
+            grad_next_memory = tuple(
+                grad if grad is not None else torch.zeros_like(tensor)
+                for grad, tensor in zip(
+                    grad_outputs[1 : 1 + (2 * ctx.num_levels)],
+                    tensor_args[1 : 1 + (2 * ctx.num_levels)],
+                    strict=False,
+                )
+            )
+            tensor_grads = _causal_memory_scan_fused_backward_cuda(
+                tensor_args,
+                num_levels=ctx.num_levels,
+                write_topks=ctx.write_topks,
+                propagation_topks=ctx.propagation_topks,
+                level_transition_topks=ctx.level_transition_topks,
+                skip_topks=ctx.skip_topks,
+                transition_compress_name=ctx.transition_compress_name,
+                propagation_compress_name=ctx.propagation_compress_name,
+                trace_tensors=tuple(trace_tensors),
+                grad_query_val=grad_query_val,
+                grad_next_memory=grad_next_memory,
+            )
+            return (*tensor_grads, None, None, None, None, None, None, None)
+
+        detached_tensors: list[Tensor] = []
+        grad_inputs: list[Tensor] = []
+        grad_index_map: list[int | None] = []
+        for tensor in tensor_args:
+            leaf = tensor.detach().requires_grad_(tensor.requires_grad)
+            detached_tensors.append(leaf)
+            if leaf.requires_grad:
+                grad_index_map.append(len(grad_inputs))
+                grad_inputs.append(leaf)
+            else:
+                grad_index_map.append(None)
+
+        with torch.enable_grad():
+            query_val, next_memory = _causal_memory_scan_fused_native_forward(
+                *tuple(detached_tensors),
+                num_levels=ctx.num_levels,
+                write_topks=ctx.write_topks,
+                propagation_topks=ctx.propagation_topks,
+                level_transition_topks=ctx.level_transition_topks,
+                skip_topks=ctx.skip_topks,
+                transition_compress_name=ctx.transition_compress_name,
+                propagation_compress_name=ctx.propagation_compress_name,
+            )
+            outputs = (query_val, *next_memory)
+            grad_tensors = [
+                grad if grad is not None else torch.zeros_like(output)
+                for grad, output in zip(grad_outputs, outputs, strict=False)
+            ]
+            grads = torch.autograd.grad(
+                outputs,
+                grad_inputs,
+                grad_outputs=grad_tensors,
+                allow_unused=True,
+            )
+
+        tensor_grads: list[Tensor | None] = []
+        for index in grad_index_map:
+            tensor_grads.append(None if index is None else grads[index])
+        return (*tensor_grads, None, None, None, None, None, None, None)
+
 
 
 def _flatten_query_tensors(
@@ -277,6 +1602,78 @@ def _signed_abs_softmax_backward(scores: Tensor, grad_routes: Tensor) -> Tensor:
     signed_routes = signs * probs
     dot = (grad_routes * signed_routes).sum(dim=-1, keepdim=True)
     return signs * probs * (signs * grad_routes - dot)
+
+
+def _packed_true_mask(scores: Tensor) -> Tensor:
+    return torch.ones_like(scores, dtype=torch.bool)
+
+
+def _pairwise_topk_compress_kind(route_compress_name: str) -> int | None:
+    if route_compress_name == "softmax":
+        return 0
+    if route_compress_name == "signed_abs_softmax":
+        return 1
+    if route_compress_name == "signed_entmax15":
+        return 2
+    return None
+
+
+def _propagation_topk_compress_kind(edge_compress_name: str) -> int | None:
+    if edge_compress_name == "softsign":
+        return 0
+    if edge_compress_name == "signed_abs_softmax":
+        return 1
+    if edge_compress_name == "signed_entmax15":
+        return 2
+    return None
+
+
+def _pairwise_routes_from_scores(scores: Tensor, compress_kind: int) -> Tensor:
+    if compress_kind == 1:
+        return _signed_abs_softmax_from_scores(scores)
+    if compress_kind == 2:
+        return torch.ops.jakal_net.signed_entmax15(scores, _packed_true_mask(scores))
+    return torch.softmax(scores, dim=-1)
+
+
+def _pairwise_routes_backward(scores: Tensor, routes: Tensor, grad_routes: Tensor, compress_kind: int) -> Tensor:
+    if compress_kind == 1:
+        return _signed_abs_softmax_backward(scores, grad_routes)
+    if compress_kind == 2:
+        return torch.ops.jakal_net.signed_entmax15_backward(
+            scores.contiguous(),
+            routes.contiguous(),
+            grad_routes.contiguous(),
+            _packed_true_mask(scores),
+        )
+    return _native_module().softmax_backward_cuda(
+        routes.contiguous(),
+        grad_routes.contiguous(),
+    )
+
+
+def _propagation_edges_from_scores(scores: Tensor, compress_kind: int) -> Tensor:
+    if compress_kind == 1:
+        return _signed_abs_softmax_from_scores(scores)
+    if compress_kind == 2:
+        return torch.ops.jakal_net.signed_entmax15(scores, _packed_true_mask(scores))
+    return torch.nn.functional.softsign(scores)
+
+
+def _propagation_edges_backward(scores: Tensor, edges: Tensor, grad_edges: Tensor, compress_kind: int) -> Tensor:
+    if compress_kind == 1:
+        return _signed_abs_softmax_backward(scores, grad_edges)
+    if compress_kind == 2:
+        return torch.ops.jakal_net.signed_entmax15_backward(
+            scores.contiguous(),
+            edges.contiguous(),
+            grad_edges.contiguous(),
+            _packed_true_mask(scores),
+        )
+    return _native_module().softsign_backward_cuda(
+        scores.contiguous(),
+        grad_edges.contiguous(),
+    )
 
 
 def _flatten_dense_tensors(
@@ -1721,7 +3118,7 @@ class _LowRankTransitionPairwiseTopK(Function):
         topk: int,
         src_block_size: int,
         dst_block_size: int,
-        signed_abs_softmax: bool,
+        compress_kind: int,
     ) -> tuple[Tensor, Tensor]:
         (
             flat_sender,
@@ -1755,13 +3152,15 @@ class _LowRankTransitionPairwiseTopK(Function):
             flat_sender.to(dtype=torch.float32).unsqueeze(-1)
             * flat_projected_val.to(dtype=torch.float32)
         ).contiguous()
+        score_bias = float(bias.item()) if bias is not None else 0.0
         delta_state, delta_val, scores, indices = _native_module().low_rank_pairwise_topk_forward_cuda(
             weighted_projected_source,
             projected_target,
             weighted_projected_state,
             weighted_projected_val,
             k,
-            signed_abs_softmax,
+            score_bias,
+            int(compress_kind),
         )
         ctx.batch_shape = batch_shape
         ctx.src_nodes = src_nodes
@@ -1769,7 +3168,7 @@ class _LowRankTransitionPairwiseTopK(Function):
         ctx.out_dim = out_dim
         ctx.temperature = float(temperature)
         ctx.has_bias = bias is not None
-        ctx.signed_abs_softmax = bool(signed_abs_softmax)
+        ctx.compress_kind = int(compress_kind)
         ctx.save_for_backward(
             sender_strength,
             src_val,
@@ -1820,11 +3219,7 @@ class _LowRankTransitionPairwiseTopK(Function):
         )
         flat_scores = scores.reshape(-1, src_nodes, scores.shape[-1]).contiguous()
         flat_indices = indices.reshape(-1, src_nodes, indices.shape[-1]).contiguous()
-        flat_routes = (
-            _signed_abs_softmax_from_scores(flat_scores)
-            if ctx.signed_abs_softmax
-            else torch.softmax(flat_scores, dim=-1)
-        ).contiguous()
+        flat_routes = _pairwise_routes_from_scores(flat_scores, ctx.compress_kind).contiguous()
         weighted_state = (
             flat_sender.to(dtype=torch.float32) * flat_projected_state.to(dtype=torch.float32)
         ).contiguous()
@@ -1847,16 +3242,12 @@ class _LowRankTransitionPairwiseTopK(Function):
             flat_grad_val.contiguous(),
         )
         module = _native_module()
-        if ctx.signed_abs_softmax:
-            grad_scores = _signed_abs_softmax_backward(
-                flat_scores.contiguous(),
-                grad_routes.contiguous(),
-            )
-        else:
-            grad_scores = module.softmax_backward_cuda(
-                flat_routes.contiguous(),
-                grad_routes.contiguous(),
-            )
+        grad_scores = _pairwise_routes_backward(
+            flat_scores.contiguous(),
+            flat_routes.contiguous(),
+            grad_routes.contiguous(),
+            ctx.compress_kind,
+        )
         projected_target = torch.matmul(flat_dst, target_weight.t()).contiguous()
         projected_source = torch.matmul(flat_src, source_weight.t()).contiguous()
         (
@@ -1915,6 +3306,7 @@ class _LowRankPropagationTopK(Function):
         target_weight: Tensor,
         core_weight: Tensor,
         bias: Tensor | None,
+        compress_kind: int,
         topk: int,
         target_block_size: int,
         source_block_size: int,
@@ -1941,8 +3333,10 @@ class _LowRankPropagationTopK(Function):
             flat_projected_val.to(dtype=torch.float32).contiguous(),
             k,
             score_bias,
+            int(compress_kind),
         )
         ctx.k = k
+        ctx.compress_kind = int(compress_kind)
         ctx.has_bias = bias is not None
         ctx.save_for_backward(
             layer_val,
@@ -1987,7 +3381,7 @@ class _LowRankPropagationTopK(Function):
         if bias is not None:
             scores = scores + bias
         best_scores, best_indices = scores.topk(ctx.k, dim=-1, largest=True, sorted=True)
-        edges = torch.nn.functional.softsign(best_scores).contiguous()
+        edges = _propagation_edges_from_scores(best_scores, ctx.compress_kind).contiguous()
         flat_grad_state = grad_delta_state.reshape(-1, nodes).contiguous()
         flat_grad_val = grad_delta_val.reshape(-1, nodes, out_dim).contiguous()
         (
@@ -2012,9 +3406,11 @@ class _LowRankPropagationTopK(Function):
             flat_grad_state,
             flat_grad_val,
         )
-        grad_scores = module.softsign_backward_cuda(
+        grad_scores = _propagation_edges_backward(
             best_scores.contiguous(),
+            edges.contiguous(),
             grad_edges.contiguous(),
+            ctx.compress_kind,
         )
         (
             grad_target,
@@ -2047,6 +3443,7 @@ class _LowRankPropagationTopK(Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -2061,6 +3458,7 @@ class _LowRankPropagationWindow(Function):
         target_weight: Tensor,
         core_weight: Tensor,
         bias: Tensor | None,
+        compress_kind: int,
         window: int,
         target_block_size: int,
         source_block_size: int,
@@ -2079,14 +3477,26 @@ class _LowRankPropagationWindow(Function):
             projected_source.dtype
         )
         score_bias = float(bias.item()) if bias is not None else 0.0
-        delta_state, delta_val = _native_module().low_rank_propagation_window_forward_cuda(
-            weighted_projected_source,
-            projected_target,
-            flat_projected_state.to(dtype=torch.float32).contiguous(),
-            flat_projected_val.to(dtype=torch.float32).contiguous(),
-            int(window),
-            score_bias,
-        )
+        module = _native_module()
+        if int(compress_kind) == 1:
+            delta_state, delta_val = module.low_rank_propagation_window_entmax15_forward_cuda(
+                weighted_projected_source,
+                projected_target,
+                flat_projected_state.to(dtype=torch.float32).contiguous(),
+                flat_projected_val.to(dtype=torch.float32).contiguous(),
+                int(window),
+                score_bias,
+            )
+        else:
+            delta_state, delta_val = module.low_rank_propagation_window_forward_cuda(
+                weighted_projected_source,
+                projected_target,
+                flat_projected_state.to(dtype=torch.float32).contiguous(),
+                flat_projected_val.to(dtype=torch.float32).contiguous(),
+                int(window),
+                score_bias,
+            )
+        ctx.compress_kind = int(compress_kind)
         ctx.window = int(window)
         ctx.has_bias = bias is not None
         ctx.save_for_backward(
@@ -2143,8 +3553,12 @@ class _LowRankPropagationWindow(Function):
         ).sum(dim=-1)
         if bias is not None:
             scores = scores + bias
-        edges = torch.nn.functional.softsign(scores)
-        edges = edges * valid.to(dtype=edges.dtype)
+        if ctx.compress_kind == 1:
+            packed_mask = valid.contiguous()
+            edges = torch.ops.jakal_net.signed_entmax15(scores, packed_mask)
+        else:
+            edges = torch.nn.functional.softsign(scores)
+            edges = edges * valid.to(dtype=edges.dtype)
         flat_grad_state = grad_delta_state.reshape(-1, nodes).contiguous()
         flat_grad_val = grad_delta_val.reshape(-1, nodes, out_dim).contiguous()
         (
@@ -2171,11 +3585,20 @@ class _LowRankPropagationWindow(Function):
         )
         valid_f32 = valid.to(dtype=grad_edges.dtype)
         grad_edges = grad_edges * valid_f32
-        grad_scores = module.softsign_backward_cuda(
-            scores.contiguous(),
-            grad_edges.contiguous(),
-        )
-        grad_scores = grad_scores * valid_f32
+        if ctx.compress_kind == 1:
+            grad_scores = torch.ops.jakal_net.signed_entmax15_backward(
+                scores.contiguous(),
+                edges.contiguous(),
+                grad_edges.contiguous(),
+                valid.contiguous(),
+            )
+            grad_scores = grad_scores * valid_f32
+        else:
+            grad_scores = module.softsign_backward_cuda(
+                scores.contiguous(),
+                grad_edges.contiguous(),
+            )
+            grad_scores = grad_scores * valid_f32
         (
             grad_target,
             grad_source,
@@ -2204,6 +3627,7 @@ class _LowRankPropagationWindow(Function):
             grad_target_weight,
             grad_core_weight,
             grad_bias if ctx.has_bias else None,
+            None,
             None,
             None,
             None,
@@ -2312,6 +3736,18 @@ def propagation_window_native(
 ) -> Any:
     if not supports_pairwise_kernel(pairwise_fn):
         raise TypeError("Unsupported pairwise_fn for native propagation.")
+    use_entmax15_cuda_autograd = (
+        _experimental_fused_training_enabled()
+        and edge_compress_name == "signed_entmax15"
+        and _signed_entmax15_ops_available()
+        and native_supports("query_topk_reduce_backward_cuda")
+        and native_supports("low_rank_pairwise_topk_backward_cuda")
+        and native_supports("low_rank_propagation_window_entmax15_forward_cuda")
+        and isinstance(pairwise_fn, LowRankBilinearPairwise)
+        and _cuda_float_tensor(layer_val)
+        and _cuda_float_tensor(projected_state)
+        and _cuda_float_tensor(projected_val)
+    )
     use_cuda_autograd = (
         _experimental_fused_training_enabled()
         and edge_compress_name == "softsign"
@@ -2323,7 +3759,7 @@ def propagation_window_native(
         and _cuda_float_tensor(projected_state)
         and _cuda_float_tensor(projected_val)
     )
-    if use_cuda_autograd:
+    if use_cuda_autograd or use_entmax15_cuda_autograd:
         delta_state, delta_val = _LowRankPropagationWindow.apply(
             layer_val,
             projected_state,
@@ -2332,6 +3768,7 @@ def propagation_window_native(
             pairwise_fn.target_proj.weight,
             pairwise_fn.weight,
             pairwise_fn.bias,
+            1 if edge_compress_name == "signed_entmax15" else 0,
             window,
             target_block_size,
             source_block_size,
@@ -2369,9 +3806,11 @@ def propagation_topk_native(
 ) -> Any:
     if not supports_pairwise_kernel(pairwise_fn):
         raise TypeError("Unsupported pairwise_fn for native propagation.")
+    compress_kind = _propagation_topk_compress_kind(edge_compress_name)
     use_cuda_autograd = (
         _experimental_fused_training_enabled()
-        and edge_compress_name == "softsign"
+        and compress_kind is not None
+        and compress_kind in {0, 1}
         and _query_backward_ops_available()
         and native_supports("low_rank_propagation_topk_forward_cuda")
         and native_supports("low_rank_pairwise_topk_backward_cuda")
@@ -2390,6 +3829,7 @@ def propagation_topk_native(
             pairwise_fn.target_proj.weight,
             pairwise_fn.weight,
             pairwise_fn.bias,
+            int(compress_kind),
             topk,
             target_block_size,
             source_block_size,
@@ -2494,6 +3934,7 @@ def propagation_query_topk_native(
 def transition_dense_native(
     *,
     route_fn: object,
+    route_compress_name: str,
     sender_strength: Tensor,
     src_val: Tensor,
     projected_state: Tensor,
@@ -2511,6 +3952,7 @@ def transition_dense_native(
         spec.in_bias,
         spec.out_weight,
         spec.out_bias,
+        route_compress_name,
         sender_strength,
         src_val,
         projected_state,
@@ -2720,11 +4162,14 @@ def transition_pairwise_topk_native(
         raise TypeError("Unsupported pairwise route_fn for native sparse transition.")
     inner = getattr(route_fn, "route_fn", route_fn)
     temperature = float(getattr(route_fn, "temperature", 1.0))
+    compress_kind = _pairwise_topk_compress_kind(route_compress_name)
     use_cuda_autograd = (
         _query_backward_ops_available()
         and native_supports("low_rank_pairwise_topk_forward_cuda")
         and native_supports("low_rank_pairwise_topk_backward_cuda")
         and isinstance(inner, LowRankBilinearRoute)
+        and compress_kind is not None
+        and (compress_kind != 2 or _signed_entmax15_ops_available())
         and topk <= 32
         and _cuda_float_tensor(sender_strength)
         and _cuda_float_tensor(src_val)
@@ -2747,13 +4192,13 @@ def transition_pairwise_topk_native(
             topk,
             src_block_size,
             dst_block_size,
-            route_compress_name == "signed_abs_softmax",
+            int(compress_kind),
         )
         return LayerDelta(delta_state=delta_state, delta_val=delta_val)
     if route_compress_name != "softmax":
         raise TypeError(
-            "Native sparse pairwise transition supports signed_abs_softmax only "
-            "through the CUDA low-rank autograd path."
+            "Native sparse pairwise transition supports signed_abs_softmax and signed_entmax15 "
+            "only through the CUDA low-rank autograd path."
         )
     spec = pairwise_route_kernel_spec(route_fn)
     return _to_layer_delta(_native_module().transition_pairwise_topk(

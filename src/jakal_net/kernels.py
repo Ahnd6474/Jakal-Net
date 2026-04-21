@@ -25,6 +25,99 @@ from jakal_net.kernel_common import (
 )
 
 
+def _native_signed_entmax15_available() -> bool:
+    try:
+        getattr(torch.ops.jakal_net, "signed_entmax15")
+        getattr(torch.ops.jakal_net, "signed_entmax15_backward")
+    except (AttributeError, RuntimeError):
+        return False
+    return True
+
+
+def _entmax15_threshold(logits: Tensor, *, dim: int = -1) -> Tensor:
+    sorted_logits = torch.sort(logits, dim=dim, descending=True).values
+    cumulative = sorted_logits.cumsum(dim=dim)
+    cumulative_sq = (sorted_logits * sorted_logits).cumsum(dim=dim)
+    rho = torch.arange(
+        1,
+        sorted_logits.shape[dim] + 1,
+        device=logits.device,
+        dtype=logits.dtype,
+    )
+    view_shape = [1] * sorted_logits.ndim
+    view_shape[dim] = sorted_logits.shape[dim]
+    rho = rho.view(view_shape)
+    mean = cumulative / rho
+    mean_sq = cumulative_sq / rho
+    support_var = rho * (mean_sq - mean.square())
+    delta = torch.clamp((1 - support_var) / rho, min=0)
+    tau = mean - torch.sqrt(delta)
+    support = (tau <= sorted_logits).sum(dim=dim, keepdim=True).clamp_min(1)
+    return tau.gather(dim, support - 1)
+
+
+def entmax15(logits: Tensor, *, dim: int = -1, mask: Tensor | None = None) -> Tensor:
+    if dim != -1:
+        raise ValueError("entmax15 currently supports dim=-1 only.")
+    clean_logits = torch.nan_to_num(logits)
+    if mask is not None:
+        bool_mask = mask.to(dtype=torch.bool)
+        masked_logits = clean_logits.masked_fill(~bool_mask, torch.finfo(clean_logits.dtype).min)
+    else:
+        bool_mask = None
+        masked_logits = clean_logits
+    shifted = masked_logits - masked_logits.max(dim=dim, keepdim=True).values
+    shifted = shifted / 2
+    tau = _entmax15_threshold(shifted, dim=dim)
+    probabilities = torch.clamp(shifted - tau, min=0).square()
+    if bool_mask is not None:
+        probabilities = probabilities * bool_mask.to(dtype=probabilities.dtype)
+    normalizer = probabilities.sum(dim=dim, keepdim=True)
+    return torch.where(
+        normalizer > 0,
+        probabilities / normalizer.clamp_min(torch.finfo(probabilities.dtype).eps),
+        torch.zeros_like(probabilities),
+    )
+
+
+class _SignedEntmax15Function(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, logits: Tensor, mask: Tensor | None) -> Tensor:
+        packed_mask = mask if mask is not None else torch.empty(0, device=logits.device, dtype=torch.bool)
+        routes = torch.ops.jakal_net.signed_entmax15(logits, packed_mask)
+        ctx.save_for_backward(logits, routes, packed_mask)
+        return routes
+
+    @staticmethod
+    def backward(ctx, grad_routes: Tensor) -> tuple[Tensor, None]:
+        logits, routes, packed_mask = ctx.saved_tensors
+        grad_scores = torch.ops.jakal_net.signed_entmax15_backward(
+            logits,
+            routes,
+            grad_routes,
+            packed_mask,
+        )
+        return grad_scores, None
+
+
+def signed_entmax15(
+    logits: Tensor,
+    *,
+    dim: int = -1,
+    mask: Tensor | None = None,
+) -> Tensor:
+    if dim != -1:
+        raise ValueError("signed_entmax15 currently supports dim=-1 only.")
+    clean_logits = torch.nan_to_num(logits)
+    if _native_signed_entmax15_available() and clean_logits.device.type in {"cpu", "cuda"}:
+        return _SignedEntmax15Function.apply(clean_logits, mask)
+    magnitudes = entmax15(clean_logits.abs(), dim=dim, mask=mask)
+    signed = torch.sign(clean_logits) * magnitudes
+    if mask is None:
+        return torch.nan_to_num(signed)
+    return torch.nan_to_num(signed * mask.to(dtype=signed.dtype))
+
+
 def _signed_abs_softmax(logits: Tensor, *, dim: int = -1) -> Tensor:
     clean_logits = torch.nan_to_num(logits)
     return torch.sign(clean_logits) * torch.softmax(clean_logits.abs(), dim=dim)
@@ -40,7 +133,8 @@ def _compress_edges(
     *,
     mask: Tensor | None = None,
 ) -> Tensor:
-    if _edge_compress_name(edge_compress_fn) in {"signed_abs_softmax", "_signed_abs_softmax_edges"}:
+    edge_name = _edge_compress_name(edge_compress_fn)
+    if edge_name in {"signed_abs_softmax", "_signed_abs_softmax_edges"}:
         clean_scores = torch.nan_to_num(scores)
         signs = torch.sign(clean_scores)
         magnitudes = clean_scores.abs()
@@ -49,6 +143,8 @@ def _compress_edges(
             signs = signs * bool_mask.to(dtype=signs.dtype)
             magnitudes = magnitudes.masked_fill(~bool_mask, -torch.inf)
         return torch.nan_to_num(signs * torch.softmax(magnitudes, dim=-1))
+    if edge_name in {"signed_entmax15", "_signed_entmax15_edges"}:
+        return signed_entmax15(scores, dim=-1, mask=mask)
     edges = edge_compress_fn(scores)
     if mask is not None:
         edges = edges * mask.to(dtype=edges.dtype)
@@ -60,6 +156,8 @@ def _compress_routes(logits: Tensor, *, route_compress_name: str) -> Tensor:
         return torch.softmax(logits, dim=-1)
     if route_compress_name == "signed_abs_softmax":
         return _signed_abs_softmax(logits, dim=-1)
+    if route_compress_name == "signed_entmax15":
+        return signed_entmax15(logits, dim=-1)
     raise ValueError(f"Unsupported route_compress_name: {route_compress_name!r}.")
 
 

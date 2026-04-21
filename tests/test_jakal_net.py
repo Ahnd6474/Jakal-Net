@@ -14,6 +14,7 @@ from jakal_net import (
     SourceTargetHadamardMLPRoute,
     Transition,
 )
+from jakal_net.kernels import signed_entmax15 as _signed_entmax15_kernel
 
 
 def _pairwise_fn(target: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
@@ -34,6 +35,10 @@ def _val_proj_fn(val: torch.Tensor) -> torch.Tensor:
 def _signed_abs_softmax_edges(scores: torch.Tensor) -> torch.Tensor:
     clean_scores = torch.nan_to_num(scores)
     return torch.sign(clean_scores) * torch.softmax(clean_scores.abs(), dim=-1)
+
+
+def _signed_entmax15_edges(scores: torch.Tensor) -> torch.Tensor:
+    return _signed_entmax15_kernel(scores, dim=-1)
 
 
 def _make_route_fn(src_dim: int, dst_nodes: int):
@@ -212,6 +217,37 @@ class JakalNetModuleTests(unittest.TestCase):
             implementation="kernel",
             target_block_size=3,
             source_block_size=2,
+        )
+        kernel.pairwise_fn.load_state_dict(reference.pairwise_fn.state_dict())
+
+        self.assert_delta_close(reference(layer), kernel(layer))
+
+    def test_sparse_window_propagation_kernel_matches_signed_entmax15_reference(self) -> None:
+        torch.manual_seed(33)
+        layer = Layer(
+            dim=3,
+            num_nodes=8,
+            state=torch.randn(2, 8),
+            val=torch.randn(2, 8, 3),
+        )
+
+        reference = SparsePropagation(
+            pairwise_fn=DiagonalBilinearPairwise(dim=3),
+            edge_compress_fn=_signed_entmax15_edges,
+            state_proj_fn=_state_proj_fn,
+            val_proj_fn=_val_proj_fn,
+            sparse_type="window",
+            window_size=3,
+            implementation="reference",
+        )
+        kernel = SparsePropagation(
+            pairwise_fn=DiagonalBilinearPairwise(dim=3),
+            edge_compress_fn=_signed_entmax15_edges,
+            state_proj_fn=_state_proj_fn,
+            val_proj_fn=_val_proj_fn,
+            sparse_type="window",
+            window_size=3,
+            implementation="kernel",
         )
         kernel.pairwise_fn.load_state_dict(reference.pairwise_fn.state_dict())
 
@@ -413,6 +449,37 @@ class JakalNetModuleTests(unittest.TestCase):
             route_fn=MLPRoute(src_dim=4, dst_nodes=5, hidden_dim=9),
             state_activation_fn=lambda x: torch.nn.functional.softplus(x) + 0.1,
             val_proj_fn=lambda val: val[..., :3].repeat_interleave(2, dim=-1),
+            state_proj_fn=_state_proj_fn,
+            implementation="kernel",
+        )
+        kernel.route_fn.load_state_dict(reference.route_fn.state_dict())
+
+        self.assert_delta_close(reference.compute_delta(src, dst), kernel.compute_delta(src, dst))
+
+    def test_dense_transition_kernel_matches_signed_entmax15_reference(self) -> None:
+        torch.manual_seed(17)
+        src = Layer(
+            dim=3,
+            num_nodes=7,
+            state=torch.randn(2, 7),
+            val=torch.randn(2, 7, 3),
+        )
+        dst = Layer.zeros(dim=4, num_nodes=6, batch_shape=(2,))
+        route_fn = LinearRoute(src_dim=3, dst_nodes=6)
+
+        reference = Transition(
+            route_fn=route_fn,
+            state_activation_fn=lambda x: x + 1.25,
+            route_compress_name="signed_entmax15",
+            val_proj_fn=lambda val: torch.cat((val, val[..., :1]), dim=-1),
+            state_proj_fn=_state_proj_fn,
+            implementation="reference",
+        )
+        kernel = Transition(
+            route_fn=LinearRoute(src_dim=3, dst_nodes=6),
+            state_activation_fn=lambda x: x + 1.25,
+            route_compress_name="signed_entmax15",
+            val_proj_fn=lambda val: torch.cat((val, val[..., :1]), dim=-1),
             state_proj_fn=_state_proj_fn,
             implementation="kernel",
         )
