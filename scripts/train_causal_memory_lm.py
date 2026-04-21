@@ -5,8 +5,10 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import nullcontext
 import json
 import math
+import queue
 import random
 import re
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -163,6 +165,74 @@ class DocumentBatch:
     target: torch.Tensor
     loss_mask: torch.Tensor
     reset_mask: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class FlatDocumentRef:
+    shard_index: int
+    document_index: int
+
+
+@dataclass(frozen=True, slots=True)
+class FlatPretokenizedShard:
+    path: Path
+    kind: tuple[str, ...]
+    source: tuple[str, ...]
+    token_count: torch.Tensor
+    document_chunk_offsets: torch.Tensor
+    chunk_token_offsets: torch.Tensor
+    context_flat: torch.Tensor
+    loss_mask_flat: torch.Tensor
+    is_continuation: torch.Tensor
+    seq_len: int
+    pad_token_id: int
+    eos_token_id: int
+    cont_token_id: int
+    vocab_size: int
+    tokenizer_label: str | None
+    tokenizer_model_path: str | None
+    corpus_info: dict[str, Any]
+
+    @property
+    def num_documents(self) -> int:
+        return len(self.kind)
+
+    def document_chunk_range(self, document_index: int) -> tuple[int, int]:
+        start = int(self.document_chunk_offsets[document_index].item())
+        end = int(self.document_chunk_offsets[document_index + 1].item())
+        return start, end
+
+    def chunk_count(self, document_index: int) -> int:
+        start, end = self.document_chunk_range(document_index)
+        return end - start
+
+    def build_chunk_tensors(self, chunk_index: int, *, is_last_chunk: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+        token_start = int(self.chunk_token_offsets[chunk_index].item())
+        token_end = int(self.chunk_token_offsets[chunk_index + 1].item())
+        active_context = self.context_flat[token_start:token_end]
+        active_length = int(active_context.shape[0])
+        context = torch.full((self.seq_len,), self.pad_token_id, dtype=torch.long)
+        if active_length > 0:
+            context[:active_length] = active_context.to(dtype=torch.long)
+        target = torch.full((self.seq_len,), self.pad_token_id, dtype=torch.long)
+        if active_length > 1:
+            target[: active_length - 1] = active_context[1:].to(dtype=torch.long)
+        if active_length > 0:
+            target[active_length - 1] = self.eos_token_id if is_last_chunk else self.cont_token_id
+        loss_mask = torch.zeros(self.seq_len, dtype=torch.float32)
+        if active_length > 0:
+            loss_mask[:active_length] = self.loss_mask_flat[token_start:token_end].to(dtype=torch.float32)
+        return context, target, loss_mask, bool(self.is_continuation[chunk_index].item())
+
+
+@dataclass(frozen=True, slots=True)
+class FlatPretokenizedDirectory:
+    shards: tuple[FlatPretokenizedShard, ...]
+    document_refs: tuple[FlatDocumentRef, ...]
+    vocab_size: int
+    tokenizer_label: str | None
+    tokenizer_model_path: str | None
+    corpus_info: dict[str, Any]
 
 
 SCHEDULED_BUCKET_ORDER = (
@@ -339,6 +409,10 @@ def _tokenize_document_payload_batch_worker(
 def document_sampling_bucket(document: SerializedDocument | TokenizedDocument) -> str:
     source = document.source.lower()
     kind = document.kind.lower()
+    return document_sampling_bucket_from_kind_source(kind=kind, source=source)
+
+
+def document_sampling_bucket_from_kind_source(*, kind: str, source: str) -> str:
     if source.startswith("mixed_dialogue:"):
         return "mixed_dialogue"
     if source.startswith("math_qa:"):
@@ -464,6 +538,59 @@ def sample_documents_uniform_by_bucket(
     return selected[:sample_count]
 
 
+def flat_document_ref_bucket(collection: FlatPretokenizedDirectory, reference: FlatDocumentRef) -> str:
+    shard = collection.shards[reference.shard_index]
+    return document_sampling_bucket_from_kind_source(
+        kind=shard.kind[reference.document_index].lower(),
+        source=shard.source[reference.document_index].lower(),
+    )
+
+
+def summarize_flat_document_buckets(
+    collection: FlatPretokenizedDirectory,
+    documents: Sequence[FlatDocumentRef],
+) -> dict[str, int]:
+    summary: dict[str, int] = {}
+    for reference in documents:
+        bucket = flat_document_ref_bucket(collection, reference)
+        summary[bucket] = summary.get(bucket, 0) + 1
+    return {bucket: summary[bucket] for bucket in SCHEDULED_BUCKET_ORDER if bucket in summary}
+
+
+def sample_flat_documents_uniform_by_bucket(
+    collection: FlatPretokenizedDirectory,
+    documents: Sequence[FlatDocumentRef],
+    *,
+    sample_count: int,
+) -> list[FlatDocumentRef]:
+    if sample_count <= 0 or not documents:
+        return []
+    bucket_to_documents: dict[str, list[FlatDocumentRef]] = {}
+    for reference in documents:
+        bucket_to_documents.setdefault(flat_document_ref_bucket(collection, reference), []).append(reference)
+    if not bucket_to_documents:
+        return random.sample(list(documents), k=min(sample_count, len(documents)))
+    ordered_buckets = [bucket for bucket in SCHEDULED_BUCKET_ORDER if bucket_to_documents.get(bucket)]
+    bucket_queues = {
+        bucket: random.sample(bucket_to_documents[bucket], k=len(bucket_to_documents[bucket]))
+        for bucket in ordered_buckets
+    }
+    selected: list[FlatDocumentRef] = []
+    while ordered_buckets and len(selected) < sample_count:
+        next_buckets: list[str] = []
+        for bucket in ordered_buckets:
+            queue = bucket_queues[bucket]
+            if not queue:
+                continue
+            selected.append(queue.pop())
+            if queue:
+                next_buckets.append(bucket)
+            if len(selected) >= sample_count:
+                break
+        ordered_buckets = next_buckets
+    return selected[:sample_count]
+
+
 class DocumentChunkBatcher:
     def __init__(
         self,
@@ -477,6 +604,7 @@ class DocumentChunkBatcher:
         self.documents = tuple(documents)
         self.batch_size = batch_size
         self.device = device
+        self.pin_memory = device.type == "cuda"
         self.current_doc = [-1] * batch_size
         self.current_chunk = [0] * batch_size
         self.needs_reset = [True] * batch_size
@@ -542,11 +670,204 @@ class DocumentChunkBatcher:
             else:
                 self.needs_reset[item_index] = False
                 self.current_chunk[item_index] = next_chunk
+        context = torch.stack(contexts, dim=0)
+        target = torch.stack(targets, dim=0)
+        loss_mask = torch.stack(masks, dim=0)
+        if self.pin_memory:
+            context = context.pin_memory()
+            target = target.pin_memory()
+            loss_mask = loss_mask.pin_memory()
+            reset_mask = reset_mask.pin_memory()
         return DocumentBatch(
-            context=torch.stack(contexts, dim=0).to(self.device),
-            target=torch.stack(targets, dim=0).to(self.device),
-            loss_mask=torch.stack(masks, dim=0).to(self.device),
-            reset_mask=reset_mask.to(self.device),
+            context=context,
+            target=target,
+            loss_mask=loss_mask,
+            reset_mask=reset_mask,
+        )
+
+
+def move_batch_to_device(
+    batch: DocumentBatch,
+    *,
+    device: torch.device,
+    non_blocking: bool = True,
+) -> DocumentBatch:
+    return DocumentBatch(
+        context=batch.context.to(device, non_blocking=non_blocking),
+        target=batch.target.to(device, non_blocking=non_blocking),
+        loss_mask=batch.loss_mask.to(device, non_blocking=non_blocking),
+        reset_mask=batch.reset_mask.to(device, non_blocking=non_blocking),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _PrefetchFailure:
+    error: BaseException
+
+
+class AsyncDocumentBatchPrefetcher:
+    def __init__(
+        self,
+        batcher: DocumentChunkBatcher,
+        *,
+        device: torch.device,
+        prefetch_batches: int,
+    ) -> None:
+        self.batcher = batcher
+        self.device = device
+        self.prefetch_batches = max(1, prefetch_batches)
+        self._queue: queue.Queue[DocumentBatch | _PrefetchFailure] = queue.Queue(maxsize=self.prefetch_batches)
+        self._stop = threading.Event()
+        self._stats_lock = threading.Lock()
+        self._produced_batches = 0
+        self._total_batch_build_seconds = 0.0
+        self._thread = threading.Thread(target=self._worker, name="cmem_batch_prefetch", daemon=True)
+        self._thread.start()
+
+    def _worker(self) -> None:
+        while not self._stop.is_set():
+            try:
+                started_at = time.perf_counter()
+                batch = self.batcher.next_batch()
+                elapsed = time.perf_counter() - started_at
+                with self._stats_lock:
+                    self._produced_batches += 1
+                    self._total_batch_build_seconds += elapsed
+                placed = False
+                while not placed and not self._stop.is_set():
+                    try:
+                        self._queue.put(batch, timeout=0.1)
+                        placed = True
+                    except queue.Full:
+                        continue
+            except BaseException as exc:  # pragma: no cover - defensive background thread path
+                while not self._stop.is_set():
+                    try:
+                        self._queue.put(_PrefetchFailure(exc), timeout=0.1)
+                        return
+                    except queue.Full:
+                        continue
+
+    def next_batch(self) -> DocumentBatch:
+        item = self._queue.get()
+        if isinstance(item, _PrefetchFailure):
+            raise RuntimeError("Async batch prefetcher failed.") from item.error
+        return move_batch_to_device(item, device=self.device, non_blocking=True)
+
+    def stats(self) -> tuple[float, int]:
+        with self._stats_lock:
+            average = (
+                self._total_batch_build_seconds / self._produced_batches
+                if self._produced_batches > 0
+                else 0.0
+            )
+        return average, self._queue.qsize()
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+
+
+class FlatDocumentChunkBatcher:
+    def __init__(
+        self,
+        collection: FlatPretokenizedDirectory,
+        documents: Sequence[FlatDocumentRef],
+        *,
+        batch_size: int,
+        device: torch.device,
+    ) -> None:
+        if not documents:
+            raise ValueError("documents must not be empty.")
+        self.collection = collection
+        self.documents = tuple(documents)
+        self.batch_size = batch_size
+        self.device = device
+        self.pin_memory = device.type == "cuda"
+        self.current_doc = [-1] * batch_size
+        self.current_chunk = [0] * batch_size
+        self.needs_reset = [True] * batch_size
+        self.bucket_to_indices: dict[str, tuple[int, ...]] = {}
+        for index, reference in enumerate(self.documents):
+            bucket = flat_document_ref_bucket(self.collection, reference)
+            self.bucket_to_indices.setdefault(bucket, []).append(index)
+        self.bucket_to_indices = {
+            bucket: tuple(indices)
+            for bucket, indices in self.bucket_to_indices.items()
+            if indices
+        }
+        self.active_buckets = tuple(self.bucket_to_indices)
+        self.active_bucket_weights = tuple(1.0 for _ in self.active_buckets)
+
+    def set_batch_size(self, batch_size: int) -> None:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+        if batch_size == self.batch_size:
+            return
+        self.batch_size = batch_size
+        self.current_doc = [-1] * batch_size
+        self.current_chunk = [0] * batch_size
+        self.needs_reset = [True] * batch_size
+
+    def _sample_document_index(self) -> int:
+        if not self.active_buckets:
+            return random.randrange(len(self.documents))
+        bucket = random.choices(self.active_buckets, weights=self.active_bucket_weights, k=1)[0]
+        return random.choice(self.bucket_to_indices[bucket])
+
+    def set_bucket_weights(self, weights: dict[str, float]) -> None:
+        active = [
+            (bucket, max(0.0, float(weights.get(bucket, 0.0))))
+            for bucket in SCHEDULED_BUCKET_ORDER
+            if bucket in self.bucket_to_indices
+        ]
+        active = [(bucket, weight) for bucket, weight in active if weight > 0.0]
+        if not active:
+            active = [(bucket, 1.0) for bucket in self.bucket_to_indices]
+        self.active_buckets = tuple(bucket for bucket, _ in active)
+        self.active_bucket_weights = tuple(weight for _, weight in active)
+
+    def next_batch(self) -> DocumentBatch:
+        contexts: list[torch.Tensor] = []
+        targets: list[torch.Tensor] = []
+        masks: list[torch.Tensor] = []
+        reset_mask = torch.zeros(self.batch_size, dtype=torch.bool)
+        for item_index in range(self.batch_size):
+            if self.needs_reset[item_index]:
+                self.current_doc[item_index] = self._sample_document_index()
+                self.current_chunk[item_index] = 0
+                reset_mask[item_index] = True
+            reference = self.documents[self.current_doc[item_index]]
+            shard = self.collection.shards[reference.shard_index]
+            chunk_start, chunk_end = shard.document_chunk_range(reference.document_index)
+            chunk_index = chunk_start + self.current_chunk[item_index]
+            context, target, loss_mask, _ = shard.build_chunk_tensors(
+                chunk_index,
+                is_last_chunk=chunk_index == chunk_end - 1,
+            )
+            contexts.append(context)
+            targets.append(target)
+            masks.append(loss_mask)
+            next_chunk = self.current_chunk[item_index] + 1
+            if chunk_start + next_chunk >= chunk_end:
+                self.needs_reset[item_index] = True
+                self.current_chunk[item_index] = 0
+            else:
+                self.needs_reset[item_index] = False
+                self.current_chunk[item_index] = next_chunk
+        context = torch.stack(contexts, dim=0)
+        target = torch.stack(targets, dim=0)
+        loss_mask = torch.stack(masks, dim=0)
+        if self.pin_memory:
+            context = context.pin_memory()
+            target = target.pin_memory()
+            loss_mask = loss_mask.pin_memory()
+            reset_mask = reset_mask.pin_memory()
+        return DocumentBatch(
+            context=context,
+            target=target,
+            loss_mask=loss_mask,
+            reset_mask=reset_mask,
         )
 
 
@@ -1144,6 +1465,93 @@ def load_pretokenized_bundle(path: Path) -> dict[str, Any]:
     }
 
 
+def load_flat_pretokenized_shard(path: Path) -> FlatPretokenizedShard:
+    bundle = torch.load(path, map_location="cpu")
+    if not isinstance(bundle, dict) or bundle.get("storage_format") != "flat_v2":
+        raise ValueError(f"Expected flat_v2 pretokenized shard: {path}")
+    corpus_info = bundle.get("corpus_info") or {}
+    special_tokens = dict(corpus_info.get("special_tokens") or {})
+    pad_token_id = special_tokens.get("pad")
+    eos_token_id = special_tokens.get("eos")
+    cont_token_id = special_tokens.get("cont")
+    if pad_token_id is None or eos_token_id is None or cont_token_id is None:
+        raise ValueError(f"Flat pretokenized bundle is missing pad/eos/cont special token ids: {path}")
+    document_meta = bundle["documents"]
+    chunk_meta = bundle["chunks"]
+    seq_len = int(bundle.get("seq_len") or 0)
+    if seq_len <= 0:
+        raise ValueError(f"Flat pretokenized bundle is missing seq_len: {path}")
+    return FlatPretokenizedShard(
+        path=path,
+        kind=tuple(str(item) for item in document_meta["kind"]),
+        source=tuple(str(item) for item in document_meta["source"]),
+        token_count=document_meta["token_count"].detach().cpu().to(dtype=torch.int64),
+        document_chunk_offsets=document_meta["chunk_offsets"].detach().cpu().to(dtype=torch.int64),
+        chunk_token_offsets=chunk_meta["token_offsets"].detach().cpu().to(dtype=torch.int64),
+        context_flat=chunk_meta["context_flat"].detach().cpu().to(dtype=torch.long),
+        loss_mask_flat=chunk_meta["loss_mask_flat"].detach().cpu(),
+        is_continuation=chunk_meta["is_continuation"].detach().cpu().to(dtype=torch.bool),
+        seq_len=seq_len,
+        pad_token_id=int(pad_token_id),
+        eos_token_id=int(eos_token_id),
+        cont_token_id=int(cont_token_id),
+        vocab_size=int(bundle["vocab_size"]),
+        tokenizer_label=bundle.get("tokenizer_label"),
+        tokenizer_model_path=bundle.get("tokenizer_model_path"),
+        corpus_info=corpus_info,
+    )
+
+
+def load_flat_pretokenized_directory(path: Path, *, load_workers: int = 1) -> FlatPretokenizedDirectory:
+    shard_paths = sorted(candidate for candidate in path.glob("*.pt") if candidate.is_file())
+    if not shard_paths:
+        raise ValueError(f"No pretokenized shard files found in {path}")
+    if load_workers <= 1:
+        shard_iterator = (load_flat_pretokenized_shard(shard_path) for shard_path in shard_paths)
+        executor: ThreadPoolExecutor | None = None
+    else:
+        executor = ThreadPoolExecutor(
+            max_workers=min(max(1, load_workers), len(shard_paths)),
+            thread_name_prefix="pretok_flat_load",
+        )
+        shard_iterator = executor.map(load_flat_pretokenized_shard, shard_paths)
+    shards: list[FlatPretokenizedShard] = []
+    tokenizer_label: str | None = None
+    tokenizer_model_path: str | None = None
+    vocab_size: int | None = None
+    shard_summaries: list[dict[str, Any]] = []
+    try:
+        for shard_path, shard in zip(shard_paths, shard_iterator):
+            shards.append(shard)
+            if tokenizer_label is None:
+                tokenizer_label = shard.tokenizer_label
+                tokenizer_model_path = shard.tokenizer_model_path
+                vocab_size = int(shard.vocab_size)
+            shard_summaries.append(
+                {
+                    "path": str(shard_path),
+                    "documents": shard.num_documents,
+                    "corpus_info": shard.corpus_info,
+                }
+            )
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
+    if vocab_size is None:
+        raise ValueError(f"Invalid pretokenized shard directory: {path}")
+    refs: list[FlatDocumentRef] = []
+    for shard_index, shard in enumerate(shards):
+        refs.extend(FlatDocumentRef(shard_index=shard_index, document_index=i) for i in range(shard.num_documents))
+    return FlatPretokenizedDirectory(
+        shards=tuple(shards),
+        document_refs=tuple(refs),
+        vocab_size=vocab_size,
+        tokenizer_label=tokenizer_label,
+        tokenizer_model_path=tokenizer_model_path,
+        corpus_info={"shards": shard_summaries, "directory": str(path)},
+    )
+
+
 def load_pretokenized_directory(path: Path, *, load_workers: int = 1) -> dict[str, Any]:
     shard_paths = sorted(candidate for candidate in path.glob("*.pt") if candidate.is_file())
     if not shard_paths:
@@ -1195,6 +1603,18 @@ def split_train_val_documents(
     *,
     train_fraction: float,
 ) -> tuple[list[TokenizedDocument], list[TokenizedDocument]]:
+    if len(documents) < 2:
+        return list(documents), list(documents)
+    split_index = int(len(documents) * train_fraction)
+    split_index = max(1, min(split_index, len(documents) - 1))
+    return list(documents[:split_index]), list(documents[split_index:])
+
+
+def split_train_val_flat_documents(
+    documents: Sequence[FlatDocumentRef],
+    *,
+    train_fraction: float,
+) -> tuple[list[FlatDocumentRef], list[FlatDocumentRef]]:
     if len(documents) < 2:
         return list(documents), list(documents)
     split_index = int(len(documents) * train_fraction)
@@ -1324,6 +1744,30 @@ def estimate_stage_weighted_steps_per_epoch(
     stage3_batch_size: int,
 ) -> int:
     total_chunks = sum(len(document.chunks) for document in documents)
+    stage1_weight = max(0.0, stage1_ratio)
+    stage2_weight = max(0.0, stage2_ratio - stage1_ratio)
+    stage3_weight = max(0.0, 1.0 - stage2_ratio)
+    effective_examples_per_step = (
+        stage1_weight * max(1, stage1_batch_size)
+        + stage2_weight * max(1, stage2_batch_size)
+        + stage3_weight * max(1, stage3_batch_size)
+    )
+    return max(1, math.ceil(total_chunks / max(1.0, effective_examples_per_step)))
+
+
+def estimate_stage_weighted_steps_per_epoch_flat(
+    *,
+    collection: FlatPretokenizedDirectory,
+    documents: Sequence[FlatDocumentRef],
+    stage1_ratio: float,
+    stage2_ratio: float,
+    stage1_batch_size: int,
+    stage2_batch_size: int,
+    stage3_batch_size: int,
+) -> int:
+    total_chunks = 0
+    for reference in documents:
+        total_chunks += collection.shards[reference.shard_index].chunk_count(reference.document_index)
     stage1_weight = max(0.0, stage1_ratio)
     stage2_weight = max(0.0, stage2_ratio - stage1_ratio)
     stage3_weight = max(0.0, 1.0 - stage2_ratio)
@@ -1487,6 +1931,64 @@ def log_eval_samples_to_tensorboard(
         model.train()
 
 
+@torch.no_grad()
+def log_eval_samples_to_tensorboard_flat(
+    writer: SummaryWriter | None,
+    model: CausalHierarchicalMemoryLM,
+    collection: FlatPretokenizedDirectory,
+    documents: Sequence[FlatDocumentRef],
+    *,
+    vocab: object | None,
+    device: torch.device,
+    precision: str,
+    step: int,
+    max_samples: int = 6,
+) -> None:
+    if writer is None or vocab is None or not documents:
+        return
+    selected = sample_flat_documents_uniform_by_bucket(collection, documents, sample_count=max_samples)
+    if not selected:
+        return
+
+    model_was_training = model.training
+    model.eval()
+    autocast_dtype = resolve_autocast_dtype(precision)
+    autocast_supported = (
+        autocast_dtype is not None
+        and (device.type == "cuda" or (device.type == "cpu" and autocast_dtype == torch.bfloat16))
+    )
+    autocast_context = (
+        torch.autocast(device_type=device.type, dtype=autocast_dtype)
+        if autocast_supported
+        else nullcontext()
+    )
+
+    with autocast_context:
+        sample_sections: list[str] = []
+        for index, reference in enumerate(selected, start=1):
+            shard = collection.shards[reference.shard_index]
+            chunk_start, _ = shard.document_chunk_range(reference.document_index)
+            context, target, loss_mask, _ = shard.build_chunk_tensors(chunk_start, is_last_chunk=shard.chunk_count(reference.document_index) == 1)
+            output = model(
+                context.unsqueeze(0).to(device),
+                reset_mask=torch.tensor([True], device=device, dtype=torch.bool),
+                return_memory_state=False,
+            )
+            assert isinstance(output, torch.Tensor)
+            predicted = output.argmax(dim=-1).squeeze(0).detach().cpu().to(dtype=torch.long)
+            sample_sections.append(
+                f"## sample {index:02d}\n\n"
+                f"kind: {shard.kind[reference.document_index]}\n\n"
+                f"source: {shard.source[reference.document_index]}\n\n"
+                f"### context\n{_decode_visible_tokens(vocab, context, None)}\n\n"
+                f"### target\n{_decode_visible_tokens(vocab, target, loss_mask)}\n\n"
+                f"### prediction\n{_decode_visible_tokens(vocab, predicted, loss_mask)}"
+            )
+        writer.add_text("eval_samples/mixed_corpus", "\n\n---\n\n".join(sample_sections), step)
+    if model_was_training:
+        model.train()
+
+
 def run_model(
     model: CausalHierarchicalMemoryLM,
     batch: DocumentBatch,
@@ -1563,6 +2065,57 @@ def estimate_eval_loss(
     return total_loss / max(1.0, total_weight)
 
 
+@torch.no_grad()
+def estimate_eval_loss_flat(
+    model: CausalHierarchicalMemoryLM,
+    collection: FlatPretokenizedDirectory,
+    documents: Sequence[FlatDocumentRef],
+    *,
+    eval_documents: int,
+    device: torch.device,
+    precision: str,
+) -> float:
+    if not documents:
+        raise ValueError("documents must not be empty.")
+    model_was_training = model.training
+    model.eval()
+    sampled_documents = sample_flat_documents_uniform_by_bucket(
+        collection,
+        documents,
+        sample_count=min(eval_documents, len(documents)),
+    )
+    total_loss = 0.0
+    total_weight = 0.0
+    for reference in sampled_documents:
+        shard = collection.shards[reference.shard_index]
+        chunk_start, chunk_end = shard.document_chunk_range(reference.document_index)
+        memory_state: tuple[Any, ...] | None = None
+        for chunk_index in range(chunk_start, chunk_end):
+            context, target, loss_mask, _ = shard.build_chunk_tensors(
+                chunk_index,
+                is_last_chunk=chunk_index == chunk_end - 1,
+            )
+            batch = DocumentBatch(
+                context=context.unsqueeze(0).to(device),
+                target=target.unsqueeze(0).to(device),
+                loss_mask=loss_mask.unsqueeze(0).to(device),
+                reset_mask=torch.tensor([chunk_index == chunk_start], device=device, dtype=torch.bool),
+            )
+            loss, memory_state = run_model(
+                model,
+                batch,
+                memory_state=memory_state,
+                precision=precision,
+                grad_enabled=False,
+            )
+            weight = float(batch.loss_mask.sum().item())
+            total_loss += float(loss.item()) * weight
+            total_weight += weight
+    if model_was_training:
+        model.train()
+    return total_loss / max(1.0, total_weight)
+
+
 def save_checkpoint(
     path: Path,
     *,
@@ -1624,6 +2177,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pretokenized-path")
     parser.add_argument("--pretokenized-dir")
     parser.add_argument("--pretokenized-load-workers", type=int, default=8)
+    parser.add_argument("--prefetch-batches", type=int, default=100)
     parser.add_argument("--save-pretokenized", action="store_true")
 
     parser.add_argument("--device", default="auto")
@@ -1703,6 +2257,23 @@ def summarize_tokenized_documents(documents: Sequence[TokenizedDocument]) -> dic
     }
 
 
+def summarize_flat_documents(
+    collection: FlatPretokenizedDirectory,
+    documents: Sequence[FlatDocumentRef],
+) -> dict[str, int]:
+    chunk_total = 0
+    token_total = 0
+    for reference in documents:
+        shard = collection.shards[reference.shard_index]
+        chunk_total += shard.chunk_count(reference.document_index)
+        token_total += int(shard.token_count[reference.document_index].item())
+    return {
+        "documents": len(documents),
+        "chunks": chunk_total,
+        "tokens": token_total,
+    }
+
+
 def main() -> None:
     args = parse_args()
     if args.pretokenize_workers < 0:
@@ -1752,20 +2323,20 @@ def main() -> None:
     tokenizer_model_path: str | None
     vocab_size: int
     corpus_metadata: dict[str, Any]
-    documents: list[TokenizedDocument]
+    documents: list[TokenizedDocument] | None = None
+    flat_collection: FlatPretokenizedDirectory | None = None
 
     if args.pretokenized_dir and Path(args.pretokenized_dir).exists():
-        bundle = load_pretokenized_directory(
+        flat_collection = load_flat_pretokenized_directory(
             Path(args.pretokenized_dir),
             load_workers=max(1, int(args.pretokenized_load_workers)),
         )
-        documents = list(bundle["documents"])
-        tokenizer_label = str(bundle.get("tokenizer_label") or "unknown")
-        tokenizer_model_path = bundle.get("tokenizer_model_path")
-        vocab_size = int(bundle["vocab_size"])
-        corpus_metadata = dict(bundle.get("corpus_info") or {})
+        tokenizer_label = str(flat_collection.tokenizer_label or "unknown")
+        tokenizer_model_path = flat_collection.tokenizer_model_path
+        vocab_size = int(flat_collection.vocab_size)
+        corpus_metadata = dict(flat_collection.corpus_info or {})
         print(
-            f"loaded_pretokenized_dir | path={args.pretokenized_dir} | documents={len(documents):,} | tokenizer={tokenizer_label}",
+            f"loaded_pretokenized_dir | path={args.pretokenized_dir} | documents={len(flat_collection.document_refs):,} | tokenizer={tokenizer_label}",
             flush=True,
         )
     elif args.pretokenized_path and Path(args.pretokenized_path).exists():
@@ -1854,20 +2425,38 @@ def main() -> None:
             )
             print(f"saved_pretokenized | path={args.pretokenized_path}", flush=True)
 
-    train_documents, val_documents = split_train_val_documents(documents, train_fraction=args.train_fraction)
-    train_bucket_summary = summarize_document_buckets(train_documents)
-    val_bucket_summary = summarize_document_buckets(val_documents)
+    if flat_collection is not None:
+        train_documents_flat, val_documents_flat = split_train_val_flat_documents(
+            flat_collection.document_refs,
+            train_fraction=args.train_fraction,
+        )
+        train_bucket_summary = summarize_flat_document_buckets(flat_collection, train_documents_flat)
+        val_bucket_summary = summarize_flat_document_buckets(flat_collection, val_documents_flat)
+        steps_per_epoch = estimate_stage_weighted_steps_per_epoch_flat(
+            collection=flat_collection,
+            documents=train_documents_flat,
+            stage1_ratio=args.curriculum_stage1_ratio,
+            stage2_ratio=args.curriculum_stage2_ratio,
+            stage1_batch_size=stage1_batch_size,
+            stage2_batch_size=stage2_batch_size,
+            stage3_batch_size=stage3_batch_size,
+        )
+    else:
+        assert documents is not None
+        train_documents, val_documents = split_train_val_documents(documents, train_fraction=args.train_fraction)
+        train_bucket_summary = summarize_document_buckets(train_documents)
+        val_bucket_summary = summarize_document_buckets(val_documents)
+        steps_per_epoch = estimate_stage_weighted_steps_per_epoch(
+            documents=train_documents,
+            stage1_ratio=args.curriculum_stage1_ratio,
+            stage2_ratio=args.curriculum_stage2_ratio,
+            stage1_batch_size=stage1_batch_size,
+            stage2_batch_size=stage2_batch_size,
+            stage3_batch_size=stage3_batch_size,
+        )
     decode_vocab = load_decode_vocab(
         tokenizer_label=tokenizer_label,
         tokenizer_model_path=tokenizer_model_path,
-    )
-    steps_per_epoch = estimate_stage_weighted_steps_per_epoch(
-        documents=train_documents,
-        stage1_ratio=args.curriculum_stage1_ratio,
-        stage2_ratio=args.curriculum_stage2_ratio,
-        stage1_batch_size=stage1_batch_size,
-        stage2_batch_size=stage2_batch_size,
-        stage3_batch_size=stage3_batch_size,
     )
     total_steps = max(1, int(math.ceil(steps_per_epoch * args.epochs)))
 
@@ -1935,7 +2524,20 @@ def main() -> None:
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scaler = torch.cuda.amp.GradScaler() if args.precision == "fp16" and device.type == "cuda" else None
-    batcher = DocumentChunkBatcher(train_documents, batch_size=stage1_batch_size, device=device)
+    if flat_collection is not None:
+        batcher: DocumentChunkBatcher | FlatDocumentChunkBatcher = FlatDocumentChunkBatcher(
+            flat_collection,
+            train_documents_flat,
+            batch_size=stage1_batch_size,
+            device=device,
+        )
+    else:
+        batcher = DocumentChunkBatcher(train_documents, batch_size=stage1_batch_size, device=device)
+    prefetcher = AsyncDocumentBatchPrefetcher(
+        batcher,
+        device=device,
+        prefetch_batches=max(1, int(args.prefetch_batches)),
+    )
 
     history_rows: list[dict[str, Any]] = []
     train_memory_state: tuple[Any, ...] | None = None
@@ -1978,6 +2580,12 @@ def main() -> None:
         batcher.set_batch_size(stage.batch_size)
         batcher.set_bucket_weights(bucket_weights)
         if stage.name != active_stage_name:
+            prefetcher.close()
+            prefetcher = AsyncDocumentBatchPrefetcher(
+                batcher,
+                device=device,
+                prefetch_batches=max(1, int(args.prefetch_batches)),
+            )
             apply_training_curriculum(model, stage)
             train_memory_state = None
             active_stage_name = stage.name
@@ -2005,7 +2613,7 @@ def main() -> None:
         loss_is_finite = True
         for span_index in range(stage.document_span):
             batch = override_batch_reset(
-                batcher.next_batch(),
+                prefetcher.next_batch(),
                 reset_all=stage.freeze_memory,
             )
             loss, next_memory_state = run_model(
@@ -2069,10 +2677,13 @@ def main() -> None:
             grad_norm = float("nan")
 
         train_loss = float(sum(span_losses) / max(1, len(span_losses)))
+        avg_cpu_batch_seconds, prefetch_queue_size = prefetcher.stats()
         if writer is not None:
             writer.add_scalar("train/loss", train_loss, step)
             writer.add_scalar("train/lr", lr, step)
             writer.add_scalar("train/document_span", stage.document_span, step)
+            writer.add_scalar("train/cpu_batch_ms", avg_cpu_batch_seconds * 1000.0, step)
+            writer.add_scalar("train/prefetch_queue_size", prefetch_queue_size, step)
             if not math.isnan(grad_norm):
                 writer.add_scalar("train/grad_norm", grad_norm, step)
             for bucket_name, bucket_weight in bucket_weights.items():
@@ -2082,19 +2693,31 @@ def main() -> None:
             elapsed = time.time() - start_time
             print(
                 f"progress | step={step:5d}/{total_steps} | stage={stage.name} | span={stage.document_span} | "
-                f"train_loss={train_loss:.4f} | lr={lr:.6g} | elapsed={elapsed:.1f}s",
+                f"train_loss={train_loss:.4f} | lr={lr:.6g} | "
+                f"cpu_batch_ms={avg_cpu_batch_seconds * 1000.0:.1f} | prefetch_q={prefetch_queue_size} | "
+                f"elapsed={elapsed:.1f}s",
                 flush=True,
             )
 
         val_loss = None
         if step == 1 or step % args.eval_interval == 0 or step == total_steps:
-            val_loss = estimate_eval_loss(
-                model,
-                val_documents,
-                eval_documents=args.eval_documents,
-                device=device,
-                precision=args.precision,
-            )
+            if flat_collection is not None:
+                val_loss = estimate_eval_loss_flat(
+                    model,
+                    flat_collection,
+                    val_documents_flat,
+                    eval_documents=args.eval_documents,
+                    device=device,
+                    precision=args.precision,
+                )
+            else:
+                val_loss = estimate_eval_loss(
+                    model,
+                    val_documents,
+                    eval_documents=args.eval_documents,
+                    device=device,
+                    precision=args.precision,
+                )
             val_ppl = perplexity_from_loss(val_loss)
             print(
                 f"eval | step={step} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | val_ppl={val_ppl:.2f}",
@@ -2103,15 +2726,27 @@ def main() -> None:
             if writer is not None:
                 writer.add_scalar("eval/val_loss", val_loss, step)
                 writer.add_scalar("eval/val_ppl", val_ppl, step)
-                log_eval_samples_to_tensorboard(
-                    writer,
-                    model,
-                    val_documents,
-                    vocab=decode_vocab,
-                    device=device,
-                    precision=args.precision,
-                    step=step,
-                )
+                if flat_collection is not None:
+                    log_eval_samples_to_tensorboard_flat(
+                        writer,
+                        model,
+                        flat_collection,
+                        val_documents_flat,
+                        vocab=decode_vocab,
+                        device=device,
+                        precision=args.precision,
+                        step=step,
+                    )
+                else:
+                    log_eval_samples_to_tensorboard(
+                        writer,
+                        model,
+                        val_documents,
+                        vocab=decode_vocab,
+                        device=device,
+                        precision=args.precision,
+                        step=step,
+                    )
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 save_checkpoint(
@@ -2161,6 +2796,7 @@ def main() -> None:
         append_jsonl(run_dir / "history.jsonl", row)
 
     write_csv_rows(run_dir / "history.csv", history_rows)
+    prefetcher.close()
     if writer is not None:
         writer.flush()
         writer.close()
