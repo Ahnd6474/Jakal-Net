@@ -1736,105 +1736,7 @@ torch::Tensor scan_cuda_full_topk_indices(const torch::Tensor& scores) {
       .expand({batch, left, right});
 }
 
-torch::Tensor scan_cuda_pairwise_scores(
-    const std::string& pairwise_kind,
-    const torch::Tensor& target_val,
-    const torch::Tensor& source_val,
-    const torch::Tensor& core_weight,
-    const torch::Tensor& bias,
-    const torch::Tensor& in_weight,
-    const torch::Tensor& out_weight) {
-  if (pairwise_kind == "diagonal_bilinear") {
-    auto target_proj = target_val * core_weight.to(target_val.scalar_type()).view({1, 1, -1});
-    auto scores = torch::bmm(target_proj, source_val.transpose(1, 2));
-    if (bias.defined() && bias.numel() != 0) {
-      scores = scores + bias.to(scores.scalar_type());
-    }
-    return scores;
-  }
-
-  if (pairwise_kind == "bilinear") {
-    auto target_proj = torch::matmul(target_val, core_weight.to(target_val.scalar_type()));
-    auto scores = torch::bmm(target_proj, source_val.transpose(1, 2));
-    if (bias.defined() && bias.numel() != 0) {
-      scores = scores + bias.to(scores.scalar_type());
-    }
-    return scores;
-  }
-
-  if (pairwise_kind == "low_rank_bilinear") {
-    auto projected_target =
-        torch::matmul(target_val, out_weight.to(target_val.scalar_type()).transpose(0, 1));
-    auto projected_source =
-        torch::matmul(source_val, in_weight.to(source_val.scalar_type()).transpose(0, 1));
-    auto weighted_source =
-        projected_source * core_weight.to(projected_source.scalar_type()).view({1, 1, -1});
-    auto scores = torch::bmm(projected_target, weighted_source.transpose(1, 2));
-    if (bias.defined() && bias.numel() != 0) {
-      scores = scores + bias.to(scores.scalar_type());
-    }
-    return scores;
-  }
-
-  if (pairwise_kind == "scaled_cosine") {
-    const double scale = core_weight.reshape({-1})[0].item<double>();
-    const double eps = (bias.defined() && bias.numel() != 0) ? bias.reshape({-1})[0].item<double>() : 1e-6;
-    auto target_norm =
-        target_val.norm(2, -1, true).clamp_min(eps).to(target_val.scalar_type());
-    auto source_norm =
-        source_val.norm(2, -1, true).clamp_min(eps).to(source_val.scalar_type());
-    auto normalized_target = target_val / target_norm;
-    auto normalized_source = source_val / source_norm;
-    return torch::bmm(normalized_target, normalized_source.transpose(1, 2)) * scale;
-  }
-
-  throw std::runtime_error("Unsupported CUDA scan pairwise kind: " + pairwise_kind);
-}
-
-torch::Tensor scan_cuda_pairwise_route_logits(
-    const std::string& route_kind,
-    const torch::Tensor& src_val,
-    const torch::Tensor& dst_val,
-    const torch::Tensor& source_weight,
-    const torch::Tensor& target_weight,
-    const torch::Tensor& core_weight,
-    const torch::Tensor& bias) {
-  torch::Tensor scores;
-  if (route_kind == "diagonal_bilinear_route") {
-    auto weighted_source = src_val * core_weight.to(src_val.scalar_type()).view({1, 1, -1});
-    scores = torch::bmm(weighted_source, dst_val.transpose(1, 2));
-  } else if (route_kind == "low_rank_bilinear_route") {
-    auto projected_source =
-        torch::matmul(src_val, source_weight.to(src_val.scalar_type()).transpose(0, 1)) *
-        core_weight.to(src_val.scalar_type()).view({1, 1, -1});
-    auto projected_target =
-        torch::matmul(dst_val, target_weight.to(dst_val.scalar_type()).transpose(0, 1));
-    scores = torch::bmm(projected_source, projected_target.transpose(1, 2));
-  } else if (route_kind == "full_bilinear_route") {
-    auto projected_source =
-        torch::matmul(src_val, source_weight.to(src_val.scalar_type()).transpose(0, 1));
-    auto projected_target =
-        torch::matmul(dst_val, target_weight.to(dst_val.scalar_type()).transpose(0, 1));
-    auto weighted_source = torch::matmul(projected_source, core_weight.to(projected_source.scalar_type()));
-    scores = torch::bmm(weighted_source, projected_target.transpose(1, 2));
-  } else if (route_kind == "query_normalized_dot_route") {
-    const double scale = core_weight.reshape({-1})[0].item<double>();
-    const double eps = (bias.defined() && bias.numel() != 0) ? bias.reshape({-1})[0].item<double>() : 1e-6;
-    auto numerators = torch::bmm(src_val, dst_val.transpose(1, 2));
-    auto denominators = src_val.square().sum(-1, true).clamp_min(eps).to(src_val.scalar_type());
-    scores = numerators / denominators * scale;
-  } else {
-    throw std::runtime_error("Unsupported CUDA scan route kind: " + route_kind);
-  }
-
-  if (bias.defined() && bias.numel() != 0 && route_kind != "query_normalized_dot_route") {
-    scores = scores + bias.to(scores.scalar_type());
-  }
-  return scores;
-}
-
-std::tuple<torch::Tensor, torch::Tensor> scan_cuda_transition_pairwise_topk(
-    const std::string& route_kind_name,
+std::tuple<torch::Tensor, torch::Tensor> scan_cuda_low_rank_transition_pairwise_topk(
     const torch::Tensor& sender_strength,
     const torch::Tensor& projected_state,
     const torch::Tensor& projected_val,
@@ -1852,7 +1754,6 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_transition_pairwise_topk(
       compress_name == "signed_abs_softmax" ||
       compress_name == "signed_entmax15";
   if (use_fused_topk &&
-      route_kind_name == "low_rank_bilinear_route" &&
       allow_fastpath &&
       topk > 0 && topk <= 32) {
     auto projected_source = torch::matmul(src_val, source_weight.to(src_val.scalar_type()).transpose(0, 1)).contiguous();
@@ -1878,14 +1779,13 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_transition_pairwise_topk(
     };
   }
 
-  auto logits = scan_cuda_pairwise_route_logits(
-      route_kind_name,
-      src_val,
-      dst_val,
-      source_weight,
-      target_weight,
-      core_weight,
-      bias);
+  auto projected_source = torch::matmul(src_val, source_weight.to(src_val.scalar_type()).transpose(0, 1));
+  auto weighted_projected_source = projected_source * core_weight.to(projected_source.scalar_type()).view({1, 1, -1});
+  auto projected_target = torch::matmul(dst_val, target_weight.to(dst_val.scalar_type()).transpose(0, 1));
+  auto logits = torch::matmul(weighted_projected_source, projected_target.transpose(1, 2));
+  if (bias.defined() && bias.numel() != 0) {
+    logits = logits + bias.to(logits.scalar_type());
+  }
   const auto dst_nodes = dst_val.size(1);
   const auto k = std::min<int64_t>(std::max<int64_t>(1, topk), dst_nodes);
   torch::Tensor selected_scores;
@@ -1924,8 +1824,7 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_transition_pairwise_topk(
   };
 }
 
-std::tuple<torch::Tensor, torch::Tensor> scan_cuda_propagation_topk(
-    const std::string& pairwise_kind,
+std::tuple<torch::Tensor, torch::Tensor> scan_cuda_low_rank_propagation_topk(
     const torch::Tensor& layer_state,
     const torch::Tensor& layer_val,
     const torch::Tensor& source_weight,
@@ -1937,10 +1836,8 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_propagation_topk(
     bool allow_fastpath) {
   const bool use_fused_topk =
       compress_name == "softsign" ||
-      compress_name == "signed_abs_softmax" ||
-      compress_name == "signed_entmax15";
+      compress_name == "signed_abs_softmax";
   if (use_fused_topk &&
-      pairwise_kind == "low_rank_bilinear" &&
       allow_fastpath &&
       topk > 0 && topk <= 32) {
     auto projected_target = torch::matmul(layer_val, target_weight.to(layer_val.scalar_type()).transpose(0, 1)).contiguous();
@@ -1958,23 +1855,20 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_propagation_topk(
         weighted_projected_val,
         topk,
         score_bias,
-        compress_name == "signed_abs_softmax"
-            ? kCompressSignedAbsSoftmax
-            : (compress_name == "signed_entmax15" ? kCompressSignedEntmax15 : 0));
+        compress_name == "signed_abs_softmax" ? kCompressSignedAbsSoftmax : 0);
     return {
         std::get<0>(fused).to(layer_state.scalar_type()),
         std::get<1>(fused).to(layer_val.scalar_type()),
     };
   }
 
-  auto scores = scan_cuda_pairwise_scores(
-      pairwise_kind,
-      layer_val,
-      layer_val,
-      core_weight,
-      bias,
-      source_weight,
-      target_weight);
+  auto projected_target = torch::matmul(layer_val, target_weight.to(layer_val.scalar_type()).transpose(0, 1));
+  auto projected_source = torch::matmul(layer_val, source_weight.to(layer_val.scalar_type()).transpose(0, 1));
+  auto weighted_projected_source = projected_source * core_weight.to(projected_source.scalar_type()).view({1, 1, -1});
+  auto scores = torch::matmul(projected_target, weighted_projected_source.transpose(1, 2));
+  if (bias.defined() && bias.numel() != 0) {
+    scores = scores + bias.to(scores.scalar_type());
+  }
   const auto nodes = layer_val.size(1);
   const auto k = std::min<int64_t>(std::max<int64_t>(1, topk), nodes);
   torch::Tensor selected_scores;

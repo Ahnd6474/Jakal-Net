@@ -138,6 +138,11 @@ except ImportError:
     ByteLevelBPETokenizer = None
 
 try:
+    from transformers import AutoTokenizer
+except ImportError:
+    AutoTokenizer = None
+
+try:
     from torch.utils.tensorboard import SummaryWriter
 except ImportError:
     SummaryWriter = None
@@ -245,6 +250,37 @@ class ByteBPEVocab:
         if idx is None:
             raise ValueError(
                 f"Tokenizer {self.vocab_path} does not contain required token {piece!r}."
+            )
+        return int(idx)
+
+
+@dataclass(frozen=True, slots=True)
+class HFTokenizerVocab:
+    tokenizer: object
+    model_path: Path
+
+    @property
+    def size(self) -> int:
+        return int(len(self.tokenizer))
+
+    def encode(self, text: str) -> torch.Tensor:
+        token_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        return torch.tensor(token_ids, dtype=torch.long)
+
+    def decode(self, token_ids: Sequence[int]) -> str:
+        return str(
+            self.tokenizer.decode(
+                list(map(int, token_ids)),
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+        )
+
+    def token_id(self, piece: str) -> int:
+        idx = self.tokenizer.convert_tokens_to_ids(piece)
+        if idx is None or int(idx) < 0:
+            raise ValueError(
+                f"Tokenizer {self.model_path} does not contain required token {piece!r}."
             )
         return int(idx)
 
@@ -455,6 +491,39 @@ def build_byte_bpe_vocab(
     )
 
 
+def build_hf_auto_vocab(
+    text: str,
+    *,
+    model_name_or_path: str,
+    tokenizer_prefix: str | None,
+    vocab_size: int,
+    trust_remote_code: bool = False,
+) -> HFTokenizerVocab:
+    if AutoTokenizer is None:
+        raise ImportError(
+            "transformers is required for --tokenizer hf_auto. "
+            "Install dependencies from requirements-base.txt first."
+        )
+    if not model_name_or_path:
+        raise ValueError("hf_tokenizer_model must be provided for --tokenizer hf_auto.")
+    prefix_path = resolve_tokenizer_prefix(
+        text=text or model_name_or_path,
+        tokenizer="hf_auto",
+        model_type="hf",
+        vocab_size=vocab_size,
+        prefix=tokenizer_prefix,
+    )
+    model_dir = prefix_path.parent / prefix_path.name
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name_or_path,
+        use_fast=True,
+        trust_remote_code=trust_remote_code,
+    )
+    model_dir.mkdir(parents=True, exist_ok=True)
+    tokenizer.save_pretrained(str(model_dir))
+    return HFTokenizerVocab(tokenizer=tokenizer, model_path=model_dir)
+
+
 def build_tokenizer(
     text: str,
     *,
@@ -467,6 +536,8 @@ def build_tokenizer(
     subword_input_sentence_size: int = 0,
     subword_num_threads: int = 0,
     user_defined_symbols: Sequence[str] = (),
+    hf_tokenizer_model: str | None = None,
+    hf_trust_remote_code: bool = False,
 ) -> tuple[object, str, Path | None]:
     if tokenizer == "char":
         return build_char_vocab(text), "char", None
@@ -498,6 +569,15 @@ def build_tokenizer(
             user_defined_symbols=user_defined_symbols,
         )
         return byte_bpe_vocab, "byte_bpe", byte_bpe_vocab.vocab_path
+    if tokenizer == "hf_auto":
+        hf_vocab = build_hf_auto_vocab(
+            text,
+            model_name_or_path=str(hf_tokenizer_model or ""),
+            tokenizer_prefix=tokenizer_prefix,
+            vocab_size=subword_vocab_size,
+            trust_remote_code=hf_trust_remote_code,
+        )
+        return hf_vocab, "hf_auto", hf_vocab.model_path
     raise ValueError(f"Unsupported tokenizer: {tokenizer!r}.")
 
 

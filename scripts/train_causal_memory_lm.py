@@ -31,6 +31,7 @@ from lm_experiment_utils import (
 )
 from train_progressive_b_lm import (
     ASSISTANT_TOKEN,
+    HFTokenizerVocab,
     ByteBPEVocab,
     ByteLevelBPETokenizer,
     EOS_TOKEN,
@@ -51,6 +52,13 @@ from train_progressive_b_lm import (
     resolve_autocast_dtype,
     resolve_tokenizer_prefix,
 )
+
+try:
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+except ImportError:
+    AutoConfig = None
+    AutoModelForCausalLM = None
+    AutoTokenizer = None
 
 from jakal_net import describe_device, resolve_device
 from jakal_net.causal_memory_lm import CausalHierarchicalMemoryLM, MemoryScanOutput, ModelRecurrentState
@@ -251,7 +259,7 @@ class FlatPretokenizedShard:
     tokenizer_label: str | None
     tokenizer_model_path: str | None
     corpus_info: dict[str, Any]
-    _load_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+    _load_lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
     _loaded: bool = False
 
     @property
@@ -273,9 +281,11 @@ class FlatPretokenizedShard:
         *,
         document_index: int,
         is_last_chunk: bool,
+        loss_mode: str = "default",
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
-        self.ensure_loaded()
         with self._load_lock:
+            if self.context_flat is None or self.loss_mask_flat is None or self.is_continuation is None:
+                self.ensure_loaded()
             if self.context_flat is None or self.loss_mask_flat is None or self.is_continuation is None:
                 raise RuntimeError(f"Shard tensors are unavailable: {self.path}")
             token_start = int(self.chunk_token_offsets[chunk_index].item())
@@ -293,7 +303,14 @@ class FlatPretokenizedShard:
             loss_mask = torch.zeros(self.seq_len, dtype=torch.float32)
             document_kind = self.kind[document_index].lower()
             if active_length > 0:
-                if document_kind in {"dialogue", "instruction"} and active_length > 2:
+                if loss_mode == "full":
+                    loss_mask[:active_length] = 1.0
+                elif (
+                    document_kind in {"dialogue", "instruction"}
+                    and active_length > 2
+                    and int(self.special_token_ids.get("assistant", -1)) >= 0
+                    and int(self.special_token_ids.get("eot", -1)) >= 0
+                ):
                     content_ids = active_context[2:].to(dtype=torch.long)
                     content_visibility = _content_target_visibility(
                         content_ids,
@@ -1076,6 +1093,95 @@ class FlatDocumentChunkBatcher:
         )
 
 
+class FlatSequentialDocumentBatcher:
+    def __init__(
+        self,
+        collection: FlatPretokenizedDirectory,
+        documents: Sequence[FlatDocumentRef],
+        *,
+        batch_size: int,
+        device: torch.device,
+        max_chunks_per_document: int = 0,
+        full_loss: bool = False,
+    ) -> None:
+        if not documents:
+            raise ValueError("documents must not be empty.")
+        self.collection = collection
+        self.documents = tuple(sorted(documents, key=lambda ref: (ref.shard_index, ref.document_index)))
+        self.batch_size = max(1, int(batch_size))
+        self.device = device
+        self.pin_memory = device.type == "cuda"
+        self.max_chunks_per_document = max(0, int(max_chunks_per_document))
+        self.full_loss = bool(full_loss)
+        self.current_doc = [-1] * self.batch_size
+        self.current_chunk = [0] * self.batch_size
+        self.needs_reset = [True] * self.batch_size
+        self._next_document_cursor = 0
+
+    def set_batch_size(self, batch_size: int) -> None:
+        batch_size = max(1, int(batch_size))
+        if batch_size == self.batch_size:
+            return
+        self.batch_size = batch_size
+        self.current_doc = [-1] * self.batch_size
+        self.current_chunk = [0] * self.batch_size
+        self.needs_reset = [True] * self.batch_size
+
+    def _assign_next_document(self) -> int:
+        document_index = self._next_document_cursor
+        self._next_document_cursor = (self._next_document_cursor + 1) % len(self.documents)
+        return document_index
+
+    def next_batch(self) -> DocumentBatch:
+        contexts: list[torch.Tensor] = []
+        targets: list[torch.Tensor] = []
+        masks: list[torch.Tensor] = []
+        reset_mask = torch.zeros(self.batch_size, dtype=torch.bool)
+        for item_index in range(self.batch_size):
+            if self.needs_reset[item_index]:
+                self.current_doc[item_index] = self._assign_next_document()
+                self.current_chunk[item_index] = 0
+                reset_mask[item_index] = True
+            reference = self.documents[self.current_doc[item_index]]
+            shard = self.collection.get_shard(reference.shard_index)
+            chunk_start, chunk_end = shard.document_chunk_range(reference.document_index)
+            max_chunk_end = chunk_end
+            if self.max_chunks_per_document > 0:
+                max_chunk_end = min(chunk_end, chunk_start + self.max_chunks_per_document)
+            chunk_index = chunk_start + self.current_chunk[item_index]
+            is_last_chunk = chunk_index >= max_chunk_end - 1
+            context, target, loss_mask, _ = shard.build_chunk_tensors(
+                chunk_index,
+                document_index=reference.document_index,
+                is_last_chunk=is_last_chunk,
+                loss_mode="full" if self.full_loss else "default",
+            )
+            contexts.append(context)
+            targets.append(target)
+            masks.append(loss_mask)
+            next_chunk = self.current_chunk[item_index] + 1
+            if chunk_start + next_chunk >= max_chunk_end:
+                self.needs_reset[item_index] = True
+                self.current_chunk[item_index] = 0
+            else:
+                self.needs_reset[item_index] = False
+                self.current_chunk[item_index] = next_chunk
+        context = torch.stack(contexts, dim=0)
+        target = torch.stack(targets, dim=0)
+        loss_mask = torch.stack(masks, dim=0)
+        if self.pin_memory:
+            context = context.pin_memory()
+            target = target.pin_memory()
+            loss_mask = loss_mask.pin_memory()
+            reset_mask = reset_mask.pin_memory()
+        return DocumentBatch(
+            context=context,
+            target=target,
+            loss_mask=loss_mask,
+            reset_mask=reset_mask,
+        )
+
+
 def _is_probably_code(text: str, *, source: str = "") -> bool:
     lower_source = source.lower()
     if any(lower_source.endswith(suffix) for suffix in CODE_SUFFIXES):
@@ -1282,7 +1388,36 @@ def render_document_for_tokenizer(document: SerializedDocument) -> str:
     return f"{BOS_TOKEN}\n{mode_token}\n{document.body}\n{EOS_TOKEN}"
 
 
-def build_training_text(documents: Sequence[SerializedDocument]) -> str:
+def render_document_for_hf_tokenizer(document: SerializedDocument) -> str:
+    body = document.body
+    replacements = {
+        f"{USER_TOKEN}\n": "<|im_start|>user\n",
+        f"{ASSISTANT_TOKEN}\n": "<|im_start|>assistant\n",
+        f"{INSTRUCTION_TOKEN}\n": "<|im_start|>system\n",
+        f"{EOT_TOKEN}": "<|im_end|>",
+        f"{TEXT_TOKEN}\n": "",
+        f"{CODE_TOKEN}\n": "Code:\n",
+        f"{MATH_TOKEN}\n": "Math:\n",
+        f"{DIALOGUE_TOKEN}\n": "Dialogue:\n",
+        f"{RESPONSE_TOKEN}\n": "Response:\n",
+    }
+    rendered = body
+    for source, target in replacements.items():
+        rendered = rendered.replace(source, target)
+    rendered = rendered.strip()
+    if document.kind == "dialogue":
+        return rendered
+    prefix = {
+        "code": "Code document:\n",
+        "math": "Math document:\n",
+        "instruction": "Instruction:\n",
+    }.get(document.kind, "")
+    return f"{prefix}{rendered}".strip()
+
+
+def build_training_text(documents: Sequence[SerializedDocument], *, tokenizer_label: str = "byte_bpe") -> str:
+    if tokenizer_label == "hf_auto":
+        return "\n\n".join(render_document_for_hf_tokenizer(document) for document in documents)
     return "\n\n".join(render_document_for_tokenizer(document) for document in documents)
 
 
@@ -1305,7 +1440,39 @@ def byte_bpe_tokenizer_cache_exists(
     return vocab_path.exists() and merges_path.exists()
 
 
-def build_special_token_id_map(vocab: object) -> dict[str, int]:
+def _safe_token_id(vocab: object, piece: str, default: int = -1) -> int:
+    if not hasattr(vocab, "token_id"):
+        return int(default)
+    try:
+        return int(vocab.token_id(piece))
+    except Exception:
+        return int(default)
+
+
+def build_special_token_id_map(vocab: object, *, tokenizer_label: str = "byte_bpe") -> dict[str, int]:
+    if tokenizer_label == "hf_auto":
+        tokenizer = getattr(vocab, "tokenizer", None)
+        bos_piece = getattr(tokenizer, "bos_token", None) if tokenizer is not None else None
+        eos_piece = getattr(tokenizer, "eos_token", None) if tokenizer is not None else None
+        pad_piece = getattr(tokenizer, "pad_token", None) if tokenizer is not None else None
+        bos_id = _safe_token_id(vocab, str(bos_piece), -1) if bos_piece is not None else -1
+        eos_id = _safe_token_id(vocab, str(eos_piece), bos_id if bos_id >= 0 else 0) if eos_piece is not None else (bos_id if bos_id >= 0 else 0)
+        pad_id = _safe_token_id(vocab, str(pad_piece), eos_id if eos_id >= 0 else 0) if pad_piece is not None else (eos_id if eos_id >= 0 else 0)
+        return {
+            "bos": bos_id if bos_id >= 0 else eos_id,
+            "eos": eos_id,
+            "pad": pad_id,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": eos_id,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": _safe_token_id(vocab, "<|im_start|>"),
+            "assistant": _safe_token_id(vocab, "<|im_start|>"),
+            "eot": _safe_token_id(vocab, "<|im_end|>"),
+        }
     if not hasattr(vocab, "token_id"):
         raise ValueError("The causal-memory path requires a tokenizer with explicit special-token ids.")
     return {
@@ -1329,7 +1496,7 @@ def make_document_chunks(
     *,
     content_ids: torch.Tensor,
     content_target_visibility: torch.Tensor | None = None,
-    mode_token_id: int,
+    mode_token_id: int | None,
     seq_len: int,
     bos_token_id: int,
     cont_token_id: int,
@@ -1349,20 +1516,29 @@ def make_document_chunks(
     chunks: list[DocumentChunk] = []
     cursor = 0
     first = True
+    first_prefix = [bos_token_id] if bos_token_id >= 0 else []
+    continuation_prefix = [cont_token_id] if cont_token_id >= 0 else []
+    if mode_token_id is not None and mode_token_id >= 0:
+        first_prefix = [*first_prefix, int(mode_token_id)]
+        continuation_prefix = [*continuation_prefix, int(mode_token_id)]
     if content_ids.numel() == 0:
-        context = torch.tensor([bos_token_id, mode_token_id], dtype=torch.long)
-        target = torch.tensor([mode_token_id, eos_token_id], dtype=torch.long)
-        loss_mask = torch.zeros(2, dtype=torch.float32)
+        empty_prefix = first_prefix if first_prefix else [eos_token_id]
+        context = torch.tensor(empty_prefix, dtype=torch.long)
+        target = torch.empty_like(context)
+        if context.numel() > 1:
+            target[:-1] = context[1:]
+        target[-1] = eos_token_id
+        loss_mask = torch.zeros(context.shape[0], dtype=torch.float32)
         return (
             DocumentChunk(
-                context=F.pad(context, (0, seq_len - 2), value=pad_token_id),
-                target=F.pad(target, (0, seq_len - 2), value=pad_token_id),
-                loss_mask=F.pad(loss_mask, (0, seq_len - 2), value=0.0),
+                context=F.pad(context, (0, seq_len - context.shape[0]), value=pad_token_id),
+                target=F.pad(target, (0, seq_len - target.shape[0]), value=pad_token_id),
+                loss_mask=F.pad(loss_mask, (0, seq_len - loss_mask.shape[0]), value=0.0),
                 is_continuation=False,
             ),
         )
     while cursor < content_ids.numel():
-        prefix = [bos_token_id, mode_token_id] if first else [cont_token_id, mode_token_id]
+        prefix = first_prefix if first else continuation_prefix
         take = min(payload_capacity, content_ids.numel() - cursor)
         content_slice = content_ids[cursor : cursor + take]
         content_visibility_slice = content_target_visibility[cursor : cursor + take]
@@ -1397,6 +1573,7 @@ def tokenize_documents(
     special_token_ids: dict[str, int],
     workers: int,
     processing_device: torch.device | str | None = None,
+    tokenizer_label: str = "byte_bpe",
 ) -> list[TokenizedDocument]:
     tokenized_documents: list[TokenizedDocument] = []
     mode_token_id_map = {
@@ -1412,20 +1589,23 @@ def tokenize_documents(
 
     def append_document(kind: str, source: str, content_ids: torch.Tensor, *, loss_mode: str, index: int) -> None:
         nonlocal token_total, chunk_total
-        visibility_input = (
-            content_ids.to(device=processing_device, dtype=torch.long)
-            if processing_device is not None and content_ids.numel() > 0
-            else content_ids
-        )
-        target_visibility = _content_target_visibility(
-            visibility_input,
-            loss_mode=loss_mode,
-            special_token_ids=special_token_ids,
-        )
+        if tokenizer_label == "hf_auto":
+            target_visibility = torch.ones(content_ids.shape[0], dtype=torch.float32)
+        else:
+            visibility_input = (
+                content_ids.to(device=processing_device, dtype=torch.long)
+                if processing_device is not None and content_ids.numel() > 0
+                else content_ids
+            )
+            target_visibility = _content_target_visibility(
+                visibility_input,
+                loss_mode=loss_mode,
+                special_token_ids=special_token_ids,
+            )
         chunks = make_document_chunks(
             content_ids=content_ids,
             content_target_visibility=target_visibility,
-            mode_token_id=mode_token_id_map[kind],
+            mode_token_id=None if tokenizer_label == "hf_auto" else mode_token_id_map[kind],
             seq_len=seq_len,
             bos_token_id=special_token_ids["bos"],
             cont_token_id=special_token_ids["cont"],
@@ -1485,7 +1665,12 @@ def tokenize_documents(
         return tokenized_documents
 
     for index, document in enumerate(documents, start=1):
-        content_ids = encode_text_in_chunks(vocab, document.body, workers=workers)
+        source_text = (
+            render_document_for_hf_tokenizer(document)
+            if tokenizer_label == "hf_auto"
+            else document.body
+        )
+        content_ids = encode_text_in_chunks(vocab, source_text, workers=workers)
         append_document(document.kind, document.source, content_ids, loss_mode=document.loss_mode, index=index)
     return tokenized_documents
 
@@ -1842,42 +2027,76 @@ def load_flat_pretokenized_directory(
     *,
     load_workers: int = 1,
     max_loaded_shards: int = 0,
+    integrity_mode: str = "meta",
+    integrity_workers: int = 1,
 ) -> FlatPretokenizedDirectory:
     shard_paths = sorted(candidate for candidate in path.glob("*.pt") if candidate.is_file())
     if not shard_paths:
         raise ValueError(f"No pretokenized shard files found in {path}")
-    validation_workers = min(max(1, load_workers), len(shard_paths))
-    print(
-        f"flat_integrity_check | path={path} | shards={len(shard_paths)} | workers={validation_workers}",
-        flush=True,
-    )
-    if validation_workers <= 1:
-        for shard_path in shard_paths:
-            try:
-                validate_flat_pretokenized_shard(shard_path)
-            except Exception as exc:
-                raise RuntimeError(f"Corrupt pretokenized shard: {shard_path}") from exc
-    else:
-        with ThreadPoolExecutor(
-            max_workers=validation_workers,
-            thread_name_prefix="pretok_flat_validate",
-        ) as validation_executor:
-            validation_futures = {
-                validation_executor.submit(validate_flat_pretokenized_shard, shard_path): shard_path
-                for shard_path in shard_paths
-            }
-            for future, shard_path in validation_futures.items():
+    integrity_mode_normalized = str(integrity_mode).strip().lower()
+    if integrity_mode_normalized not in {"none", "meta", "full"}:
+        raise ValueError(f"Unsupported flat integrity mode: {integrity_mode!r}")
+
+    metadata_workers = min(max(1, load_workers), len(shard_paths))
+    metadata_executor: ThreadPoolExecutor | None = None
+    metadata_futures = None
+    preloaded_shards: list[FlatPretokenizedShard] | None = None
+
+    if integrity_mode_normalized == "full":
+        validation_workers = min(max(1, integrity_workers), len(shard_paths))
+        print(
+            f"flat_integrity_check | path={path} | shards={len(shard_paths)} | workers={validation_workers}",
+            flush=True,
+        )
+        if validation_workers <= 1:
+            for shard_path in shard_paths:
                 try:
-                    future.result()
+                    validate_flat_pretokenized_shard(shard_path)
                 except Exception as exc:
                     raise RuntimeError(f"Corrupt pretokenized shard: {shard_path}") from exc
-    print(f"flat_integrity_ok | path={path} | shards={len(shard_paths)}", flush=True)
-    if load_workers <= 1:
+        else:
+            with ThreadPoolExecutor(
+                max_workers=validation_workers,
+                thread_name_prefix="pretok_flat_validate",
+            ) as validation_executor:
+                validation_futures = {
+                    validation_executor.submit(validate_flat_pretokenized_shard, shard_path): shard_path
+                    for shard_path in shard_paths
+                }
+                for future, shard_path in validation_futures.items():
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        raise RuntimeError(f"Corrupt pretokenized shard: {shard_path}") from exc
+        print(f"flat_integrity_ok | path={path} | shards={len(shard_paths)}", flush=True)
+    elif integrity_mode_normalized == "meta":
+        metadata_workers = min(max(1, integrity_workers), len(shard_paths))
+        print(
+            f"flat_metadata_index | path={path} | shards={len(shard_paths)} | workers={metadata_workers}",
+            flush=True,
+        )
+        if metadata_workers <= 1:
+            preloaded_shards = [load_flat_pretokenized_shard_metadata(shard_path) for shard_path in shard_paths]
+        else:
+            with ThreadPoolExecutor(
+                max_workers=metadata_workers,
+                thread_name_prefix="pretok_flat_meta",
+            ) as validation_executor:
+                metadata_futures = validation_executor.map(load_flat_pretokenized_shard_metadata, shard_paths)
+                preloaded_shards = list(metadata_futures)
+        print(f"flat_metadata_ok | path={path} | shards={len(shard_paths)}", flush=True)
+    else:
+        print(f"flat_integrity_skip | path={path} | shards={len(shard_paths)}", flush=True)
+
+    if preloaded_shards is not None:
+        shard_iterator = iter(preloaded_shards)
+        executor = None
+    elif metadata_workers <= 1:
         shard_iterator = (load_flat_pretokenized_shard_metadata(shard_path) for shard_path in shard_paths)
-        executor: ThreadPoolExecutor | None = None
+        executor = None
     else:
         executor = ThreadPoolExecutor(
-            max_workers=min(max(1, load_workers), len(shard_paths)),
+            max_workers=metadata_workers,
             thread_name_prefix="pretok_flat_load",
         )
         shard_iterator = executor.map(load_flat_pretokenized_shard_metadata, shard_paths)
@@ -1920,6 +2139,16 @@ def load_flat_pretokenized_directory(
         corpus_info={"shards": shard_summaries, "directory": str(path)},
         max_loaded_shards=max_loaded_shards,
     )
+
+
+def preload_flat_pretokenized_directory(collection: FlatPretokenizedDirectory) -> None:
+    total_shards = len(collection.shards)
+    print(f"flat_preload_start | shards={total_shards}", flush=True)
+    started_at = time.perf_counter()
+    for shard_index in range(total_shards):
+        collection.get_shard(shard_index)
+    elapsed = time.perf_counter() - started_at
+    print(f"flat_preload_done | shards={total_shards} | seconds={elapsed:.1f}", flush=True)
 
 
 def load_pretokenized_directory(path: Path, *, load_workers: int = 1) -> dict[str, Any]:
@@ -2245,6 +2474,24 @@ def compute_decayed_scalar(
     return float(final_value + (initial_value - final_value) * cosine)
 
 
+def compute_warmup_scalar(
+    *,
+    step: int,
+    start_step: int,
+    end_step: int,
+    initial_value: float = 0.0,
+    final_value: float = 1.0,
+) -> float:
+    if step <= start_step:
+        return float(initial_value)
+    if end_step <= start_step:
+        return float(final_value)
+    if step >= end_step:
+        return float(final_value)
+    progress = (step - start_step) / max(1, end_step - start_step)
+    return float(initial_value + (final_value - initial_value) * progress)
+
+
 def detach_memory_state(memory_state: Any | None) -> Any | None:
     if memory_state is None:
         return None
@@ -2286,7 +2533,17 @@ def memory_state_is_finite(memory_state: Any | None) -> bool:
 
 
 def load_decode_vocab(*, tokenizer_label: str, tokenizer_model_path: str | None) -> object | None:
-    if tokenizer_label != "byte_bpe" or tokenizer_model_path is None or ByteLevelBPETokenizer is None:
+    if tokenizer_model_path is None:
+        return None
+    if tokenizer_label == "hf_auto":
+        if AutoTokenizer is None:
+            return None
+        tokenizer_path = Path(tokenizer_model_path)
+        if not tokenizer_path.exists():
+            return None
+        tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_path), use_fast=True)
+        return HFTokenizerVocab(tokenizer=tokenizer, model_path=tokenizer_path)
+    if tokenizer_label != "byte_bpe" or ByteLevelBPETokenizer is None:
         return None
     vocab_path = Path(tokenizer_model_path)
     if not vocab_path.exists():
@@ -2299,6 +2556,60 @@ def load_decode_vocab(*, tokenizer_label: str, tokenizer_model_path: str | None)
         return None
     tokenizer = ByteLevelBPETokenizer(str(vocab_path), str(merges_path))
     return ByteBPEVocab(tokenizer=tokenizer, vocab_path=vocab_path, merges_path=merges_path)
+
+
+def infer_hf_hidden_size(*, model_name_or_path: str, trust_remote_code: bool = False) -> int:
+    if AutoConfig is None:
+        raise ImportError("transformers is required to infer HF embedding dimensions.")
+    config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
+    hidden_size = getattr(config, "hidden_size", None)
+    if hidden_size is None:
+        raise ValueError(f"Could not infer hidden_size from HF config: {model_name_or_path}")
+    return int(hidden_size)
+
+
+@torch.no_grad()
+def initialize_model_embedding_from_hf(
+    *,
+    model: CausalHierarchicalMemoryLM,
+    vocab: HFTokenizerVocab,
+    model_name_or_path: str,
+    trust_remote_code: bool = False,
+) -> dict[str, int]:
+    if AutoModelForCausalLM is None:
+        raise ImportError("transformers is required to load HF pretrained embeddings.")
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        model_name_or_path,
+        trust_remote_code=trust_remote_code,
+        low_cpu_mem_usage=True,
+        torch_dtype=torch.float32,
+        device_map="cpu",
+    )
+    try:
+        hf_embedding = hf_model.get_input_embeddings().weight.detach().cpu()
+        target_weight = model.s_module.token_embedding.weight.detach()
+        if target_weight.shape[1] != hf_embedding.shape[1]:
+            raise ValueError(
+                f"Embedding dimension mismatch: target={target_weight.shape[1]}, hf={hf_embedding.shape[1]}"
+            )
+        copied = 0
+        skipped = 0
+        for token, token_id in vocab.tokenizer.get_vocab().items():
+            source_id = vocab.tokenizer.convert_tokens_to_ids(token)
+            if source_id is None or int(source_id) < 0:
+                skipped += 1
+                continue
+            source_index = int(source_id)
+            if source_index >= hf_embedding.shape[0] or int(token_id) >= target_weight.shape[0]:
+                skipped += 1
+                continue
+            target_weight[int(token_id)].copy_(hf_embedding[source_index])
+            copied += 1
+        if model.lm_head.weight.data_ptr() != model.s_module.token_embedding.weight.data_ptr():
+            model.lm_head.weight.copy_(model.s_module.token_embedding.weight)
+        return {"copied": copied, "skipped": skipped}
+    finally:
+        del hf_model
 
 
 def _decode_visible_tokens(
@@ -2500,9 +2811,7 @@ def run_model(
     memory_state: Any | None,
     precision: str,
     grad_enabled: bool,
-    rnn_aux_head: SharedEmbeddingRnnAuxHead | None = None,
-    rnn_aux_weight: float = 0.0,
-) -> tuple[torch.Tensor, float, float, Any | None]:
+) -> tuple[torch.Tensor, float, Any | None]:
     autocast_dtype = resolve_autocast_dtype(precision)
     autocast_supported = (
         autocast_dtype is not None
@@ -2527,15 +2836,37 @@ def run_model(
             )
             assert isinstance(output, MemoryScanOutput)
             main_loss = compute_masked_loss(output.logits, batch.target, batch.loss_mask)
-            aux_loss_value = 0.0
-            total_loss = main_loss
-            if grad_enabled and rnn_aux_head is not None and rnn_aux_weight > 0.0:
-                embedded_tokens = model.s_module.token_embedding(batch.context)
-                aux_logits = rnn_aux_head(embedded_tokens)
-                aux_loss = compute_masked_loss(aux_logits, batch.target, batch.loss_mask)
-                aux_loss_value = float(aux_loss.detach().item())
-                total_loss = total_loss + aux_loss * float(rnn_aux_weight)
-    return total_loss, float(main_loss.detach().item()), aux_loss_value, output.recurrent_state
+    return main_loss, float(main_loss.detach().item()), output.recurrent_state
+
+
+def run_rnn_aux_model(
+    model: CausalHierarchicalMemoryLM,
+    rnn_aux_head: SharedEmbeddingRnnAuxHead,
+    batch: DocumentBatch,
+    *,
+    precision: str,
+    grad_enabled: bool,
+) -> tuple[torch.Tensor, float]:
+    autocast_dtype = resolve_autocast_dtype(precision)
+    autocast_supported = (
+        autocast_dtype is not None
+        and (
+            batch.context.device.type == "cuda"
+            or (batch.context.device.type == "cpu" and autocast_dtype == torch.bfloat16)
+        )
+    )
+    autocast_context = (
+        torch.autocast(device_type=batch.context.device.type, dtype=autocast_dtype)
+        if autocast_supported
+        else nullcontext()
+    )
+    grad_context = torch.enable_grad() if grad_enabled else torch.no_grad()
+    with grad_context:
+        with autocast_context:
+            embedded_tokens = model.s_module.token_embedding(batch.context)
+            aux_logits = rnn_aux_head(embedded_tokens)
+            aux_loss = compute_masked_loss(aux_logits, batch.target, batch.loss_mask)
+    return aux_loss, float(aux_loss.detach().item())
 
 
 @torch.no_grad()
@@ -2546,12 +2877,14 @@ def estimate_eval_loss(
     eval_documents: int,
     device: torch.device,
     precision: str,
-) -> float:
+    rnn_aux_head: SharedEmbeddingRnnAuxHead | None = None,
+) -> tuple[float, float | None]:
     if not documents:
         raise ValueError("documents must not be empty.")
     model_was_training = model.training
     model.eval()
     total_loss = 0.0
+    total_aux_loss = 0.0
     total_weight = 0.0
     for document in documents[: min(eval_documents, len(documents))]:
         memory_state: tuple[Any, ...] | None = None
@@ -2562,7 +2895,7 @@ def estimate_eval_loss(
                 loss_mask=chunk.loss_mask.unsqueeze(0).to(device),
                 reset_mask=torch.tensor([chunk_index == 0], device=device, dtype=torch.bool),
             )
-            loss, _, _, memory_state = run_model(
+            loss, _, memory_state = run_model(
                 model,
                 batch,
                 memory_state=memory_state,
@@ -2573,9 +2906,20 @@ def estimate_eval_loss(
             weight = float(chunk.loss_mask.sum().item())
             total_loss += float(loss.item()) * weight
             total_weight += weight
+            if rnn_aux_head is not None:
+                aux_loss, _ = run_rnn_aux_model(
+                    model,
+                    rnn_aux_head,
+                    batch,
+                    precision=precision,
+                    grad_enabled=False,
+                )
+                total_aux_loss += float(aux_loss.item()) * weight
     if model_was_training:
         model.train()
-    return total_loss / max(1.0, total_weight)
+    denom = max(1.0, total_weight)
+    aux_value = None if rnn_aux_head is None else (total_aux_loss / denom)
+    return total_loss / denom, aux_value
 
 
 @torch.no_grad()
@@ -2587,12 +2931,14 @@ def estimate_eval_loss_flat(
     eval_documents: int,
     device: torch.device,
     precision: str,
-) -> float:
+    rnn_aux_head: SharedEmbeddingRnnAuxHead | None = None,
+) -> tuple[float, float | None]:
     if not documents:
         raise ValueError("documents must not be empty.")
     model_was_training = model.training
     model.eval()
     total_loss = 0.0
+    total_aux_loss = 0.0
     total_weight = 0.0
     for reference in documents[: min(eval_documents, len(documents))]:
         shard = collection.get_shard(reference.shard_index)
@@ -2610,7 +2956,7 @@ def estimate_eval_loss_flat(
                 loss_mask=loss_mask.unsqueeze(0).to(device),
                 reset_mask=torch.tensor([chunk_index == chunk_start], device=device, dtype=torch.bool),
             )
-            loss, _, _, memory_state = run_model(
+            loss, _, memory_state = run_model(
                 model,
                 batch,
                 memory_state=memory_state,
@@ -2620,9 +2966,20 @@ def estimate_eval_loss_flat(
             weight = float(batch.loss_mask.sum().item())
             total_loss += float(loss.item()) * weight
             total_weight += weight
+            if rnn_aux_head is not None:
+                aux_loss, _ = run_rnn_aux_model(
+                    model,
+                    rnn_aux_head,
+                    batch,
+                    precision=precision,
+                    grad_enabled=False,
+                )
+                total_aux_loss += float(aux_loss.item()) * weight
     if model_was_training:
         model.train()
-    return total_loss / max(1.0, total_weight)
+    denom = max(1.0, total_weight)
+    aux_value = None if rnn_aux_head is None else (total_aux_loss / denom)
+    return total_loss / denom, aux_value
 
 
 def save_checkpoint(
@@ -2631,6 +2988,7 @@ def save_checkpoint(
     model: CausalHierarchicalMemoryLM,
     rnn_aux_head: SharedEmbeddingRnnAuxHead | None,
     optimizer: torch.optim.Optimizer,
+    rnn_aux_optimizer: torch.optim.Optimizer | None,
     step: int,
     args: argparse.Namespace,
     train_loss: float,
@@ -2643,6 +3001,7 @@ def save_checkpoint(
         {
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
+            "rnn_aux_optimizer_state_dict": None if rnn_aux_optimizer is None else rnn_aux_optimizer.state_dict(),
             "rnn_aux_state_dict": None if rnn_aux_head is None else rnn_aux_head.state_dict(),
             "step": step,
             "args": vars(args),
@@ -2677,10 +3036,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hf-streaming", action="store_true")
     parser.add_argument("--max-samples", type=int)
 
-    parser.add_argument("--tokenizer", choices=("byte_bpe",), default="byte_bpe")
+    parser.add_argument("--tokenizer", choices=("byte_bpe", "hf_auto"), default="byte_bpe")
     parser.add_argument("--subword-vocab-size", type=int, default=16384)
     parser.add_argument("--subword-model-type", default="bpe")
     parser.add_argument("--tokenizer-prefix")
+    parser.add_argument("--hf-tokenizer-model")
+    parser.add_argument("--hf-embedding-model")
+    parser.add_argument("--hf-trust-remote-code", action="store_true")
+    parser.add_argument("--match-dim-to-hf-embedding", action="store_true")
     parser.add_argument("--subword-character-coverage", type=float, default=1.0)
     parser.add_argument("--subword-input-sentence-size", type=int, default=0)
     parser.add_argument("--subword-num-threads", type=int, default=0)
@@ -2688,7 +3051,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pretokenized-path")
     parser.add_argument("--pretokenized-dir")
     parser.add_argument("--pretokenized-load-workers", type=int, default=8)
+    parser.add_argument("--flat-integrity-mode", choices=("none", "meta", "full"), default="meta")
+    parser.add_argument("--flat-integrity-workers", type=int, default=8)
     parser.add_argument("--pretokenized-max-loaded-shards", type=int, default=8)
+    parser.add_argument("--preload-flat-shards", action="store_true")
     parser.add_argument("--pretokenized-active-shards-per-bucket", type=int, default=2)
     parser.add_argument("--pretokenized-shard-rotation-interval", type=int, default=256)
     parser.add_argument("--prefetch-batches", type=int, default=100)
@@ -2744,18 +3110,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--optimizer", choices=("adamw", "adamw_fused", "adamw8bit"), default="adamw_fused")
     parser.add_argument("--embedding-lr-mult", type=float, default=1.0)
+    parser.add_argument("--embedding-warmup-start", type=int, default=1500)
+    parser.add_argument("--embedding-warmup-end", type=int, default=2000)
     parser.add_argument("--b-lr-mult", type=float, default=0.4)
     parser.add_argument("--b-propagation-lr-mult", type=float, default=0.15)
+    parser.add_argument("--b-propagation-warmup-start", type=int, default=0)
+    parser.add_argument("--b-propagation-warmup-end", type=int, default=1500)
     parser.add_argument("--b-route-lr-mult", type=float, default=0.05)
+    parser.add_argument("--b-route-warmup-start", type=int, default=0)
+    parser.add_argument("--b-route-warmup-end", type=int, default=1500)
     parser.add_argument("--rnn-aux-head", action="store_true")
-    parser.add_argument("--rnn-aux-hidden-dim", type=int, default=0)
-    parser.add_argument("--rnn-aux-layers", type=int, default=1)
-    parser.add_argument("--rnn-aux-loss-weight", type=float, default=0.5)
+    parser.add_argument("--rnn-aux-hidden-dim", type=int, default=1024)
+    parser.add_argument("--rnn-aux-layers", type=int, default=2)
+    parser.add_argument("--rnn-aux-loss-weight", type=float, default=1.0)
     parser.add_argument("--rnn-aux-loss-weight-final", type=float, default=0.05)
-    parser.add_argument("--rnn-aux-decay-start", type=int, default=500)
+    parser.add_argument("--rnn-aux-decay-start", type=int, default=2000)
     parser.add_argument("--rnn-aux-decay-end", type=int, default=5000)
     parser.add_argument("--rnn-aux-lr-mult", type=float, default=1.0)
     parser.add_argument("--rnn-aux-lr-final-ratio", type=float, default=0.1)
+    parser.add_argument("--rnn-aux-batch-size", type=int, default=128)
+    parser.add_argument("--rnn-aux-prefetch-batches", type=int, default=32)
+    parser.add_argument("--rnn-aux-updates-per-step", type=int, default=1)
+    parser.add_argument("--rnn-aux-max-chunks-per-doc", type=int, default=0)
+    parser.add_argument("--rnn-pretrain-steps", type=int, default=0)
+    parser.add_argument("--rnn-pretrain-log-interval", type=int, default=10)
     parser.add_argument("--warmup-steps", type=int, default=200)
     parser.add_argument("--lr-min-ratio", type=float, default=0.1)
     parser.add_argument("--epochs", type=float, default=1.0)
@@ -2868,8 +3246,6 @@ def build_parameter_groups(
     b_lr_mult: float,
     b_propagation_lr_mult: float,
     b_route_lr_mult: float,
-    rnn_aux_head: SharedEmbeddingRnnAuxHead | None = None,
-    rnn_aux_lr_mult: float = 1.0,
 ) -> tuple[list[dict[str, Any]], tuple[OptimizerParameterGroupConfig, ...]]:
     lr_scales = {
         "default": 1.0,
@@ -2877,7 +3253,6 @@ def build_parameter_groups(
         "b_module": float(b_lr_mult),
         "b_propagation": float(b_propagation_lr_mult),
         "b_route": float(b_route_lr_mult),
-        "rnn_aux": float(rnn_aux_lr_mult),
     }
     grouped: dict[str, dict[str, Any]] = {
         group_name: {
@@ -2892,8 +3267,6 @@ def build_parameter_groups(
     counts = {group_name: 0 for group_name in lr_scales}
     seen: set[int] = set()
     named_parameter_sources: list[tuple[str, torch.nn.Parameter]] = list(model.named_parameters())
-    if rnn_aux_head is not None:
-        named_parameter_sources.extend((f"rnn_aux_head.{name}", parameter) for name, parameter in rnn_aux_head.named_parameters())
     for parameter_name, parameter in named_parameter_sources:
         if not parameter.requires_grad:
             continue
@@ -2913,7 +3286,7 @@ def build_parameter_groups(
             parameter_count=counts[group_name],
         )
         for group_name in ("default", "embedding", "b_module", "b_propagation", "b_route", "rnn_aux")
-        if counts[group_name] > 0
+        if group_name in counts and counts[group_name] > 0
     )
     return param_groups, group_configs
 
@@ -2950,12 +3323,67 @@ def build_optimizer(
     raise ValueError(f"Unsupported optimizer: {name!r}")
 
 
+def build_rnn_aux_optimizer(
+    model: CausalHierarchicalMemoryLM,
+    rnn_aux_head: SharedEmbeddingRnnAuxHead | None,
+    *,
+    name: str,
+    learning_rate: float,
+    weight_decay: float,
+    rnn_aux_lr_mult: float,
+    device: torch.device,
+) -> tuple[torch.optim.Optimizer | None, tuple[OptimizerParameterGroupConfig, ...]]:
+    if rnn_aux_head is None:
+        return None, ()
+    head_parameters = [parameter for parameter in rnn_aux_head.parameters() if parameter.requires_grad]
+    embedding_parameters = [
+        parameter for parameter in model.s_module.token_embedding.parameters() if parameter.requires_grad
+    ]
+    parameters: list[torch.nn.Parameter] = []
+    seen: set[int] = set()
+    for parameter in head_parameters + embedding_parameters:
+        parameter_id = id(parameter)
+        if parameter_id in seen:
+            continue
+        seen.add(parameter_id)
+        parameters.append(parameter)
+    if not parameters:
+        return None, ()
+    lr_scale = float(rnn_aux_lr_mult)
+    param_groups = [
+        {
+            "params": parameters,
+            "lr": learning_rate * lr_scale,
+            "weight_decay": weight_decay,
+            "group_name": "rnn_aux",
+            "lr_scale": lr_scale,
+        }
+    ]
+    optimizer = build_optimizer(
+        param_groups,
+        name=name,
+        learning_rate=learning_rate * lr_scale,
+        weight_decay=weight_decay,
+        device=device,
+    )
+    return optimizer, (
+        OptimizerParameterGroupConfig(
+            name="rnn_aux",
+            lr_scale=lr_scale,
+            weight_decay=weight_decay,
+            parameter_count=sum(int(parameter.numel()) for parameter in parameters),
+        ),
+    )
+
+
 def main() -> None:
     args = parse_args()
     if args.pretokenize_workers < 0:
         raise ValueError("pretokenize-workers must be non-negative.")
     if args.pretokenized_load_workers <= 0:
         raise ValueError("pretokenized-load-workers must be positive.")
+    if args.flat_integrity_workers <= 0:
+        raise ValueError("flat-integrity-workers must be positive.")
     if args.pretokenized_max_loaded_shards < 0:
         raise ValueError("pretokenized-max-loaded-shards must be non-negative.")
     if args.pretokenized_active_shards_per_bucket <= 0:
@@ -2992,6 +3420,37 @@ def main() -> None:
         raise ValueError("Learning-rate multipliers must be non-negative.")
     if args.rnn_aux_layers <= 0:
         raise ValueError("rnn-aux-layers must be positive.")
+    if args.rnn_aux_batch_size <= 0:
+        raise ValueError("rnn-aux-batch-size must be positive.")
+    if args.rnn_aux_prefetch_batches <= 0:
+        raise ValueError("rnn-aux-prefetch-batches must be positive.")
+    if args.rnn_aux_updates_per_step <= 0:
+        raise ValueError("rnn-aux-updates-per-step must be positive.")
+    if args.rnn_aux_max_chunks_per_doc < 0:
+        raise ValueError("rnn-aux-max-chunks-per-doc must be non-negative.")
+    if args.rnn_pretrain_steps < 0:
+        raise ValueError("rnn-pretrain-steps must be non-negative.")
+    if args.rnn_pretrain_log_interval <= 0:
+        raise ValueError("rnn-pretrain-log-interval must be positive.")
+    if args.tokenizer == "hf_auto" and not args.hf_tokenizer_model and not (args.pretokenized_dir or args.pretokenized_path):
+        raise ValueError("--hf-tokenizer-model is required when --tokenizer hf_auto is used without pretokenized input.")
+    if args.hf_embedding_model and args.tokenizer != "hf_auto" and not (args.pretokenized_dir or args.pretokenized_path):
+        raise ValueError("--hf-embedding-model currently requires --tokenizer hf_auto.")
+    if args.embedding_warmup_start < 0 or args.embedding_warmup_end < 0:
+        raise ValueError("embedding warmup steps must be non-negative.")
+    if args.embedding_warmup_end < args.embedding_warmup_start:
+        raise ValueError("embedding-warmup-end must be greater than or equal to embedding-warmup-start.")
+    if min(
+        args.b_propagation_warmup_start,
+        args.b_propagation_warmup_end,
+        args.b_route_warmup_start,
+        args.b_route_warmup_end,
+    ) < 0:
+        raise ValueError("B warmup steps must be non-negative.")
+    if args.b_propagation_warmup_end < args.b_propagation_warmup_start:
+        raise ValueError("b-propagation-warmup-end must be greater than or equal to b-propagation-warmup-start.")
+    if args.b_route_warmup_end < args.b_route_warmup_start:
+        raise ValueError("b-route-warmup-end must be greater than or equal to b-route-warmup-start.")
     if any(
         value < 0
         for value in (
@@ -3029,7 +3488,11 @@ def main() -> None:
             Path(args.pretokenized_dir),
             load_workers=max(1, int(args.pretokenized_load_workers)),
             max_loaded_shards=max(0, int(args.pretokenized_max_loaded_shards)),
+            integrity_mode=str(args.flat_integrity_mode),
+            integrity_workers=max(1, int(args.flat_integrity_workers)),
         )
+        if args.preload_flat_shards:
+            preload_flat_pretokenized_directory(flat_collection)
         tokenizer_label = str(flat_collection.tokenizer_label or "unknown")
         tokenizer_model_path = flat_collection.tokenizer_model_path
         vocab_size = int(flat_collection.vocab_size)
@@ -3080,7 +3543,7 @@ def main() -> None:
                 flush=True,
             )
         else:
-            training_text = build_training_text(serialized_documents)
+            training_text = build_training_text(serialized_documents, tokenizer_label=args.tokenizer)
         vocab, tokenizer_label, tokenizer_path = build_tokenizer(
             training_text,
             text_path=None,
@@ -3091,10 +3554,12 @@ def main() -> None:
             subword_character_coverage=args.subword_character_coverage,
             subword_input_sentence_size=args.subword_input_sentence_size,
             subword_num_threads=args.subword_num_threads,
-            user_defined_symbols=CAUSAL_DOC_SPECIAL_TOKENS,
+            user_defined_symbols=CAUSAL_DOC_SPECIAL_TOKENS if args.tokenizer == "byte_bpe" else (),
+            hf_tokenizer_model=args.hf_tokenizer_model,
+            hf_trust_remote_code=args.hf_trust_remote_code,
         )
         tokenizer_model_path = None if tokenizer_path is None else str(tokenizer_path)
-        special_token_ids = build_special_token_id_map(vocab)
+        special_token_ids = build_special_token_id_map(vocab, tokenizer_label=tokenizer_label)
         workers = min(args.pretokenize_workers, max(1, torch.get_num_threads()))
         documents = tokenize_documents(
             serialized_documents,
@@ -3102,6 +3567,7 @@ def main() -> None:
             seq_len=args.seq_len,
             special_token_ids=special_token_ids,
             workers=workers,
+            tokenizer_label=tokenizer_label,
         )
         vocab_size = int(getattr(vocab, "size"))
         corpus_metadata = {
@@ -3130,8 +3596,10 @@ def main() -> None:
             flat_collection.document_refs,
             train_fraction=args.train_fraction,
         )
+        print("startup | split_train_val_flat_done", flush=True)
         train_bucket_summary = summarize_flat_document_buckets(flat_collection, train_documents_flat)
         val_bucket_summary = summarize_flat_document_buckets(flat_collection, val_documents_flat)
+        print("startup | summarize_flat_buckets_done", flush=True)
         steps_per_epoch = estimate_stage_weighted_steps_per_epoch_flat(
             collection=flat_collection,
             documents=train_documents_flat,
@@ -3141,21 +3609,26 @@ def main() -> None:
             stage2_batch_size=stage2_batch_size,
             stage3_batch_size=stage3_batch_size,
         )
+        print("startup | estimate_steps_flat_done", flush=True)
         fixed_eval_documents_flat = sample_flat_documents_uniform_by_bucket(
             flat_collection,
             val_documents_flat,
             sample_count=min(args.eval_documents, len(val_documents_flat)),
         )
+        print("startup | fixed_eval_documents_flat_done", flush=True)
         fixed_eval_sample_documents_flat = sample_flat_documents_for_logging(
             flat_collection,
             val_documents_flat,
             sample_count=1,
         )
+        print("startup | fixed_eval_sample_documents_flat_done", flush=True)
     else:
         assert documents is not None
         train_documents, val_documents = split_train_val_documents(documents, train_fraction=args.train_fraction)
+        print("startup | split_train_val_done", flush=True)
         train_bucket_summary = summarize_document_buckets(train_documents)
         val_bucket_summary = summarize_document_buckets(val_documents)
+        print("startup | summarize_buckets_done", flush=True)
         steps_per_epoch = estimate_stage_weighted_steps_per_epoch(
             documents=train_documents,
             stage1_ratio=args.curriculum_stage1_ratio,
@@ -3164,18 +3637,30 @@ def main() -> None:
             stage2_batch_size=stage2_batch_size,
             stage3_batch_size=stage3_batch_size,
         )
+        print("startup | estimate_steps_done", flush=True)
         fixed_eval_documents = sample_documents_uniform_by_bucket(
             val_documents,
             sample_count=min(args.eval_documents, len(val_documents)),
         )
+        print("startup | fixed_eval_documents_done", flush=True)
         fixed_eval_sample_documents = sample_documents_uniform_by_bucket(
             val_documents,
             sample_count=1,
         )
+        print("startup | fixed_eval_sample_documents_done", flush=True)
     decode_vocab = load_decode_vocab(
         tokenizer_label=tokenizer_label,
         tokenizer_model_path=tokenizer_model_path,
     )
+    if args.match_dim_to_hf_embedding:
+        hf_dim_source = args.hf_embedding_model or args.hf_tokenizer_model
+        if not hf_dim_source:
+            raise ValueError("--match-dim-to-hf-embedding requires --hf-embedding-model or --hf-tokenizer-model.")
+        args.dim = infer_hf_hidden_size(
+            model_name_or_path=hf_dim_source,
+            trust_remote_code=args.hf_trust_remote_code,
+        )
+        print(f"hf_embedding_dim | source={hf_dim_source} | dim={args.dim}", flush=True)
     total_steps = max(1, int(math.ceil(steps_per_epoch * args.epochs)))
 
     model = CausalHierarchicalMemoryLM(
@@ -3203,6 +3688,20 @@ def main() -> None:
         knowledge_propagation_topk=None if args.knowledge_propagation_topk <= 0 else args.knowledge_propagation_topk,
         knowledge_propagation_layers=args.knowledge_propagation_layers,
     ).to(device)
+    if args.hf_embedding_model:
+        if not isinstance(decode_vocab, HFTokenizerVocab):
+            raise ValueError("--hf-embedding-model requires --tokenizer hf_auto.")
+        embedding_init_stats = initialize_model_embedding_from_hf(
+            model=model,
+            vocab=decode_vocab,
+            model_name_or_path=args.hf_embedding_model,
+            trust_remote_code=args.hf_trust_remote_code,
+        )
+        print(
+            f"hf_embedding_init | model={args.hf_embedding_model} | copied={embedding_init_stats['copied']:,} | skipped={embedding_init_stats['skipped']:,}",
+            flush=True,
+        )
+    print("startup | model_init_done", flush=True)
     rnn_aux_head = None
     if args.rnn_aux_head:
         rnn_aux_head = SharedEmbeddingRnnAuxHead(
@@ -3211,6 +3710,7 @@ def main() -> None:
             hidden_dim=None if args.rnn_aux_hidden_dim <= 0 else args.rnn_aux_hidden_dim,
             num_layers=args.rnn_aux_layers,
         ).to(device)
+    print("startup | rnn_aux_init_done", flush=True)
     parameter_count = count_parameters(model)
     rnn_aux_parameter_count = 0 if rnn_aux_head is None else count_parameters(rnn_aux_head)
     print(
@@ -3225,7 +3725,8 @@ def main() -> None:
     if rnn_aux_head is not None:
         print(
             f"rnn_aux | params={rnn_aux_parameter_count:,} | hidden_dim={rnn_aux_head.hidden_dim} | "
-            f"layers={rnn_aux_head.num_layers} | loss_weight={args.rnn_aux_loss_weight} | "
+            f"layers={rnn_aux_head.num_layers} | batch_size={args.rnn_aux_batch_size} | "
+            f"updates_per_step={args.rnn_aux_updates_per_step} | loss_weight={args.rnn_aux_loss_weight} | "
             f"loss_weight_final={args.rnn_aux_loss_weight_final} | decay_start={args.rnn_aux_decay_start} | "
             f"decay_end={args.rnn_aux_decay_end}",
             flush=True,
@@ -3291,14 +3792,21 @@ def main() -> None:
         b_lr_mult=args.b_lr_mult,
         b_propagation_lr_mult=args.b_propagation_lr_mult,
         b_route_lr_mult=args.b_route_lr_mult,
-        rnn_aux_head=rnn_aux_head,
+    )
+    rnn_aux_optimizer, rnn_aux_group_configs = build_rnn_aux_optimizer(
+        model,
+        rnn_aux_head,
+        name=args.optimizer,
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
         rnn_aux_lr_mult=args.rnn_aux_lr_mult,
+        device=device,
     )
     print(
         "optimizer_groups | "
         + " | ".join(
             f"{group.name}:count={group.parameter_count:,},lr_scale={group.lr_scale:.4f}"
-            for group in param_group_configs
+            for group in (param_group_configs + rnn_aux_group_configs)
         ),
         flush=True,
     )
@@ -3309,6 +3817,7 @@ def main() -> None:
         weight_decay=args.weight_decay,
         device=device,
     )
+    print("startup | main_optimizer_done", flush=True)
     scaler = torch.cuda.amp.GradScaler() if args.precision == "fp16" and device.type == "cuda" else None
     if flat_collection is not None:
         batcher: DocumentChunkBatcher | FlatDocumentChunkBatcher = FlatDocumentChunkBatcher(
@@ -3321,11 +3830,39 @@ def main() -> None:
         )
     else:
         batcher = DocumentChunkBatcher(train_documents, batch_size=stage1_batch_size, device=device)
+    print("startup | batcher_done", flush=True)
     prefetcher = AsyncDocumentBatchPrefetcher(
         batcher,
         device=device,
         prefetch_batches=max(1, int(args.prefetch_batches)),
     )
+    print("startup | prefetcher_done", flush=True)
+    rnn_prefetcher: AsyncDocumentBatchPrefetcher | None = None
+    if rnn_aux_head is not None:
+        if flat_collection is not None:
+            rnn_batcher = FlatSequentialDocumentBatcher(
+                flat_collection,
+                train_documents_flat,
+                batch_size=args.rnn_aux_batch_size,
+                device=device,
+                max_chunks_per_document=args.rnn_aux_max_chunks_per_doc,
+                full_loss=True,
+            )
+        else:
+            rnn_batcher = DocumentChunkBatcher(
+                train_documents,
+                batch_size=args.rnn_aux_batch_size,
+                device=device,
+            )
+        rnn_prefetcher = AsyncDocumentBatchPrefetcher(
+            rnn_batcher,
+            device=device,
+            prefetch_batches=max(1, int(args.rnn_aux_prefetch_batches)),
+        )
+        print("startup | rnn_prefetcher_done", flush=True)
+
+    run_rnn_pretrain = rnn_aux_head is not None and args.rnn_pretrain_steps > 0
+    run_concurrent_rnn = rnn_aux_head is not None and not run_rnn_pretrain
 
     history_rows: list[dict[str, Any]] = []
     train_memory_state: tuple[Any, ...] | None = None
@@ -3339,6 +3876,8 @@ def main() -> None:
         if rnn_aux_head is not None and checkpoint.get("rnn_aux_state_dict") is not None:
             rnn_aux_head.load_state_dict(checkpoint["rnn_aux_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if rnn_aux_optimizer is not None and checkpoint.get("rnn_aux_optimizer_state_dict") is not None:
+            rnn_aux_optimizer.load_state_dict(checkpoint["rnn_aux_optimizer_state_dict"])
         start_step = int(checkpoint.get("step", 0))
         checkpoint_val_loss = checkpoint.get("val_loss")
         if checkpoint_val_loss is not None:
@@ -3349,10 +3888,66 @@ def main() -> None:
             flush=True,
         )
     optimizer.zero_grad(set_to_none=True)
+    if rnn_aux_optimizer is not None:
+        rnn_aux_optimizer.zero_grad(set_to_none=True)
     start_time = time.time()
     grad_clip_parameters = list(model.parameters())
+    rnn_grad_clip_parameters: list[torch.nn.Parameter] = []
     if rnn_aux_head is not None:
-        grad_clip_parameters.extend(parameter for parameter in rnn_aux_head.parameters() if parameter.requires_grad)
+        rnn_grad_clip_parameters.extend(parameter for parameter in rnn_aux_head.parameters() if parameter.requires_grad)
+        rnn_grad_clip_parameters.extend(
+            parameter for parameter in model.s_module.token_embedding.parameters() if parameter.requires_grad
+        )
+
+    if run_rnn_pretrain and rnn_aux_optimizer is not None and rnn_prefetcher is not None:
+        print(
+            f"rnn_pretrain | steps={args.rnn_pretrain_steps} | batch_size={args.rnn_aux_batch_size} | "
+            f"log_interval={args.rnn_pretrain_log_interval}",
+            flush=True,
+        )
+        for rnn_pretrain_step in range(1, args.rnn_pretrain_steps + 1):
+            rnn_batch = rnn_prefetcher.next_batch()
+            rnn_aux_optimizer.zero_grad(set_to_none=True)
+            rnn_loss, rnn_loss_value = run_rnn_aux_model(
+                model,
+                rnn_aux_head,
+                rnn_batch,
+                precision=args.precision,
+                grad_enabled=True,
+            )
+            if not bool(torch.isfinite(rnn_loss.detach()).item()):
+                raise RuntimeError(f"Non-finite RNN pretrain loss at step {rnn_pretrain_step}.")
+            if scaler is not None:
+                scaler.scale(rnn_loss).backward()
+                scaler.unscale_(rnn_aux_optimizer)
+            else:
+                rnn_loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                rnn_grad_clip_parameters,
+                args.grad_clip,
+                error_if_nonfinite=True,
+            )
+            if scaler is not None:
+                scaler.step(rnn_aux_optimizer)
+                scaler.update()
+            else:
+                rnn_aux_optimizer.step()
+            if writer is not None:
+                writer.add_scalar("pretrain/rnn_loss", float(rnn_loss_value), rnn_pretrain_step)
+            if (
+                rnn_pretrain_step == 1
+                or rnn_pretrain_step == args.rnn_pretrain_steps
+                or rnn_pretrain_step % args.rnn_pretrain_log_interval == 0
+            ):
+                print(
+                    f"rnn_pretrain_progress | step={rnn_pretrain_step}/{args.rnn_pretrain_steps} | "
+                    f"loss={rnn_loss_value:.4f}",
+                    flush=True,
+                )
+        rnn_aux_optimizer.zero_grad(set_to_none=True)
+        rnn_prefetcher.close()
+        rnn_prefetcher = None
+        print("rnn_pretrain | complete", flush=True)
 
     for step in range(start_step + 1, total_steps + 1):
         stage = resolve_curriculum_stage(
@@ -3398,44 +3993,74 @@ def main() -> None:
             warmup_steps=args.warmup_steps,
             min_ratio=args.lr_min_ratio,
         )
-        rnn_aux_lr_scale = compute_decayed_scalar(
+        rnn_aux_lr_scale = 0.0
+        rnn_aux_weight = 0.0
+        if run_concurrent_rnn:
+            rnn_aux_lr_scale = compute_decayed_scalar(
+                step=step,
+                start_step=max(0, int(args.rnn_aux_decay_start)),
+                end_step=max(int(args.rnn_aux_decay_start), int(args.rnn_aux_decay_end)),
+                initial_value=1.0,
+                final_value=float(args.rnn_aux_lr_final_ratio),
+            )
+            rnn_aux_weight = compute_decayed_scalar(
+                step=step,
+                start_step=max(0, int(args.rnn_aux_decay_start)),
+                end_step=max(int(args.rnn_aux_decay_start), int(args.rnn_aux_decay_end)),
+                initial_value=float(args.rnn_aux_loss_weight),
+                final_value=float(args.rnn_aux_loss_weight_final),
+            )
+        embedding_lr_scale = compute_warmup_scalar(
             step=step,
-            start_step=max(0, int(args.rnn_aux_decay_start)),
-            end_step=max(int(args.rnn_aux_decay_start), int(args.rnn_aux_decay_end)),
-            initial_value=1.0,
-            final_value=float(args.rnn_aux_lr_final_ratio),
+            start_step=max(0, int(args.embedding_warmup_start)),
+            end_step=max(int(args.embedding_warmup_start), int(args.embedding_warmup_end)),
+            initial_value=0.0,
+            final_value=1.0,
         )
-        rnn_aux_weight = compute_decayed_scalar(
+        b_propagation_lr_scale = compute_warmup_scalar(
             step=step,
-            start_step=max(0, int(args.rnn_aux_decay_start)),
-            end_step=max(int(args.rnn_aux_decay_start), int(args.rnn_aux_decay_end)),
-            initial_value=float(args.rnn_aux_loss_weight),
-            final_value=float(args.rnn_aux_loss_weight_final),
+            start_step=max(0, int(args.b_propagation_warmup_start)),
+            end_step=max(int(args.b_propagation_warmup_start), int(args.b_propagation_warmup_end)),
+            initial_value=0.0,
+            final_value=1.0,
+        )
+        b_route_lr_scale = compute_warmup_scalar(
+            step=step,
+            start_step=max(0, int(args.b_route_warmup_start)),
+            end_step=max(int(args.b_route_warmup_start), int(args.b_route_warmup_end)),
+            initial_value=0.0,
+            final_value=1.0,
         )
         for param_group in optimizer.param_groups:
             group_lr = lr * float(param_group.get("lr_scale", 1.0))
-            if param_group.get("group_name") == "rnn_aux":
-                group_lr *= rnn_aux_lr_scale
+            if param_group.get("group_name") == "embedding":
+                group_lr *= embedding_lr_scale
+            elif param_group.get("group_name") == "b_propagation":
+                group_lr *= b_propagation_lr_scale
+            elif param_group.get("group_name") == "b_route":
+                group_lr *= b_route_lr_scale
             param_group["lr"] = group_lr
+        if rnn_aux_optimizer is not None:
+            for param_group in rnn_aux_optimizer.param_groups:
+                group_lr = args.learning_rate * float(param_group.get("lr_scale", 1.0))
+                group_lr *= rnn_aux_lr_scale
+                param_group["lr"] = group_lr
 
         current_memory_state = None if stage.freeze_memory else train_memory_state
         span_losses: list[float] = []
-        span_aux_losses: list[float] = []
-        span_loss_tensors: list[torch.Tensor] = []
+        last_span_loss_tensor: torch.Tensor | None = None
         loss_is_finite = True
         for span_index in range(stage.document_span):
             batch = override_batch_reset(
                 prefetcher.next_batch(),
                 reset_all=stage.freeze_memory,
             )
-            loss, main_loss_value, aux_loss_value, next_memory_state = run_model(
+            loss, main_loss_value, next_memory_state = run_model(
                 model,
                 batch,
                 memory_state=current_memory_state,
                 precision=args.precision,
                 grad_enabled=True,
-                rnn_aux_head=rnn_aux_head,
-                rnn_aux_weight=rnn_aux_weight,
             )
             loss_is_finite = bool(torch.isfinite(loss.detach()).item())
             if not loss_is_finite:
@@ -3445,12 +4070,11 @@ def main() -> None:
                 )
                 break
             span_losses.append(main_loss_value)
-            span_aux_losses.append(aux_loss_value)
-            span_loss_tensors.append(loss)
+            last_span_loss_tensor = loss
             current_memory_state = None if stage.freeze_memory else next_memory_state
 
-        if loss_is_finite and span_loss_tensors:
-            total_span_loss = sum(span_loss_tensors) / (stage.grad_accum_steps * len(span_loss_tensors))
+        if loss_is_finite and last_span_loss_tensor is not None:
+            total_span_loss = last_span_loss_tensor / stage.grad_accum_steps
             if scaler is not None:
                 scaler.scale(total_span_loss).backward()
             else:
@@ -3462,6 +4086,8 @@ def main() -> None:
                 train_memory_state = None
         else:
             optimizer.zero_grad(set_to_none=True)
+            if rnn_aux_optimizer is not None:
+                rnn_aux_optimizer.zero_grad(set_to_none=True)
             train_memory_state = None
 
         should_step_optimizer = step % stage.grad_accum_steps == 0 or step == total_steps
@@ -3491,20 +4117,83 @@ def main() -> None:
         else:
             grad_norm = float("nan")
 
-        train_loss = float(sum(span_losses) / max(1, len(span_losses)))
-        train_aux_loss = float(sum(span_aux_losses) / max(1, len(span_aux_losses))) if span_aux_losses else 0.0
-        train_total_loss = train_loss + rnn_aux_weight * train_aux_loss
+        train_loss = float(span_losses[-1] if span_losses else float("nan"))
+        train_aux_loss = 0.0
+        avg_rnn_batch_seconds = 0.0
+        rnn_prefetch_queue_size = 0
+        if (
+            run_concurrent_rnn
+            and rnn_aux_head is not None
+            and rnn_aux_optimizer is not None
+            and rnn_prefetcher is not None
+            and rnn_aux_weight > 0.0
+        ):
+            rnn_aux_optimizer.zero_grad(set_to_none=True)
+            rnn_losses: list[float] = []
+            rnn_loss_tensors: list[torch.Tensor] = []
+            rnn_loss_is_finite = True
+            for _ in range(max(1, int(args.rnn_aux_updates_per_step))):
+                rnn_batch = rnn_prefetcher.next_batch()
+                rnn_loss, rnn_loss_value = run_rnn_aux_model(
+                    model,
+                    rnn_aux_head,
+                    rnn_batch,
+                    precision=args.precision,
+                    grad_enabled=True,
+                )
+                if not bool(torch.isfinite(rnn_loss.detach()).item()):
+                    rnn_loss_is_finite = False
+                    print(
+                        f"warning | step={step} | non-finite rnn aux loss; skipping rnn optimizer step",
+                        flush=True,
+                    )
+                    break
+                rnn_losses.append(rnn_loss_value)
+                rnn_loss_tensors.append(rnn_loss * float(rnn_aux_weight))
+            if rnn_loss_is_finite and rnn_loss_tensors:
+                total_rnn_aux_loss = sum(rnn_loss_tensors) / max(1, len(rnn_loss_tensors))
+                if scaler is not None:
+                    scaler.scale(total_rnn_aux_loss).backward()
+                    scaler.unscale_(rnn_aux_optimizer)
+                else:
+                    total_rnn_aux_loss.backward()
+                try:
+                    torch.nn.utils.clip_grad_norm_(
+                        rnn_grad_clip_parameters,
+                        args.grad_clip,
+                        error_if_nonfinite=True,
+                    )
+                except RuntimeError as exc:
+                    print(
+                        f"warning | step={step} | non-finite rnn grad norm; skipping rnn optimizer step | {exc}",
+                        flush=True,
+                    )
+                    rnn_aux_optimizer.zero_grad(set_to_none=True)
+                else:
+                    if scaler is not None:
+                        scaler.step(rnn_aux_optimizer)
+                    else:
+                        rnn_aux_optimizer.step()
+                    rnn_aux_optimizer.zero_grad(set_to_none=True)
+                    train_aux_loss = float(sum(rnn_losses) / max(1, len(rnn_losses)))
+            else:
+                rnn_aux_optimizer.zero_grad(set_to_none=True)
+            avg_rnn_batch_seconds, rnn_prefetch_queue_size = rnn_prefetcher.stats()
         avg_cpu_batch_seconds, prefetch_queue_size = prefetcher.stats()
         if writer is not None:
             writer.add_scalar("train/loss", train_loss, step)
-            writer.add_scalar("train/aux_loss", train_aux_loss, step)
-            writer.add_scalar("train/total_loss", train_total_loss, step)
+            writer.add_scalar("train/rnn_aux_loss", train_aux_loss, step)
             writer.add_scalar("train/lr", lr, step)
+            writer.add_scalar("train/embedding_lr_scale", embedding_lr_scale, step)
+            writer.add_scalar("train/b_propagation_lr_scale", b_propagation_lr_scale, step)
+            writer.add_scalar("train/b_route_lr_scale", b_route_lr_scale, step)
             writer.add_scalar("train/rnn_aux_lr_scale", rnn_aux_lr_scale, step)
             writer.add_scalar("train/rnn_aux_weight", rnn_aux_weight, step)
             writer.add_scalar("train/document_span", stage.document_span, step)
             writer.add_scalar("train/cpu_batch_ms", avg_cpu_batch_seconds * 1000.0, step)
             writer.add_scalar("train/prefetch_queue_size", prefetch_queue_size, step)
+            writer.add_scalar("train/rnn_cpu_batch_ms", avg_rnn_batch_seconds * 1000.0, step)
+            writer.add_scalar("train/rnn_prefetch_queue_size", rnn_prefetch_queue_size, step)
             if not math.isnan(grad_norm):
                 writer.add_scalar("train/grad_norm", grad_norm, step)
             for bucket_name, bucket_weight in bucket_weights.items():
@@ -3514,38 +4203,48 @@ def main() -> None:
             elapsed = time.time() - start_time
             print(
                 f"progress | step={step:5d}/{total_steps} | stage={stage.name} | span={stage.document_span} | "
-                f"train_loss={train_loss:.4f} | aux_loss={train_aux_loss:.4f} | total_loss={train_total_loss:.4f} | lr={lr:.6g} | "
+                f"train_loss={train_loss:.4f} | rnn_aux_loss={train_aux_loss:.4f} | lr={lr:.6g} | "
+                f"embed_lr_scale={embedding_lr_scale:.3f} | "
+                f"edge_lr_scale={b_propagation_lr_scale:.3f} | route_lr_scale={b_route_lr_scale:.3f} | "
                 f"cpu_batch_ms={avg_cpu_batch_seconds * 1000.0:.1f} | prefetch_q={prefetch_queue_size} | "
+                f"rnn_cpu_batch_ms={avg_rnn_batch_seconds * 1000.0:.1f} | rnn_prefetch_q={rnn_prefetch_queue_size} | "
                 f"elapsed={elapsed:.1f}s",
                 flush=True,
             )
 
         val_loss = None
+        val_rnn_aux_loss = None
         if step == 1 or step % args.eval_interval == 0 or step == total_steps:
             if flat_collection is not None:
-                val_loss = estimate_eval_loss_flat(
+                val_loss, val_rnn_aux_loss = estimate_eval_loss_flat(
                     model,
                     flat_collection,
                     fixed_eval_documents_flat,
                     eval_documents=len(fixed_eval_documents_flat),
                     device=device,
                     precision=args.precision,
+                    rnn_aux_head=rnn_aux_head if run_concurrent_rnn else None,
                 )
             else:
-                val_loss = estimate_eval_loss(
+                val_loss, val_rnn_aux_loss = estimate_eval_loss(
                     model,
                     fixed_eval_documents,
                     eval_documents=len(fixed_eval_documents),
                     device=device,
                     precision=args.precision,
+                    rnn_aux_head=rnn_aux_head if run_concurrent_rnn else None,
                 )
             val_ppl = perplexity_from_loss(val_loss)
+            val_rnn_aux_text = "n/a" if val_rnn_aux_loss is None else f"{val_rnn_aux_loss:.4f}"
             print(
-                f"eval | step={step} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | val_ppl={val_ppl:.2f}",
+                f"eval | step={step} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
+                f"val_rnn_aux_loss={val_rnn_aux_text} | val_ppl={val_ppl:.2f}",
                 flush=True,
             )
             if writer is not None:
                 writer.add_scalar("eval/val_loss", val_loss, step)
+                if val_rnn_aux_loss is not None:
+                    writer.add_scalar("eval/rnn_aux_loss", float(val_rnn_aux_loss), step)
                 writer.add_scalar("eval/val_ppl", val_ppl, step)
                 if flat_collection is not None:
                     log_eval_samples_to_tensorboard_flat(
@@ -3577,6 +4276,7 @@ def main() -> None:
                     model=model,
                     rnn_aux_head=rnn_aux_head,
                     optimizer=optimizer,
+                    rnn_aux_optimizer=rnn_aux_optimizer,
                     step=step,
                     args=args,
                     train_loss=train_loss,
@@ -3595,6 +4295,7 @@ def main() -> None:
                 model=model,
                 rnn_aux_head=rnn_aux_head,
                 optimizer=optimizer,
+                rnn_aux_optimizer=rnn_aux_optimizer,
                 step=step,
                 args=args,
                 train_loss=train_loss,
@@ -3612,13 +4313,16 @@ def main() -> None:
             "stage": stage.name,
             "document_span": stage.document_span,
             "train_loss": train_loss,
-            "train_aux_loss": train_aux_loss,
-            "train_total_loss": train_total_loss,
+            "train_rnn_aux_loss": train_aux_loss,
             "grad_norm": grad_norm,
             "lr": lr,
+            "embedding_lr_scale": embedding_lr_scale,
+            "b_propagation_lr_scale": b_propagation_lr_scale,
+            "b_route_lr_scale": b_route_lr_scale,
             "rnn_aux_lr_scale": rnn_aux_lr_scale,
             "rnn_aux_weight": rnn_aux_weight,
             "val_loss": val_loss,
+            "val_rnn_aux_loss": val_rnn_aux_loss,
             "val_ppl": None if val_loss is None else perplexity_from_loss(val_loss),
         }
         history_rows.append(row)
@@ -3626,6 +4330,8 @@ def main() -> None:
 
     write_csv_rows(run_dir / "history.csv", history_rows)
     prefetcher.close()
+    if rnn_prefetcher is not None:
+        rnn_prefetcher.close()
     if writer is not None:
         writer.flush()
         writer.close()
