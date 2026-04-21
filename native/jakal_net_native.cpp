@@ -985,9 +985,33 @@ std::tuple<torch::Tensor, torch::Tensor> low_rank_transition_pairwise_topk_signe
       experimental_cuda_scan_fastpath_enabled() &&
       jakal_net_low_rank_pairwise_topk_forward_cuda_available() &&
       topk > 0 && topk <= 32) {
-    auto projected_source = torch::matmul(src_val, cast_tensor_like(source_weight, src_val).transpose(0, 1)).contiguous();
-    auto weighted_projected_source = projected_source * cast_tensor_like(core_weight, projected_source).view({1, 1, -1});
-    auto projected_target = torch::matmul(dst_val, cast_tensor_like(target_weight, dst_val).transpose(0, 1)).contiguous();
+    const bool multihead = source_weight.dim() >= 3 || target_weight.dim() >= 3 || core_weight.dim() >= 2;
+    torch::Tensor weighted_projected_source;
+    torch::Tensor projected_target;
+    if (multihead) {
+      auto cast_source = cast_tensor_like(source_weight, src_val);
+      auto cast_target = cast_tensor_like(target_weight, dst_val);
+      auto cast_core = cast_tensor_like(core_weight, src_val);
+      auto projected_source = torch::einsum("bid,hrd->bhir", std::vector<torch::Tensor>{src_val, cast_source}).contiguous();
+      std::vector<int64_t> core_shape(projected_source.dim(), 1);
+      core_shape[1] = cast_core.size(0);
+      core_shape[3] = cast_core.size(1);
+      weighted_projected_source = (projected_source * cast_core.view(core_shape)).contiguous();
+      projected_target = torch::einsum("bkd,hrd->bhkr", std::vector<torch::Tensor>{dst_val, cast_target}).contiguous();
+      if (bias.defined() && bias.numel() != 0) {
+        auto cast_bias = cast_tensor_like(bias, src_val).reshape({1, bias.numel(), 1, 1});
+        auto bias_column = cast_bias.expand({weighted_projected_source.size(0), weighted_projected_source.size(1), weighted_projected_source.size(2), 1});
+        auto target_ones = torch::ones(
+            {projected_target.size(0), projected_target.size(1), projected_target.size(2), 1},
+            projected_target.options());
+        weighted_projected_source = torch::cat({weighted_projected_source, bias_column}, -1).contiguous();
+        projected_target = torch::cat({projected_target, target_ones}, -1).contiguous();
+      }
+    } else {
+      auto projected_source = torch::matmul(src_val, cast_tensor_like(source_weight, src_val).transpose(0, 1)).contiguous();
+      weighted_projected_source = projected_source * cast_tensor_like(core_weight, projected_source).view({1, 1, -1});
+      projected_target = torch::matmul(dst_val, cast_tensor_like(target_weight, dst_val).transpose(0, 1)).contiguous();
+    }
     auto weighted_projected_state =
         (sender_strength.to(torch::kFloat32) * projected_state.to(torch::kFloat32)).contiguous();
     auto weighted_projected_val =
@@ -998,7 +1022,7 @@ std::tuple<torch::Tensor, torch::Tensor> low_rank_transition_pairwise_topk_signe
         weighted_projected_state,
         weighted_projected_val,
         topk,
-        (bias.defined() && bias.numel() != 0) ? bias.item<double>() : 0.0,
+        (!multihead && bias.defined() && bias.numel() != 0) ? bias.item<double>() : 0.0,
         1);
     return {
         std::get<0>(fused).to(projected_state.scalar_type()),
@@ -1088,13 +1112,42 @@ std::tuple<torch::Tensor, torch::Tensor> low_rank_propagation_topk_signed_abs(
       experimental_cuda_scan_fastpath_enabled() &&
       jakal_net_low_rank_propagation_topk_forward_cuda_available() &&
       topk > 0 && topk <= 32) {
-    auto projected_target = torch::matmul(layer_val, cast_tensor_like(target_weight, layer_val).transpose(0, 1)).contiguous();
-    auto projected_source = torch::matmul(layer_val, cast_tensor_like(source_weight, layer_val).transpose(0, 1)).contiguous();
-    auto weighted_projected_source = projected_source * cast_tensor_like(core_weight, projected_source).view({1, 1, -1});
+    const bool multihead = source_weight.dim() >= 3 || target_weight.dim() >= 3 || core_weight.dim() >= 2;
+    torch::Tensor weighted_projected_source;
+    torch::Tensor projected_target;
+    if (multihead) {
+      auto cast_source = cast_tensor_like(source_weight, layer_val);
+      auto cast_target = cast_tensor_like(target_weight, layer_val);
+      auto cast_core = cast_tensor_like(core_weight, layer_val);
+      auto projected_source = torch::einsum("bid,hrd->bhir", std::vector<torch::Tensor>{layer_val, cast_source}).contiguous();
+      std::vector<int64_t> core_shape(projected_source.dim(), 1);
+      core_shape[1] = cast_core.size(0);
+      core_shape[3] = cast_core.size(1);
+      weighted_projected_source = (projected_source * cast_core.view(core_shape)).contiguous();
+      projected_target = torch::einsum("bid,hrd->bhir", std::vector<torch::Tensor>{layer_val, cast_target}).contiguous();
+      auto maybe_bias = packed_optional_tensor(bias);
+      if (maybe_bias.has_value() && maybe_bias.value().numel() != 0) {
+        auto cast_bias = cast_tensor_like(maybe_bias.value(), layer_val).reshape({1, maybe_bias.value().numel(), 1, 1});
+        auto bias_column = cast_bias.expand({weighted_projected_source.size(0), weighted_projected_source.size(1), weighted_projected_source.size(2), 1});
+        auto target_ones = torch::ones(
+            {projected_target.size(0), projected_target.size(1), projected_target.size(2), 1},
+            projected_target.options());
+        weighted_projected_source = torch::cat({weighted_projected_source, bias_column}, -1).contiguous();
+        projected_target = torch::cat({projected_target, target_ones}, -1).contiguous();
+      }
+    } else {
+      auto projected_target_single = torch::matmul(layer_val, cast_tensor_like(target_weight, layer_val).transpose(0, 1)).contiguous();
+      auto projected_source_single = torch::matmul(layer_val, cast_tensor_like(source_weight, layer_val).transpose(0, 1)).contiguous();
+      weighted_projected_source = projected_source_single * cast_tensor_like(core_weight, projected_source_single).view({1, 1, -1});
+      projected_target = projected_target_single;
+    }
     auto weighted_projected_state = (layer_state.to(torch::kFloat32) * layer_state.to(torch::kFloat32)).contiguous();
     auto weighted_projected_val =
         (layer_state.to(torch::kFloat32).unsqueeze(-1) * layer_val.to(torch::kFloat32)).contiguous();
-    const auto score_bias = packed_optional_tensor(bias).has_value() ? packed_optional_tensor(bias).value().item<double>() : 0.0;
+    const auto score_bias =
+        (!multihead && packed_optional_tensor(bias).has_value())
+            ? packed_optional_tensor(bias).value().item<double>()
+            : 0.0;
     auto fused = low_rank_propagation_topk_forward_cuda_wrapper(
         weighted_projected_source,
         projected_target,
