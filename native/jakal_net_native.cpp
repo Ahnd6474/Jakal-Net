@@ -440,20 +440,26 @@ torch::Tensor pairwise_scores(
       if (!in_weight.has_value() || !out_weight.has_value()) {
         throw std::runtime_error("multihead_max low_rank_bilinear is missing projection weights.");
       }
-      auto cast_source = cast_tensor_like(in_weight.value(), source_val);
-      auto cast_target = cast_tensor_like(out_weight.value(), target_val);
-      auto cast_core = cast_tensor_like(weight, source_val);
-      auto projected_source = torch::einsum("bid,hrd->bhir", {source_val, cast_source});
-      auto projected_target = torch::einsum("bkd,hrd->bhkr", {target_val, cast_target});
+      auto cast_source = in_weight.value().to(source_val.scalar_type());
+      auto cast_target = out_weight.value().to(target_val.scalar_type());
+      auto cast_core = weight.to(source_val.scalar_type());
+      auto projected_source = torch::einsum(
+          "bid,hrd->bhir",
+          std::vector<torch::Tensor>{source_val, cast_source});
+      auto projected_target = torch::einsum(
+          "bkd,hrd->bhkr",
+          std::vector<torch::Tensor>{target_val, cast_target});
       std::vector<int64_t> core_shape(projected_source.dim(), 1);
       core_shape[projected_source.dim() - 3] = cast_core.size(0);
       core_shape[projected_source.dim() - 1] = cast_core.size(1);
       auto weighted_source = projected_source * cast_core.view(core_shape);
-      auto scores = torch::einsum("bhir,bhkr->bhik", {weighted_source, projected_target});
+      auto scores = torch::einsum(
+          "bhir,bhkr->bhik",
+          std::vector<torch::Tensor>{weighted_source, projected_target});
       if (bias.has_value()) {
         std::vector<int64_t> bias_shape(scores.dim(), 1);
         bias_shape[scores.dim() - 3] = bias.value().size(0);
-        scores = scores + cast_tensor_like(bias.value(), scores).view(bias_shape);
+        scores = scores + bias.value().to(scores.scalar_type()).view(bias_shape);
       }
       return std::get<0>(scores.max(1));
     }
@@ -596,20 +602,26 @@ torch::Tensor pairwise_route_block_logits(
   if (starts_with(route_kind, "multihead_max_")) {
     const auto base_kind = route_kind.substr(std::string("multihead_max_").size());
     if (base_kind == "low_rank_bilinear_route") {
-      auto cast_source = cast_tensor_like(source_weight.value(), src_val);
-      auto cast_target = cast_tensor_like(target_weight.value(), dst_val);
-      auto cast_core = cast_tensor_like(core_weight, src_val);
-      auto projected_source = torch::einsum("bid,hrd->bhir", {src_val, cast_source});
-      auto projected_target = torch::einsum("bkd,hrd->bhkr", {dst_val, cast_target});
+      auto cast_source = source_weight.value().to(src_val.scalar_type());
+      auto cast_target = target_weight.value().to(dst_val.scalar_type());
+      auto cast_core = core_weight.to(src_val.scalar_type());
+      auto projected_source = torch::einsum(
+          "bid,hrd->bhir",
+          std::vector<torch::Tensor>{src_val, cast_source});
+      auto projected_target = torch::einsum(
+          "bkd,hrd->bhkr",
+          std::vector<torch::Tensor>{dst_val, cast_target});
       std::vector<int64_t> core_shape(projected_source.dim(), 1);
       core_shape[projected_source.dim() - 3] = cast_core.size(0);
       core_shape[projected_source.dim() - 1] = cast_core.size(1);
       auto weighted_source = projected_source * cast_core.view(core_shape);
-      auto scores = torch::einsum("bhir,bhkr->bhik", {weighted_source, projected_target});
+      auto scores = torch::einsum(
+          "bhir,bhkr->bhik",
+          std::vector<torch::Tensor>{weighted_source, projected_target});
       if (bias.has_value()) {
         std::vector<int64_t> bias_shape(scores.dim(), 1);
         bias_shape[scores.dim() - 3] = bias.value().size(0);
-        scores = scores + cast_tensor_like(bias.value(), scores).view(bias_shape);
+        scores = scores + bias.value().to(scores.scalar_type()).view(bias_shape);
       }
       if (temperature != 1.0) {
         scores = scores / temperature;
