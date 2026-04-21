@@ -2581,9 +2581,7 @@ def initialize_model_embedding_from_hf(
     hf_model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
         trust_remote_code=trust_remote_code,
-        low_cpu_mem_usage=True,
         torch_dtype=torch.float32,
-        device_map="cpu",
     )
     try:
         hf_embedding = hf_model.get_input_embeddings().weight.detach().cpu()
