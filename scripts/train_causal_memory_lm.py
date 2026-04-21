@@ -54,9 +54,10 @@ from train_progressive_b_lm import (
 )
 
 try:
-    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoTokenizer
 except ImportError:
     AutoConfig = None
+    AutoModel = None
     AutoModelForCausalLM = None
     AutoTokenizer = None
 
@@ -1391,10 +1392,10 @@ def render_document_for_tokenizer(document: SerializedDocument) -> str:
 def render_document_for_hf_tokenizer(document: SerializedDocument) -> str:
     body = document.body
     replacements = {
-        f"{USER_TOKEN}\n": "<|im_start|>user\n",
-        f"{ASSISTANT_TOKEN}\n": "<|im_start|>assistant\n",
-        f"{INSTRUCTION_TOKEN}\n": "<|im_start|>system\n",
-        f"{EOT_TOKEN}": "<|im_end|>",
+        f"{USER_TOKEN}\n": "User:\n",
+        f"{ASSISTANT_TOKEN}\n": "Assistant:\n",
+        f"{INSTRUCTION_TOKEN}\n": "System:\n",
+        f"{EOT_TOKEN}": "\n",
         f"{TEXT_TOKEN}\n": "",
         f"{CODE_TOKEN}\n": "Code:\n",
         f"{MATH_TOKEN}\n": "Math:\n",
@@ -2576,14 +2577,24 @@ def initialize_model_embedding_from_hf(
     model_name_or_path: str,
     trust_remote_code: bool = False,
 ) -> dict[str, int]:
-    if AutoModelForCausalLM is None:
+    if AutoModelForCausalLM is None or AutoModel is None:
         raise ImportError("transformers is required to load HF pretrained embeddings.")
-    hf_model = AutoModelForCausalLM.from_pretrained(
-        model_name_or_path,
-        trust_remote_code=trust_remote_code,
-        torch_dtype=torch.float32,
-    )
+    hf_model: object
     try:
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            model_name_or_path,
+            trust_remote_code=trust_remote_code,
+            torch_dtype=torch.float32,
+        )
+    except Exception:
+        hf_model = AutoModel.from_pretrained(
+            model_name_or_path,
+            trust_remote_code=trust_remote_code,
+            torch_dtype=torch.float32,
+        )
+    try:
+        if not hasattr(hf_model, "get_input_embeddings"):
+            raise RuntimeError(f"Model {model_name_or_path} does not expose input embeddings.")
         hf_embedding = hf_model.get_input_embeddings().weight.detach().cpu()
         target_weight = model.s_module.token_embedding.weight.detach()
         if target_weight.shape[1] != hf_embedding.shape[1]:
