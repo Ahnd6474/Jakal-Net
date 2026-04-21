@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Sequence
 
+import torch
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from jakal_net._architectural_common import (
     PARAM_INIT_STD,
@@ -63,6 +65,8 @@ class CausalHierarchicalMemoryLM(nn.Module):
         s_window: int | None = None,
         s_microbatch_size: int | None = None,
         prediction_window: int = 64,
+        checkpoint_sequence_layers: bool = False,
+        checkpoint_prediction_layers: bool = False,
         memory_topk: int = 16,
         pairwise_kind: str = "low_rank_bilinear",
         route_kind: str = "low_rank_bilinear",
@@ -108,6 +112,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
         self.prediction_window = prediction_window
         self.scan_backend = scan_backend
         self.scan_checkpoint_chunk_size = scan_checkpoint_chunk_size
+        self.checkpoint_prediction_layers = checkpoint_prediction_layers
         if knowledge_module is None and knowledge_nodes > 0:
             knowledge_module = KModule(
                 dim=dim,
@@ -134,6 +139,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
             implementation=implementation,
             s_window=s_window,
             s_microbatch_size=s_microbatch_size,
+            checkpoint_sequence_layers=checkpoint_sequence_layers,
         )
         self.b_module = BModule(
             dim=dim,
@@ -227,12 +233,36 @@ class CausalHierarchicalMemoryLM(nn.Module):
         query_layer = scan_output.query_layer
         current_memory = scan_output.memory_state
         for propagation, norm in zip(self.prediction_layers, self.prediction_norms):
-            query_layer = apply_delta(
-                query_layer,
-                propagation.compute_delta(layer_with_val_norm(query_layer, norm)),
-                residual=True,
-                val_norm=norm,
-            )
+            if self.checkpoint_prediction_layers and torch.is_grad_enabled():
+                def _run_prediction_layer(state: Tensor, val: Tensor) -> tuple[Tensor, Tensor]:
+                    current_layer = Layer(dim=self.dim, num_nodes=query_layer.num_nodes, state=state, val=val)
+                    next_layer = apply_delta(
+                        current_layer,
+                        propagation.compute_delta(layer_with_val_norm(current_layer, norm)),
+                        residual=True,
+                        val_norm=norm,
+                    )
+                    return next_layer.state, next_layer.val
+
+                next_state, next_val = torch_checkpoint(
+                    _run_prediction_layer,
+                    query_layer.state,
+                    query_layer.val,
+                    use_reentrant=False,
+                )
+                query_layer = Layer(
+                    dim=self.dim,
+                    num_nodes=query_layer.num_nodes,
+                    state=next_state,
+                    val=next_val,
+                )
+            else:
+                query_layer = apply_delta(
+                    query_layer,
+                    propagation.compute_delta(layer_with_val_norm(query_layer, norm)),
+                    residual=True,
+                    val_norm=norm,
+                )
 
         logits = self.lm_head(self.output_norm(query_layer.val))
         if not (return_memory_state or return_layers):

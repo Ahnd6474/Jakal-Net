@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from jakal_net._architectural_common import (
     apply_delta,
@@ -27,6 +28,7 @@ class SModule(nn.Module):
         implementation: str,
         s_window: int | None = None,
         s_microbatch_size: int | None = None,
+        checkpoint_sequence_layers: bool = False,
     ) -> None:
         super().__init__()
         if vocab_size <= 0:
@@ -44,6 +46,7 @@ class SModule(nn.Module):
         self.dim = dim
         self.max_seq_len = max_seq_len
         self.s_microbatch_size = s_microbatch_size
+        self.checkpoint_sequence_layers = checkpoint_sequence_layers
 
         self.token_embedding = nn.Embedding(vocab_size, dim)
         self.position_encoding = LearnedPositionEncoding(dim)
@@ -136,10 +139,29 @@ class SModule(nn.Module):
         seq_state = torch.cat((anchor_state, state_projection(token_val).squeeze(-1)), dim=1)
         layer = Layer(dim=self.dim, num_nodes=seq_len + 1, state=seq_state, val=seq_val)
         for propagation, norm in zip(self.sequence_layers, self.sequence_norms):
-            layer = apply_delta(
-                layer,
-                propagation.compute_delta(layer_with_val_norm(layer, norm)),
-                residual=True,
-                val_norm=norm,
-            )
+            if self.checkpoint_sequence_layers and torch.is_grad_enabled():
+                def _run_sequence_layer(state: Tensor, val: Tensor) -> tuple[Tensor, Tensor]:
+                    current_layer = Layer(dim=self.dim, num_nodes=seq_len + 1, state=state, val=val)
+                    next_layer = apply_delta(
+                        current_layer,
+                        propagation.compute_delta(layer_with_val_norm(current_layer, norm)),
+                        residual=True,
+                        val_norm=norm,
+                    )
+                    return next_layer.state, next_layer.val
+
+                next_state, next_val = torch_checkpoint(
+                    _run_sequence_layer,
+                    layer.state,
+                    layer.val,
+                    use_reentrant=False,
+                )
+                layer = Layer(dim=self.dim, num_nodes=seq_len + 1, state=next_state, val=next_val)
+            else:
+                layer = apply_delta(
+                    layer,
+                    propagation.compute_delta(layer_with_val_norm(layer, norm)),
+                    residual=True,
+                    val_norm=norm,
+                )
         return layer

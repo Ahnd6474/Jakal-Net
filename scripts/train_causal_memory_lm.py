@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import nullcontext
 import json
@@ -11,7 +12,7 @@ import random
 import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 from uuid import uuid4
@@ -53,6 +54,11 @@ from train_progressive_b_lm import (
 
 from jakal_net import describe_device, resolve_device
 from jakal_net.causal_memory_lm import CausalHierarchicalMemoryLM, MemoryScanOutput, ModelRecurrentState
+from jakal_net.native_backend import (
+    EXPERIMENTAL_FUSED_TRAINING_CHECKPOINT_STRIDE_ENV,
+    EXPERIMENTAL_FUSED_TRAINING_ENV,
+    EXPERIMENTAL_SCAN_BACKWARD_CUDA_ENV,
+)
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -175,7 +181,7 @@ class FlatDocumentRef:
     document_index: int
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class FlatPretokenizedShard:
     path: Path
     kind: tuple[str, ...]
@@ -183,9 +189,9 @@ class FlatPretokenizedShard:
     token_count: torch.Tensor
     document_chunk_offsets: torch.Tensor
     chunk_token_offsets: torch.Tensor
-    context_flat: torch.Tensor
-    loss_mask_flat: torch.Tensor
-    is_continuation: torch.Tensor
+    context_flat: torch.Tensor | None
+    loss_mask_flat: torch.Tensor | None
+    is_continuation: torch.Tensor | None
     seq_len: int
     pad_token_id: int
     eos_token_id: int
@@ -195,6 +201,8 @@ class FlatPretokenizedShard:
     tokenizer_label: str | None
     tokenizer_model_path: str | None
     corpus_info: dict[str, Any]
+    _load_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+    _loaded: bool = False
 
     @property
     def num_documents(self) -> int:
@@ -216,35 +224,62 @@ class FlatPretokenizedShard:
         document_index: int,
         is_last_chunk: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
-        token_start = int(self.chunk_token_offsets[chunk_index].item())
-        token_end = int(self.chunk_token_offsets[chunk_index + 1].item())
-        active_context = self.context_flat[token_start:token_end]
-        active_length = int(active_context.shape[0])
-        context = torch.full((self.seq_len,), self.pad_token_id, dtype=torch.long)
-        if active_length > 0:
-            context[:active_length] = active_context.to(dtype=torch.long)
-        target = torch.full((self.seq_len,), self.pad_token_id, dtype=torch.long)
-        if active_length > 1:
-            target[: active_length - 1] = active_context[1:].to(dtype=torch.long)
-        if active_length > 0:
-            target[active_length - 1] = self.eos_token_id if is_last_chunk else self.cont_token_id
-        loss_mask = torch.zeros(self.seq_len, dtype=torch.float32)
-        document_kind = self.kind[document_index].lower()
-        if active_length > 0:
-            if document_kind in {"dialogue", "instruction"} and active_length > 2:
-                content_ids = active_context[2:].to(dtype=torch.long)
-                content_visibility = _content_target_visibility(
-                    content_ids,
-                    loss_mode="assistant_only",
-                    special_token_ids=self.special_token_ids,
-                )
-                loss_mask[1 : 1 + content_visibility.shape[0]] = content_visibility.to(dtype=torch.float32)
-            else:
-                loss_mask[:active_length] = self.loss_mask_flat[token_start:token_end].to(dtype=torch.float32)
-        return context, target, loss_mask, bool(self.is_continuation[chunk_index].item())
+        self.ensure_loaded()
+        with self._load_lock:
+            if self.context_flat is None or self.loss_mask_flat is None or self.is_continuation is None:
+                raise RuntimeError(f"Shard tensors are unavailable: {self.path}")
+            token_start = int(self.chunk_token_offsets[chunk_index].item())
+            token_end = int(self.chunk_token_offsets[chunk_index + 1].item())
+            active_context = self.context_flat[token_start:token_end]
+            active_length = int(active_context.shape[0])
+            context = torch.full((self.seq_len,), self.pad_token_id, dtype=torch.long)
+            if active_length > 0:
+                context[:active_length] = active_context.to(dtype=torch.long)
+            target = torch.full((self.seq_len,), self.pad_token_id, dtype=torch.long)
+            if active_length > 1:
+                target[: active_length - 1] = active_context[1:].to(dtype=torch.long)
+            if active_length > 0:
+                target[active_length - 1] = self.eos_token_id if is_last_chunk else self.cont_token_id
+            loss_mask = torch.zeros(self.seq_len, dtype=torch.float32)
+            document_kind = self.kind[document_index].lower()
+            if active_length > 0:
+                if document_kind in {"dialogue", "instruction"} and active_length > 2:
+                    content_ids = active_context[2:].to(dtype=torch.long)
+                    content_visibility = _content_target_visibility(
+                        content_ids,
+                        loss_mode="assistant_only",
+                        special_token_ids=self.special_token_ids,
+                    )
+                    loss_mask[1 : 1 + content_visibility.shape[0]] = content_visibility.to(dtype=torch.float32)
+                else:
+                    loss_mask[:active_length] = self.loss_mask_flat[token_start:token_end].to(dtype=torch.float32)
+            return context, target, loss_mask, bool(self.is_continuation[chunk_index].item())
+
+    def ensure_loaded(self) -> None:
+        if self._loaded:
+            return
+        with self._load_lock:
+            if self._loaded:
+                return
+            bundle = torch.load(self.path, map_location="cpu")
+            if not isinstance(bundle, dict):
+                raise ValueError(f"Invalid pretokenized shard payload: {self.path}")
+            _validate_flat_bundle_payload(bundle, path=self.path)
+            chunk_meta = bundle["chunks"]
+            self.context_flat = chunk_meta["context_flat"].detach().cpu().to(dtype=torch.long)
+            self.loss_mask_flat = chunk_meta["loss_mask_flat"].detach().cpu()
+            self.is_continuation = chunk_meta["is_continuation"].detach().cpu().to(dtype=torch.bool)
+            self._loaded = True
+
+    def unload(self) -> None:
+        with self._load_lock:
+            self.context_flat = None
+            self.loss_mask_flat = None
+            self.is_continuation = None
+            self._loaded = False
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class FlatPretokenizedDirectory:
     shards: tuple[FlatPretokenizedShard, ...]
     document_refs: tuple[FlatDocumentRef, ...]
@@ -252,6 +287,29 @@ class FlatPretokenizedDirectory:
     tokenizer_label: str | None
     tokenizer_model_path: str | None
     corpus_info: dict[str, Any]
+    max_loaded_shards: int = 0
+    _cache_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+    _loaded_shard_lru: OrderedDict[int, None] = field(default_factory=OrderedDict, repr=False, compare=False)
+
+    def get_shard(self, shard_index: int) -> FlatPretokenizedShard:
+        shard = self.shards[shard_index]
+        shard.ensure_loaded()
+        max_loaded_shards = max(0, int(self.max_loaded_shards))
+        if max_loaded_shards <= 0:
+            return shard
+        evicted: list[FlatPretokenizedShard] = []
+        with self._cache_lock:
+            self._loaded_shard_lru.pop(shard_index, None)
+            self._loaded_shard_lru[shard_index] = None
+            while len(self._loaded_shard_lru) > max_loaded_shards:
+                evicted_index, _ = self._loaded_shard_lru.popitem(last=False)
+                if evicted_index == shard_index:
+                    self._loaded_shard_lru[shard_index] = None
+                    break
+                evicted.append(self.shards[evicted_index])
+        for evicted_shard in evicted:
+            evicted_shard.unload()
+        return shard
 
 
 SCHEDULED_BUCKET_ORDER = (
@@ -837,6 +895,8 @@ class FlatDocumentChunkBatcher:
         *,
         batch_size: int,
         device: torch.device,
+        active_shards_per_bucket: int = 2,
+        shard_rotation_interval: int = 256,
     ) -> None:
         if not documents:
             raise ValueError("documents must not be empty.")
@@ -845,20 +905,32 @@ class FlatDocumentChunkBatcher:
         self.batch_size = batch_size
         self.device = device
         self.pin_memory = device.type == "cuda"
+        self.active_shards_per_bucket = max(1, int(active_shards_per_bucket))
+        self.shard_rotation_interval = max(1, int(shard_rotation_interval))
+        self._rng = random.Random(1337)
+        self._batches_served = 0
         self.current_doc = [-1] * batch_size
         self.current_chunk = [0] * batch_size
         self.needs_reset = [True] * batch_size
         self.bucket_to_indices: dict[str, tuple[int, ...]] = {}
+        self.bucket_to_shard_indices: dict[str, dict[int, tuple[int, ...]]] = {}
         for index, reference in enumerate(self.documents):
             bucket = flat_document_ref_bucket(self.collection, reference)
             self.bucket_to_indices.setdefault(bucket, []).append(index)
+            self.bucket_to_shard_indices.setdefault(bucket, {}).setdefault(reference.shard_index, []).append(index)
         self.bucket_to_indices = {
             bucket: tuple(indices)
             for bucket, indices in self.bucket_to_indices.items()
             if indices
         }
+        self.bucket_to_shard_indices = {
+            bucket: {shard_index: tuple(indices) for shard_index, indices in shard_map.items() if indices}
+            for bucket, shard_map in self.bucket_to_shard_indices.items()
+            if shard_map
+        }
         self.active_buckets = tuple(self.bucket_to_indices)
         self.active_bucket_weights = tuple(1.0 for _ in self.active_buckets)
+        self.active_bucket_shards = self._sample_active_bucket_shards()
 
     def set_batch_size(self, batch_size: int) -> None:
         if batch_size <= 0:
@@ -870,11 +942,29 @@ class FlatDocumentChunkBatcher:
         self.current_chunk = [0] * batch_size
         self.needs_reset = [True] * batch_size
 
+    def _sample_active_bucket_shards(self) -> dict[str, tuple[int, ...]]:
+        active_bucket_shards: dict[str, tuple[int, ...]] = {}
+        for bucket, shard_map in self.bucket_to_shard_indices.items():
+            shard_indices = list(shard_map)
+            if len(shard_indices) <= self.active_shards_per_bucket:
+                active_bucket_shards[bucket] = tuple(shard_indices)
+                continue
+            active_bucket_shards[bucket] = tuple(
+                self._rng.sample(shard_indices, k=self.active_shards_per_bucket)
+            )
+        return active_bucket_shards
+
+    def _refresh_active_bucket_shards(self, *, force: bool = False) -> None:
+        if force or self._batches_served % self.shard_rotation_interval == 0:
+            self.active_bucket_shards = self._sample_active_bucket_shards()
+
     def _sample_document_index(self) -> int:
         if not self.active_buckets:
             return random.randrange(len(self.documents))
         bucket = random.choices(self.active_buckets, weights=self.active_bucket_weights, k=1)[0]
-        return random.choice(self.bucket_to_indices[bucket])
+        active_shards = self.active_bucket_shards.get(bucket) or tuple(self.bucket_to_shard_indices[bucket])
+        shard_index = self._rng.choice(active_shards)
+        return self._rng.choice(self.bucket_to_shard_indices[bucket][shard_index])
 
     def set_bucket_weights(self, weights: dict[str, float]) -> None:
         active = [
@@ -887,8 +977,11 @@ class FlatDocumentChunkBatcher:
             active = [(bucket, 1.0) for bucket in self.bucket_to_indices]
         self.active_buckets = tuple(bucket for bucket, _ in active)
         self.active_bucket_weights = tuple(weight for _, weight in active)
+        self._refresh_active_bucket_shards(force=True)
 
     def next_batch(self) -> DocumentBatch:
+        self._batches_served += 1
+        self._refresh_active_bucket_shards()
         contexts: list[torch.Tensor] = []
         targets: list[torch.Tensor] = []
         masks: list[torch.Tensor] = []
@@ -899,7 +992,7 @@ class FlatDocumentChunkBatcher:
                 self.current_chunk[item_index] = 0
                 reset_mask[item_index] = True
             reference = self.documents[self.current_doc[item_index]]
-            shard = self.collection.shards[reference.shard_index]
+            shard = self.collection.get_shard(reference.shard_index)
             chunk_start, chunk_end = shard.document_chunk_range(reference.document_index)
             chunk_index = chunk_start + self.current_chunk[item_index]
             context, target, loss_mask, _ = shard.build_chunk_tensors(
@@ -1434,12 +1527,31 @@ def save_pretokenized_bundle(
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_name(f"{path.name}.tmp-{os.getpid()}-{uuid4().hex}")
+    meta_path = path.with_suffix(f"{path.suffix}.meta.json")
+    meta_payload = {
+        "storage_format": "flat_v2",
+        "documents": {
+            "kind": document_kinds,
+            "source": document_sources,
+            "token_count": document_token_counts,
+            "chunk_offsets": document_offsets,
+        },
+        "chunks": {
+            "token_offsets": chunk_offsets,
+        },
+        "seq_len": seq_len,
+        "vocab_size": vocab_size,
+        "tokenizer_label": tokenizer_label,
+        "tokenizer_model_path": tokenizer_model_path,
+        "corpus_info": corpus_info,
+    }
     try:
         with temp_path.open("wb") as handle:
             torch.save(payload, handle)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_path, path)
+        write_json(meta_path, meta_payload)
     finally:
         if temp_path.exists():
             try:
@@ -1476,6 +1588,71 @@ def validate_flat_pretokenized_shard(path: Path) -> None:
     if not isinstance(bundle, dict):
         raise ValueError(f"Invalid pretokenized shard payload: {path}")
     _validate_flat_bundle_payload(bundle, path=path)
+
+
+def _flat_shard_meta_path(path: Path) -> Path:
+    return path.with_suffix(f"{path.suffix}.meta.json")
+
+
+def _flat_shard_meta_payload(shard: FlatPretokenizedShard) -> dict[str, Any]:
+    return {
+        "storage_format": "flat_v2",
+        "documents": {
+            "kind": list(shard.kind),
+            "source": list(shard.source),
+            "token_count": shard.token_count.to(dtype=torch.int64).tolist(),
+            "chunk_offsets": shard.document_chunk_offsets.to(dtype=torch.int64).tolist(),
+        },
+        "chunks": {
+            "token_offsets": shard.chunk_token_offsets.to(dtype=torch.int64).tolist(),
+        },
+        "seq_len": int(shard.seq_len),
+        "vocab_size": int(shard.vocab_size),
+        "tokenizer_label": shard.tokenizer_label,
+        "tokenizer_model_path": shard.tokenizer_model_path,
+        "corpus_info": shard.corpus_info,
+    }
+
+
+def load_flat_pretokenized_shard_metadata(path: Path) -> FlatPretokenizedShard:
+    meta_path = _flat_shard_meta_path(path)
+    if meta_path.exists():
+        with meta_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if payload.get("storage_format") != "flat_v2":
+            raise ValueError(f"Expected flat_v2 shard metadata: {meta_path}")
+        corpus_info = payload.get("corpus_info") or {}
+        special_tokens = dict(corpus_info.get("special_tokens") or {})
+        pad_token_id = special_tokens.get("pad")
+        eos_token_id = special_tokens.get("eos")
+        cont_token_id = special_tokens.get("cont")
+        if pad_token_id is None or eos_token_id is None or cont_token_id is None:
+            raise ValueError(f"Flat pretokenized metadata is missing pad/eos/cont ids: {meta_path}")
+        document_meta = payload["documents"]
+        chunk_meta = payload["chunks"]
+        return FlatPretokenizedShard(
+            path=path,
+            kind=tuple(str(item) for item in document_meta["kind"]),
+            source=tuple(str(item) for item in document_meta["source"]),
+            token_count=torch.tensor(document_meta["token_count"], dtype=torch.int64),
+            document_chunk_offsets=torch.tensor(document_meta["chunk_offsets"], dtype=torch.int64),
+            chunk_token_offsets=torch.tensor(chunk_meta["token_offsets"], dtype=torch.int64),
+            context_flat=None,
+            loss_mask_flat=None,
+            is_continuation=None,
+            seq_len=int(payload["seq_len"]),
+            pad_token_id=int(pad_token_id),
+            eos_token_id=int(eos_token_id),
+            cont_token_id=int(cont_token_id),
+            special_token_ids={key: int(value) for key, value in special_tokens.items()},
+            vocab_size=int(payload["vocab_size"]),
+            tokenizer_label=payload.get("tokenizer_label"),
+            tokenizer_model_path=payload.get("tokenizer_model_path"),
+            corpus_info=corpus_info,
+        )
+    shard = load_flat_pretokenized_shard(path)
+    write_json(meta_path, _flat_shard_meta_payload(shard))
+    return shard
 
 
 def load_pretokenized_bundle(path: Path) -> dict[str, Any]:
@@ -1606,10 +1783,16 @@ def load_flat_pretokenized_shard(path: Path) -> FlatPretokenizedShard:
         tokenizer_label=bundle.get("tokenizer_label"),
         tokenizer_model_path=bundle.get("tokenizer_model_path"),
         corpus_info=corpus_info,
+        _loaded=True,
     )
 
 
-def load_flat_pretokenized_directory(path: Path, *, load_workers: int = 1) -> FlatPretokenizedDirectory:
+def load_flat_pretokenized_directory(
+    path: Path,
+    *,
+    load_workers: int = 1,
+    max_loaded_shards: int = 0,
+) -> FlatPretokenizedDirectory:
     shard_paths = sorted(candidate for candidate in path.glob("*.pt") if candidate.is_file())
     if not shard_paths:
         raise ValueError(f"No pretokenized shard files found in {path}")
@@ -1640,14 +1823,14 @@ def load_flat_pretokenized_directory(path: Path, *, load_workers: int = 1) -> Fl
                     raise RuntimeError(f"Corrupt pretokenized shard: {shard_path}") from exc
     print(f"flat_integrity_ok | path={path} | shards={len(shard_paths)}", flush=True)
     if load_workers <= 1:
-        shard_iterator = (load_flat_pretokenized_shard(shard_path) for shard_path in shard_paths)
+        shard_iterator = (load_flat_pretokenized_shard_metadata(shard_path) for shard_path in shard_paths)
         executor: ThreadPoolExecutor | None = None
     else:
         executor = ThreadPoolExecutor(
             max_workers=min(max(1, load_workers), len(shard_paths)),
             thread_name_prefix="pretok_flat_load",
         )
-        shard_iterator = executor.map(load_flat_pretokenized_shard, shard_paths)
+        shard_iterator = executor.map(load_flat_pretokenized_shard_metadata, shard_paths)
     shards: list[FlatPretokenizedShard] = []
     tokenizer_label: str | None = None
     tokenizer_model_path: str | None = None
@@ -1672,6 +1855,9 @@ def load_flat_pretokenized_directory(path: Path, *, load_workers: int = 1) -> Fl
             executor.shutdown(wait=True)
     if vocab_size is None:
         raise ValueError(f"Invalid pretokenized shard directory: {path}")
+    if max_loaded_shards > 0:
+        for shard in shards:
+            shard.unload()
     refs: list[FlatDocumentRef] = []
     for shard_index, shard in enumerate(shards):
         refs.extend(FlatDocumentRef(shard_index=shard_index, document_index=i) for i in range(shard.num_documents))
@@ -1682,6 +1868,7 @@ def load_flat_pretokenized_directory(path: Path, *, load_workers: int = 1) -> Fl
         tokenizer_label=tokenizer_label,
         tokenizer_model_path=tokenizer_model_path,
         corpus_info={"shards": shard_summaries, "directory": str(path)},
+        max_loaded_shards=max_loaded_shards,
     )
 
 
@@ -2184,7 +2371,7 @@ def log_eval_samples_to_tensorboard_flat(
     with autocast_context:
         sample_sections: list[str] = []
         for index, reference in enumerate(selected, start=1):
-            shard = collection.shards[reference.shard_index]
+            shard = collection.get_shard(reference.shard_index)
             chunk_start, _ = shard.document_chunk_range(reference.document_index)
             context, target, loss_mask, _ = shard.build_chunk_tensors(
                 chunk_start,
@@ -2315,7 +2502,7 @@ def estimate_eval_loss_flat(
     total_loss = 0.0
     total_weight = 0.0
     for reference in sampled_documents:
-        shard = collection.shards[reference.shard_index]
+        shard = collection.get_shard(reference.shard_index)
         chunk_start, chunk_end = shard.document_chunk_range(reference.document_index)
         memory_state: tuple[Any, ...] | None = None
         for chunk_index in range(chunk_start, chunk_end):
@@ -2406,6 +2593,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pretokenized-path")
     parser.add_argument("--pretokenized-dir")
     parser.add_argument("--pretokenized-load-workers", type=int, default=8)
+    parser.add_argument("--pretokenized-max-loaded-shards", type=int, default=8)
+    parser.add_argument("--pretokenized-active-shards-per-bucket", type=int, default=2)
+    parser.add_argument("--pretokenized-shard-rotation-interval", type=int, default=256)
     parser.add_argument("--prefetch-batches", type=int, default=100)
     parser.add_argument("--save-pretokenized", action="store_true")
 
@@ -2421,9 +2611,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--s-window", type=int, default=256)
     parser.add_argument("--s-microbatch-size", type=int, default=0)
     parser.add_argument("--prediction-window", type=int, default=64)
+    parser.add_argument("--checkpoint-sequence-layers", action="store_true")
+    parser.add_argument("--checkpoint-prediction-layers", action="store_true")
     parser.add_argument("--memory-topk", type=int, default=16)
     parser.add_argument("--scan-checkpoint-chunk-size", type=int, default=0)
     parser.add_argument("--scan-backend", choices=("auto", "python", "native"), default="auto")
+    parser.add_argument("--enable-fused-training", action="store_true")
+    parser.add_argument("--fused-training-checkpoint-stride", type=int, default=0)
+    parser.add_argument("--enable-scan-backward-cuda", action="store_true")
     parser.add_argument(
         "--pairwise-kind",
         choices=("low_rank_bilinear", "diagonal_bilinear", "bilinear", "additive_low_rank"),
@@ -2452,6 +2647,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage3-grad-accum-steps", type=int, default=0)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--optimizer", choices=("adamw", "adamw_fused", "adamw8bit"), default="adamw_fused")
     parser.add_argument("--warmup-steps", type=int, default=200)
     parser.add_argument("--lr-min-ratio", type=float, default=0.1)
     parser.add_argument("--epochs", type=float, default=1.0)
@@ -2503,10 +2699,69 @@ def summarize_flat_documents(
     }
 
 
+def configure_native_runtime_flags(args: argparse.Namespace) -> None:
+    if args.enable_fused_training:
+        os.environ[EXPERIMENTAL_FUSED_TRAINING_ENV] = "1"
+    else:
+        os.environ.pop(EXPERIMENTAL_FUSED_TRAINING_ENV, None)
+    if args.fused_training_checkpoint_stride > 0:
+        os.environ[EXPERIMENTAL_FUSED_TRAINING_CHECKPOINT_STRIDE_ENV] = str(
+            int(args.fused_training_checkpoint_stride)
+        )
+    else:
+        os.environ.pop(EXPERIMENTAL_FUSED_TRAINING_CHECKPOINT_STRIDE_ENV, None)
+    if args.enable_scan_backward_cuda:
+        os.environ[EXPERIMENTAL_SCAN_BACKWARD_CUDA_ENV] = "1"
+    else:
+        os.environ.pop(EXPERIMENTAL_SCAN_BACKWARD_CUDA_ENV, None)
+
+
+def build_optimizer(
+    model: CausalHierarchicalMemoryLM,
+    *,
+    name: str,
+    learning_rate: float,
+    weight_decay: float,
+    device: torch.device,
+) -> torch.optim.Optimizer:
+    optimizer_name = name.lower()
+    parameter_iterable = model.parameters()
+    if optimizer_name == "adamw":
+        return torch.optim.AdamW(parameter_iterable, lr=learning_rate, weight_decay=weight_decay)
+    if optimizer_name == "adamw_fused":
+        if device.type == "cuda":
+            try:
+                return torch.optim.AdamW(
+                    parameter_iterable,
+                    lr=learning_rate,
+                    weight_decay=weight_decay,
+                    fused=True,
+                )
+            except TypeError:
+                pass
+        return torch.optim.AdamW(parameter_iterable, lr=learning_rate, weight_decay=weight_decay)
+    if optimizer_name == "adamw8bit":
+        try:
+            from bitsandbytes.optim import AdamW8bit  # type: ignore
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise ImportError("bitsandbytes is required for --optimizer adamw8bit.") from exc
+        return AdamW8bit(parameter_iterable, lr=learning_rate, weight_decay=weight_decay)
+    raise ValueError(f"Unsupported optimizer: {name!r}")
+
+
 def main() -> None:
     args = parse_args()
     if args.pretokenize_workers < 0:
         raise ValueError("pretokenize-workers must be non-negative.")
+    if args.pretokenized_load_workers <= 0:
+        raise ValueError("pretokenized-load-workers must be positive.")
+    if args.pretokenized_max_loaded_shards < 0:
+        raise ValueError("pretokenized-max-loaded-shards must be non-negative.")
+    if args.pretokenized_active_shards_per_bucket <= 0:
+        raise ValueError("pretokenized-active-shards-per-bucket must be positive.")
+    if args.pretokenized_shard_rotation_interval <= 0:
+        raise ValueError("pretokenized-shard-rotation-interval must be positive.")
+    configure_native_runtime_flags(args)
     if args.grad_accum_steps <= 0:
         raise ValueError("grad-accum-steps must be positive.")
     if args.batch_size <= 0:
@@ -2559,6 +2814,7 @@ def main() -> None:
         flat_collection = load_flat_pretokenized_directory(
             Path(args.pretokenized_dir),
             load_workers=max(1, int(args.pretokenized_load_workers)),
+            max_loaded_shards=max(0, int(args.pretokenized_max_loaded_shards)),
         )
         tokenizer_label = str(flat_collection.tokenizer_label or "unknown")
         tokenizer_model_path = flat_collection.tokenizer_model_path
@@ -2700,6 +2956,8 @@ def main() -> None:
         s_window=args.s_window,
         s_microbatch_size=None if args.s_microbatch_size <= 0 else args.s_microbatch_size,
         prediction_window=args.prediction_window,
+        checkpoint_sequence_layers=args.checkpoint_sequence_layers,
+        checkpoint_prediction_layers=args.checkpoint_prediction_layers,
         memory_topk=args.memory_topk,
         scan_checkpoint_chunk_size=None if args.scan_checkpoint_chunk_size <= 0 else args.scan_checkpoint_chunk_size,
         scan_backend=args.scan_backend,
@@ -2718,7 +2976,15 @@ def main() -> None:
         f"model=causal_memory_doc | params={parameter_count:,} | dim={args.dim} | seq_len={args.seq_len} | "
         f"s_window={args.s_window} | s_microbatch_size={args.s_microbatch_size} | "
         f"scan_backend={args.scan_backend} | scan_checkpoint_chunk_size={args.scan_checkpoint_chunk_size} | "
-        f"memory_slots={args.memory_slots} | knowledge_nodes={args.knowledge_nodes}",
+        f"memory_slots={args.memory_slots} | knowledge_nodes={args.knowledge_nodes} | "
+        f"optimizer={args.optimizer} | checkpoint_sequence={args.checkpoint_sequence_layers} | "
+        f"checkpoint_prediction={args.checkpoint_prediction_layers}",
+        flush=True,
+    )
+    print(
+        f"native_runtime | fused_training={args.enable_fused_training} | "
+        f"fused_training_checkpoint_stride={args.fused_training_checkpoint_stride} | "
+        f"scan_backward_cuda={args.enable_scan_backward_cuda}",
         flush=True,
     )
     print(
@@ -2752,7 +3018,13 @@ def main() -> None:
             raise ImportError("tensorboard is not installed.")
         writer = SummaryWriter(log_dir=str(run_dir / "tensorboard"))
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    optimizer = build_optimizer(
+        model,
+        name=args.optimizer,
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
+        device=device,
+    )
     scaler = torch.cuda.amp.GradScaler() if args.precision == "fp16" and device.type == "cuda" else None
     if flat_collection is not None:
         batcher: DocumentChunkBatcher | FlatDocumentChunkBatcher = FlatDocumentChunkBatcher(
@@ -2760,6 +3032,8 @@ def main() -> None:
             train_documents_flat,
             batch_size=stage1_batch_size,
             device=device,
+            active_shards_per_bucket=args.pretokenized_active_shards_per_bucket,
+            shard_rotation_interval=args.pretokenized_shard_rotation_interval,
         )
     else:
         batcher = DocumentChunkBatcher(train_documents, batch_size=stage1_batch_size, device=device)
