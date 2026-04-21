@@ -436,6 +436,27 @@ torch::Tensor pairwise_scores(
     const c10::optional<torch::Tensor>& out_bias) {
   if (starts_with(pairwise_kind, "multihead_max_")) {
     const auto base_kind = pairwise_kind.substr(std::string("multihead_max_").size());
+    if (base_kind == "low_rank_bilinear") {
+      if (!in_weight.has_value() || !out_weight.has_value()) {
+        throw std::runtime_error("multihead_max low_rank_bilinear is missing projection weights.");
+      }
+      auto cast_source = cast_tensor_like(in_weight.value(), source_val);
+      auto cast_target = cast_tensor_like(out_weight.value(), target_val);
+      auto cast_core = cast_tensor_like(weight, source_val);
+      auto projected_source = torch::einsum("bid,hrd->bhir", {source_val, cast_source});
+      auto projected_target = torch::einsum("bkd,hrd->bhkr", {target_val, cast_target});
+      std::vector<int64_t> core_shape(projected_source.dim(), 1);
+      core_shape[projected_source.dim() - 3] = cast_core.size(0);
+      core_shape[projected_source.dim() - 1] = cast_core.size(1);
+      auto weighted_source = projected_source * cast_core.view(core_shape);
+      auto scores = torch::einsum("bhir,bhkr->bhik", {weighted_source, projected_target});
+      if (bias.has_value()) {
+        std::vector<int64_t> bias_shape(scores.dim(), 1);
+        bias_shape[scores.dim() - 3] = bias.value().size(0);
+        scores = scores + cast_tensor_like(bias.value(), scores).view(bias_shape);
+      }
+      return std::get<0>(scores.max(1));
+    }
     const auto num_heads = infer_multihead_count(weight, in_weight, out_weight);
     c10::optional<torch::Tensor> best_scores = c10::nullopt;
     for (int64_t head_index = 0; head_index < num_heads; ++head_index) {
@@ -574,6 +595,27 @@ torch::Tensor pairwise_route_block_logits(
     double temperature) {
   if (starts_with(route_kind, "multihead_max_")) {
     const auto base_kind = route_kind.substr(std::string("multihead_max_").size());
+    if (base_kind == "low_rank_bilinear_route") {
+      auto cast_source = cast_tensor_like(source_weight.value(), src_val);
+      auto cast_target = cast_tensor_like(target_weight.value(), dst_val);
+      auto cast_core = cast_tensor_like(core_weight, src_val);
+      auto projected_source = torch::einsum("bid,hrd->bhir", {src_val, cast_source});
+      auto projected_target = torch::einsum("bkd,hrd->bhkr", {dst_val, cast_target});
+      std::vector<int64_t> core_shape(projected_source.dim(), 1);
+      core_shape[projected_source.dim() - 3] = cast_core.size(0);
+      core_shape[projected_source.dim() - 1] = cast_core.size(1);
+      auto weighted_source = projected_source * cast_core.view(core_shape);
+      auto scores = torch::einsum("bhir,bhkr->bhik", {weighted_source, projected_target});
+      if (bias.has_value()) {
+        std::vector<int64_t> bias_shape(scores.dim(), 1);
+        bias_shape[scores.dim() - 3] = bias.value().size(0);
+        scores = scores + cast_tensor_like(bias.value(), scores).view(bias_shape);
+      }
+      if (temperature != 1.0) {
+        scores = scores / temperature;
+      }
+      return std::get<0>(scores.max(1));
+    }
     const auto num_heads = infer_multihead_count(core_weight, source_weight, target_weight);
     c10::optional<torch::Tensor> best_scores = c10::nullopt;
     for (int64_t head_index = 0; head_index < num_heads; ++head_index) {

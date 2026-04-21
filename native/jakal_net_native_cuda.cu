@@ -1797,31 +1797,22 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_low_rank_transition_pairwise_
 
   torch::Tensor logits;
   if (multihead) {
-    const auto num_heads = core_weight.dim() >= 2 ? core_weight.size(0) : source_weight.size(0);
-    c10::optional<torch::Tensor> best_logits = c10::nullopt;
-    for (int64_t head_index = 0; head_index < num_heads; ++head_index) {
-      auto head_source_weight = scan_cuda_select_head_tensor(source_weight, head_index, num_heads);
-      auto head_target_weight = scan_cuda_select_head_tensor(target_weight, head_index, num_heads);
-      auto head_core_weight = scan_cuda_select_head_tensor(core_weight, head_index, num_heads);
-      auto head_bias = scan_cuda_select_head_tensor(bias, head_index, num_heads);
-      auto projected_source = torch::matmul(src_val, head_source_weight.to(src_val.scalar_type()).transpose(0, 1));
-      auto weighted_projected_source =
-          projected_source * head_core_weight.to(projected_source.scalar_type()).view({1, 1, -1});
-      auto projected_target = torch::matmul(dst_val, head_target_weight.to(dst_val.scalar_type()).transpose(0, 1));
-      auto head_scores = torch::matmul(weighted_projected_source, projected_target.transpose(1, 2));
-      if (head_bias.defined() && head_bias.numel() != 0) {
-        head_scores = head_scores + head_bias.to(head_scores.scalar_type());
-      }
-      if (best_logits.has_value()) {
-        best_logits = torch::maximum(best_logits.value(), head_scores);
-      } else {
-        best_logits = head_scores;
-      }
+    auto cast_source = source_weight.to(src_val.scalar_type());
+    auto cast_target = target_weight.to(dst_val.scalar_type());
+    auto cast_core = core_weight.to(src_val.scalar_type());
+    auto projected_source = torch::einsum("bid,hrd->bhir", {src_val, cast_source});
+    auto projected_target = torch::einsum("bkd,hrd->bhkr", {dst_val, cast_target});
+    std::vector<int64_t> core_shape(projected_source.dim(), 1);
+    core_shape[projected_source.dim() - 3] = cast_core.size(0);
+    core_shape[projected_source.dim() - 1] = cast_core.size(1);
+    auto weighted_projected_source = projected_source * cast_core.view(core_shape);
+    logits = torch::einsum("bhir,bhkr->bhik", {weighted_projected_source, projected_target});
+    if (bias.defined() && bias.numel() != 0) {
+      std::vector<int64_t> bias_shape(logits.dim(), 1);
+      bias_shape[logits.dim() - 3] = bias.size(0);
+      logits = logits + bias.to(logits.scalar_type()).view(bias_shape);
     }
-    if (!best_logits.has_value()) {
-      throw std::runtime_error("multihead transition path requires at least one head.");
-    }
-    logits = best_logits.value();
+    logits = std::get<0>(logits.max(1));
   } else {
     auto projected_source = torch::matmul(src_val, source_weight.to(src_val.scalar_type()).transpose(0, 1));
     auto weighted_projected_source = projected_source * core_weight.to(projected_source.scalar_type()).view({1, 1, -1});
@@ -1912,31 +1903,22 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_low_rank_propagation_topk(
 
   torch::Tensor scores;
   if (multihead) {
-    const auto num_heads = core_weight.dim() >= 2 ? core_weight.size(0) : source_weight.size(0);
-    c10::optional<torch::Tensor> best_scores = c10::nullopt;
-    for (int64_t head_index = 0; head_index < num_heads; ++head_index) {
-      auto head_source_weight = scan_cuda_select_head_tensor(source_weight, head_index, num_heads);
-      auto head_target_weight = scan_cuda_select_head_tensor(target_weight, head_index, num_heads);
-      auto head_core_weight = scan_cuda_select_head_tensor(core_weight, head_index, num_heads);
-      auto head_bias = scan_cuda_select_head_tensor(bias, head_index, num_heads);
-      auto projected_target = torch::matmul(layer_val, head_target_weight.to(layer_val.scalar_type()).transpose(0, 1));
-      auto projected_source = torch::matmul(layer_val, head_source_weight.to(layer_val.scalar_type()).transpose(0, 1));
-      auto weighted_projected_source =
-          projected_source * head_core_weight.to(projected_source.scalar_type()).view({1, 1, -1});
-      auto head_score = torch::matmul(projected_target, weighted_projected_source.transpose(1, 2));
-      if (head_bias.defined() && head_bias.numel() != 0) {
-        head_score = head_score + head_bias.to(head_score.scalar_type());
-      }
-      if (best_scores.has_value()) {
-        best_scores = torch::maximum(best_scores.value(), head_score);
-      } else {
-        best_scores = head_score;
-      }
+    auto cast_source = source_weight.to(layer_val.scalar_type());
+    auto cast_target = target_weight.to(layer_val.scalar_type());
+    auto cast_core = core_weight.to(layer_val.scalar_type());
+    auto projected_target = torch::einsum("bid,hrd->bhir", {layer_val, cast_target});
+    auto projected_source = torch::einsum("bid,hrd->bhir", {layer_val, cast_source});
+    std::vector<int64_t> core_shape(projected_source.dim(), 1);
+    core_shape[projected_source.dim() - 3] = cast_core.size(0);
+    core_shape[projected_source.dim() - 1] = cast_core.size(1);
+    auto weighted_projected_source = projected_source * cast_core.view(core_shape);
+    scores = torch::einsum("bhir,bhkr->bhik", {projected_target, weighted_projected_source});
+    if (bias.defined() && bias.numel() != 0) {
+      std::vector<int64_t> bias_shape(scores.dim(), 1);
+      bias_shape[scores.dim() - 3] = bias.size(0);
+      scores = scores + bias.to(scores.scalar_type()).view(bias_shape);
     }
-    if (!best_scores.has_value()) {
-      throw std::runtime_error("multihead propagation path requires at least one head.");
-    }
-    scores = best_scores.value();
+    scores = std::get<0>(scores.max(1));
   } else {
     auto projected_target = torch::matmul(layer_val, target_weight.to(layer_val.scalar_type()).transpose(0, 1));
     auto projected_source = torch::matmul(layer_val, source_weight.to(layer_val.scalar_type()).transpose(0, 1));

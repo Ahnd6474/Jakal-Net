@@ -804,6 +804,27 @@ def _native_scan_pairwise_scores(
 ) -> Tensor:
     if pairwise_kind.startswith("multihead_max_"):
         base_kind = pairwise_kind[len("multihead_max_") :]
+        if base_kind == "low_rank_bilinear":
+            projected_source = torch.einsum(
+                "...id,hrd->...hir",
+                src_val,
+                source_weight.to(dtype=src_val.dtype),
+            )
+            projected_target = torch.einsum(
+                "...kd,hrd->...hkr",
+                dst_val,
+                target_weight.to(dtype=dst_val.dtype),
+            )
+            core_view_shape = [1] * projected_source.dim()
+            core_view_shape[-3] = core_weight.shape[0]
+            core_view_shape[-1] = core_weight.shape[1]
+            weighted_source = projected_source * core_weight.to(dtype=src_val.dtype).view(*core_view_shape)
+            scores = torch.einsum("...hir,...hkr->...hik", weighted_source, projected_target)
+            if packed_bias.numel() != 0:
+                scores = scores + packed_bias.to(dtype=scores.dtype).view(
+                    *([1] * (scores.dim() - 3)), packed_bias.shape[0], 1, 1
+                )
+            return scores.max(dim=-3).values
         num_heads = int(core_weight.shape[0])
         best_scores: Tensor | None = None
         for head_index in range(num_heads):
@@ -859,6 +880,27 @@ def _native_scan_route_scores(
 ) -> Tensor:
     if route_kind_name.startswith("multihead_max_"):
         base_kind = route_kind_name[len("multihead_max_") :]
+        if base_kind == "low_rank_bilinear_route":
+            projected_source = torch.einsum(
+                "...id,hrd->...hir",
+                src_val,
+                source_weight.to(dtype=src_val.dtype),
+            )
+            projected_target = torch.einsum(
+                "...kd,hrd->...hkr",
+                dst_val,
+                target_weight.to(dtype=dst_val.dtype),
+            )
+            core_view_shape = [1] * projected_source.dim()
+            core_view_shape[-3] = core_weight.shape[0]
+            core_view_shape[-1] = core_weight.shape[1]
+            weighted_source = projected_source * core_weight.to(dtype=src_val.dtype).view(*core_view_shape)
+            scores = torch.einsum("...hir,...hkr->...hik", weighted_source, projected_target)
+            if packed_bias.numel() != 0:
+                scores = scores + packed_bias.to(dtype=scores.dtype).view(
+                    *([1] * (scores.dim() - 3)), packed_bias.shape[0], 1, 1
+                )
+            return scores.max(dim=-3).values
         num_heads = int(core_weight.shape[0])
         best_scores: Tensor | None = None
         for head_index in range(num_heads):
