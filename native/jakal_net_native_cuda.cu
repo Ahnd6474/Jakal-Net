@@ -1798,8 +1798,7 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_low_rank_transition_pairwise_
   torch::Tensor logits;
   if (multihead) {
     const auto num_heads = core_weight.dim() >= 2 ? core_weight.size(0) : source_weight.size(0);
-    std::vector<torch::Tensor> head_logits;
-    head_logits.reserve(static_cast<size_t>(num_heads));
+    c10::optional<torch::Tensor> best_logits = c10::nullopt;
     for (int64_t head_index = 0; head_index < num_heads; ++head_index) {
       auto head_source_weight = scan_cuda_select_head_tensor(source_weight, head_index, num_heads);
       auto head_target_weight = scan_cuda_select_head_tensor(target_weight, head_index, num_heads);
@@ -1813,9 +1812,16 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_low_rank_transition_pairwise_
       if (head_bias.defined() && head_bias.numel() != 0) {
         head_scores = head_scores + head_bias.to(head_scores.scalar_type());
       }
-      head_logits.push_back(head_scores);
+      if (best_logits.has_value()) {
+        best_logits = torch::maximum(best_logits.value(), head_scores);
+      } else {
+        best_logits = head_scores;
+      }
     }
-    logits = std::get<0>(torch::stack(head_logits, -1).max(-1));
+    if (!best_logits.has_value()) {
+      throw std::runtime_error("multihead transition path requires at least one head.");
+    }
+    logits = best_logits.value();
   } else {
     auto projected_source = torch::matmul(src_val, source_weight.to(src_val.scalar_type()).transpose(0, 1));
     auto weighted_projected_source = projected_source * core_weight.to(projected_source.scalar_type()).view({1, 1, -1});
@@ -1907,8 +1913,7 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_low_rank_propagation_topk(
   torch::Tensor scores;
   if (multihead) {
     const auto num_heads = core_weight.dim() >= 2 ? core_weight.size(0) : source_weight.size(0);
-    std::vector<torch::Tensor> head_scores;
-    head_scores.reserve(static_cast<size_t>(num_heads));
+    c10::optional<torch::Tensor> best_scores = c10::nullopt;
     for (int64_t head_index = 0; head_index < num_heads; ++head_index) {
       auto head_source_weight = scan_cuda_select_head_tensor(source_weight, head_index, num_heads);
       auto head_target_weight = scan_cuda_select_head_tensor(target_weight, head_index, num_heads);
@@ -1922,9 +1927,16 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_low_rank_propagation_topk(
       if (head_bias.defined() && head_bias.numel() != 0) {
         head_score = head_score + head_bias.to(head_score.scalar_type());
       }
-      head_scores.push_back(head_score);
+      if (best_scores.has_value()) {
+        best_scores = torch::maximum(best_scores.value(), head_score);
+      } else {
+        best_scores = head_score;
+      }
     }
-    scores = std::get<0>(torch::stack(head_scores, -1).max(-1));
+    if (!best_scores.has_value()) {
+      throw std::runtime_error("multihead propagation path requires at least one head.");
+    }
+    scores = best_scores.value();
   } else {
     auto projected_target = torch::matmul(layer_val, target_weight.to(layer_val.scalar_type()).transpose(0, 1));
     auto projected_source = torch::matmul(layer_val, source_weight.to(layer_val.scalar_type()).transpose(0, 1));

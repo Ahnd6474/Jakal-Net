@@ -437,10 +437,9 @@ torch::Tensor pairwise_scores(
   if (starts_with(pairwise_kind, "multihead_max_")) {
     const auto base_kind = pairwise_kind.substr(std::string("multihead_max_").size());
     const auto num_heads = infer_multihead_count(weight, in_weight, out_weight);
-    std::vector<torch::Tensor> head_scores;
-    head_scores.reserve(static_cast<size_t>(num_heads));
+    c10::optional<torch::Tensor> best_scores = c10::nullopt;
     for (int64_t head_index = 0; head_index < num_heads; ++head_index) {
-      head_scores.push_back(pairwise_scores(
+      auto head_scores = pairwise_scores(
           base_kind,
           target_val,
           source_val,
@@ -449,9 +448,17 @@ torch::Tensor pairwise_scores(
           select_head_optional_tensor(in_weight, head_index, num_heads),
           select_head_optional_tensor(in_bias, head_index, num_heads),
           select_head_optional_tensor(out_weight, head_index, num_heads),
-          select_head_optional_tensor(out_bias, head_index, num_heads)));
+          select_head_optional_tensor(out_bias, head_index, num_heads));
+      if (best_scores.has_value()) {
+        best_scores = torch::maximum(best_scores.value(), head_scores);
+      } else {
+        best_scores = head_scores;
+      }
     }
-    return std::get<0>(torch::stack(head_scores, -1).max(-1));
+    if (!best_scores.has_value()) {
+      throw std::runtime_error("multihead_max pairwise kernel requires at least one head.");
+    }
+    return best_scores.value();
   }
 
   if (pairwise_kind == "diagonal_bilinear") {
@@ -568,10 +575,9 @@ torch::Tensor pairwise_route_block_logits(
   if (starts_with(route_kind, "multihead_max_")) {
     const auto base_kind = route_kind.substr(std::string("multihead_max_").size());
     const auto num_heads = infer_multihead_count(core_weight, source_weight, target_weight);
-    std::vector<torch::Tensor> head_scores;
-    head_scores.reserve(static_cast<size_t>(num_heads));
+    c10::optional<torch::Tensor> best_scores = c10::nullopt;
     for (int64_t head_index = 0; head_index < num_heads; ++head_index) {
-      head_scores.push_back(pairwise_route_block_logits(
+      auto head_scores = pairwise_route_block_logits(
           base_kind,
           src_val,
           dst_val,
@@ -585,9 +591,17 @@ torch::Tensor pairwise_route_block_logits(
           select_head_optional_tensor(hidden_bias, head_index, num_heads),
           select_head_optional_tensor(out_weight, head_index, num_heads),
           select_head_optional_tensor(out_bias, head_index, num_heads),
-          temperature));
+          temperature);
+      if (best_scores.has_value()) {
+        best_scores = torch::maximum(best_scores.value(), head_scores);
+      } else {
+        best_scores = head_scores;
+      }
     }
-    return std::get<0>(torch::stack(head_scores, -1).max(-1));
+    if (!best_scores.has_value()) {
+      throw std::runtime_error("multihead_max route kernel requires at least one head.");
+    }
+    return best_scores.value();
   }
 
   if (temperature <= 0.0) {

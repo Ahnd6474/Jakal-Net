@@ -804,21 +804,21 @@ def _native_scan_pairwise_scores(
 ) -> Tensor:
     if pairwise_kind.startswith("multihead_max_"):
         base_kind = pairwise_kind[len("multihead_max_") :]
-        head_scores: list[Tensor] = []
         num_heads = int(core_weight.shape[0])
+        best_scores: Tensor | None = None
         for head_index in range(num_heads):
-            head_scores.append(
-                _native_scan_pairwise_scores(
-                    base_kind,
-                    src_val,
-                    dst_val,
-                    source_weight[head_index] if source_weight.numel() != 0 else source_weight,
-                    target_weight[head_index] if target_weight.numel() != 0 else target_weight,
-                    core_weight[head_index],
-                    packed_bias[head_index] if packed_bias.numel() != 0 else packed_bias,
-                )
+            head_scores = _native_scan_pairwise_scores(
+                base_kind,
+                src_val,
+                dst_val,
+                source_weight[head_index] if source_weight.numel() != 0 else source_weight,
+                target_weight[head_index] if target_weight.numel() != 0 else target_weight,
+                core_weight[head_index],
+                packed_bias[head_index] if packed_bias.numel() != 0 else packed_bias,
             )
-        return torch.stack(head_scores, dim=-1).max(dim=-1).values
+            best_scores = head_scores if best_scores is None else torch.maximum(best_scores, head_scores)
+        assert best_scores is not None
+        return best_scores
     if pairwise_kind == "low_rank_bilinear":
         projected_source = F.linear(src_val, source_weight.to(dtype=src_val.dtype), None)
         projected_source = projected_source * core_weight.to(dtype=src_val.dtype)
@@ -859,21 +859,21 @@ def _native_scan_route_scores(
 ) -> Tensor:
     if route_kind_name.startswith("multihead_max_"):
         base_kind = route_kind_name[len("multihead_max_") :]
-        head_scores: list[Tensor] = []
         num_heads = int(core_weight.shape[0])
+        best_scores: Tensor | None = None
         for head_index in range(num_heads):
-            head_scores.append(
-                _native_scan_route_scores(
-                    base_kind,
-                    src_val,
-                    dst_val,
-                    source_weight[head_index] if source_weight.numel() != 0 else source_weight,
-                    target_weight[head_index] if target_weight.numel() != 0 else target_weight,
-                    core_weight[head_index],
-                    packed_bias[head_index] if packed_bias.numel() != 0 else packed_bias,
-                )
+            head_scores = _native_scan_route_scores(
+                base_kind,
+                src_val,
+                dst_val,
+                source_weight[head_index] if source_weight.numel() != 0 else source_weight,
+                target_weight[head_index] if target_weight.numel() != 0 else target_weight,
+                core_weight[head_index],
+                packed_bias[head_index] if packed_bias.numel() != 0 else packed_bias,
             )
-        return torch.stack(head_scores, dim=-1).max(dim=-1).values
+            best_scores = head_scores if best_scores is None else torch.maximum(best_scores, head_scores)
+        assert best_scores is not None
+        return best_scores
     if route_kind_name == "low_rank_bilinear_route":
         projected_source = F.linear(src_val, source_weight.to(dtype=src_val.dtype), None)
         projected_source = projected_source * core_weight.to(dtype=src_val.dtype)
