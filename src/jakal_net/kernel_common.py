@@ -17,6 +17,8 @@ from jakal_net.modules import (
     LowRankBilinearRoute,
     MLPRoute,
     BilinearPairwiseRoute,
+    QueryNormalizedDotRoute,
+    ScaledCosinePairwise,
     SourceTargetHadamardMLPRoute,
 )
 
@@ -101,6 +103,7 @@ def supports_pairwise_kernel(pairwise_fn: object) -> bool:
             BilinearPairwise,
             LowRankBilinearPairwise,
             HadamardMLPPairwise,
+            ScaledCosinePairwise,
         ),
     )
 
@@ -123,6 +126,7 @@ def supports_pairwise_route_kernel(route_fn: object) -> bool:
             DiagonalBilinearRoute,
             LowRankBilinearRoute,
             BilinearPairwiseRoute,
+            QueryNormalizedDotRoute,
             SourceTargetHadamardMLPRoute,
         ),
     )
@@ -148,6 +152,12 @@ def pairwise_kernel_spec(pairwise_fn: object) -> PairwiseKernelSpec:
             kind="bilinear",
             weight=pairwise_fn.weight,
             bias=pairwise_fn.bias,
+        )
+    if isinstance(pairwise_fn, ScaledCosinePairwise):
+        return PairwiseKernelSpec(
+            kind="scaled_cosine",
+            weight=pairwise_fn.scale_buffer,
+            bias=pairwise_fn.eps_buffer,
         )
     if isinstance(pairwise_fn, HadamardMLPPairwise):
         return PairwiseKernelSpec(
@@ -215,6 +225,17 @@ def pairwise_route_kernel_spec(route_fn: object) -> PairwiseRouteKernelSpec:
             target_bias=None,
             core_weight=inner.weight,
             bias=inner.bias,
+            temperature=temperature,
+        )
+    if isinstance(inner, QueryNormalizedDotRoute):
+        return PairwiseRouteKernelSpec(
+            kind="query_normalized_dot_route",
+            source_weight=None,
+            source_bias=None,
+            target_weight=None,
+            target_bias=None,
+            core_weight=inner.scale_buffer,
+            bias=inner.eps_buffer,
             temperature=temperature,
         )
     if isinstance(inner, SourceTargetHadamardMLPRoute):

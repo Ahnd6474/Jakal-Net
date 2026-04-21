@@ -152,6 +152,56 @@ class TrainingCurriculumStage:
 
 
 @dataclass(frozen=True, slots=True)
+class OptimizerParameterGroupConfig:
+    name: str
+    lr_scale: float
+    weight_decay: float
+    parameter_count: int
+
+
+class SharedEmbeddingRnnAuxHead(torch.nn.Module):
+    def __init__(
+        self,
+        *,
+        embedding_dim: int,
+        vocab_size: int,
+        hidden_dim: int | None = None,
+        num_layers: int = 1,
+    ) -> None:
+        super().__init__()
+        if num_layers <= 0:
+            raise ValueError("num_layers must be positive.")
+        hidden_size = int(hidden_dim or embedding_dim)
+        if hidden_size <= 0:
+            raise ValueError("hidden_dim must be positive.")
+        self.embedding_dim = int(embedding_dim)
+        self.hidden_dim = hidden_size
+        self.num_layers = int(num_layers)
+        self.rnn = torch.nn.GRU(
+            input_size=self.embedding_dim,
+            hidden_size=self.hidden_dim,
+            num_layers=self.num_layers,
+            batch_first=True,
+        )
+        self.norm = torch.nn.LayerNorm(self.hidden_dim)
+        self.output = torch.nn.Linear(self.hidden_dim, int(vocab_size), bias=False)
+        self._reset_parameters()
+
+    def _reset_parameters(self) -> None:
+        for name, parameter in self.rnn.named_parameters():
+            if "weight" in name:
+                torch.nn.init.xavier_uniform_(parameter)
+            elif "bias" in name:
+                torch.nn.init.zeros_(parameter)
+        torch.nn.init.normal_(self.output.weight, mean=0.0, std=0.02)
+
+    def forward(self, embedded_tokens: torch.Tensor) -> torch.Tensor:
+        hidden, _ = self.rnn(embedded_tokens)
+        hidden = self.norm(hidden)
+        return self.output(hidden)
+
+
+@dataclass(frozen=True, slots=True)
 class TokenizedDocument:
     kind: str
     source: str
@@ -2024,6 +2074,7 @@ def resolve_curriculum_stage(
     total_steps: int,
     stage1_ratio: float,
     stage2_ratio: float,
+    stage1_span: int,
     stage2_span: int,
     stage3_span: int,
     stage1_batch_size: int,
@@ -2038,12 +2089,12 @@ def resolve_curriculum_stage(
     if stage1_end > 0 and step <= stage1_end:
         return TrainingCurriculumStage(
             name="stage1",
-            document_span=1,
+            document_span=max(1, stage1_span),
             batch_size=max(1, stage1_batch_size),
             grad_accum_steps=max(1, stage1_grad_accum_steps),
-            freeze_memory=True,
-            freeze_propagation=True,
-            freeze_skip=True,
+            freeze_memory=False,
+            freeze_propagation=False,
+            freeze_skip=False,
             bucket_weights=resolve_stage_bucket_weights(stage_name="stage1"),
         )
     if stage2_end > 0 and step <= stage2_end:
@@ -2053,8 +2104,8 @@ def resolve_curriculum_stage(
             batch_size=max(1, stage2_batch_size),
             grad_accum_steps=max(1, stage2_grad_accum_steps),
             freeze_memory=False,
-            freeze_propagation=True,
-            freeze_skip=True,
+            freeze_propagation=False,
+            freeze_skip=False,
             bucket_weights=resolve_stage_bucket_weights(stage_name="stage2"),
         )
     return TrainingCurriculumStage(
@@ -2071,18 +2122,16 @@ def resolve_curriculum_stage(
 
 def apply_training_curriculum(model: CausalHierarchicalMemoryLM, stage: TrainingCurriculumStage) -> None:
     b_module = model.b_module
-    _set_module_requires_grad(b_module.memory_levels, not stage.freeze_memory)
-    _set_module_requires_grad(b_module.level_transitions, not stage.freeze_memory)
-    _set_module_requires_grad(b_module.level_norms, not stage.freeze_memory)
-    _set_module_requires_grad(b_module.read_projections, not stage.freeze_memory)
-    _set_parameter_collection_requires_grad(b_module.read_gates, not stage.freeze_memory)
-    b_module.read_template_val.requires_grad_(not stage.freeze_memory)
-
+    _set_module_requires_grad(b_module.memory_levels, True)
+    _set_module_requires_grad(b_module.level_transitions, True)
+    _set_module_requires_grad(b_module.level_norms, True)
+    _set_module_requires_grad(b_module.read_projections, True)
+    _set_parameter_collection_requires_grad(b_module.read_gates, True)
+    b_module.read_template_val.requires_grad_(True)
     for level in b_module.memory_levels:
-        _set_module_requires_grad(level.propagation, not stage.freeze_propagation)
-
-    _set_module_requires_grad(b_module.skip_transitions, not stage.freeze_skip)
-    _set_parameter_collection_requires_grad(tuple(b_module.skip_gates.values()), not stage.freeze_skip)
+        _set_module_requires_grad(level.propagation, True)
+    _set_module_requires_grad(b_module.skip_transitions, True)
+    _set_parameter_collection_requires_grad(tuple(b_module.skip_gates.values()), True)
 
 
 def override_batch_reset(batch: DocumentBatch, *, reset_all: bool) -> DocumentBatch:
@@ -2175,6 +2224,25 @@ def compute_learning_rate(
     progress = max(0.0, min(1.0, (step - warmup_steps) / denom))
     cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
     return base_lr * (min_ratio + (1.0 - min_ratio) * cosine)
+
+
+def compute_decayed_scalar(
+    *,
+    step: int,
+    start_step: int,
+    end_step: int,
+    initial_value: float,
+    final_value: float,
+) -> float:
+    if step <= start_step:
+        return float(initial_value)
+    if end_step <= start_step:
+        return float(final_value)
+    if step >= end_step:
+        return float(final_value)
+    progress = (step - start_step) / max(1, end_step - start_step)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return float(final_value + (initial_value - final_value) * cosine)
 
 
 def detach_memory_state(memory_state: Any | None) -> Any | None:
@@ -2411,7 +2479,9 @@ def run_model(
     memory_state: Any | None,
     precision: str,
     grad_enabled: bool,
-) -> tuple[torch.Tensor, Any | None]:
+    rnn_aux_head: SharedEmbeddingRnnAuxHead | None = None,
+    rnn_aux_weight: float = 0.0,
+) -> tuple[torch.Tensor, float, float, Any | None]:
     autocast_dtype = resolve_autocast_dtype(precision)
     autocast_supported = (
         autocast_dtype is not None
@@ -2435,8 +2505,16 @@ def run_model(
                 return_memory_state=True,
             )
             assert isinstance(output, MemoryScanOutput)
-            loss = compute_masked_loss(output.logits, batch.target, batch.loss_mask)
-    return loss, output.recurrent_state
+            main_loss = compute_masked_loss(output.logits, batch.target, batch.loss_mask)
+            aux_loss_value = 0.0
+            total_loss = main_loss
+            if grad_enabled and rnn_aux_head is not None and rnn_aux_weight > 0.0:
+                embedded_tokens = model.s_module.token_embedding(batch.context)
+                aux_logits = rnn_aux_head(embedded_tokens)
+                aux_loss = compute_masked_loss(aux_logits, batch.target, batch.loss_mask)
+                aux_loss_value = float(aux_loss.detach().item())
+                total_loss = total_loss + aux_loss * float(rnn_aux_weight)
+    return total_loss, float(main_loss.detach().item()), aux_loss_value, output.recurrent_state
 
 
 @torch.no_grad()
@@ -2464,7 +2542,7 @@ def estimate_eval_loss(
                 loss_mask=chunk.loss_mask.unsqueeze(0).to(device),
                 reset_mask=torch.tensor([chunk_index == 0], device=device, dtype=torch.bool),
             )
-            loss, memory_state = run_model(
+            loss, _, _, memory_state = run_model(
                 model,
                 batch,
                 memory_state=memory_state,
@@ -2517,7 +2595,7 @@ def estimate_eval_loss_flat(
                 loss_mask=loss_mask.unsqueeze(0).to(device),
                 reset_mask=torch.tensor([chunk_index == chunk_start], device=device, dtype=torch.bool),
             )
-            loss, memory_state = run_model(
+            loss, _, _, memory_state = run_model(
                 model,
                 batch,
                 memory_state=memory_state,
@@ -2536,6 +2614,7 @@ def save_checkpoint(
     path: Path,
     *,
     model: CausalHierarchicalMemoryLM,
+    rnn_aux_head: SharedEmbeddingRnnAuxHead | None,
     optimizer: torch.optim.Optimizer,
     step: int,
     args: argparse.Namespace,
@@ -2549,6 +2628,7 @@ def save_checkpoint(
         {
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
+            "rnn_aux_state_dict": None if rnn_aux_head is None else rnn_aux_head.state_dict(),
             "step": step,
             "args": vars(args),
             "train_loss": train_loss,
@@ -2621,12 +2701,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable-scan-backward-cuda", action="store_true")
     parser.add_argument(
         "--pairwise-kind",
-        choices=("low_rank_bilinear", "diagonal_bilinear", "bilinear", "additive_low_rank"),
+        choices=("low_rank_bilinear", "diagonal_bilinear", "bilinear", "additive_low_rank", "scaled_cosine"),
         default="low_rank_bilinear",
     )
     parser.add_argument(
         "--route-kind",
-        choices=("low_rank_bilinear", "diagonal_bilinear", "bilinear", "additive_low_rank"),
+        choices=("low_rank_bilinear", "diagonal_bilinear", "bilinear", "additive_low_rank", "query_norm_dot"),
         default="low_rank_bilinear",
     )
     parser.add_argument("--pairwise-rank", type=int, default=64)
@@ -2648,6 +2728,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--optimizer", choices=("adamw", "adamw_fused", "adamw8bit"), default="adamw_fused")
+    parser.add_argument("--embedding-lr-mult", type=float, default=1.0)
+    parser.add_argument("--b-lr-mult", type=float, default=0.4)
+    parser.add_argument("--b-propagation-lr-mult", type=float, default=0.15)
+    parser.add_argument("--b-route-lr-mult", type=float, default=0.05)
+    parser.add_argument("--rnn-aux-head", action="store_true")
+    parser.add_argument("--rnn-aux-hidden-dim", type=int, default=0)
+    parser.add_argument("--rnn-aux-layers", type=int, default=1)
+    parser.add_argument("--rnn-aux-loss-weight", type=float, default=0.5)
+    parser.add_argument("--rnn-aux-loss-weight-final", type=float, default=0.05)
+    parser.add_argument("--rnn-aux-decay-start", type=int, default=500)
+    parser.add_argument("--rnn-aux-decay-end", type=int, default=5000)
+    parser.add_argument("--rnn-aux-lr-mult", type=float, default=1.0)
+    parser.add_argument("--rnn-aux-lr-final-ratio", type=float, default=0.1)
     parser.add_argument("--warmup-steps", type=int, default=200)
     parser.add_argument("--lr-min-ratio", type=float, default=0.1)
     parser.add_argument("--epochs", type=float, default=1.0)
@@ -2657,6 +2750,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-documents", type=int, default=8)
     parser.add_argument("--curriculum-stage1-ratio", type=float, default=0.1)
     parser.add_argument("--curriculum-stage2-ratio", type=float, default=0.4)
+    parser.add_argument("--curriculum-stage1-span", type=int, default=2)
     parser.add_argument("--curriculum-stage2-span", type=int, default=4)
     parser.add_argument("--curriculum-stage3-span", type=int, default=8)
 
@@ -2716,8 +2810,81 @@ def configure_native_runtime_flags(args: argparse.Namespace) -> None:
         os.environ.pop(EXPERIMENTAL_SCAN_BACKWARD_CUDA_ENV, None)
 
 
-def build_optimizer(
+def _parameter_group_name(name: str) -> str:
+    if name.startswith("rnn_aux_head."):
+        return "rnn_aux"
+    if name.startswith("s_module.token_embedding."):
+        return "embedding"
+    if name.startswith("b_module."):
+        if ".route_fn." in name:
+            return "b_route"
+        if ".pairwise_fn." in name:
+            return "b_propagation"
+        return "b_module"
+    return "default"
+
+
+def build_parameter_groups(
     model: CausalHierarchicalMemoryLM,
+    *,
+    learning_rate: float,
+    weight_decay: float,
+    embedding_lr_mult: float,
+    b_lr_mult: float,
+    b_propagation_lr_mult: float,
+    b_route_lr_mult: float,
+    rnn_aux_head: SharedEmbeddingRnnAuxHead | None = None,
+    rnn_aux_lr_mult: float = 1.0,
+) -> tuple[list[dict[str, Any]], tuple[OptimizerParameterGroupConfig, ...]]:
+    lr_scales = {
+        "default": 1.0,
+        "embedding": float(embedding_lr_mult),
+        "b_module": float(b_lr_mult),
+        "b_propagation": float(b_propagation_lr_mult),
+        "b_route": float(b_route_lr_mult),
+        "rnn_aux": float(rnn_aux_lr_mult),
+    }
+    grouped: dict[str, dict[str, Any]] = {
+        group_name: {
+            "params": [],
+            "lr": learning_rate * scale,
+            "weight_decay": weight_decay,
+            "group_name": group_name,
+            "lr_scale": scale,
+        }
+        for group_name, scale in lr_scales.items()
+    }
+    counts = {group_name: 0 for group_name in lr_scales}
+    seen: set[int] = set()
+    named_parameter_sources: list[tuple[str, torch.nn.Parameter]] = list(model.named_parameters())
+    if rnn_aux_head is not None:
+        named_parameter_sources.extend((f"rnn_aux_head.{name}", parameter) for name, parameter in rnn_aux_head.named_parameters())
+    for parameter_name, parameter in named_parameter_sources:
+        if not parameter.requires_grad:
+            continue
+        parameter_id = id(parameter)
+        if parameter_id in seen:
+            continue
+        seen.add(parameter_id)
+        group_name = _parameter_group_name(parameter_name)
+        grouped[group_name]["params"].append(parameter)
+        counts[group_name] += int(parameter.numel())
+    param_groups = [group for group in grouped.values() if group["params"]]
+    group_configs = tuple(
+        OptimizerParameterGroupConfig(
+            name=group_name,
+            lr_scale=lr_scales[group_name],
+            weight_decay=weight_decay,
+            parameter_count=counts[group_name],
+        )
+        for group_name in ("default", "embedding", "b_module", "b_propagation", "b_route", "rnn_aux")
+        if counts[group_name] > 0
+    )
+    return param_groups, group_configs
+
+
+def build_optimizer(
+    param_groups: Sequence[dict[str, Any]],
     *,
     name: str,
     learning_rate: float,
@@ -2725,27 +2892,26 @@ def build_optimizer(
     device: torch.device,
 ) -> torch.optim.Optimizer:
     optimizer_name = name.lower()
-    parameter_iterable = model.parameters()
     if optimizer_name == "adamw":
-        return torch.optim.AdamW(parameter_iterable, lr=learning_rate, weight_decay=weight_decay)
+        return torch.optim.AdamW(param_groups, lr=learning_rate, weight_decay=weight_decay)
     if optimizer_name == "adamw_fused":
         if device.type == "cuda":
             try:
                 return torch.optim.AdamW(
-                    parameter_iterable,
+                    param_groups,
                     lr=learning_rate,
                     weight_decay=weight_decay,
                     fused=True,
                 )
             except TypeError:
                 pass
-        return torch.optim.AdamW(parameter_iterable, lr=learning_rate, weight_decay=weight_decay)
+        return torch.optim.AdamW(param_groups, lr=learning_rate, weight_decay=weight_decay)
     if optimizer_name == "adamw8bit":
         try:
             from bitsandbytes.optim import AdamW8bit  # type: ignore
         except ImportError as exc:  # pragma: no cover - optional dependency
             raise ImportError("bitsandbytes is required for --optimizer adamw8bit.") from exc
-        return AdamW8bit(parameter_iterable, lr=learning_rate, weight_decay=weight_decay)
+        return AdamW8bit(param_groups, lr=learning_rate, weight_decay=weight_decay)
     raise ValueError(f"Unsupported optimizer: {name!r}")
 
 
@@ -2776,8 +2942,21 @@ def main() -> None:
         raise ValueError("curriculum-stage2-ratio must be between 0 and 1.")
     if args.curriculum_stage2_ratio < args.curriculum_stage1_ratio:
         raise ValueError("curriculum-stage2-ratio must be greater than or equal to curriculum-stage1-ratio.")
-    if args.curriculum_stage2_span <= 0 or args.curriculum_stage3_span <= 0:
+    if args.curriculum_stage1_span <= 0 or args.curriculum_stage2_span <= 0 or args.curriculum_stage3_span <= 0:
         raise ValueError("curriculum-stage spans must be positive.")
+    if min(
+        args.embedding_lr_mult,
+        args.b_lr_mult,
+        args.b_propagation_lr_mult,
+        args.b_route_lr_mult,
+        args.rnn_aux_lr_mult,
+        args.rnn_aux_lr_final_ratio,
+        args.rnn_aux_loss_weight,
+        args.rnn_aux_loss_weight_final,
+    ) < 0.0:
+        raise ValueError("Learning-rate multipliers must be non-negative.")
+    if args.rnn_aux_layers <= 0:
+        raise ValueError("rnn-aux-layers must be positive.")
     if any(
         value < 0
         for value in (
@@ -2971,7 +3150,16 @@ def main() -> None:
         knowledge_propagation_topk=None if args.knowledge_propagation_topk <= 0 else args.knowledge_propagation_topk,
         knowledge_propagation_layers=args.knowledge_propagation_layers,
     ).to(device)
+    rnn_aux_head = None
+    if args.rnn_aux_head:
+        rnn_aux_head = SharedEmbeddingRnnAuxHead(
+            embedding_dim=args.dim,
+            vocab_size=vocab_size,
+            hidden_dim=None if args.rnn_aux_hidden_dim <= 0 else args.rnn_aux_hidden_dim,
+            num_layers=args.rnn_aux_layers,
+        ).to(device)
     parameter_count = count_parameters(model)
+    rnn_aux_parameter_count = 0 if rnn_aux_head is None else count_parameters(rnn_aux_head)
     print(
         f"model=causal_memory_doc | params={parameter_count:,} | dim={args.dim} | seq_len={args.seq_len} | "
         f"s_window={args.s_window} | s_microbatch_size={args.s_microbatch_size} | "
@@ -2981,6 +3169,14 @@ def main() -> None:
         f"checkpoint_prediction={args.checkpoint_prediction_layers}",
         flush=True,
     )
+    if rnn_aux_head is not None:
+        print(
+            f"rnn_aux | params={rnn_aux_parameter_count:,} | hidden_dim={rnn_aux_head.hidden_dim} | "
+            f"layers={rnn_aux_head.num_layers} | loss_weight={args.rnn_aux_loss_weight} | "
+            f"loss_weight_final={args.rnn_aux_loss_weight_final} | decay_start={args.rnn_aux_decay_start} | "
+            f"decay_end={args.rnn_aux_decay_end}",
+            flush=True,
+        )
     print(
         f"native_runtime | fused_training={args.enable_fused_training} | "
         f"fused_training_checkpoint_stride={args.fused_training_checkpoint_stride} | "
@@ -2991,6 +3187,11 @@ def main() -> None:
         f"curriculum_batches | stage1=batch{stage1_batch_size}/ga{stage1_grad_accum_steps} | "
         f"stage2=batch{stage2_batch_size}/ga{stage2_grad_accum_steps} | "
         f"stage3=batch{stage3_batch_size}/ga{stage3_grad_accum_steps}",
+        flush=True,
+    )
+    print(
+        f"curriculum_spans | stage1={args.curriculum_stage1_span} | "
+        f"stage2={args.curriculum_stage2_span} | stage3={args.curriculum_stage3_span}",
         flush=True,
     )
     print(
@@ -3008,6 +3209,7 @@ def main() -> None:
             "tokenizer_label": tokenizer_label,
             "tokenizer_model_path": tokenizer_model_path,
             "parameter_count": parameter_count,
+            "rnn_aux_parameter_count": rnn_aux_parameter_count,
             "corpus_metadata": corpus_metadata,
         },
     )
@@ -3018,8 +3220,27 @@ def main() -> None:
             raise ImportError("tensorboard is not installed.")
         writer = SummaryWriter(log_dir=str(run_dir / "tensorboard"))
 
-    optimizer = build_optimizer(
+    param_groups, param_group_configs = build_parameter_groups(
         model,
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
+        embedding_lr_mult=args.embedding_lr_mult,
+        b_lr_mult=args.b_lr_mult,
+        b_propagation_lr_mult=args.b_propagation_lr_mult,
+        b_route_lr_mult=args.b_route_lr_mult,
+        rnn_aux_head=rnn_aux_head,
+        rnn_aux_lr_mult=args.rnn_aux_lr_mult,
+    )
+    print(
+        "optimizer_groups | "
+        + " | ".join(
+            f"{group.name}:count={group.parameter_count:,},lr_scale={group.lr_scale:.4f}"
+            for group in param_group_configs
+        ),
+        flush=True,
+    )
+    optimizer = build_optimizer(
+        param_groups,
         name=args.optimizer,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
@@ -3052,6 +3273,8 @@ def main() -> None:
         checkpoint_path = Path(args.resume_checkpoint)
         checkpoint = load_checkpoint(checkpoint_path, device=device)
         model.load_state_dict(checkpoint["model_state_dict"])
+        if rnn_aux_head is not None and checkpoint.get("rnn_aux_state_dict") is not None:
+            rnn_aux_head.load_state_dict(checkpoint["rnn_aux_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         start_step = int(checkpoint.get("step", 0))
         checkpoint_val_loss = checkpoint.get("val_loss")
@@ -3064,6 +3287,9 @@ def main() -> None:
         )
     optimizer.zero_grad(set_to_none=True)
     start_time = time.time()
+    grad_clip_parameters = list(model.parameters())
+    if rnn_aux_head is not None:
+        grad_clip_parameters.extend(parameter for parameter in rnn_aux_head.parameters() if parameter.requires_grad)
 
     for step in range(start_step + 1, total_steps + 1):
         stage = resolve_curriculum_stage(
@@ -3071,6 +3297,7 @@ def main() -> None:
             total_steps=total_steps,
             stage1_ratio=args.curriculum_stage1_ratio,
             stage2_ratio=args.curriculum_stage2_ratio,
+            stage1_span=args.curriculum_stage1_span,
             stage2_span=args.curriculum_stage2_span,
             stage3_span=args.curriculum_stage3_span,
             stage1_batch_size=stage1_batch_size,
@@ -3108,11 +3335,29 @@ def main() -> None:
             warmup_steps=args.warmup_steps,
             min_ratio=args.lr_min_ratio,
         )
+        rnn_aux_lr_scale = compute_decayed_scalar(
+            step=step,
+            start_step=max(0, int(args.rnn_aux_decay_start)),
+            end_step=max(int(args.rnn_aux_decay_start), int(args.rnn_aux_decay_end)),
+            initial_value=1.0,
+            final_value=float(args.rnn_aux_lr_final_ratio),
+        )
+        rnn_aux_weight = compute_decayed_scalar(
+            step=step,
+            start_step=max(0, int(args.rnn_aux_decay_start)),
+            end_step=max(int(args.rnn_aux_decay_start), int(args.rnn_aux_decay_end)),
+            initial_value=float(args.rnn_aux_loss_weight),
+            final_value=float(args.rnn_aux_loss_weight_final),
+        )
         for param_group in optimizer.param_groups:
-            param_group["lr"] = lr
+            group_lr = lr * float(param_group.get("lr_scale", 1.0))
+            if param_group.get("group_name") == "rnn_aux":
+                group_lr *= rnn_aux_lr_scale
+            param_group["lr"] = group_lr
 
         current_memory_state = None if stage.freeze_memory else train_memory_state
         span_losses: list[float] = []
+        span_aux_losses: list[float] = []
         span_loss_tensors: list[torch.Tensor] = []
         loss_is_finite = True
         for span_index in range(stage.document_span):
@@ -3120,12 +3365,14 @@ def main() -> None:
                 prefetcher.next_batch(),
                 reset_all=stage.freeze_memory,
             )
-            loss, next_memory_state = run_model(
+            loss, main_loss_value, aux_loss_value, next_memory_state = run_model(
                 model,
                 batch,
                 memory_state=current_memory_state,
                 precision=args.precision,
                 grad_enabled=True,
+                rnn_aux_head=rnn_aux_head,
+                rnn_aux_weight=rnn_aux_weight,
             )
             loss_is_finite = bool(torch.isfinite(loss.detach()).item())
             if not loss_is_finite:
@@ -3134,7 +3381,8 @@ def main() -> None:
                     flush=True,
                 )
                 break
-            span_losses.append(float(loss.item()))
+            span_losses.append(main_loss_value)
+            span_aux_losses.append(aux_loss_value)
             span_loss_tensors.append(loss)
             current_memory_state = None if stage.freeze_memory else next_memory_state
 
@@ -3160,7 +3408,7 @@ def main() -> None:
             try:
                 grad_norm = float(
                     torch.nn.utils.clip_grad_norm_(
-                        model.parameters(),
+                        grad_clip_parameters,
                         args.grad_clip,
                         error_if_nonfinite=True,
                     ).item()
@@ -3181,10 +3429,16 @@ def main() -> None:
             grad_norm = float("nan")
 
         train_loss = float(sum(span_losses) / max(1, len(span_losses)))
+        train_aux_loss = float(sum(span_aux_losses) / max(1, len(span_aux_losses))) if span_aux_losses else 0.0
+        train_total_loss = train_loss + rnn_aux_weight * train_aux_loss
         avg_cpu_batch_seconds, prefetch_queue_size = prefetcher.stats()
         if writer is not None:
             writer.add_scalar("train/loss", train_loss, step)
+            writer.add_scalar("train/aux_loss", train_aux_loss, step)
+            writer.add_scalar("train/total_loss", train_total_loss, step)
             writer.add_scalar("train/lr", lr, step)
+            writer.add_scalar("train/rnn_aux_lr_scale", rnn_aux_lr_scale, step)
+            writer.add_scalar("train/rnn_aux_weight", rnn_aux_weight, step)
             writer.add_scalar("train/document_span", stage.document_span, step)
             writer.add_scalar("train/cpu_batch_ms", avg_cpu_batch_seconds * 1000.0, step)
             writer.add_scalar("train/prefetch_queue_size", prefetch_queue_size, step)
@@ -3197,7 +3451,7 @@ def main() -> None:
             elapsed = time.time() - start_time
             print(
                 f"progress | step={step:5d}/{total_steps} | stage={stage.name} | span={stage.document_span} | "
-                f"train_loss={train_loss:.4f} | lr={lr:.6g} | "
+                f"train_loss={train_loss:.4f} | aux_loss={train_aux_loss:.4f} | total_loss={train_total_loss:.4f} | lr={lr:.6g} | "
                 f"cpu_batch_ms={avg_cpu_batch_seconds * 1000.0:.1f} | prefetch_q={prefetch_queue_size} | "
                 f"elapsed={elapsed:.1f}s",
                 flush=True,
@@ -3256,6 +3510,7 @@ def main() -> None:
                 save_checkpoint(
                     checkpoints_dir / "best.pt",
                     model=model,
+                    rnn_aux_head=rnn_aux_head,
                     optimizer=optimizer,
                     step=step,
                     args=args,
@@ -3273,6 +3528,7 @@ def main() -> None:
             save_checkpoint(
                 checkpoints_dir / "last.pt",
                 model=model,
+                rnn_aux_head=rnn_aux_head,
                 optimizer=optimizer,
                 step=step,
                 args=args,
@@ -3291,8 +3547,12 @@ def main() -> None:
             "stage": stage.name,
             "document_span": stage.document_span,
             "train_loss": train_loss,
+            "train_aux_loss": train_aux_loss,
+            "train_total_loss": train_total_loss,
             "grad_norm": grad_norm,
             "lr": lr,
+            "rnn_aux_lr_scale": rnn_aux_lr_scale,
+            "rnn_aux_weight": rnn_aux_weight,
             "val_loss": val_loss,
             "val_ppl": None if val_loss is None else perplexity_from_loss(val_loss),
         }

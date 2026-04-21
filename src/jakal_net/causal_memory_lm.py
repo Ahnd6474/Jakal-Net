@@ -19,8 +19,13 @@ from jakal_net._architectural_common import (
 )
 from jakal_net.core import Layer
 from jakal_net.hierarchical_memory import BModule, BScanOutput
+from jakal_net.kernel_common import (
+    pairwise_kernel_spec,
+    pairwise_route_kernel_spec,
+    supports_pairwise_kernel,
+    supports_pairwise_route_kernel,
+)
 from jakal_net.latent_graph import KModule
-from jakal_net.modules import LowRankBilinearPairwise, LowRankBilinearRoute
 from jakal_net.native_backend import (
     causal_memory_scan_fused_native,
     native_supports,
@@ -294,40 +299,48 @@ class CausalHierarchicalMemoryLM(nn.Module):
         supported_route_compress = {"softmax", "signed_abs_softmax", "signed_entmax15"}
         supported_edge_compress = {"softsign", "signed_abs_softmax", "signed_entmax15"}
 
-        def _is_low_rank_route(transition) -> bool:
+        def _is_supported_route(transition) -> bool:
             return (
-                isinstance(transition.route_fn, LowRankBilinearRoute)
+                supports_pairwise_route_kernel(transition.route_fn)
                 and transition.route_compress_name in supported_route_compress
             )
 
-        def _is_low_rank_topk_propagation(propagation) -> bool:
+        def _is_supported_propagation(propagation) -> bool:
             return (
-                isinstance(propagation.pairwise_fn, LowRankBilinearPairwise)
-                and propagation.sparse_type == "topk"
+                supports_pairwise_kernel(propagation.pairwise_fn)
+                and propagation.sparse_type in {"topk", "dense"}
                 and propagation.state_weight_edges
                 and self._native_edge_compress_name(propagation.edge_compress_fn) in supported_edge_compress
             )
 
         if not isinstance(self.value_to_state, nn.Linear):
             return False
-        if not all(_is_low_rank_route(level.write) for level in self.b_module.memory_levels):
+        if not all(_is_supported_route(level.write) for level in self.b_module.memory_levels):
             return False
-        if not all(_is_low_rank_topk_propagation(level.propagation) for level in self.b_module.memory_levels):
+        if not all(_is_supported_propagation(level.propagation) for level in self.b_module.memory_levels):
             return False
-        if not all(_is_low_rank_route(transition) for transition in self.b_module.level_transitions):
+        if not all(_is_supported_route(transition) for transition in self.b_module.level_transitions):
             return False
-        if not all(_is_low_rank_route(transition) for transition in self.b_module.skip_transitions.values()):
+        if not all(_is_supported_route(transition) for transition in self.b_module.skip_transitions.values()):
             return False
         route_names = {level.write.route_compress_name for level in self.b_module.memory_levels}
         route_names.update(transition.route_compress_name for transition in self.b_module.level_transitions)
         route_names.update(transition.route_compress_name for transition in self.b_module.skip_transitions.values())
         if len(route_names) != 1:
             return False
+        route_kinds = {pairwise_route_kernel_spec(level.write.route_fn).kind for level in self.b_module.memory_levels}
+        route_kinds.update(pairwise_route_kernel_spec(transition.route_fn).kind for transition in self.b_module.level_transitions)
+        route_kinds.update(pairwise_route_kernel_spec(transition.route_fn).kind for transition in self.b_module.skip_transitions.values())
+        if len(route_kinds) != 1:
+            return False
         propagation_names = {
             self._native_edge_compress_name(level.propagation.edge_compress_fn)
             for level in self.b_module.memory_levels
         }
         if None in propagation_names or len(propagation_names) != 1:
+            return False
+        propagation_kinds = {pairwise_kernel_spec(level.propagation.pairwise_fn).kind for level in self.b_module.memory_levels}
+        if len(propagation_kinds) != 1:
             return False
         return True
 
@@ -349,6 +362,31 @@ class CausalHierarchicalMemoryLM(nn.Module):
         if propagation_compress_name is None:
             raise RuntimeError("Unsupported propagation edge_compress_fn for native scan.")
 
+        route_kind_name = pairwise_route_kernel_spec(self.b_module.memory_levels[0].write.route_fn).kind
+        propagation_pairwise_kind = pairwise_kernel_spec(self.b_module.memory_levels[0].propagation.pairwise_fn).kind
+
+        def _route_spec(route_fn: nn.Module) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+            spec = pairwise_route_kernel_spec(route_fn)
+            return (
+                self._tensor_or_empty(spec.source_weight, aligned_s),
+                self._tensor_or_empty(spec.target_weight, aligned_s),
+                spec.core_weight,
+                self._tensor_or_empty(spec.bias, aligned_s),
+            )
+
+        def _pairwise_spec(pairwise_fn: nn.Module) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+            spec = pairwise_kernel_spec(pairwise_fn)
+            return (
+                self._tensor_or_empty(spec.in_weight, aligned_s),
+                self._tensor_or_empty(spec.out_weight, aligned_s),
+                spec.weight,
+                self._tensor_or_empty(spec.bias, aligned_s),
+            )
+
+        write_specs = [_route_spec(level.write.route_fn) for level in self.b_module.memory_levels]
+        propagation_specs = [_pairwise_spec(level.propagation.pairwise_fn) for level in self.b_module.memory_levels]
+        level_transition_specs = [_route_spec(transition.route_fn) for transition in self.b_module.level_transitions]
+
         skip_source_weights: list[Tensor] = []
         skip_target_weights: list[Tensor] = []
         skip_core_weights: list[Tensor] = []
@@ -357,23 +395,21 @@ class CausalHierarchicalMemoryLM(nn.Module):
         skip_topks: list[int] = []
         if self.num_memory_levels >= 2:
             transition = self.b_module.skip_transitions["token_to_1"]
-            route = transition.route_fn
-            assert isinstance(route, LowRankBilinearRoute)
-            skip_source_weights.append(route.source_proj.weight)
-            skip_target_weights.append(route.target_proj.weight)
-            skip_core_weights.append(route.weight)
-            skip_biases.append(self._tensor_or_empty(route.bias, aligned_s))
+            src_weight, tgt_weight, core_weight, packed_bias = _route_spec(transition.route_fn)
+            skip_source_weights.append(src_weight)
+            skip_target_weights.append(tgt_weight)
+            skip_core_weights.append(core_weight)
+            skip_biases.append(packed_bias)
             skip_gates.append(self.b_module.skip_gates["token_to_1"])
             skip_topks.append(int(transition.topk))
         for level_index in range(2, self.num_memory_levels):
             key = f"{level_index - 2}_to_{level_index}"
             transition = self.b_module.skip_transitions[key]
-            route = transition.route_fn
-            assert isinstance(route, LowRankBilinearRoute)
-            skip_source_weights.append(route.source_proj.weight)
-            skip_target_weights.append(route.target_proj.weight)
-            skip_core_weights.append(route.weight)
-            skip_biases.append(self._tensor_or_empty(route.bias, aligned_s))
+            src_weight, tgt_weight, core_weight, packed_bias = _route_spec(transition.route_fn)
+            skip_source_weights.append(src_weight)
+            skip_target_weights.append(tgt_weight)
+            skip_core_weights.append(core_weight)
+            skip_biases.append(packed_bias)
             skip_gates.append(self.b_module.skip_gates[key])
             skip_topks.append(int(transition.topk))
 
@@ -388,33 +424,26 @@ class CausalHierarchicalMemoryLM(nn.Module):
             "read_template_val": self.b_module.read_template_val,
             "read_projection_weights": tuple(projection.weight for projection in self.b_module.read_projections),
             "read_gates": tuple(self.b_module.read_gates),
-            "write_source_weights": tuple(level.write.route_fn.source_proj.weight for level in self.b_module.memory_levels),
-            "write_target_weights": tuple(level.write.route_fn.target_proj.weight for level in self.b_module.memory_levels),
-            "write_core_weights": tuple(level.write.route_fn.weight for level in self.b_module.memory_levels),
-            "write_biases": tuple(
-                self._tensor_or_empty(level.write.route_fn.bias, aligned_s)
-                for level in self.b_module.memory_levels
-            ),
+            "route_kind_name": route_kind_name,
+            "propagation_pairwise_kind": propagation_pairwise_kind,
+            "write_source_weights": tuple(spec[0] for spec in write_specs),
+            "write_target_weights": tuple(spec[1] for spec in write_specs),
+            "write_core_weights": tuple(spec[2] for spec in write_specs),
+            "write_biases": tuple(spec[3] for spec in write_specs),
             "write_topks": tuple(int(level.write.topk) for level in self.b_module.memory_levels),
             "transition_compress_name": transition_compress_name,
-            "propagation_source_weights": tuple(level.propagation.pairwise_fn.source_proj.weight for level in self.b_module.memory_levels),
-            "propagation_target_weights": tuple(level.propagation.pairwise_fn.target_proj.weight for level in self.b_module.memory_levels),
-            "propagation_core_weights": tuple(level.propagation.pairwise_fn.weight for level in self.b_module.memory_levels),
-            "propagation_biases": tuple(
-                self._tensor_or_empty(level.propagation.pairwise_fn.bias, aligned_s)
-                for level in self.b_module.memory_levels
-            ),
+            "propagation_source_weights": tuple(spec[0] for spec in propagation_specs),
+            "propagation_target_weights": tuple(spec[1] for spec in propagation_specs),
+            "propagation_core_weights": tuple(spec[2] for spec in propagation_specs),
+            "propagation_biases": tuple(spec[3] for spec in propagation_specs),
             "propagation_topks": tuple(int(level.propagation.topk or level.num_slots) for level in self.b_module.memory_levels),
             "propagation_compress_name": propagation_compress_name,
             "val_norm_weights": tuple(level.val_norm.weight for level in self.b_module.memory_levels),
             "val_norm_biases": tuple(level.val_norm.bias for level in self.b_module.memory_levels),
-            "level_transition_source_weights": tuple(transition.route_fn.source_proj.weight for transition in self.b_module.level_transitions),
-            "level_transition_target_weights": tuple(transition.route_fn.target_proj.weight for transition in self.b_module.level_transitions),
-            "level_transition_core_weights": tuple(transition.route_fn.weight for transition in self.b_module.level_transitions),
-            "level_transition_biases": tuple(
-                self._tensor_or_empty(transition.route_fn.bias, aligned_s)
-                for transition in self.b_module.level_transitions
-            ),
+            "level_transition_source_weights": tuple(spec[0] for spec in level_transition_specs),
+            "level_transition_target_weights": tuple(spec[1] for spec in level_transition_specs),
+            "level_transition_core_weights": tuple(spec[2] for spec in level_transition_specs),
+            "level_transition_biases": tuple(spec[3] for spec in level_transition_specs),
             "level_transition_topks": tuple(int(transition.topk) for transition in self.b_module.level_transitions),
             "level_norm_weights": tuple(norm.weight for norm in self.b_module.level_norms),
             "level_norm_biases": tuple(norm.bias for norm in self.b_module.level_norms),

@@ -84,6 +84,22 @@ class LowRankBilinearPairwise(nn.Module):
         return scores
 
 
+class ScaledCosinePairwise(nn.Module):
+    def __init__(self, dim: int, *, eps: float = 1e-6, scale: float | None = None) -> None:
+        super().__init__()
+        if dim <= 0:
+            raise ValueError("dim must be positive.")
+        self.eps = float(eps)
+        self.scale = float(dim**0.5 if scale is None else scale)
+        self.register_buffer("eps_buffer", torch.tensor(self.eps))
+        self.register_buffer("scale_buffer", torch.tensor(self.scale))
+
+    def forward(self, target_val: Tensor, source_val: Tensor) -> Tensor:
+        normalized_target = F.normalize(target_val, dim=-1, eps=self.eps)
+        normalized_source = F.normalize(source_val, dim=-1, eps=self.eps)
+        return torch.einsum("...id,...jd->...ij", normalized_target, normalized_source) * self.scale
+
+
 class HadamardMLPPairwise(nn.Module):
     def __init__(self, dim: int, hidden_dim: int | None = None) -> None:
         super().__init__()
@@ -216,6 +232,32 @@ class LowRankBilinearRoute(nn.Module):
         if self.bias is not None:
             scores = scores + self.bias
         return scores
+
+
+class QueryNormalizedDotRoute(nn.Module):
+    expects_pairwise_inputs = True
+
+    def __init__(
+        self,
+        src_dim: int,
+        dst_dim: int | None = None,
+        *,
+        eps: float = 1e-6,
+        scale: float = 1.0,
+    ) -> None:
+        super().__init__()
+        target_dim = src_dim if dst_dim is None else dst_dim
+        if target_dim != src_dim:
+            raise ValueError("QueryNormalizedDotRoute requires matching src/dst dimensions.")
+        self.eps = float(eps)
+        self.scale = float(scale)
+        self.register_buffer("eps_buffer", torch.tensor(self.eps))
+        self.register_buffer("scale_buffer", torch.tensor(self.scale))
+
+    def forward(self, source_val: Tensor, target_val: Tensor) -> Tensor:
+        numerators = torch.einsum("...id,...kd->...ik", source_val, target_val)
+        denominators = source_val.square().sum(dim=-1, keepdim=True).clamp_min(self.eps)
+        return numerators / denominators * self.scale
 
 
 class BilinearPairwiseRoute(nn.Module):

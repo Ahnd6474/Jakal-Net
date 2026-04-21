@@ -17,6 +17,8 @@ from jakal_net.modules import (
     LowRankBilinearPairwise,
     LowRankBilinearRoute,
     MLPRoute,
+    QueryNormalizedDotRoute,
+    ScaledCosinePairwise,
     ScalarAffine,
     SourceTargetHadamardMLPRoute,
 )
@@ -50,7 +52,9 @@ __all__ = [
     "native_available",
     "native_status",
     "Propagation",
+    "QueryNormalizedDotRoute",
     "resolve_device",
+    "ScaledCosinePairwise",
     "SModule",
     "ScalarAffine",
     "SparsePropagation",

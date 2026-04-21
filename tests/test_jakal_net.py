@@ -9,6 +9,8 @@ from jakal_net import (
     LinearRoute,
     MLPRoute,
     Propagation,
+    QueryNormalizedDotRoute,
+    ScaledCosinePairwise,
     SparsePropagation,
     SparseTransition,
     SourceTargetHadamardMLPRoute,
@@ -102,6 +104,30 @@ class JakalNetModuleTests(unittest.TestCase):
         )
 
         self.assert_delta_close(reference(layer), streaming(layer))
+
+    def test_scaled_cosine_pairwise_matches_manual_formula(self) -> None:
+        pairwise = ScaledCosinePairwise(dim=2, eps=1e-6, scale=1.0)
+        target = torch.tensor([[[1.0, 0.0], [1.0, 1.0]]])
+        source = torch.tensor([[[0.0, 1.0], [1.0, 1.0]]])
+
+        scores = pairwise(target, source)
+        expected = torch.einsum(
+            "...id,...jd->...ij",
+            torch.nn.functional.normalize(target, dim=-1, eps=1e-6),
+            torch.nn.functional.normalize(source, dim=-1, eps=1e-6),
+        )
+        self.assertTrue(torch.allclose(scores, expected, atol=1e-6, rtol=1e-6))
+
+    def test_query_normalized_dot_route_matches_manual_formula(self) -> None:
+        route = QueryNormalizedDotRoute(src_dim=2, dst_dim=2, eps=1e-6, scale=1.0)
+        source = torch.tensor([[[2.0, 0.0], [1.0, 1.0]]])
+        target = torch.tensor([[[1.0, 0.0], [1.0, 1.0]]])
+
+        logits = route(source, target)
+        numerators = torch.einsum("...id,...kd->...ik", source, target)
+        denominators = source.square().sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        expected = numerators / denominators
+        self.assertTrue(torch.allclose(logits, expected, atol=1e-6, rtol=1e-6))
 
     def test_dense_propagation_kernel_matches_reference(self) -> None:
         torch.manual_seed(10)

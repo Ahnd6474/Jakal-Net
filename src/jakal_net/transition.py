@@ -132,7 +132,7 @@ class Transition(nn.Module):
         self.route_fn = route_fn
         self.norm_fn = norm_fn
         self.state_activation_fn = state_activation_fn
-        if route_compress_name not in {"softmax", "signed_abs_softmax"}:
+        if route_compress_name not in {"softmax", "signed_abs_softmax", "signed_entmax15"}:
             raise ValueError(f"Unsupported route_compress_name: {route_compress_name!r}.")
         self.route_compress_name = route_compress_name
         self.val_proj_fn = nn.Identity() if val_proj_fn is None else val_proj_fn
@@ -162,6 +162,8 @@ class Transition(nn.Module):
     def _compress_routes(self, logits: Tensor, mask: Tensor | None = None) -> Tensor:
         if self.route_compress_name == "signed_abs_softmax":
             return signed_abs_softmax(logits, dim=-1, mask=mask)
+        if self.route_compress_name == "signed_entmax15":
+            return signed_entmax15_routes(logits, dim=-1, mask=mask)
         if mask is not None:
             return masked_softmax(logits, mask, dim=-1)
         return torch.softmax(logits, dim=-1)
@@ -286,7 +288,7 @@ class Transition(nn.Module):
             self.last_stats = _summarize_routes(routes)
         if self.implementation == "native":
             if (
-                self.route_compress_name == "softmax"
+                self.route_compress_name in {"softmax", "signed_entmax15"}
                 and
                 supports_pairwise_route_kernel(self.route_fn)
                 and native_supports("transition_pairwise_dense")
@@ -304,9 +306,10 @@ class Transition(nn.Module):
                     projected_val=projected_val,
                     src_block_size=self.src_block_size or src_layer.num_nodes,
                     dst_block_size=self.dst_block_size or dst_layer.num_nodes,
+                    route_compress_name=self.route_compress_name,
                 )
             if (
-                self.route_compress_name == "softmax"
+                self.route_compress_name in {"softmax", "signed_entmax15"}
                 and
                 not _route_uses_pairwise_inputs(self.route_fn)
                 and supports_route_kernel(self.route_fn)
@@ -325,6 +328,7 @@ class Transition(nn.Module):
                     dst_nodes=dst_layer.num_nodes,
                     src_block_size=self.src_block_size or src_layer.num_nodes,
                     dst_block_size=self.dst_block_size or dst_layer.num_nodes,
+                    route_compress_name=self.route_compress_name,
                 )
             return self._compute_delta_kernel_preferred(src_layer, dst_layer)
         if self.implementation == "reference":

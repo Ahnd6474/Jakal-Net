@@ -13,6 +13,8 @@ from jakal_net.modules import (
     DiagonalBilinearRoute,
     LowRankBilinearPairwise,
     LowRankBilinearRoute,
+    QueryNormalizedDotRoute,
+    ScaledCosinePairwise,
 )
 
 STATE_MASS_PER_NODE = 1.0
@@ -34,6 +36,8 @@ def make_pairwise(
         return BilinearPairwise(dim=dim)
     if kind == "additive_low_rank":
         return AdditiveLowRankPairwise(dim=dim, rank=rank)
+    if kind == "scaled_cosine":
+        return ScaledCosinePairwise(dim=dim)
     raise ValueError(f"Unsupported pairwise kind: {kind!r}.")
 
 
@@ -51,6 +55,8 @@ def make_route(
         return BilinearPairwiseRoute(src_dim=dim, dst_dim=dim, route_dim=dim)
     if kind == "additive_low_rank":
         return AdditiveLowRankRoute(src_dim=dim, dst_dim=dim, route_dim=rank)
+    if kind == "query_norm_dot":
+        return QueryNormalizedDotRoute(src_dim=dim, dst_dim=dim)
     raise ValueError(f"Unsupported route kind: {kind!r}.")
 
 

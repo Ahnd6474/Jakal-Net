@@ -424,6 +424,18 @@ torch::Tensor pairwise_scores(
     return scores;
   }
 
+  if (pairwise_kind == "scaled_cosine") {
+    const double scale = weight.reshape({-1})[0].item<double>();
+    const double eps = bias.has_value() ? bias.value().reshape({-1})[0].item<double>() : 1e-6;
+    auto target_norm =
+        target_val.norm(2, -1, true).clamp_min(eps).to(target_val.scalar_type());
+    auto source_norm =
+        source_val.norm(2, -1, true).clamp_min(eps).to(source_val.scalar_type());
+    auto normalized_target = target_val / target_norm;
+    auto normalized_source = source_val / source_norm;
+    return torch::bmm(normalized_target, normalized_source.transpose(1, 2)) * scale;
+  }
+
   if (pairwise_kind == "hadamard_mlp") {
     if (!in_weight.has_value() || !out_weight.has_value()) {
       throw std::runtime_error("Hadamard MLP pairwise kernel is missing MLP weights.");
@@ -552,11 +564,18 @@ torch::Tensor pairwise_route_block_logits(
     if (out_bias.has_value()) {
       scores = scores + out_bias.value();
     }
+  } else if (route_kind == "query_normalized_dot_route") {
+    const double scale = core_weight.reshape({-1})[0].item<double>();
+    const double eps = bias.has_value() ? bias.value().reshape({-1})[0].item<double>() : 1e-6;
+    auto numerators = torch::bmm(src_val, dst_val.transpose(1, 2));
+    auto denominators =
+        src_val.square().sum(-1, true).clamp_min(eps).to(src_val.scalar_type());
+    scores = numerators / denominators * scale;
   } else {
     throw std::runtime_error("Unsupported pairwise route kernel kind: " + route_kind);
   }
 
-  if (bias.has_value()) {
+  if (bias.has_value() && route_kind != "query_normalized_dot_route") {
     scores = scores + bias.value();
   }
   if (temperature != 1.0) {
@@ -807,7 +826,8 @@ torch::Tensor full_topk_indices(const torch::Tensor& scores) {
       .expand({batch, left, right});
 }
 
-std::tuple<torch::Tensor, torch::Tensor> low_rank_transition_pairwise_topk_signed_abs(
+std::tuple<torch::Tensor, torch::Tensor> scan_transition_pairwise_topk(
+    const std::string& route_kind,
     const torch::Tensor& sender_strength,
     const torch::Tensor& projected_state,
     const torch::Tensor& projected_val,
@@ -820,7 +840,8 @@ std::tuple<torch::Tensor, torch::Tensor> low_rank_transition_pairwise_topk_signe
     int64_t topk,
     const std::string& compress_name) {
 #ifdef WITH_CUDA
-  if (src_val.is_cuda() &&
+  if (route_kind == "low_rank_bilinear_route" &&
+      src_val.is_cuda() &&
       sender_strength.is_cuda() &&
       projected_state.is_cuda() &&
       projected_val.is_cuda() &&
@@ -855,12 +876,12 @@ std::tuple<torch::Tensor, torch::Tensor> low_rank_transition_pairwise_topk_signe
   auto cast_core_weight = cast_tensor_like(core_weight, src_val);
   auto cast_bias = cast_packed_optional_like(bias, src_val);
   auto logits = pairwise_route_block_logits(
-      "low_rank_bilinear_route",
+      route_kind,
       src_val,
       dst_val,
-      cast_source_weight,
+      packed_optional_tensor(cast_source_weight),
       c10::nullopt,
-      cast_target_weight,
+      packed_optional_tensor(cast_target_weight),
       c10::nullopt,
       cast_core_weight,
       cast_bias,
@@ -914,7 +935,8 @@ std::tuple<torch::Tensor, torch::Tensor> low_rank_transition_pairwise_topk_signe
   };
 }
 
-std::tuple<torch::Tensor, torch::Tensor> low_rank_propagation_topk_signed_abs(
+std::tuple<torch::Tensor, torch::Tensor> scan_propagation_topk(
+    const std::string& pairwise_kind,
     const torch::Tensor& layer_state,
     const torch::Tensor& layer_val,
     const torch::Tensor& source_weight,
@@ -924,7 +946,8 @@ std::tuple<torch::Tensor, torch::Tensor> low_rank_propagation_topk_signed_abs(
     int64_t topk,
     const std::string& compress_name) {
 #ifdef WITH_CUDA
-  if (layer_val.is_cuda() &&
+  if (pairwise_kind == "low_rank_bilinear" &&
+      layer_val.is_cuda() &&
       layer_state.is_cuda() &&
       compress_name == "signed_abs_softmax" &&
       !c10::GradMode::is_enabled() &&
@@ -957,14 +980,14 @@ std::tuple<torch::Tensor, torch::Tensor> low_rank_propagation_topk_signed_abs(
   auto cast_core_weight = cast_tensor_like(core_weight, layer_val);
   auto cast_bias = cast_packed_optional_like(bias, layer_val);
   auto scores = pairwise_scores(
-      "low_rank_bilinear",
+      pairwise_kind,
       layer_val,
       layer_val,
       cast_core_weight,
       cast_bias,
-      cast_source_weight,
+      packed_optional_tensor(cast_source_weight),
       c10::nullopt,
-      cast_target_weight,
+      packed_optional_tensor(cast_target_weight),
       c10::nullopt);
   const auto nodes = layer_val.size(1);
   const auto k = std::min<int64_t>(std::max<int64_t>(1, topk), nodes);
@@ -1056,12 +1079,14 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> causal_memory_scan_fused(
     const std::vector<torch::Tensor>& write_core_weights,
     const std::vector<torch::Tensor>& write_biases,
     const std::vector<int64_t>& write_topks,
+    const std::string& route_kind_name,
     const std::string& transition_compress_name,
     const std::vector<torch::Tensor>& propagation_source_weights,
     const std::vector<torch::Tensor>& propagation_target_weights,
     const std::vector<torch::Tensor>& propagation_core_weights,
     const std::vector<torch::Tensor>& propagation_biases,
     const std::vector<int64_t>& propagation_topks,
+    const std::string& propagation_pairwise_kind,
     const std::string& propagation_compress_name,
     const std::vector<torch::Tensor>& val_norm_weights,
     const std::vector<torch::Tensor>& val_norm_biases,
@@ -1103,12 +1128,14 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> causal_memory_scan_fused(
         write_core_weights,
         write_biases,
         write_topks,
+        route_kind_name,
         transition_compress_name,
         propagation_source_weights,
         propagation_target_weights,
         propagation_core_weights,
         propagation_biases,
         propagation_topks,
+        propagation_pairwise_kind,
         propagation_compress_name,
         val_norm_weights,
         val_norm_biases,
@@ -1182,7 +1209,8 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> causal_memory_scan_fused(
     next_memory.reserve(num_levels);
 
     auto first_level_normed = layer_with_val_norm(current_memory[0], val_norm_weights[0], val_norm_biases[0]);
-    auto first_write_delta = low_rank_transition_pairwise_topk_signed_abs(
+    auto first_write_delta = scan_transition_pairwise_topk(
+        route_kind_name,
         torch::softplus(token_layer.state),
         token_layer.state,
         token_layer.val,
@@ -1201,7 +1229,8 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> causal_memory_scan_fused(
         val_norm_weights[0],
         val_norm_biases[0]);
     auto level_for_propagation = layer_with_val_norm(level, val_norm_weights[0], val_norm_biases[0]);
-    auto first_prop_delta = low_rank_propagation_topk_signed_abs(
+    auto first_prop_delta = scan_propagation_topk(
+        propagation_pairwise_kind,
         level_for_propagation.state,
         level_for_propagation.val,
         propagation_source_weights[0],
@@ -1228,7 +1257,8 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> causal_memory_scan_fused(
           next_memory[level_index - 1],
           level_norm_weights[level_index - 1],
           level_norm_biases[level_index - 1]);
-      auto parent_delta = low_rank_transition_pairwise_topk_signed_abs(
+      auto parent_delta = scan_transition_pairwise_topk(
+          route_kind_name,
           torch::softplus(normalized_parent.state),
           normalized_parent.state,
           normalized_parent.val,
@@ -1249,7 +1279,8 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> causal_memory_scan_fused(
 
       if (level_index == 1 && expected_skip_count > 0) {
         auto skip_gate = torch::sigmoid(cast_tensor_like(skip_gates[0], token_val));
-        auto skip_delta = low_rank_transition_pairwise_topk_signed_abs(
+        auto skip_delta = scan_transition_pairwise_topk(
+            route_kind_name,
             torch::softplus(token_layer.state),
             token_layer.state,
             token_layer.val,
@@ -1276,7 +1307,8 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> causal_memory_scan_fused(
             level_norm_weights[level_index - 2],
             level_norm_biases[level_index - 2]);
         auto skip_gate = torch::sigmoid(cast_tensor_like(skip_gates[skip_index], normalized_skip_source.val));
-        auto skip_delta = low_rank_transition_pairwise_topk_signed_abs(
+        auto skip_delta = scan_transition_pairwise_topk(
+            route_kind_name,
             torch::softplus(normalized_skip_source.state),
             normalized_skip_source.state,
             normalized_skip_source.val,
@@ -1300,7 +1332,8 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> causal_memory_scan_fused(
           updated_level,
           val_norm_weights[level_index],
           val_norm_biases[level_index]);
-      auto propagation_delta = low_rank_propagation_topk_signed_abs(
+      auto propagation_delta = scan_propagation_topk(
+          propagation_pairwise_kind,
           updated_level_for_prop.state,
           updated_level_for_prop.val,
           propagation_source_weights[level_index],
@@ -1366,12 +1399,14 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>, std::vector<torch::Tensor>
     const std::vector<torch::Tensor>& write_core_weights,
     const std::vector<torch::Tensor>& write_biases,
     const std::vector<int64_t>& write_topks,
+    const std::string& route_kind_name,
     const std::string& transition_compress_name,
     const std::vector<torch::Tensor>& propagation_source_weights,
     const std::vector<torch::Tensor>& propagation_target_weights,
     const std::vector<torch::Tensor>& propagation_core_weights,
     const std::vector<torch::Tensor>& propagation_biases,
     const std::vector<int64_t>& propagation_topks,
+    const std::string& propagation_pairwise_kind,
     const std::string& propagation_compress_name,
     const std::vector<torch::Tensor>& val_norm_weights,
     const std::vector<torch::Tensor>& val_norm_biases,
@@ -1413,12 +1448,14 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>, std::vector<torch::Tensor>
         write_core_weights,
         write_biases,
         write_topks,
+        route_kind_name,
         transition_compress_name,
         propagation_source_weights,
         propagation_target_weights,
         propagation_core_weights,
         propagation_biases,
         propagation_topks,
+        propagation_pairwise_kind,
         propagation_compress_name,
         val_norm_weights,
         val_norm_biases,
@@ -1499,7 +1536,8 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>, std::vector<torch::Tensor>
     next_memory.reserve(num_levels);
 
     auto first_level_normed = layer_with_val_norm(current_memory[0], val_norm_weights[0], val_norm_biases[0]);
-    auto first_write_delta = low_rank_transition_pairwise_topk_signed_abs(
+    auto first_write_delta = scan_transition_pairwise_topk(
+        route_kind_name,
         torch::softplus(token_layer.state),
         token_layer.state,
         token_layer.val,
@@ -1518,7 +1556,8 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>, std::vector<torch::Tensor>
         val_norm_weights[0],
         val_norm_biases[0]);
     auto level_for_propagation = layer_with_val_norm(level, val_norm_weights[0], val_norm_biases[0]);
-    auto first_prop_delta = low_rank_propagation_topk_signed_abs(
+    auto first_prop_delta = scan_propagation_topk(
+        propagation_pairwise_kind,
         level_for_propagation.state,
         level_for_propagation.val,
         propagation_source_weights[0],
@@ -1545,7 +1584,8 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>, std::vector<torch::Tensor>
           next_memory[level_index - 1],
           level_norm_weights[level_index - 1],
           level_norm_biases[level_index - 1]);
-      auto parent_delta = low_rank_transition_pairwise_topk_signed_abs(
+      auto parent_delta = scan_transition_pairwise_topk(
+          route_kind_name,
           torch::softplus(normalized_parent.state),
           normalized_parent.state,
           normalized_parent.val,
@@ -1566,7 +1606,8 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>, std::vector<torch::Tensor>
 
       if (level_index == 1 && expected_skip_count > 0) {
         auto skip_gate = torch::sigmoid(cast_tensor_like(skip_gates[0], token_val));
-        auto skip_delta = low_rank_transition_pairwise_topk_signed_abs(
+        auto skip_delta = scan_transition_pairwise_topk(
+            route_kind_name,
             torch::softplus(token_layer.state),
             token_layer.state,
             token_layer.val,
@@ -1593,7 +1634,8 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>, std::vector<torch::Tensor>
             level_norm_weights[level_index - 2],
             level_norm_biases[level_index - 2]);
         auto skip_gate = torch::sigmoid(cast_tensor_like(skip_gates[skip_index], normalized_skip_source.val));
-        auto skip_delta = low_rank_transition_pairwise_topk_signed_abs(
+        auto skip_delta = scan_transition_pairwise_topk(
+            route_kind_name,
             torch::softplus(normalized_skip_source.state),
             normalized_skip_source.state,
             normalized_skip_source.val,
@@ -1617,7 +1659,8 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>, std::vector<torch::Tensor>
           updated_level,
           val_norm_weights[level_index],
           val_norm_biases[level_index]);
-      auto propagation_delta = low_rank_propagation_topk_signed_abs(
+      auto propagation_delta = scan_propagation_topk(
+          propagation_pairwise_kind,
           updated_level_for_prop.state,
           updated_level_for_prop.val,
           propagation_source_weights[level_index],
@@ -1691,12 +1734,14 @@ causal_memory_scan_fused_checkpoints(
     const std::vector<torch::Tensor>& write_core_weights,
     const std::vector<torch::Tensor>& write_biases,
     const std::vector<int64_t>& write_topks,
+    const std::string& route_kind_name,
     const std::string& transition_compress_name,
     const std::vector<torch::Tensor>& propagation_source_weights,
     const std::vector<torch::Tensor>& propagation_target_weights,
     const std::vector<torch::Tensor>& propagation_core_weights,
     const std::vector<torch::Tensor>& propagation_biases,
     const std::vector<int64_t>& propagation_topks,
+    const std::string& propagation_pairwise_kind,
     const std::string& propagation_compress_name,
     const std::vector<torch::Tensor>& val_norm_weights,
     const std::vector<torch::Tensor>& val_norm_biases,
@@ -1783,7 +1828,8 @@ causal_memory_scan_fused_checkpoints(
     next_memory.reserve(num_levels);
 
     auto first_level_normed = layer_with_val_norm(current_memory[0], val_norm_weights[0], val_norm_biases[0]);
-    auto first_write_delta = low_rank_transition_pairwise_topk_signed_abs(
+    auto first_write_delta = scan_transition_pairwise_topk(
+        route_kind_name,
         torch::softplus(token_layer.state),
         token_layer.state,
         token_layer.val,
@@ -1802,7 +1848,8 @@ causal_memory_scan_fused_checkpoints(
         val_norm_weights[0],
         val_norm_biases[0]);
     auto level_for_propagation = layer_with_val_norm(level, val_norm_weights[0], val_norm_biases[0]);
-    auto first_prop_delta = low_rank_propagation_topk_signed_abs(
+    auto first_prop_delta = scan_propagation_topk(
+        propagation_pairwise_kind,
         level_for_propagation.state,
         level_for_propagation.val,
         propagation_source_weights[0],
@@ -1829,7 +1876,8 @@ causal_memory_scan_fused_checkpoints(
           next_memory[level_index - 1],
           level_norm_weights[level_index - 1],
           level_norm_biases[level_index - 1]);
-      auto parent_delta = low_rank_transition_pairwise_topk_signed_abs(
+      auto parent_delta = scan_transition_pairwise_topk(
+          route_kind_name,
           torch::softplus(normalized_parent.state),
           normalized_parent.state,
           normalized_parent.val,
@@ -1850,7 +1898,8 @@ causal_memory_scan_fused_checkpoints(
 
       if (level_index == 1 && expected_skip_count > 0) {
         auto skip_gate = torch::sigmoid(cast_tensor_like(skip_gates[0], token_val));
-        auto skip_delta = low_rank_transition_pairwise_topk_signed_abs(
+        auto skip_delta = scan_transition_pairwise_topk(
+            route_kind_name,
             torch::softplus(token_layer.state),
             token_layer.state,
             token_layer.val,
@@ -1877,7 +1926,8 @@ causal_memory_scan_fused_checkpoints(
             level_norm_weights[level_index - 2],
             level_norm_biases[level_index - 2]);
         auto skip_gate = torch::sigmoid(cast_tensor_like(skip_gates[skip_index], normalized_skip_source.val));
-        auto skip_delta = low_rank_transition_pairwise_topk_signed_abs(
+        auto skip_delta = scan_transition_pairwise_topk(
+            route_kind_name,
             torch::softplus(normalized_skip_source.state),
             normalized_skip_source.state,
             normalized_skip_source.val,
@@ -1901,7 +1951,8 @@ causal_memory_scan_fused_checkpoints(
           updated_level,
           val_norm_weights[level_index],
           val_norm_biases[level_index]);
-      auto propagation_delta = low_rank_propagation_topk_signed_abs(
+      auto propagation_delta = scan_propagation_topk(
+          propagation_pairwise_kind,
           updated_level_for_prop.state,
           updated_level_for_prop.val,
           propagation_source_weights[level_index],
@@ -1983,12 +2034,14 @@ std::vector<torch::Tensor> causal_memory_scan_fused_backward_cuda(
     const std::vector<torch::Tensor>& write_core_weights,
     const std::vector<torch::Tensor>& write_biases,
     const std::vector<int64_t>& write_topks,
+    const std::string& route_kind_name,
     const std::string& transition_compress_name,
     const std::vector<torch::Tensor>& propagation_source_weights,
     const std::vector<torch::Tensor>& propagation_target_weights,
     const std::vector<torch::Tensor>& propagation_core_weights,
     const std::vector<torch::Tensor>& propagation_biases,
     const std::vector<int64_t>& propagation_topks,
+    const std::string& propagation_pairwise_kind,
     const std::string& propagation_compress_name,
     const std::vector<torch::Tensor>& val_norm_weights,
     const std::vector<torch::Tensor>& val_norm_biases,
@@ -2029,12 +2082,14 @@ std::vector<torch::Tensor> causal_memory_scan_fused_backward_cuda(
       write_core_weights,
       write_biases,
       write_topks,
+      route_kind_name,
       transition_compress_name,
       propagation_source_weights,
       propagation_target_weights,
       propagation_core_weights,
       propagation_biases,
       propagation_topks,
+      propagation_pairwise_kind,
       propagation_compress_name,
       val_norm_weights,
       val_norm_biases,
@@ -2075,12 +2130,14 @@ std::vector<torch::Tensor> causal_memory_scan_fused_backward_cuda(
       write_core_weights,
       write_biases,
       write_topks,
+      route_kind_name,
       transition_compress_name,
       propagation_source_weights,
       propagation_target_weights,
       propagation_core_weights,
       propagation_biases,
       propagation_topks,
+      propagation_pairwise_kind,
       propagation_compress_name,
       val_norm_weights,
       val_norm_biases,
@@ -2207,7 +2264,8 @@ std::vector<torch::Tensor> causal_memory_scan_fused_backward_cuda(
     std::vector<NativeLayerState> next_memory;
     next_memory.reserve(current_memory.size());
     auto first_level_normed = layer_with_val_norm(current_memory[0], val_norm_weights_leaves[0], val_norm_biases_leaves[0]);
-    auto first_write_delta = low_rank_transition_pairwise_topk_signed_abs(
+    auto first_write_delta = scan_transition_pairwise_topk(
+        route_kind_name,
         torch::softplus(token_state),
         token_state,
         token_val_leaf,
@@ -2226,7 +2284,8 @@ std::vector<torch::Tensor> causal_memory_scan_fused_backward_cuda(
         val_norm_weights_leaves[0],
         val_norm_biases_leaves[0]);
     auto level_for_propagation = layer_with_val_norm(level, val_norm_weights_leaves[0], val_norm_biases_leaves[0]);
-    auto first_prop_delta = low_rank_propagation_topk_signed_abs(
+    auto first_prop_delta = scan_propagation_topk(
+        propagation_pairwise_kind,
         level_for_propagation.state,
         level_for_propagation.val,
         propagation_source_weights_leaves[0],
@@ -2247,7 +2306,8 @@ std::vector<torch::Tensor> causal_memory_scan_fused_backward_cuda(
       auto current_level = current_memory[level_index];
       auto normalized_level = layer_with_val_norm(current_level, val_norm_weights_leaves[level_index], val_norm_biases_leaves[level_index]);
       auto normalized_parent = layer_with_val_norm(next_memory[level_index - 1], level_norm_weights_leaves[level_index - 1], level_norm_biases_leaves[level_index - 1]);
-      auto parent_delta = low_rank_transition_pairwise_topk_signed_abs(
+      auto parent_delta = scan_transition_pairwise_topk(
+          route_kind_name,
           torch::softplus(normalized_parent.state),
           normalized_parent.state,
           normalized_parent.val,
@@ -2268,7 +2328,8 @@ std::vector<torch::Tensor> causal_memory_scan_fused_backward_cuda(
 
       if (level_index == 1 && !skip_source_weights_leaves.empty()) {
         auto skip_gate = torch::sigmoid(cast_tensor_like(skip_gates_leaves[0], token_val_leaf));
-        auto skip_delta = low_rank_transition_pairwise_topk_signed_abs(
+        auto skip_delta = scan_transition_pairwise_topk(
+            route_kind_name,
             torch::softplus(token_state),
             token_state,
             token_val_leaf,
@@ -2292,7 +2353,8 @@ std::vector<torch::Tensor> causal_memory_scan_fused_backward_cuda(
         const auto skip_index = level_index - 1;
         auto normalized_skip_source = layer_with_val_norm(next_memory[level_index - 2], level_norm_weights_leaves[level_index - 2], level_norm_biases_leaves[level_index - 2]);
         auto skip_gate = torch::sigmoid(cast_tensor_like(skip_gates_leaves[skip_index], normalized_skip_source.val));
-        auto skip_delta = low_rank_transition_pairwise_topk_signed_abs(
+        auto skip_delta = scan_transition_pairwise_topk(
+            route_kind_name,
             torch::softplus(normalized_skip_source.state),
             normalized_skip_source.state,
             normalized_skip_source.val,
@@ -2313,7 +2375,8 @@ std::vector<torch::Tensor> causal_memory_scan_fused_backward_cuda(
       }
 
       auto updated_level_for_prop = layer_with_val_norm(updated_level, val_norm_weights_leaves[level_index], val_norm_biases_leaves[level_index]);
-      auto propagation_delta = low_rank_propagation_topk_signed_abs(
+      auto propagation_delta = scan_propagation_topk(
+          propagation_pairwise_kind,
           updated_level_for_prop.state,
           updated_level_for_prop.val,
           propagation_source_weights_leaves[level_index],
@@ -3255,6 +3318,7 @@ std::tuple<torch::Tensor, torch::Tensor> transition_pairwise_dense(
     const c10::optional<torch::Tensor>& out_weight,
     const c10::optional<torch::Tensor>& out_bias,
     double temperature,
+    const std::string& route_compress_name,
     const torch::Tensor& sender_strength,
     const torch::Tensor& src_val,
     const torch::Tensor& dst_val,
@@ -3262,6 +3326,7 @@ std::tuple<torch::Tensor, torch::Tensor> transition_pairwise_dense(
     const torch::Tensor& projected_val,
     int64_t src_block_size,
     int64_t dst_block_size) {
+  require_known_route_compress(route_compress_name);
   require_supported_device(sender_strength, "sender_strength");
   require_supported_device(src_val, "src_val");
   require_supported_device(dst_val, "dst_val");
@@ -3299,7 +3364,9 @@ std::tuple<torch::Tensor, torch::Tensor> transition_pairwise_dense(
         out_weight,
         out_bias,
         temperature);
-    auto routes = torch::softmax(logits, -1);
+    auto routes = route_compress_name == "signed_entmax15"
+                      ? signed_entmax15_scores(logits)
+                      : torch::softmax(logits, -1);
     auto state_sender =
         (flat_sender_strength.to(state_acc_dtype) * flat_projected_state.to(state_acc_dtype));
     auto val_sender =
@@ -3327,45 +3394,6 @@ std::tuple<torch::Tensor, torch::Tensor> transition_pairwise_dense(
     const auto src_end = std::min(src_start + src_step, src_nodes);
     auto src_block = flat_src_val.slice(1, src_start, src_end);
 
-    torch::Tensor running_max;
-    torch::Tensor running_sum;
-    bool initialized = false;
-
-    for (int64_t dst_start = 0; dst_start < dst_nodes; dst_start += dst_step) {
-      const auto dst_end = std::min(dst_start + dst_step, dst_nodes);
-      auto dst_block = flat_dst_val.slice(1, dst_start, dst_end);
-      auto logits = pairwise_route_block_logits(
-          route_kind,
-          src_block,
-          dst_block,
-          source_weight,
-          source_bias,
-          target_weight,
-          target_bias,
-          core_weight,
-          bias,
-          hidden_weight,
-          hidden_bias,
-          out_weight,
-          out_bias,
-          temperature);
-      auto block_max = std::get<0>(logits.max(-1));
-      auto block_exp = torch::exp(logits - block_max.unsqueeze(-1));
-      auto block_sum = block_exp.sum(-1);
-
-      if (!initialized) {
-        running_max = block_max;
-        running_sum = block_sum;
-        initialized = true;
-      } else {
-        auto next_max = torch::maximum(running_max, block_max);
-        auto running_scale = torch::exp(running_max - next_max);
-        auto block_scale = torch::exp(block_max - next_max);
-        running_sum = running_sum * running_scale + block_sum * block_scale;
-        running_max = next_max;
-      }
-    }
-
     auto state_sender =
         (flat_sender_strength.slice(1, src_start, src_end).to(state_acc_dtype) *
          flat_projected_state.slice(1, src_start, src_end).to(state_acc_dtype));
@@ -3373,32 +3401,100 @@ std::tuple<torch::Tensor, torch::Tensor> transition_pairwise_dense(
         (flat_sender_strength.slice(1, src_start, src_end).to(val_acc_dtype).unsqueeze(-1) *
          flat_projected_val.slice(1, src_start, src_end).to(val_acc_dtype));
 
-    for (int64_t dst_start = 0; dst_start < dst_nodes; dst_start += dst_step) {
-      const auto dst_end = std::min(dst_start + dst_step, dst_nodes);
-      auto dst_block = flat_dst_val.slice(1, dst_start, dst_end);
-      auto logits = pairwise_route_block_logits(
-          route_kind,
-          src_block,
-          dst_block,
-          source_weight,
-          source_bias,
-          target_weight,
-          target_bias,
-          core_weight,
-          bias,
-          hidden_weight,
-          hidden_bias,
-          out_weight,
-          out_bias,
-          temperature);
-      auto routes = torch::exp(logits - running_max.unsqueeze(-1)) / running_sum.unsqueeze(-1);
+    if (route_compress_name == "signed_entmax15") {
+      std::vector<torch::Tensor> logits_blocks;
+      logits_blocks.reserve((dst_nodes + dst_step - 1) / dst_step);
+      for (int64_t dst_start = 0; dst_start < dst_nodes; dst_start += dst_step) {
+        const auto dst_end = std::min(dst_start + dst_step, dst_nodes);
+        auto dst_block = flat_dst_val.slice(1, dst_start, dst_end);
+        logits_blocks.push_back(pairwise_route_block_logits(
+            route_kind,
+            src_block,
+            dst_block,
+            source_weight,
+            source_bias,
+            target_weight,
+            target_bias,
+            core_weight,
+            bias,
+            hidden_weight,
+            hidden_bias,
+            out_weight,
+            out_bias,
+            temperature));
+      }
+      auto routes = signed_entmax15_scores(torch::cat(logits_blocks, -1));
       auto transport = routes.transpose(1, 2).contiguous();
-      delta_state.slice(1, dst_start, dst_end) =
-          delta_state.slice(1, dst_start, dst_end) +
-          torch::bmm(transport.to(state_acc_dtype), state_sender.unsqueeze(-1)).squeeze(-1);
-      delta_val.slice(1, dst_start, dst_end) =
-          delta_val.slice(1, dst_start, dst_end) +
-          torch::bmm(transport.to(val_acc_dtype), val_sender);
+      delta_state =
+          delta_state + torch::bmm(transport.to(state_acc_dtype), state_sender.unsqueeze(-1)).squeeze(-1);
+      delta_val = delta_val + torch::bmm(transport.to(val_acc_dtype), val_sender);
+    } else {
+      torch::Tensor running_max;
+      torch::Tensor running_sum;
+      bool initialized = false;
+
+      for (int64_t dst_start = 0; dst_start < dst_nodes; dst_start += dst_step) {
+        const auto dst_end = std::min(dst_start + dst_step, dst_nodes);
+        auto dst_block = flat_dst_val.slice(1, dst_start, dst_end);
+        auto logits = pairwise_route_block_logits(
+            route_kind,
+            src_block,
+            dst_block,
+            source_weight,
+            source_bias,
+            target_weight,
+            target_bias,
+            core_weight,
+            bias,
+            hidden_weight,
+            hidden_bias,
+            out_weight,
+            out_bias,
+            temperature);
+        auto block_max = std::get<0>(logits.max(-1));
+        auto block_exp = torch::exp(logits - block_max.unsqueeze(-1));
+        auto block_sum = block_exp.sum(-1);
+
+        if (!initialized) {
+          running_max = block_max;
+          running_sum = block_sum;
+          initialized = true;
+        } else {
+          auto next_max = torch::maximum(running_max, block_max);
+          auto running_scale = torch::exp(running_max - next_max);
+          auto block_scale = torch::exp(block_max - next_max);
+          running_sum = running_sum * running_scale + block_sum * block_scale;
+          running_max = next_max;
+        }
+      }
+
+      for (int64_t dst_start = 0; dst_start < dst_nodes; dst_start += dst_step) {
+        const auto dst_end = std::min(dst_start + dst_step, dst_nodes);
+        auto dst_block = flat_dst_val.slice(1, dst_start, dst_end);
+        auto logits = pairwise_route_block_logits(
+            route_kind,
+            src_block,
+            dst_block,
+            source_weight,
+            source_bias,
+            target_weight,
+            target_bias,
+            core_weight,
+            bias,
+            hidden_weight,
+            hidden_bias,
+            out_weight,
+            out_bias,
+            temperature);
+        auto routes = torch::exp(logits - running_max.unsqueeze(-1)) / running_sum.unsqueeze(-1);
+        auto transport = routes.transpose(1, 2).contiguous();
+        delta_state.slice(1, dst_start, dst_end) =
+            delta_state.slice(1, dst_start, dst_end) +
+            torch::bmm(transport.to(state_acc_dtype), state_sender.unsqueeze(-1)).squeeze(-1);
+        delta_val.slice(1, dst_start, dst_end) =
+            delta_val.slice(1, dst_start, dst_end) +
+            torch::bmm(transport.to(val_acc_dtype), val_sender);
+      }
     }
   }
 
