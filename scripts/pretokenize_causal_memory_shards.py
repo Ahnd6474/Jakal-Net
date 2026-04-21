@@ -20,6 +20,7 @@ from train_causal_memory_lm import (
     summarize_documents,
     summarize_tokenized_documents,
     tokenize_documents,
+    validate_flat_pretokenized_shard,
 )
 from train_progressive_b_lm import build_tokenizer
 from lm_experiment_utils import _expand_sources
@@ -180,8 +181,13 @@ def launch_parallel_shards(
     for shard_index in range(num_shards):
         bundle_path = bundle_dir / f"raw_shard_{shard_index:04d}.pt"
         if skip_existing and bundle_path.exists():
-            print(f"skip_existing | path={bundle_path}", flush=True)
-            continue
+            try:
+                validate_flat_pretokenized_shard(bundle_path)
+            except Exception as exc:
+                print(f"rebuild_corrupt_existing | path={bundle_path} | error={exc}", flush=True)
+            else:
+                print(f"skip_existing | path={bundle_path}", flush=True)
+                continue
         queue.append(shard_index)
     running: list[tuple[int, subprocess.Popen[str]]] = []
     while queue or running:

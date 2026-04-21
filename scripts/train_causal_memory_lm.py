@@ -5,6 +5,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import nullcontext
 import json
 import math
+import os
 import queue
 import random
 import re
@@ -13,6 +14,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
+from uuid import uuid4
 
 import torch
 from torch.nn import functional as F
@@ -1370,7 +1372,50 @@ def save_pretokenized_bundle(
         "tokenizer_model_path": tokenizer_model_path,
         "corpus_info": corpus_info,
     }
-    torch.save(payload, path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f"{path.name}.tmp-{os.getpid()}-{uuid4().hex}")
+    try:
+        with temp_path.open("wb") as handle:
+            torch.save(payload, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
+
+def _validate_flat_bundle_payload(bundle: dict[str, Any], *, path: Path) -> None:
+    if bundle.get("storage_format") != "flat_v2":
+        raise ValueError(f"Expected flat_v2 pretokenized shard: {path}")
+    if not isinstance(bundle.get("documents"), dict) or not isinstance(bundle.get("chunks"), dict):
+        raise ValueError(f"Invalid flat pretokenized shard structure: {path}")
+    corpus_info = bundle.get("corpus_info") or {}
+    special_tokens = dict(corpus_info.get("special_tokens") or {})
+    for key in ("pad", "eos", "cont"):
+        if special_tokens.get(key) is None:
+            raise ValueError(f"Flat pretokenized bundle is missing special token '{key}': {path}")
+    seq_len = int(bundle.get("seq_len") or 0)
+    if seq_len <= 0:
+        raise ValueError(f"Flat pretokenized bundle is missing seq_len: {path}")
+    document_meta = bundle["documents"]
+    chunk_meta = bundle["chunks"]
+    for key in ("kind", "source", "token_count", "chunk_offsets"):
+        if key not in document_meta:
+            raise ValueError(f"Flat pretokenized bundle is missing documents['{key}']: {path}")
+    for key in ("token_offsets", "context_flat", "loss_mask_flat", "is_continuation"):
+        if key not in chunk_meta:
+            raise ValueError(f"Flat pretokenized bundle is missing chunks['{key}']: {path}")
+
+
+def validate_flat_pretokenized_shard(path: Path) -> None:
+    bundle = torch.load(path, map_location="cpu")
+    if not isinstance(bundle, dict):
+        raise ValueError(f"Invalid pretokenized shard payload: {path}")
+    _validate_flat_bundle_payload(bundle, path=path)
 
 
 def load_pretokenized_bundle(path: Path) -> dict[str, Any]:
@@ -1467,8 +1512,9 @@ def load_pretokenized_bundle(path: Path) -> dict[str, Any]:
 
 def load_flat_pretokenized_shard(path: Path) -> FlatPretokenizedShard:
     bundle = torch.load(path, map_location="cpu")
-    if not isinstance(bundle, dict) or bundle.get("storage_format") != "flat_v2":
-        raise ValueError(f"Expected flat_v2 pretokenized shard: {path}")
+    if not isinstance(bundle, dict):
+        raise ValueError(f"Invalid pretokenized shard payload: {path}")
+    _validate_flat_bundle_payload(bundle, path=path)
     corpus_info = bundle.get("corpus_info") or {}
     special_tokens = dict(corpus_info.get("special_tokens") or {})
     pad_token_id = special_tokens.get("pad")
@@ -1506,6 +1552,32 @@ def load_flat_pretokenized_directory(path: Path, *, load_workers: int = 1) -> Fl
     shard_paths = sorted(candidate for candidate in path.glob("*.pt") if candidate.is_file())
     if not shard_paths:
         raise ValueError(f"No pretokenized shard files found in {path}")
+    validation_workers = min(max(1, load_workers), len(shard_paths))
+    print(
+        f"flat_integrity_check | path={path} | shards={len(shard_paths)} | workers={validation_workers}",
+        flush=True,
+    )
+    if validation_workers <= 1:
+        for shard_path in shard_paths:
+            try:
+                validate_flat_pretokenized_shard(shard_path)
+            except Exception as exc:
+                raise RuntimeError(f"Corrupt pretokenized shard: {shard_path}") from exc
+    else:
+        with ThreadPoolExecutor(
+            max_workers=validation_workers,
+            thread_name_prefix="pretok_flat_validate",
+        ) as validation_executor:
+            validation_futures = {
+                validation_executor.submit(validate_flat_pretokenized_shard, shard_path): shard_path
+                for shard_path in shard_paths
+            }
+            for future, shard_path in validation_futures.items():
+                try:
+                    future.result()
+                except Exception as exc:
+                    raise RuntimeError(f"Corrupt pretokenized shard: {shard_path}") from exc
+    print(f"flat_integrity_ok | path={path} | shards={len(shard_paths)}", flush=True)
     if load_workers <= 1:
         shard_iterator = (load_flat_pretokenized_shard(shard_path) for shard_path in shard_paths)
         executor: ThreadPoolExecutor | None = None
