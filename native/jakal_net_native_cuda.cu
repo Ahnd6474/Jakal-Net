@@ -273,6 +273,154 @@ __global__ void low_rank_pairwise_topk_forward_kernel(
 }
 
 template <typename scalar_t>
+__global__ void low_rank_pairwise_topk_forward_multihead_kernel(
+    const scalar_t* __restrict__ weighted_projected_source,
+    const scalar_t* __restrict__ projected_target,
+    const float* __restrict__ weighted_projected_state,
+    const float* __restrict__ weighted_projected_val,
+    float* __restrict__ delta_state,
+    float* __restrict__ delta_val,
+    float* __restrict__ topk_scores,
+    int64_t* __restrict__ topk_indices,
+    int64_t batch_flat,
+    int64_t num_heads,
+    int64_t src_nodes,
+    int64_t dst_nodes,
+    int64_t rank_dim,
+    int64_t out_dim,
+    int64_t k,
+    float score_bias,
+    int64_t compress_kind) {
+  const int64_t linear_row = blockIdx.x;
+  const int64_t batch = linear_row / src_nodes;
+  const int64_t src = linear_row - batch * src_nodes;
+  const int tid = threadIdx.x;
+
+  float local_scores[kPairwiseTopkForwardMaxK];
+  int64_t local_indices[kPairwiseTopkForwardMaxK];
+  for (int64_t rank = 0; rank < kPairwiseTopkForwardMaxK; ++rank) {
+    local_scores[rank] = kNegativeInfinity;
+    local_indices[rank] = 0;
+  }
+
+  for (int64_t dst = tid; dst < dst_nodes; dst += blockDim.x) {
+    float best_score = kNegativeInfinity;
+    for (int64_t head = 0; head < num_heads; ++head) {
+      const int64_t source_offset =
+          (((batch * num_heads + head) * src_nodes + src) * rank_dim);
+      const int64_t target_offset =
+          (((batch * num_heads + head) * dst_nodes + dst) * rank_dim);
+      float score = 0.0f;
+      for (int64_t feature = 0; feature < rank_dim; ++feature) {
+        score += static_cast<float>(weighted_projected_source[source_offset + feature]) *
+                 static_cast<float>(projected_target[target_offset + feature]);
+      }
+      score += score_bias;
+      best_score = fmaxf(best_score, score);
+    }
+    insert_descending_topk(best_score, dst, local_scores, local_indices, k);
+  }
+
+  extern __shared__ unsigned char shared_storage[];
+  auto* shared_scores = reinterpret_cast<float*>(shared_storage);
+  auto* shared_indices = reinterpret_cast<int64_t*>(shared_scores + blockDim.x * k);
+  auto* shared_routes = reinterpret_cast<float*>(shared_indices + blockDim.x * k);
+  auto* selected_indices = reinterpret_cast<int32_t*>(shared_routes + k);
+
+  const int64_t thread_base = static_cast<int64_t>(tid) * k;
+  for (int64_t rank = 0; rank < k; ++rank) {
+    shared_scores[thread_base + rank] = local_scores[rank];
+    shared_indices[thread_base + rank] = local_indices[rank];
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    const bool signed_abs_softmax = compress_kind == kCompressSignedAbsSoftmax;
+    const bool signed_entmax15 = compress_kind == kCompressSignedEntmax15;
+    float merged_scores[kPairwiseTopkForwardMaxK];
+    int64_t merged_indices[kPairwiseTopkForwardMaxK];
+    for (int64_t rank = 0; rank < k; ++rank) {
+      merged_scores[rank] = kNegativeInfinity;
+      merged_indices[rank] = 0;
+    }
+    for (int64_t thread = 0; thread < blockDim.x; ++thread) {
+      const int64_t base = thread * k;
+      for (int64_t rank = 0; rank < k; ++rank) {
+        insert_descending_topk(
+            shared_scores[base + rank],
+            shared_indices[base + rank],
+            merged_scores,
+            merged_indices,
+            k);
+      }
+    }
+
+    float denom = 0.0f;
+    if (signed_entmax15) {
+      float shifted_scores[kPairwiseTopkForwardMaxK];
+      float max_abs_score = fabsf(merged_scores[0]);
+      for (int64_t rank = 0; rank < k; ++rank) {
+        max_abs_score = rank == 0 ? fabsf(merged_scores[rank]) : fmaxf(max_abs_score, fabsf(merged_scores[rank]));
+      }
+      for (int64_t rank = 0; rank < k; ++rank) {
+        shifted_scores[rank] = (fabsf(merged_scores[rank]) - max_abs_score) * 0.5f;
+      }
+      const float tau = entmax15_tau_from_shifted(shifted_scores, k);
+      for (int64_t rank = 0; rank < k; ++rank) {
+        const float shifted = (fabsf(merged_scores[rank]) - max_abs_score) * 0.5f;
+        const float positive = fmaxf(shifted - tau, 0.0f);
+        const float route = positive * positive;
+        shared_routes[rank] = route;
+        denom += route;
+      }
+    } else {
+      const float max_score = signed_abs_softmax ? fabsf(merged_scores[0]) : merged_scores[0];
+      for (int64_t rank = 0; rank < k; ++rank) {
+        const float normalized_score =
+            signed_abs_softmax ? fabsf(merged_scores[rank]) : merged_scores[rank];
+        const float route = expf(normalized_score - max_score);
+        shared_routes[rank] = route;
+        denom += route;
+      }
+    }
+    denom = denom > 0.0f ? denom : 1.0f;
+    const int64_t output_base = (batch * src_nodes + src) * k;
+    for (int64_t rank = 0; rank < k; ++rank) {
+      shared_routes[rank] /= denom;
+      if (signed_abs_softmax || signed_entmax15) {
+        if (merged_scores[rank] < 0.0f) {
+          shared_routes[rank] = -shared_routes[rank];
+        } else if (merged_scores[rank] == 0.0f) {
+          shared_routes[rank] = 0.0f;
+        }
+      }
+      topk_scores[output_base + rank] = merged_scores[rank];
+      topk_indices[output_base + rank] = merged_indices[rank];
+      selected_indices[rank] = static_cast<int32_t>(merged_indices[rank]);
+    }
+
+    const float state_contrib = weighted_projected_state[batch * src_nodes + src];
+    const int64_t dst_base = batch * dst_nodes;
+    for (int64_t rank = 0; rank < k; ++rank) {
+      atomicAdd(&delta_state[dst_base + merged_indices[rank]], shared_routes[rank] * state_contrib);
+    }
+  }
+  __syncthreads();
+
+  const int64_t source_val_base = (batch * src_nodes + src) * out_dim;
+  const int64_t delta_val_batch_base = batch * dst_nodes * out_dim;
+  for (int64_t out = tid; out < out_dim; out += blockDim.x) {
+    const float sender_val = weighted_projected_val[source_val_base + out];
+    for (int64_t rank = 0; rank < k; ++rank) {
+      const int64_t dst = static_cast<int64_t>(selected_indices[rank]);
+      atomicAdd(
+          &delta_val[delta_val_batch_base + dst * out_dim + out],
+          shared_routes[rank] * sender_val);
+    }
+  }
+}
+
+template <typename scalar_t>
 __global__ void low_rank_propagation_topk_forward_kernel(
     const scalar_t* __restrict__ weighted_projected_source,
     const scalar_t* __restrict__ projected_target,
@@ -309,6 +457,170 @@ __global__ void low_rank_propagation_topk_forward_kernel(
                static_cast<float>(weighted_projected_source[source_offset + feature]);
     }
     insert_descending_topk(score, source, local_scores, local_indices, k);
+  }
+
+  extern __shared__ unsigned char shared_storage[];
+  auto* shared_scores = reinterpret_cast<float*>(shared_storage);
+  auto* shared_indices = reinterpret_cast<int64_t*>(shared_scores + blockDim.x * k);
+  auto* shared_edges = reinterpret_cast<float*>(shared_indices + blockDim.x * k);
+  auto* selected_indices = reinterpret_cast<int32_t*>(shared_edges + k);
+
+  const int64_t thread_base = static_cast<int64_t>(tid) * k;
+  for (int64_t rank = 0; rank < k; ++rank) {
+    shared_scores[thread_base + rank] = local_scores[rank];
+    shared_indices[thread_base + rank] = local_indices[rank];
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    const bool signed_abs_softmax = compress_kind == kCompressSignedAbsSoftmax;
+    const bool signed_entmax15 = compress_kind == kCompressSignedEntmax15;
+    float merged_scores[kPairwiseTopkForwardMaxK];
+    int64_t merged_indices[kPairwiseTopkForwardMaxK];
+    for (int64_t rank = 0; rank < k; ++rank) {
+      merged_scores[rank] = kNegativeInfinity;
+      merged_indices[rank] = 0;
+    }
+    for (int64_t thread = 0; thread < blockDim.x; ++thread) {
+      const int64_t base = thread * k;
+      for (int64_t rank = 0; rank < k; ++rank) {
+        insert_descending_topk(
+            shared_scores[base + rank],
+            shared_indices[base + rank],
+            merged_scores,
+            merged_indices,
+            k);
+      }
+    }
+
+    float state_acc = 0.0f;
+    const int64_t state_base = batch * source_nodes;
+    if (signed_entmax15) {
+      float shifted_scores[kPairwiseTopkForwardMaxK];
+      float max_abs_score = fabsf(merged_scores[0] + score_bias);
+      for (int64_t rank = 0; rank < k; ++rank) {
+        const float signed_score = merged_scores[rank] + score_bias;
+        max_abs_score = rank == 0 ? fabsf(signed_score) : fmaxf(max_abs_score, fabsf(signed_score));
+      }
+      float denom = 0.0f;
+      for (int64_t rank = 0; rank < k; ++rank) {
+        shifted_scores[rank] = (fabsf(merged_scores[rank] + score_bias) - max_abs_score) * 0.5f;
+      }
+      const float tau = entmax15_tau_from_shifted(shifted_scores, k);
+      for (int64_t rank = 0; rank < k; ++rank) {
+        const float signed_score = merged_scores[rank] + score_bias;
+        const float shifted = (fabsf(signed_score) - max_abs_score) * 0.5f;
+        const float positive = fmaxf(shifted - tau, 0.0f);
+        const float edge = positive * positive;
+        shared_edges[rank] = edge;
+        denom += edge;
+      }
+      denom = denom > 0.0f ? denom : 1.0f;
+      for (int64_t rank = 0; rank < k; ++rank) {
+        const float signed_score = merged_scores[rank] + score_bias;
+        float edge = shared_edges[rank] / denom;
+        if (signed_score < 0.0f) {
+          edge = -edge;
+        } else if (signed_score == 0.0f) {
+          edge = 0.0f;
+        }
+        const int64_t source = merged_indices[rank];
+        shared_edges[rank] = edge;
+        selected_indices[rank] = static_cast<int32_t>(source);
+        state_acc += edge * projected_state[state_base + source];
+      }
+    } else if (signed_abs_softmax) {
+      float max_score = fabsf(merged_scores[0] + score_bias);
+      float denom = 0.0f;
+      for (int64_t rank = 0; rank < k; ++rank) {
+        const float signed_score = merged_scores[rank] + score_bias;
+        const float edge = expf(fabsf(signed_score) - max_score);
+        shared_edges[rank] = edge;
+        denom += edge;
+      }
+      denom = denom > 0.0f ? denom : 1.0f;
+      for (int64_t rank = 0; rank < k; ++rank) {
+        const float signed_score = merged_scores[rank] + score_bias;
+        float edge = shared_edges[rank] / denom;
+        if (signed_score < 0.0f) {
+          edge = -edge;
+        } else if (signed_score == 0.0f) {
+          edge = 0.0f;
+        }
+        const int64_t source = merged_indices[rank];
+        shared_edges[rank] = edge;
+        selected_indices[rank] = static_cast<int32_t>(source);
+        state_acc += edge * projected_state[state_base + source];
+      }
+    } else {
+      for (int64_t rank = 0; rank < k; ++rank) {
+        const float edge = softsignf_device(merged_scores[rank] + score_bias);
+        const int64_t source = merged_indices[rank];
+        shared_edges[rank] = edge;
+        selected_indices[rank] = static_cast<int32_t>(source);
+        state_acc += edge * projected_state[state_base + source];
+      }
+    }
+    delta_state[linear_row] = state_acc;
+  }
+  __syncthreads();
+
+  const int64_t projected_val_base = batch * source_nodes * out_dim;
+  const int64_t delta_val_base = linear_row * out_dim;
+  for (int64_t out = tid; out < out_dim; out += blockDim.x) {
+    float acc = 0.0f;
+    for (int64_t rank = 0; rank < k; ++rank) {
+      const int64_t source = static_cast<int64_t>(selected_indices[rank]);
+      acc += shared_edges[rank] * projected_val[projected_val_base + source * out_dim + out];
+    }
+    delta_val[delta_val_base + out] = acc;
+  }
+}
+
+template <typename scalar_t>
+__global__ void low_rank_propagation_topk_forward_multihead_kernel(
+    const scalar_t* __restrict__ weighted_projected_source,
+    const scalar_t* __restrict__ projected_target,
+    const float* __restrict__ projected_state,
+    const float* __restrict__ projected_val,
+    float* __restrict__ delta_state,
+    float* __restrict__ delta_val,
+    int64_t batch_flat,
+    int64_t num_heads,
+    int64_t target_nodes,
+    int64_t source_nodes,
+    int64_t rank_dim,
+    int64_t out_dim,
+    int64_t k,
+    float score_bias,
+    int64_t compress_kind) {
+  const int64_t linear_row = blockIdx.x;
+  const int64_t batch = linear_row / target_nodes;
+  const int64_t target = linear_row - batch * target_nodes;
+  const int tid = threadIdx.x;
+
+  float local_scores[kPairwiseTopkForwardMaxK];
+  int64_t local_indices[kPairwiseTopkForwardMaxK];
+  for (int64_t rank = 0; rank < kPairwiseTopkForwardMaxK; ++rank) {
+    local_scores[rank] = kNegativeInfinity;
+    local_indices[rank] = 0;
+  }
+
+  for (int64_t source = tid; source < source_nodes; source += blockDim.x) {
+    float best_score = kNegativeInfinity;
+    for (int64_t head = 0; head < num_heads; ++head) {
+      const int64_t target_offset =
+          (((batch * num_heads + head) * target_nodes + target) * rank_dim);
+      const int64_t source_offset =
+          (((batch * num_heads + head) * source_nodes + source) * rank_dim);
+      float score = 0.0f;
+      for (int64_t feature = 0; feature < rank_dim; ++feature) {
+        score += static_cast<float>(projected_target[target_offset + feature]) *
+                 static_cast<float>(weighted_projected_source[source_offset + feature]);
+      }
+      best_score = fmaxf(best_score, score);
+    }
+    insert_descending_topk(best_score, source, local_scores, local_indices, k);
   }
 
   extern __shared__ unsigned char shared_storage[];
@@ -944,9 +1256,12 @@ jakal_net_low_rank_pairwise_topk_forward_cuda(
   if (compress_kind < kCompressSoftmax || compress_kind > kCompressSignedEntmax15) {
     throw std::runtime_error("compress_kind must be 0 (softmax), 1 (signed_abs_softmax), or 2 (signed_entmax15).");
   }
-  if (weighted_projected_source.dim() != 3 || projected_target.dim() != 3) {
+  const bool multihead =
+      weighted_projected_source.dim() == 4 && projected_target.dim() == 4;
+  if ((!multihead && (weighted_projected_source.dim() != 3 || projected_target.dim() != 3)) ||
+      (multihead && (weighted_projected_source.dim() != 4 || projected_target.dim() != 4))) {
     throw std::runtime_error(
-        "weighted_projected_source and projected_target must be shaped [batch, nodes, rank].");
+        "weighted_projected_source and projected_target must be shaped [batch, nodes, rank] or [batch, heads, nodes, rank].");
   }
   if (weighted_projected_state.dim() != 2 || weighted_projected_val.dim() != 3) {
     throw std::runtime_error(
@@ -973,9 +1288,10 @@ jakal_net_low_rank_pairwise_topk_forward_cuda(
   }
 
   const auto batch_flat = weighted_projected_source.size(0);
-  const auto src_nodes = weighted_projected_source.size(1);
-  const auto dst_nodes = projected_target.size(1);
-  const auto rank_dim = weighted_projected_source.size(2);
+  const auto num_heads = multihead ? weighted_projected_source.size(1) : 1;
+  const auto src_nodes = multihead ? weighted_projected_source.size(2) : weighted_projected_source.size(1);
+  const auto dst_nodes = multihead ? projected_target.size(2) : projected_target.size(1);
+  const auto rank_dim = multihead ? weighted_projected_source.size(3) : weighted_projected_source.size(2);
   const auto out_dim = weighted_projected_val.size(2);
   const auto k = std::min<int64_t>(topk, dst_nodes);
   if (k <= 0) {
@@ -1000,24 +1316,46 @@ jakal_net_low_rank_pairwise_topk_forward_cuda(
       weighted_projected_source.scalar_type(),
       "low_rank_pairwise_topk_forward_cuda",
       [&] {
-        low_rank_pairwise_topk_forward_kernel<scalar_t>
-            <<<blocks, threads, shmem, stream>>>(
-                weighted_projected_source.data_ptr<scalar_t>(),
-                projected_target.data_ptr<scalar_t>(),
-                weighted_projected_state.data_ptr<float>(),
-                weighted_projected_val.data_ptr<float>(),
-                delta_state.data_ptr<float>(),
-                delta_val.data_ptr<float>(),
-                topk_scores.data_ptr<float>(),
-                topk_indices.data_ptr<int64_t>(),
-                batch_flat,
-                src_nodes,
-                dst_nodes,
-                rank_dim,
-                out_dim,
-                k,
-                static_cast<float>(score_bias),
-                compress_kind);
+        if (multihead) {
+          low_rank_pairwise_topk_forward_multihead_kernel<scalar_t>
+              <<<blocks, threads, shmem, stream>>>(
+                  weighted_projected_source.data_ptr<scalar_t>(),
+                  projected_target.data_ptr<scalar_t>(),
+                  weighted_projected_state.data_ptr<float>(),
+                  weighted_projected_val.data_ptr<float>(),
+                  delta_state.data_ptr<float>(),
+                  delta_val.data_ptr<float>(),
+                  topk_scores.data_ptr<float>(),
+                  topk_indices.data_ptr<int64_t>(),
+                  batch_flat,
+                  num_heads,
+                  src_nodes,
+                  dst_nodes,
+                  rank_dim,
+                  out_dim,
+                  k,
+                  static_cast<float>(score_bias),
+                  compress_kind);
+        } else {
+          low_rank_pairwise_topk_forward_kernel<scalar_t>
+              <<<blocks, threads, shmem, stream>>>(
+                  weighted_projected_source.data_ptr<scalar_t>(),
+                  projected_target.data_ptr<scalar_t>(),
+                  weighted_projected_state.data_ptr<float>(),
+                  weighted_projected_val.data_ptr<float>(),
+                  delta_state.data_ptr<float>(),
+                  delta_val.data_ptr<float>(),
+                  topk_scores.data_ptr<float>(),
+                  topk_indices.data_ptr<int64_t>(),
+                  batch_flat,
+                  src_nodes,
+                  dst_nodes,
+                  rank_dim,
+                  out_dim,
+                  k,
+                  static_cast<float>(score_bias),
+                  compress_kind);
+        }
         C10_CUDA_KERNEL_LAUNCH_CHECK();
       });
 
@@ -1043,9 +1381,12 @@ jakal_net_low_rank_propagation_topk_forward_cuda(
   if (compress_kind < 0 || compress_kind > 2) {
     throw std::runtime_error("compress_kind must be 0 (softsign), 1 (signed_abs_softmax), or 2 (signed_entmax15).");
   }
-  if (weighted_projected_source.dim() != 3 || projected_target.dim() != 3) {
+  const bool multihead =
+      weighted_projected_source.dim() == 4 && projected_target.dim() == 4;
+  if ((!multihead && (weighted_projected_source.dim() != 3 || projected_target.dim() != 3)) ||
+      (multihead && (weighted_projected_source.dim() != 4 || projected_target.dim() != 4))) {
     throw std::runtime_error(
-        "weighted_projected_source and projected_target must be shaped [batch, nodes, rank].");
+        "weighted_projected_source and projected_target must be shaped [batch, nodes, rank] or [batch, heads, nodes, rank].");
   }
   if (projected_state.dim() != 2 || projected_val.dim() != 3) {
     throw std::runtime_error(
@@ -1072,9 +1413,10 @@ jakal_net_low_rank_propagation_topk_forward_cuda(
   }
 
   const auto batch_flat = weighted_projected_source.size(0);
-  const auto source_nodes = weighted_projected_source.size(1);
-  const auto target_nodes = projected_target.size(1);
-  const auto rank_dim = weighted_projected_source.size(2);
+  const auto num_heads = multihead ? weighted_projected_source.size(1) : 1;
+  const auto source_nodes = multihead ? weighted_projected_source.size(2) : weighted_projected_source.size(1);
+  const auto target_nodes = multihead ? projected_target.size(2) : projected_target.size(1);
+  const auto rank_dim = multihead ? weighted_projected_source.size(3) : weighted_projected_source.size(2);
   const auto out_dim = projected_val.size(2);
   const auto k = std::min<int64_t>(topk, source_nodes);
   if (k <= 0) {
@@ -1096,22 +1438,42 @@ jakal_net_low_rank_propagation_topk_forward_cuda(
       weighted_projected_source.scalar_type(),
       "low_rank_propagation_topk_forward_cuda",
       [&] {
-        low_rank_propagation_topk_forward_kernel<scalar_t>
-            <<<blocks, threads, shmem, stream>>>(
-                weighted_projected_source.data_ptr<scalar_t>(),
-                projected_target.data_ptr<scalar_t>(),
-                projected_state.data_ptr<float>(),
-                projected_val.data_ptr<float>(),
-                delta_state.data_ptr<float>(),
-                delta_val.data_ptr<float>(),
-                batch_flat,
-                target_nodes,
-                source_nodes,
-                rank_dim,
-                out_dim,
-                k,
-                static_cast<float>(score_bias),
-                compress_kind);
+        if (multihead) {
+          low_rank_propagation_topk_forward_multihead_kernel<scalar_t>
+              <<<blocks, threads, shmem, stream>>>(
+                  weighted_projected_source.data_ptr<scalar_t>(),
+                  projected_target.data_ptr<scalar_t>(),
+                  projected_state.data_ptr<float>(),
+                  projected_val.data_ptr<float>(),
+                  delta_state.data_ptr<float>(),
+                  delta_val.data_ptr<float>(),
+                  batch_flat,
+                  num_heads,
+                  target_nodes,
+                  source_nodes,
+                  rank_dim,
+                  out_dim,
+                  k,
+                  static_cast<float>(score_bias),
+                  compress_kind);
+        } else {
+          low_rank_propagation_topk_forward_kernel<scalar_t>
+              <<<blocks, threads, shmem, stream>>>(
+                  weighted_projected_source.data_ptr<scalar_t>(),
+                  projected_target.data_ptr<scalar_t>(),
+                  projected_state.data_ptr<float>(),
+                  projected_val.data_ptr<float>(),
+                  delta_state.data_ptr<float>(),
+                  delta_val.data_ptr<float>(),
+                  batch_flat,
+                  target_nodes,
+                  source_nodes,
+                  rank_dim,
+                  out_dim,
+                  k,
+                  static_cast<float>(score_bias),
+                  compress_kind);
+        }
         C10_CUDA_KERNEL_LAUNCH_CHECK();
       });
 
@@ -1770,11 +2132,24 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_low_rank_transition_pairwise_
       compress_name == "signed_entmax15";
   if (use_fused_topk &&
       allow_fastpath &&
-      !multihead &&
       topk > 0 && topk <= 32) {
-    auto projected_source = torch::matmul(src_val, source_weight.to(src_val.scalar_type()).transpose(0, 1)).contiguous();
-    auto weighted_projected_source = projected_source * core_weight.to(projected_source.scalar_type()).view({1, 1, -1});
-    auto projected_target = torch::matmul(dst_val, target_weight.to(dst_val.scalar_type()).transpose(0, 1)).contiguous();
+    torch::Tensor weighted_projected_source;
+    torch::Tensor projected_target;
+    if (multihead) {
+      auto cast_source = source_weight.to(src_val.scalar_type());
+      auto cast_target = target_weight.to(dst_val.scalar_type());
+      auto cast_core = core_weight.to(src_val.scalar_type());
+      auto projected_source = torch::einsum("bid,hrd->bhir", {src_val, cast_source}).contiguous();
+      std::vector<int64_t> core_shape(projected_source.dim(), 1);
+      core_shape[1] = cast_core.size(0);
+      core_shape[3] = cast_core.size(1);
+      weighted_projected_source = (projected_source * cast_core.view(core_shape)).contiguous();
+      projected_target = torch::einsum("bkd,hrd->bhkr", {dst_val, cast_target}).contiguous();
+    } else {
+      auto projected_source = torch::matmul(src_val, source_weight.to(src_val.scalar_type()).transpose(0, 1)).contiguous();
+      weighted_projected_source = (projected_source * core_weight.to(projected_source.scalar_type()).view({1, 1, -1})).contiguous();
+      projected_target = torch::matmul(dst_val, target_weight.to(dst_val.scalar_type()).transpose(0, 1)).contiguous();
+    }
     auto weighted_projected_state =
         (sender_strength.to(torch::kFloat32) * projected_state.to(torch::kFloat32)).contiguous();
     auto weighted_projected_val =
@@ -1877,11 +2252,25 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_low_rank_propagation_topk(
       compress_name == "signed_abs_softmax";
   if (use_fused_topk &&
       allow_fastpath &&
-      !multihead &&
       topk > 0 && topk <= 32) {
-    auto projected_target = torch::matmul(layer_val, target_weight.to(layer_val.scalar_type()).transpose(0, 1)).contiguous();
-    auto projected_source = torch::matmul(layer_val, source_weight.to(layer_val.scalar_type()).transpose(0, 1)).contiguous();
-    auto weighted_projected_source = projected_source * core_weight.to(projected_source.scalar_type()).view({1, 1, -1});
+    torch::Tensor weighted_projected_source;
+    torch::Tensor projected_target;
+    if (multihead) {
+      auto cast_source = source_weight.to(layer_val.scalar_type());
+      auto cast_target = target_weight.to(layer_val.scalar_type());
+      auto cast_core = core_weight.to(layer_val.scalar_type());
+      auto projected_source = torch::einsum("bid,hrd->bhir", {layer_val, cast_source}).contiguous();
+      std::vector<int64_t> core_shape(projected_source.dim(), 1);
+      core_shape[1] = cast_core.size(0);
+      core_shape[3] = cast_core.size(1);
+      weighted_projected_source = (projected_source * cast_core.view(core_shape)).contiguous();
+      projected_target = torch::einsum("bid,hrd->bhir", {layer_val, cast_target}).contiguous();
+    } else {
+      auto projected_target_single = torch::matmul(layer_val, target_weight.to(layer_val.scalar_type()).transpose(0, 1)).contiguous();
+      auto projected_source_single = torch::matmul(layer_val, source_weight.to(layer_val.scalar_type()).transpose(0, 1)).contiguous();
+      weighted_projected_source = (projected_source_single * core_weight.to(projected_source_single.scalar_type()).view({1, 1, -1})).contiguous();
+      projected_target = projected_target_single;
+    }
     auto weighted_projected_state = (layer_state.to(torch::kFloat32) * layer_state.to(torch::kFloat32)).contiguous();
     auto weighted_projected_val =
         (layer_state.to(torch::kFloat32).unsqueeze(-1) * layer_val.to(torch::kFloat32)).contiguous();
