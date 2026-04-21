@@ -1272,11 +1272,14 @@ jakal_net_low_rank_pairwise_topk_forward_cuda(
       weighted_projected_source.size(0) != weighted_projected_val.size(0)) {
     throw std::runtime_error("All fused low-rank inputs must share batch_flat.");
   }
-  if (weighted_projected_source.size(1) != weighted_projected_state.size(1) ||
-      weighted_projected_source.size(1) != weighted_projected_val.size(1)) {
+  const auto src_nodes = multihead ? weighted_projected_source.size(2) : weighted_projected_source.size(1);
+  const auto dst_nodes = multihead ? projected_target.size(2) : projected_target.size(1);
+  const auto rank_dim = multihead ? weighted_projected_source.size(3) : weighted_projected_source.size(2);
+  if (src_nodes != weighted_projected_state.size(1) ||
+      src_nodes != weighted_projected_val.size(1)) {
     throw std::runtime_error("weighted projected tensors must share src_nodes.");
   }
-  if (weighted_projected_source.size(2) != projected_target.size(2)) {
+  if (rank_dim != (multihead ? projected_target.size(3) : projected_target.size(2))) {
     throw std::runtime_error("weighted_projected_source and projected_target must share rank_dim.");
   }
   if (weighted_projected_state.scalar_type() != torch::kFloat32 ||
@@ -1289,9 +1292,6 @@ jakal_net_low_rank_pairwise_topk_forward_cuda(
 
   const auto batch_flat = weighted_projected_source.size(0);
   const auto num_heads = multihead ? weighted_projected_source.size(1) : 1;
-  const auto src_nodes = multihead ? weighted_projected_source.size(2) : weighted_projected_source.size(1);
-  const auto dst_nodes = multihead ? projected_target.size(2) : projected_target.size(1);
-  const auto rank_dim = multihead ? weighted_projected_source.size(3) : weighted_projected_source.size(2);
   const auto out_dim = weighted_projected_val.size(2);
   const auto k = std::min<int64_t>(topk, dst_nodes);
   if (k <= 0) {
@@ -1397,11 +1397,14 @@ jakal_net_low_rank_propagation_topk_forward_cuda(
       weighted_projected_source.size(0) != projected_val.size(0)) {
     throw std::runtime_error("All fused low-rank inputs must share batch_flat.");
   }
-  if (weighted_projected_source.size(1) != projected_state.size(1) ||
-      weighted_projected_source.size(1) != projected_val.size(1)) {
+  const auto source_nodes = multihead ? weighted_projected_source.size(2) : weighted_projected_source.size(1);
+  const auto target_nodes = multihead ? projected_target.size(2) : projected_target.size(1);
+  const auto rank_dim = multihead ? weighted_projected_source.size(3) : weighted_projected_source.size(2);
+  if (source_nodes != projected_state.size(1) ||
+      source_nodes != projected_val.size(1)) {
     throw std::runtime_error("projected_state/projected_val must share source_nodes.");
   }
-  if (weighted_projected_source.size(2) != projected_target.size(2)) {
+  if (rank_dim != (multihead ? projected_target.size(3) : projected_target.size(2))) {
     throw std::runtime_error("weighted_projected_source and projected_target must share rank_dim.");
   }
   if (projected_state.scalar_type() != torch::kFloat32 ||
@@ -1414,9 +1417,6 @@ jakal_net_low_rank_propagation_topk_forward_cuda(
 
   const auto batch_flat = weighted_projected_source.size(0);
   const auto num_heads = multihead ? weighted_projected_source.size(1) : 1;
-  const auto source_nodes = multihead ? weighted_projected_source.size(2) : weighted_projected_source.size(1);
-  const auto target_nodes = multihead ? projected_target.size(2) : projected_target.size(1);
-  const auto rank_dim = multihead ? weighted_projected_source.size(3) : weighted_projected_source.size(2);
   const auto out_dim = projected_val.size(2);
   const auto k = std::min<int64_t>(topk, source_nodes);
   if (k <= 0) {
