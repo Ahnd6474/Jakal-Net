@@ -41,6 +41,7 @@ from jakal_net.native_backend import (
     propagation_topk_native,
     propagation_window_native,
 )
+from jakal_net.modules import MultiHeadPairwise
 
 
 def _edge_compress_name(edge_compress_fn: Callable[[Tensor], Tensor]) -> str | None:
@@ -121,6 +122,9 @@ class Propagation(nn.Module):
         scores = self.pairwise_fn(layer.val, layer.val)
         validate_pairwise_scores(scores, layer)
         return scores
+
+    def _supports_multihead_vectorized_fast_path(self) -> bool:
+        return isinstance(self.pairwise_fn, MultiHeadPairwise)
 
     def compute_edges(self, layer: Layer) -> Tensor:
         return self.edge_compress_fn(self.compute_scores(layer))
@@ -260,6 +264,8 @@ class Propagation(nn.Module):
         return self._compute_delta_streaming(layer)
 
     def compute_delta(self, layer: Layer) -> LayerDelta:
+        if self._supports_multihead_vectorized_fast_path():
+            return self._compute_delta_reference(layer)
         if self.implementation == "native":
             edge_compress_name = _native_edge_compress_name(self.edge_compress_fn)
             if (
@@ -613,6 +619,8 @@ class SparsePropagation(Propagation):
         return self._compute_delta_streaming(layer)
 
     def compute_delta(self, layer: Layer) -> LayerDelta:
+        if self._supports_multihead_vectorized_fast_path():
+            return self._compute_delta_reference(layer)
         if self.implementation == "native":
             edge_compress_name = _native_edge_compress_name(self.edge_compress_fn)
             if (

@@ -8,6 +8,8 @@ from jakal_net import (
     Layer,
     LinearRoute,
     MLPRoute,
+    MultiHeadPairwise,
+    MultiHeadRoute,
     Propagation,
     QueryNormalizedDotRoute,
     ScaledCosinePairwise,
@@ -127,6 +129,33 @@ class JakalNetModuleTests(unittest.TestCase):
         numerators = torch.einsum("...id,...kd->...ik", source, target)
         denominators = source.square().sum(dim=-1, keepdim=True).clamp_min(1e-6)
         expected = numerators / denominators
+        self.assertTrue(torch.allclose(logits, expected, atol=1e-6, rtol=1e-6))
+
+    def test_multi_head_pairwise_matches_max_of_heads(self) -> None:
+        head_a = DiagonalBilinearPairwise(dim=2)
+        head_b = DiagonalBilinearPairwise(dim=2)
+        with torch.no_grad():
+            head_a.weight.copy_(torch.tensor([1.0, 2.0]))
+            head_b.weight.copy_(torch.tensor([3.0, 4.0]))
+            head_a.bias.zero_()
+            head_b.bias.zero_()
+        pairwise = MultiHeadPairwise([head_a, head_b])
+        target = torch.tensor([[[1.0, 2.0], [0.5, -1.0]]])
+        source = torch.tensor([[[2.0, 1.0], [1.0, -2.0]]])
+
+        scores = pairwise(target, source)
+        expected = torch.maximum(head_a(target, source), head_b(target, source))
+        self.assertTrue(torch.allclose(scores, expected, atol=1e-6, rtol=1e-6))
+
+    def test_multi_head_route_matches_max_of_heads(self) -> None:
+        head_a = QueryNormalizedDotRoute(src_dim=2, dst_dim=2, eps=1e-6, scale=1.0)
+        head_b = QueryNormalizedDotRoute(src_dim=2, dst_dim=2, eps=1e-6, scale=2.0)
+        route = MultiHeadRoute([head_a, head_b])
+        source = torch.tensor([[[2.0, 0.0], [1.0, 1.0]]])
+        target = torch.tensor([[[1.0, 0.0], [1.0, 1.0]]])
+
+        logits = route(source, target)
+        expected = torch.maximum(head_a(source, target), head_b(source, target))
         self.assertTrue(torch.allclose(logits, expected, atol=1e-6, rtol=1e-6))
 
     def test_dense_propagation_kernel_matches_reference(self) -> None:

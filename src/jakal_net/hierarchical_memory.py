@@ -41,6 +41,8 @@ class _MemoryLevel(nn.Module):
         route_kind: str,
         pairwise_rank: int,
         route_rank: int,
+        pairwise_heads: int,
+        route_heads: int,
         memory_topk: int,
         implementation: str,
     ) -> None:
@@ -52,7 +54,7 @@ class _MemoryLevel(nn.Module):
         nn.init.normal_(self.init_state, mean=0.0, std=0.02)
         nn.init.normal_(self.init_val, mean=0.0, std=0.02)
         self.write = SparseTransition(
-            route_fn=make_route(route_kind, dim=dim, rank=route_rank),
+            route_fn=make_route(route_kind, dim=dim, rank=route_rank, heads=route_heads),
             topk=min(memory_topk, num_slots),
             state_activation_fn=F.softplus,
             route_compress_name="signed_abs_softmax",
@@ -60,7 +62,12 @@ class _MemoryLevel(nn.Module):
             merge_mode="add",
         )
         self.propagation = SparsePropagation(
-            pairwise_fn=make_pairwise(pairwise_kind, dim=dim, rank=pairwise_rank),
+            pairwise_fn=make_pairwise(
+                pairwise_kind,
+                dim=dim,
+                rank=pairwise_rank,
+                heads=pairwise_heads,
+            ),
             sparse_type="topk",
             topk=min(memory_topk, num_slots),
             edge_compress_fn=signed_abs_softmax_edges,
@@ -98,6 +105,8 @@ class BModule(nn.Module):
         route_kind: str,
         pairwise_rank: int,
         route_rank: int,
+        pairwise_heads: int = 1,
+        route_heads: int = 1,
         implementation: str,
     ) -> None:
         super().__init__()
@@ -122,6 +131,8 @@ class BModule(nn.Module):
                 route_kind=route_kind,
                 pairwise_rank=pairwise_rank,
                 route_rank=route_rank,
+                pairwise_heads=pairwise_heads,
+                route_heads=route_heads,
                 memory_topk=memory_topk,
                 implementation=implementation,
             )
@@ -129,7 +140,7 @@ class BModule(nn.Module):
         )
         self.level_transitions = nn.ModuleList(
             SparseTransition(
-                route_fn=make_route(route_kind, dim=dim, rank=route_rank),
+                route_fn=make_route(route_kind, dim=dim, rank=route_rank, heads=route_heads),
                 topk=min(memory_topk, self.memory_slots[index + 1]),
                 state_activation_fn=F.softplus,
                 route_compress_name="signed_abs_softmax",
@@ -144,7 +155,7 @@ class BModule(nn.Module):
         self.skip_gates = nn.ParameterDict()
         if len(self.memory_slots) >= 2:
             self.skip_transitions["token_to_1"] = SparseTransition(
-                route_fn=make_route(route_kind, dim=dim, rank=route_rank),
+                route_fn=make_route(route_kind, dim=dim, rank=route_rank, heads=route_heads),
                 topk=min(memory_topk, self.memory_slots[1]),
                 state_activation_fn=F.softplus,
                 route_compress_name="signed_abs_softmax",
@@ -155,7 +166,7 @@ class BModule(nn.Module):
         for level_index in range(2, len(self.memory_slots)):
             key = f"{level_index - 2}_to_{level_index}"
             self.skip_transitions[key] = SparseTransition(
-                route_fn=make_route(route_kind, dim=dim, rank=route_rank),
+                route_fn=make_route(route_kind, dim=dim, rank=route_rank, heads=route_heads),
                 topk=min(memory_topk, self.memory_slots[level_index]),
                 state_activation_fn=F.softplus,
                 route_compress_name="signed_abs_softmax",
@@ -171,7 +182,7 @@ class BModule(nn.Module):
         self.bridge_input_norm = nn.LayerNorm(dim)
         self.bridge_to_levels = nn.ModuleList(
             SparseTransition(
-                route_fn=make_route(route_kind, dim=dim, rank=route_rank),
+                route_fn=make_route(route_kind, dim=dim, rank=route_rank, heads=route_heads),
                 topk=min(memory_topk, slots),
                 state_activation_fn=F.softplus,
                 route_compress_name="signed_abs_softmax",

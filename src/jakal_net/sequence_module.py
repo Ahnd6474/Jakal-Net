@@ -25,6 +25,7 @@ class SModule(nn.Module):
         s_layers: int,
         pairwise_kind: str,
         pairwise_rank: int,
+        pairwise_heads: int = 1,
         implementation: str,
         s_window: int | None = None,
         s_microbatch_size: int | None = None,
@@ -58,7 +59,12 @@ class SModule(nn.Module):
         self.sequence_norms = nn.ModuleList(nn.LayerNorm(dim) for _ in range(s_layers))
         self.sequence_layers = nn.ModuleList(
             SparsePropagation(
-                pairwise_fn=make_pairwise(pairwise_kind, dim=dim, rank=pairwise_rank),
+                pairwise_fn=make_pairwise(
+                    pairwise_kind,
+                    dim=dim,
+                    rank=pairwise_rank,
+                    heads=pairwise_heads,
+                ),
                 sparse_type="window",
                 window=max_seq_len if s_window is None else max(1, s_window),
                 edge_compress_fn=signed_abs_softmax_edges,

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import os
 
 import torch
@@ -98,6 +100,33 @@ class ScaledCosinePairwise(nn.Module):
         normalized_target = F.normalize(target_val, dim=-1, eps=self.eps)
         normalized_source = F.normalize(source_val, dim=-1, eps=self.eps)
         return torch.einsum("...id,...jd->...ij", normalized_target, normalized_source) * self.scale
+
+
+class MultiHeadPairwise(nn.Module):
+    def __init__(self, heads: Sequence[nn.Module], *, aggregate: str = "max") -> None:
+        super().__init__()
+        if not heads:
+            raise ValueError("heads must contain at least one pairwise module.")
+        if aggregate not in {"max", "mean", "sum"}:
+            raise ValueError(f"Unsupported aggregate mode: {aggregate!r}.")
+        self.heads = nn.ModuleList(heads)
+        self.aggregate = aggregate
+        self.num_heads = len(self.heads)
+
+    def head_scores(self, target_val: Tensor, source_val: Tensor) -> Tensor:
+        stacked = [head(target_val, source_val) for head in self.heads]
+        if not stacked:
+            raise RuntimeError("MultiHeadPairwise requires at least one head.")
+        return torch.stack(stacked, dim=-1)
+
+    def forward(self, target_val: Tensor, source_val: Tensor) -> Tensor:
+        head_scores = self.head_scores(target_val, source_val)
+        if self.aggregate == "max":
+            return head_scores.max(dim=-1).values
+        combined = head_scores.sum(dim=-1)
+        if self.aggregate == "mean":
+            combined = combined / float(self.num_heads)
+        return combined
 
 
 class HadamardMLPPairwise(nn.Module):
@@ -258,6 +287,45 @@ class QueryNormalizedDotRoute(nn.Module):
         numerators = torch.einsum("...id,...kd->...ik", source_val, target_val)
         denominators = source_val.square().sum(dim=-1, keepdim=True).clamp_min(self.eps)
         return numerators / denominators * self.scale
+
+
+class MultiHeadRoute(nn.Module):
+    def __init__(self, heads: Sequence[nn.Module], *, aggregate: str = "max") -> None:
+        super().__init__()
+        if not heads:
+            raise ValueError("heads must contain at least one route module.")
+        if aggregate not in {"max", "mean", "sum"}:
+            raise ValueError(f"Unsupported aggregate mode: {aggregate!r}.")
+        self.heads = nn.ModuleList(heads)
+        self.aggregate = aggregate
+        self.num_heads = len(self.heads)
+        self.expects_pairwise_inputs = any(
+            getattr(head, "expects_pairwise_inputs", False) for head in self.heads
+        )
+
+    def head_logits(self, source_val: Tensor, target_val: Tensor | None = None) -> Tensor:
+        stacked: list[Tensor] = []
+        for head in self.heads:
+            if getattr(head, "expects_pairwise_inputs", False):
+                if target_val is None:
+                    raise ValueError(
+                        "target_val is required for MultiHeadRoute heads with pairwise inputs."
+                    )
+                stacked.append(head(source_val, target_val))
+            else:
+                stacked.append(head(source_val))
+        if not stacked:
+            raise RuntimeError("MultiHeadRoute requires at least one head.")
+        return torch.stack(stacked, dim=-1)
+
+    def forward(self, source_val: Tensor, target_val: Tensor | None = None) -> Tensor:
+        head_logits = self.head_logits(source_val, target_val)
+        if self.aggregate == "max":
+            return head_logits.max(dim=-1).values
+        combined = head_logits.sum(dim=-1)
+        if self.aggregate == "mean":
+            combined = combined / float(self.num_heads)
+        return combined
 
 
 class BilinearPairwiseRoute(nn.Module):

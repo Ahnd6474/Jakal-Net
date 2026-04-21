@@ -31,6 +31,7 @@ from jakal_net.native_backend import (
     native_supports,
     native_supports_device,
 )
+from jakal_net.modules import MultiHeadPairwise, MultiHeadRoute
 from jakal_net.propagation import SparsePropagation
 from jakal_net.sequence_module import SModule
 
@@ -77,6 +78,8 @@ class CausalHierarchicalMemoryLM(nn.Module):
         route_kind: str = "low_rank_bilinear",
         pairwise_rank: int = 64,
         route_rank: int = 64,
+        pairwise_heads: int = 1,
+        route_heads: int = 1,
         scan_backend: str = "auto",
         scan_checkpoint_chunk_size: int | None = None,
         implementation: str = "streaming",
@@ -126,6 +129,8 @@ class CausalHierarchicalMemoryLM(nn.Module):
                 pairwise_kind=pairwise_kind,
                 route_rank=route_rank,
                 pairwise_rank=pairwise_rank,
+                route_heads=route_heads,
+                pairwise_heads=pairwise_heads,
                 route_topk=knowledge_route_topk or memory_topk,
                 propagation_topk=knowledge_propagation_topk or memory_topk,
                 propagation_layers=knowledge_propagation_layers,
@@ -141,6 +146,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
             s_layers=s_layers,
             pairwise_kind=pairwise_kind,
             pairwise_rank=pairwise_rank,
+            pairwise_heads=pairwise_heads,
             implementation=implementation,
             s_window=s_window,
             s_microbatch_size=s_microbatch_size,
@@ -154,6 +160,8 @@ class CausalHierarchicalMemoryLM(nn.Module):
             route_kind=route_kind,
             pairwise_rank=pairwise_rank,
             route_rank=route_rank,
+            pairwise_heads=pairwise_heads,
+            route_heads=route_heads,
             implementation=implementation,
         )
 
@@ -162,7 +170,12 @@ class CausalHierarchicalMemoryLM(nn.Module):
         self.prediction_norms = nn.ModuleList(nn.LayerNorm(dim) for _ in range(prediction_layers))
         self.prediction_layers = nn.ModuleList(
             SparsePropagation(
-                pairwise_fn=make_pairwise(pairwise_kind, dim=dim, rank=pairwise_rank),
+                pairwise_fn=make_pairwise(
+                    pairwise_kind,
+                    dim=dim,
+                    rank=pairwise_rank,
+                    heads=pairwise_heads,
+                ),
                 sparse_type="window",
                 window=max(1, prediction_window),
                 edge_compress_fn=signed_abs_softmax_edges,
@@ -290,6 +303,51 @@ class CausalHierarchicalMemoryLM(nn.Module):
         return None
 
     @staticmethod
+    def _stack_optional_specs(
+        tensors: Sequence[Tensor | None],
+        reference: Tensor,
+    ) -> Tensor:
+        if not tensors or all(tensor is None for tensor in tensors):
+            return reference.new_empty((0,))
+        if any(tensor is None for tensor in tensors):
+            raise RuntimeError("Native scan multi-head specs must be uniformly present or absent.")
+        return torch.stack([tensor for tensor in tensors if tensor is not None], dim=0)
+
+    @staticmethod
+    def _route_kernel_kind(route_fn: nn.Module) -> str | None:
+        if isinstance(route_fn, MultiHeadRoute):
+            if route_fn.aggregate != "max":
+                return None
+            head_kinds = []
+            for head in route_fn.heads:
+                if not supports_pairwise_route_kernel(head):
+                    return None
+                head_kinds.append(pairwise_route_kernel_spec(head).kind)
+            if not head_kinds or len(set(head_kinds)) != 1:
+                return None
+            return f"multihead_max_{head_kinds[0]}"
+        if not supports_pairwise_route_kernel(route_fn):
+            return None
+        return pairwise_route_kernel_spec(route_fn).kind
+
+    @staticmethod
+    def _pairwise_kernel_kind(pairwise_fn: nn.Module) -> str | None:
+        if isinstance(pairwise_fn, MultiHeadPairwise):
+            if pairwise_fn.aggregate != "max":
+                return None
+            head_kinds = []
+            for head in pairwise_fn.heads:
+                if not supports_pairwise_kernel(head):
+                    return None
+                head_kinds.append(pairwise_kernel_spec(head).kind)
+            if not head_kinds or len(set(head_kinds)) != 1:
+                return None
+            return f"multihead_max_{head_kinds[0]}"
+        if not supports_pairwise_kernel(pairwise_fn):
+            return None
+        return pairwise_kernel_spec(pairwise_fn).kind
+
+    @staticmethod
     def _tensor_or_empty(tensor: Tensor | None, reference: Tensor) -> Tensor:
         if tensor is None:
             return reference.new_empty((0,))
@@ -301,13 +359,13 @@ class CausalHierarchicalMemoryLM(nn.Module):
 
         def _is_supported_route(transition) -> bool:
             return (
-                supports_pairwise_route_kernel(transition.route_fn)
+                self._route_kernel_kind(transition.route_fn) is not None
                 and transition.route_compress_name in supported_route_compress
             )
 
         def _is_supported_propagation(propagation) -> bool:
             return (
-                supports_pairwise_kernel(propagation.pairwise_fn)
+                self._pairwise_kernel_kind(propagation.pairwise_fn) is not None
                 and propagation.sparse_type in {"topk", "dense"}
                 and propagation.state_weight_edges
                 and self._native_edge_compress_name(propagation.edge_compress_fn) in supported_edge_compress
@@ -328,10 +386,12 @@ class CausalHierarchicalMemoryLM(nn.Module):
         route_names.update(transition.route_compress_name for transition in self.b_module.skip_transitions.values())
         if len(route_names) != 1:
             return False
-        route_kinds = {pairwise_route_kernel_spec(level.write.route_fn).kind for level in self.b_module.memory_levels}
-        route_kinds.update(pairwise_route_kernel_spec(transition.route_fn).kind for transition in self.b_module.level_transitions)
-        route_kinds.update(pairwise_route_kernel_spec(transition.route_fn).kind for transition in self.b_module.skip_transitions.values())
+        route_kinds = {self._route_kernel_kind(level.write.route_fn) for level in self.b_module.memory_levels}
+        route_kinds.update(self._route_kernel_kind(transition.route_fn) for transition in self.b_module.level_transitions)
+        route_kinds.update(self._route_kernel_kind(transition.route_fn) for transition in self.b_module.skip_transitions.values())
         if len(route_kinds) != 1:
+            return False
+        if None in route_kinds:
             return False
         propagation_names = {
             self._native_edge_compress_name(level.propagation.edge_compress_fn)
@@ -339,8 +399,10 @@ class CausalHierarchicalMemoryLM(nn.Module):
         }
         if None in propagation_names or len(propagation_names) != 1:
             return False
-        propagation_kinds = {pairwise_kernel_spec(level.propagation.pairwise_fn).kind for level in self.b_module.memory_levels}
+        propagation_kinds = {self._pairwise_kernel_kind(level.propagation.pairwise_fn) for level in self.b_module.memory_levels}
         if len(propagation_kinds) != 1:
+            return False
+        if None in propagation_kinds:
             return False
         return True
 
@@ -361,11 +423,20 @@ class CausalHierarchicalMemoryLM(nn.Module):
         )
         if propagation_compress_name is None:
             raise RuntimeError("Unsupported propagation edge_compress_fn for native scan.")
-
-        route_kind_name = pairwise_route_kernel_spec(self.b_module.memory_levels[0].write.route_fn).kind
-        propagation_pairwise_kind = pairwise_kernel_spec(self.b_module.memory_levels[0].propagation.pairwise_fn).kind
+        route_kind_name = self._route_kernel_kind(self.b_module.memory_levels[0].write.route_fn)
+        propagation_pairwise_kind = self._pairwise_kernel_kind(self.b_module.memory_levels[0].propagation.pairwise_fn)
+        if route_kind_name is None or propagation_pairwise_kind is None:
+            raise RuntimeError("Unsupported route/pairwise kind for native scan.")
 
         def _route_spec(route_fn: nn.Module) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+            if isinstance(route_fn, MultiHeadRoute):
+                specs = [pairwise_route_kernel_spec(head) for head in route_fn.heads]
+                return (
+                    self._stack_optional_specs([spec.source_weight for spec in specs], aligned_s),
+                    self._stack_optional_specs([spec.target_weight for spec in specs], aligned_s),
+                    torch.stack([spec.core_weight for spec in specs], dim=0),
+                    self._stack_optional_specs([spec.bias for spec in specs], aligned_s),
+                )
             spec = pairwise_route_kernel_spec(route_fn)
             return (
                 self._tensor_or_empty(spec.source_weight, aligned_s),
@@ -375,6 +446,14 @@ class CausalHierarchicalMemoryLM(nn.Module):
             )
 
         def _pairwise_spec(pairwise_fn: nn.Module) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+            if isinstance(pairwise_fn, MultiHeadPairwise):
+                specs = [pairwise_kernel_spec(head) for head in pairwise_fn.heads]
+                return (
+                    self._stack_optional_specs([spec.in_weight for spec in specs], aligned_s),
+                    self._stack_optional_specs([spec.out_weight for spec in specs], aligned_s),
+                    torch.stack([spec.weight for spec in specs], dim=0),
+                    self._stack_optional_specs([spec.bias for spec in specs], aligned_s),
+                )
             spec = pairwise_kernel_spec(pairwise_fn)
             return (
                 self._tensor_or_empty(spec.in_weight, aligned_s),
@@ -482,6 +561,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
         use_native_scan = (
             self.knowledge_module is None
             and self.scan_backend != "python"
+            and self._native_scan_supported_config()
             and native_supports("causal_memory_scan_fused")
             and native_supports_device(aligned_s.device.type)
         )

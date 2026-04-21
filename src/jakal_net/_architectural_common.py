@@ -13,6 +13,8 @@ from jakal_net.modules import (
     DiagonalBilinearRoute,
     LowRankBilinearPairwise,
     LowRankBilinearRoute,
+    MultiHeadPairwise,
+    MultiHeadRoute,
     QueryNormalizedDotRoute,
     ScaledCosinePairwise,
 )
@@ -22,7 +24,7 @@ PARAM_INIT_STD = 0.02
 LOW_RANK_SCALE_INIT = 0.1
 
 
-def make_pairwise(
+def _make_single_pairwise(
     kind: str,
     *,
     dim: int,
@@ -41,7 +43,23 @@ def make_pairwise(
     raise ValueError(f"Unsupported pairwise kind: {kind!r}.")
 
 
-def make_route(
+def make_pairwise(
+    kind: str,
+    *,
+    dim: int,
+    rank: int,
+    heads: int = 1,
+) -> nn.Module:
+    if heads <= 0:
+        raise ValueError("heads must be positive.")
+    if heads == 1:
+        return _make_single_pairwise(kind, dim=dim, rank=rank)
+    return MultiHeadPairwise(
+        [_make_single_pairwise(kind, dim=dim, rank=rank) for _ in range(heads)]
+    )
+
+
+def _make_single_route(
     kind: str,
     *,
     dim: int,
@@ -58,6 +76,22 @@ def make_route(
     if kind == "query_norm_dot":
         return QueryNormalizedDotRoute(src_dim=dim, dst_dim=dim)
     raise ValueError(f"Unsupported route kind: {kind!r}.")
+
+
+def make_route(
+    kind: str,
+    *,
+    dim: int,
+    rank: int,
+    heads: int = 1,
+) -> nn.Module:
+    if heads <= 0:
+        raise ValueError("heads must be positive.")
+    if heads == 1:
+        return _make_single_route(kind, dim=dim, rank=rank)
+    return MultiHeadRoute(
+        [_make_single_route(kind, dim=dim, rank=rank) for _ in range(heads)]
+    )
 
 
 def layer_with_val_norm(layer: Layer, norm: nn.LayerNorm) -> Layer:

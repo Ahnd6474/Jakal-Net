@@ -1736,6 +1736,19 @@ torch::Tensor scan_cuda_full_topk_indices(const torch::Tensor& scores) {
       .expand({batch, left, right});
 }
 
+torch::Tensor scan_cuda_select_head_tensor(
+    const torch::Tensor& tensor,
+    int64_t head_index,
+    int64_t num_heads) {
+  if (!tensor.defined() || tensor.numel() == 0) {
+    return tensor;
+  }
+  if (tensor.dim() > 0 && tensor.size(0) == num_heads) {
+    return tensor.select(0, head_index).contiguous();
+  }
+  return tensor;
+}
+
 std::tuple<torch::Tensor, torch::Tensor> scan_cuda_low_rank_transition_pairwise_topk(
     const torch::Tensor& sender_strength,
     const torch::Tensor& projected_state,
@@ -1749,12 +1762,15 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_low_rank_transition_pairwise_
     int64_t topk,
     const std::string& compress_name,
     bool allow_fastpath) {
+  const bool multihead =
+      source_weight.dim() >= 3 || target_weight.dim() >= 3 || core_weight.dim() >= 2;
   const bool use_fused_topk =
       compress_name == "softmax" ||
       compress_name == "signed_abs_softmax" ||
       compress_name == "signed_entmax15";
   if (use_fused_topk &&
       allow_fastpath &&
+      !multihead &&
       topk > 0 && topk <= 32) {
     auto projected_source = torch::matmul(src_val, source_weight.to(src_val.scalar_type()).transpose(0, 1)).contiguous();
     auto weighted_projected_source = projected_source * core_weight.to(projected_source.scalar_type()).view({1, 1, -1});
@@ -1779,12 +1795,35 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_low_rank_transition_pairwise_
     };
   }
 
-  auto projected_source = torch::matmul(src_val, source_weight.to(src_val.scalar_type()).transpose(0, 1));
-  auto weighted_projected_source = projected_source * core_weight.to(projected_source.scalar_type()).view({1, 1, -1});
-  auto projected_target = torch::matmul(dst_val, target_weight.to(dst_val.scalar_type()).transpose(0, 1));
-  auto logits = torch::matmul(weighted_projected_source, projected_target.transpose(1, 2));
-  if (bias.defined() && bias.numel() != 0) {
-    logits = logits + bias.to(logits.scalar_type());
+  torch::Tensor logits;
+  if (multihead) {
+    const auto num_heads = core_weight.dim() >= 2 ? core_weight.size(0) : source_weight.size(0);
+    std::vector<torch::Tensor> head_logits;
+    head_logits.reserve(static_cast<size_t>(num_heads));
+    for (int64_t head_index = 0; head_index < num_heads; ++head_index) {
+      auto head_source_weight = scan_cuda_select_head_tensor(source_weight, head_index, num_heads);
+      auto head_target_weight = scan_cuda_select_head_tensor(target_weight, head_index, num_heads);
+      auto head_core_weight = scan_cuda_select_head_tensor(core_weight, head_index, num_heads);
+      auto head_bias = scan_cuda_select_head_tensor(bias, head_index, num_heads);
+      auto projected_source = torch::matmul(src_val, head_source_weight.to(src_val.scalar_type()).transpose(0, 1));
+      auto weighted_projected_source =
+          projected_source * head_core_weight.to(projected_source.scalar_type()).view({1, 1, -1});
+      auto projected_target = torch::matmul(dst_val, head_target_weight.to(dst_val.scalar_type()).transpose(0, 1));
+      auto head_scores = torch::matmul(weighted_projected_source, projected_target.transpose(1, 2));
+      if (head_bias.defined() && head_bias.numel() != 0) {
+        head_scores = head_scores + head_bias.to(head_scores.scalar_type());
+      }
+      head_logits.push_back(head_scores);
+    }
+    logits = std::get<0>(torch::stack(head_logits, -1).max(-1));
+  } else {
+    auto projected_source = torch::matmul(src_val, source_weight.to(src_val.scalar_type()).transpose(0, 1));
+    auto weighted_projected_source = projected_source * core_weight.to(projected_source.scalar_type()).view({1, 1, -1});
+    auto projected_target = torch::matmul(dst_val, target_weight.to(dst_val.scalar_type()).transpose(0, 1));
+    logits = torch::matmul(weighted_projected_source, projected_target.transpose(1, 2));
+    if (bias.defined() && bias.numel() != 0) {
+      logits = logits + bias.to(logits.scalar_type());
+    }
   }
   const auto dst_nodes = dst_val.size(1);
   const auto k = std::min<int64_t>(std::max<int64_t>(1, topk), dst_nodes);
@@ -1834,11 +1873,14 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_low_rank_propagation_topk(
     int64_t topk,
     const std::string& compress_name,
     bool allow_fastpath) {
+  const bool multihead =
+      source_weight.dim() >= 3 || target_weight.dim() >= 3 || core_weight.dim() >= 2;
   const bool use_fused_topk =
       compress_name == "softsign" ||
       compress_name == "signed_abs_softmax";
   if (use_fused_topk &&
       allow_fastpath &&
+      !multihead &&
       topk > 0 && topk <= 32) {
     auto projected_target = torch::matmul(layer_val, target_weight.to(layer_val.scalar_type()).transpose(0, 1)).contiguous();
     auto projected_source = torch::matmul(layer_val, source_weight.to(layer_val.scalar_type()).transpose(0, 1)).contiguous();
@@ -1862,12 +1904,35 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_low_rank_propagation_topk(
     };
   }
 
-  auto projected_target = torch::matmul(layer_val, target_weight.to(layer_val.scalar_type()).transpose(0, 1));
-  auto projected_source = torch::matmul(layer_val, source_weight.to(layer_val.scalar_type()).transpose(0, 1));
-  auto weighted_projected_source = projected_source * core_weight.to(projected_source.scalar_type()).view({1, 1, -1});
-  auto scores = torch::matmul(projected_target, weighted_projected_source.transpose(1, 2));
-  if (bias.defined() && bias.numel() != 0) {
-    scores = scores + bias.to(scores.scalar_type());
+  torch::Tensor scores;
+  if (multihead) {
+    const auto num_heads = core_weight.dim() >= 2 ? core_weight.size(0) : source_weight.size(0);
+    std::vector<torch::Tensor> head_scores;
+    head_scores.reserve(static_cast<size_t>(num_heads));
+    for (int64_t head_index = 0; head_index < num_heads; ++head_index) {
+      auto head_source_weight = scan_cuda_select_head_tensor(source_weight, head_index, num_heads);
+      auto head_target_weight = scan_cuda_select_head_tensor(target_weight, head_index, num_heads);
+      auto head_core_weight = scan_cuda_select_head_tensor(core_weight, head_index, num_heads);
+      auto head_bias = scan_cuda_select_head_tensor(bias, head_index, num_heads);
+      auto projected_target = torch::matmul(layer_val, head_target_weight.to(layer_val.scalar_type()).transpose(0, 1));
+      auto projected_source = torch::matmul(layer_val, head_source_weight.to(layer_val.scalar_type()).transpose(0, 1));
+      auto weighted_projected_source =
+          projected_source * head_core_weight.to(projected_source.scalar_type()).view({1, 1, -1});
+      auto head_score = torch::matmul(projected_target, weighted_projected_source.transpose(1, 2));
+      if (head_bias.defined() && head_bias.numel() != 0) {
+        head_score = head_score + head_bias.to(head_score.scalar_type());
+      }
+      head_scores.push_back(head_score);
+    }
+    scores = std::get<0>(torch::stack(head_scores, -1).max(-1));
+  } else {
+    auto projected_target = torch::matmul(layer_val, target_weight.to(layer_val.scalar_type()).transpose(0, 1));
+    auto projected_source = torch::matmul(layer_val, source_weight.to(layer_val.scalar_type()).transpose(0, 1));
+    auto weighted_projected_source = projected_source * core_weight.to(projected_source.scalar_type()).view({1, 1, -1});
+    scores = torch::matmul(projected_target, weighted_projected_source.transpose(1, 2));
+    if (bias.defined() && bias.numel() != 0) {
+      scores = scores + bias.to(scores.scalar_type());
+    }
   }
   const auto nodes = layer_val.size(1);
   const auto k = std::min<int64_t>(std::max<int64_t>(1, topk), nodes);

@@ -381,6 +381,49 @@ c10::optional<torch::Tensor> slice_optional_tensor(
   return tensor.value().slice(0, start, end).contiguous();
 }
 
+bool starts_with(const std::string& value, const std::string& prefix) {
+  return value.rfind(prefix, 0) == 0;
+}
+
+int64_t infer_multihead_count(
+    const torch::Tensor& core_weight,
+    const c10::optional<torch::Tensor>& source_weight,
+    const c10::optional<torch::Tensor>& target_weight) {
+  if (core_weight.dim() >= 2) {
+    return core_weight.size(0);
+  }
+  if (source_weight.has_value() && source_weight.value().dim() >= 3) {
+    return source_weight.value().size(0);
+  }
+  if (target_weight.has_value() && target_weight.value().dim() >= 3) {
+    return target_weight.value().size(0);
+  }
+  throw std::runtime_error("Unable to infer multi-head count from packed weights.");
+}
+
+torch::Tensor select_head_tensor(
+    const torch::Tensor& tensor,
+    int64_t head_index,
+    int64_t num_heads) {
+  if (!tensor.defined() || tensor.numel() == 0) {
+    return tensor;
+  }
+  if (tensor.dim() > 0 && tensor.size(0) == num_heads) {
+    return tensor.select(0, head_index).contiguous();
+  }
+  return tensor;
+}
+
+c10::optional<torch::Tensor> select_head_optional_tensor(
+    const c10::optional<torch::Tensor>& tensor,
+    int64_t head_index,
+    int64_t num_heads) {
+  if (!tensor.has_value()) {
+    return c10::nullopt;
+  }
+  return select_head_tensor(tensor.value(), head_index, num_heads);
+}
+
 torch::Tensor pairwise_scores(
     const std::string& pairwise_kind,
     const torch::Tensor& target_val,
@@ -391,6 +434,26 @@ torch::Tensor pairwise_scores(
     const c10::optional<torch::Tensor>& in_bias,
     const c10::optional<torch::Tensor>& out_weight,
     const c10::optional<torch::Tensor>& out_bias) {
+  if (starts_with(pairwise_kind, "multihead_max_")) {
+    const auto base_kind = pairwise_kind.substr(std::string("multihead_max_").size());
+    const auto num_heads = infer_multihead_count(weight, in_weight, out_weight);
+    std::vector<torch::Tensor> head_scores;
+    head_scores.reserve(static_cast<size_t>(num_heads));
+    for (int64_t head_index = 0; head_index < num_heads; ++head_index) {
+      head_scores.push_back(pairwise_scores(
+          base_kind,
+          target_val,
+          source_val,
+          select_head_tensor(weight, head_index, num_heads),
+          select_head_optional_tensor(bias, head_index, num_heads),
+          select_head_optional_tensor(in_weight, head_index, num_heads),
+          select_head_optional_tensor(in_bias, head_index, num_heads),
+          select_head_optional_tensor(out_weight, head_index, num_heads),
+          select_head_optional_tensor(out_bias, head_index, num_heads)));
+    }
+    return std::get<0>(torch::stack(head_scores, -1).max(-1));
+  }
+
   if (pairwise_kind == "diagonal_bilinear") {
     auto target_proj = target_val * weight.view({1, 1, -1});
     auto scores = torch::bmm(target_proj, source_val.transpose(1, 2));
@@ -502,6 +565,31 @@ torch::Tensor pairwise_route_block_logits(
     const c10::optional<torch::Tensor>& out_weight,
     const c10::optional<torch::Tensor>& out_bias,
     double temperature) {
+  if (starts_with(route_kind, "multihead_max_")) {
+    const auto base_kind = route_kind.substr(std::string("multihead_max_").size());
+    const auto num_heads = infer_multihead_count(core_weight, source_weight, target_weight);
+    std::vector<torch::Tensor> head_scores;
+    head_scores.reserve(static_cast<size_t>(num_heads));
+    for (int64_t head_index = 0; head_index < num_heads; ++head_index) {
+      head_scores.push_back(pairwise_route_block_logits(
+          base_kind,
+          src_val,
+          dst_val,
+          select_head_optional_tensor(source_weight, head_index, num_heads),
+          select_head_optional_tensor(source_bias, head_index, num_heads),
+          select_head_optional_tensor(target_weight, head_index, num_heads),
+          select_head_optional_tensor(target_bias, head_index, num_heads),
+          select_head_tensor(core_weight, head_index, num_heads),
+          select_head_optional_tensor(bias, head_index, num_heads),
+          select_head_optional_tensor(hidden_weight, head_index, num_heads),
+          select_head_optional_tensor(hidden_bias, head_index, num_heads),
+          select_head_optional_tensor(out_weight, head_index, num_heads),
+          select_head_optional_tensor(out_bias, head_index, num_heads),
+          temperature));
+    }
+    return std::get<0>(torch::stack(head_scores, -1).max(-1));
+  }
+
   if (temperature <= 0.0) {
     throw std::runtime_error("route temperature must be positive.");
   }
@@ -850,12 +938,13 @@ std::tuple<torch::Tensor, torch::Tensor> low_rank_transition_pairwise_topk_signe
     };
   }
 #endif
+  const bool multihead = source_weight.dim() >= 3 || target_weight.dim() >= 3 || core_weight.dim() >= 2;
   auto cast_source_weight = cast_tensor_like(source_weight, src_val);
   auto cast_target_weight = cast_tensor_like(target_weight, src_val);
   auto cast_core_weight = cast_tensor_like(core_weight, src_val);
   auto cast_bias = cast_packed_optional_like(bias, src_val);
   auto logits = pairwise_route_block_logits(
-      "low_rank_bilinear_route",
+      multihead ? "multihead_max_low_rank_bilinear_route" : "low_rank_bilinear_route",
       src_val,
       dst_val,
       cast_source_weight,
@@ -952,12 +1041,13 @@ std::tuple<torch::Tensor, torch::Tensor> low_rank_propagation_topk_signed_abs(
     };
   }
 #endif
+  const bool multihead = source_weight.dim() >= 3 || target_weight.dim() >= 3 || core_weight.dim() >= 2;
   auto cast_source_weight = cast_tensor_like(source_weight, layer_val);
   auto cast_target_weight = cast_tensor_like(target_weight, layer_val);
   auto cast_core_weight = cast_tensor_like(core_weight, layer_val);
   auto cast_bias = cast_packed_optional_like(bias, layer_val);
   auto scores = pairwise_scores(
-      "low_rank_bilinear",
+      multihead ? "multihead_max_low_rank_bilinear" : "low_rank_bilinear",
       layer_val,
       layer_val,
       cast_core_weight,

@@ -18,6 +18,7 @@ from train_causal_memory_lm import (  # noqa: E402
 
 from jakal_net.causal_memory_lm import CausalHierarchicalMemoryLM, MemoryScanOutput, ModelRecurrentState  # noqa: E402
 from jakal_net.latent_graph import KModule  # noqa: E402
+from jakal_net.native_backend import _native_scan_uses_legacy_low_rank_extension  # noqa: E402
 
 
 class CausalMemoryLMTests(unittest.TestCase):
@@ -161,6 +162,32 @@ class CausalMemoryLMTests(unittest.TestCase):
 
         self.assertEqual(model.scan_backend, "native")
         self.assertEqual(model.scan_checkpoint_chunk_size, 32)
+
+    def test_multi_head_config_is_supported_by_native_fused_wrapper(self) -> None:
+        model = CausalHierarchicalMemoryLM(
+            vocab_size=64,
+            dim=16,
+            max_seq_len=16,
+            s_layers=1,
+            memory_slots=(8, 4, 2),
+            prediction_layers=1,
+            memory_topk=2,
+            pairwise_rank=8,
+            route_rank=8,
+            pairwise_heads=2,
+            route_heads=2,
+            scan_backend="native",
+        )
+
+        self.assertTrue(model._native_scan_supported_config())
+
+    def test_multi_head_low_rank_scan_uses_legacy_extension_path(self) -> None:
+        self.assertTrue(
+            _native_scan_uses_legacy_low_rank_extension(
+                "multihead_max_low_rank_bilinear_route",
+                "multihead_max_low_rank_bilinear",
+            )
+        )
 
     def test_forward_supports_optional_knowledge_module(self) -> None:
         torch.manual_seed(11)

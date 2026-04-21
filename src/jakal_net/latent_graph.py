@@ -45,6 +45,8 @@ class KModule(nn.Module):
         pairwise_kind: str = "low_rank_bilinear",
         route_rank: int = 64,
         pairwise_rank: int = 64,
+        route_heads: int = 1,
+        pairwise_heads: int = 1,
         route_topk: int = 16,
         propagation_topk: int = 16,
         propagation_layers: int = 1,
@@ -70,6 +72,8 @@ class KModule(nn.Module):
         self.pairwise_kind = pairwise_kind
         self.route_rank = route_rank
         self.pairwise_rank = pairwise_rank
+        self.route_heads = route_heads
+        self.pairwise_heads = pairwise_heads
         self.route_topk = route_topk
         self.propagation_topk = propagation_topk
         self.propagation_layers_count = propagation_layers
@@ -81,7 +85,7 @@ class KModule(nn.Module):
         self.init_val = nn.Parameter(torch.empty(num_nodes, dim))
 
         self.b_to_k = SparseTransition(
-            route_fn=make_route(route_kind, dim=dim, rank=route_rank),
+            route_fn=make_route(route_kind, dim=dim, rank=route_rank, heads=route_heads),
             topk=min(route_topk, num_nodes),
             state_activation_fn=F.softplus,
             route_compress_name=route_compress_name,
@@ -89,7 +93,7 @@ class KModule(nn.Module):
             merge_mode="add",
         )
         self.k_to_b = SparseTransition(
-            route_fn=make_route(route_kind, dim=dim, rank=route_rank),
+            route_fn=make_route(route_kind, dim=dim, rank=route_rank, heads=route_heads),
             topk=max(1, route_topk),
             state_activation_fn=F.softplus,
             route_compress_name=route_compress_name,
@@ -98,7 +102,12 @@ class KModule(nn.Module):
         )
         self.propagation_layers = nn.ModuleList(
             SparsePropagation(
-                pairwise_fn=make_pairwise(pairwise_kind, dim=dim, rank=pairwise_rank),
+                pairwise_fn=make_pairwise(
+                    pairwise_kind,
+                    dim=dim,
+                    rank=pairwise_rank,
+                    heads=pairwise_heads,
+                ),
                 sparse_type="topk",
                 topk=min(propagation_topk, num_nodes),
                 edge_compress_fn=signed_abs_softmax_edges,

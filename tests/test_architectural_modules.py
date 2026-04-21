@@ -124,6 +124,38 @@ class ArchitecturalModuleTests(unittest.TestCase):
         self.assertEqual(output.bridge_layer.val.shape, (2, 1, 8))
         self.assertEqual(output.knowledge_state.val.shape, (2, 10, 8))
 
+    def test_b_module_scan_supports_multi_level_multi_head_configuration(self) -> None:
+        torch.manual_seed(4)
+        b_module = BModule(
+            dim=8,
+            memory_slots=(8, 4, 2, 2),
+            memory_topk=2,
+            pairwise_kind="low_rank_bilinear",
+            route_kind="low_rank_bilinear",
+            pairwise_rank=4,
+            route_rank=4,
+            pairwise_heads=2,
+            route_heads=2,
+            implementation="native",
+        )
+        state_projection = torch.nn.Linear(8, 1)
+        query_projection = torch.nn.Linear(8, 8, bias=False)
+        query_input_norm = torch.nn.LayerNorm(8)
+        aligned_s = torch.randn(2, 3, 8)
+        memory_state = b_module.initialize_state(2, device="cpu", dtype=aligned_s.dtype)
+
+        output = b_module.scan(
+            aligned_s,
+            memory_state,
+            state_projection=state_projection,
+            query_projection=query_projection,
+            query_input_norm=query_input_norm,
+        )
+
+        self.assertEqual(len(output.memory_state), 4)
+        self.assertEqual(output.memory_state[0].val.shape, (2, 8, 8))
+        self.assertEqual(output.memory_state[3].val.shape, (2, 2, 8))
+
 
 if __name__ == "__main__":
     unittest.main()

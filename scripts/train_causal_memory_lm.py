@@ -3101,6 +3101,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--pairwise-rank", type=int, default=64)
     parser.add_argument("--route-rank", type=int, default=64)
+    parser.add_argument("--pairwise-heads", type=int, default=1)
+    parser.add_argument("--route-heads", type=int, default=1)
     parser.add_argument("--implementation", choices=("reference", "streaming", "kernel", "native"), default="streaming")
     parser.add_argument("--knowledge-nodes", type=int, default=0)
     parser.add_argument("--knowledge-route-topk", type=int, default=0)
@@ -3691,6 +3693,8 @@ def main() -> None:
         route_kind=args.route_kind,
         pairwise_rank=args.pairwise_rank,
         route_rank=args.route_rank,
+        pairwise_heads=args.pairwise_heads,
+        route_heads=args.route_heads,
         implementation=args.implementation,
         knowledge_nodes=args.knowledge_nodes,
         knowledge_route_topk=None if args.knowledge_route_topk <= 0 else args.knowledge_route_topk,

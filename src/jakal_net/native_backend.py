@@ -170,6 +170,19 @@ def native_supports_device(device_type: str) -> bool:
     return status.available and device_type in status.supported_devices
 
 
+def _native_scan_uses_legacy_low_rank_extension(
+    route_kind_name: str,
+    propagation_pairwise_kind: str,
+) -> bool:
+    return (
+        route_kind_name in {"low_rank_bilinear", "low_rank_bilinear_route"}
+        and propagation_pairwise_kind == "low_rank_bilinear"
+    ) or (
+        route_kind_name == "multihead_max_low_rank_bilinear_route"
+        and propagation_pairwise_kind == "multihead_max_low_rank_bilinear"
+    )
+
+
 def causal_memory_scan_fused_trace_native(
     *,
     aligned_s: Tensor,
@@ -212,7 +225,7 @@ def causal_memory_scan_fused_trace_native(
     skip_gates: tuple[Tensor, ...],
     skip_topks: tuple[int, ...],
 ) -> tuple[Tensor, tuple[Tensor, ...], tuple[Tensor, ...]]:
-    if route_kind_name in {"low_rank_bilinear", "low_rank_bilinear_route"} and propagation_pairwise_kind == "low_rank_bilinear":
+    if _native_scan_uses_legacy_low_rank_extension(route_kind_name, propagation_pairwise_kind):
         result = _native_module().causal_memory_scan_fused_trace(
             aligned_s,
             list(flat_memory),
@@ -343,7 +356,7 @@ def causal_memory_scan_fused_checkpoints_native(
     skip_gates: tuple[Tensor, ...],
     skip_topks: tuple[int, ...],
 ) -> tuple[Tensor, tuple[Tensor, ...], tuple[Tensor, ...]]:
-    if route_kind_name in {"low_rank_bilinear", "low_rank_bilinear_route"} and propagation_pairwise_kind == "low_rank_bilinear":
+    if _native_scan_uses_legacy_low_rank_extension(route_kind_name, propagation_pairwise_kind):
         result = _native_module().causal_memory_scan_fused_checkpoints(
             aligned_s,
             list(flat_memory),
@@ -789,6 +802,23 @@ def _native_scan_pairwise_scores(
     core_weight: Tensor,
     packed_bias: Tensor,
 ) -> Tensor:
+    if pairwise_kind.startswith("multihead_max_"):
+        base_kind = pairwise_kind[len("multihead_max_") :]
+        head_scores: list[Tensor] = []
+        num_heads = int(core_weight.shape[0])
+        for head_index in range(num_heads):
+            head_scores.append(
+                _native_scan_pairwise_scores(
+                    base_kind,
+                    src_val,
+                    dst_val,
+                    source_weight[head_index] if source_weight.numel() != 0 else source_weight,
+                    target_weight[head_index] if target_weight.numel() != 0 else target_weight,
+                    core_weight[head_index],
+                    packed_bias[head_index] if packed_bias.numel() != 0 else packed_bias,
+                )
+            )
+        return torch.stack(head_scores, dim=-1).max(dim=-1).values
     if pairwise_kind == "low_rank_bilinear":
         projected_source = F.linear(src_val, source_weight.to(dtype=src_val.dtype), None)
         projected_source = projected_source * core_weight.to(dtype=src_val.dtype)
@@ -827,6 +857,23 @@ def _native_scan_route_scores(
     core_weight: Tensor,
     packed_bias: Tensor,
 ) -> Tensor:
+    if route_kind_name.startswith("multihead_max_"):
+        base_kind = route_kind_name[len("multihead_max_") :]
+        head_scores: list[Tensor] = []
+        num_heads = int(core_weight.shape[0])
+        for head_index in range(num_heads):
+            head_scores.append(
+                _native_scan_route_scores(
+                    base_kind,
+                    src_val,
+                    dst_val,
+                    source_weight[head_index] if source_weight.numel() != 0 else source_weight,
+                    target_weight[head_index] if target_weight.numel() != 0 else target_weight,
+                    core_weight[head_index],
+                    packed_bias[head_index] if packed_bias.numel() != 0 else packed_bias,
+                )
+            )
+        return torch.stack(head_scores, dim=-1).max(dim=-1).values
     if route_kind_name == "low_rank_bilinear_route":
         projected_source = F.linear(src_val, source_weight.to(dtype=src_val.dtype), None)
         projected_source = projected_source * core_weight.to(dtype=src_val.dtype)
@@ -1188,7 +1235,21 @@ def _causal_memory_scan_fused_native_forward(
     propagation_compress_name: str,
 ) -> tuple[Tensor, tuple[Tensor, ...]]:
     args = _unpack_causal_memory_scan_tensor_args(tensor_args, num_levels)
-    if route_kind_name in {"low_rank_bilinear", "low_rank_bilinear_route"} and propagation_pairwise_kind == "low_rank_bilinear":
+    if (
+        (route_kind_name.startswith("multihead_max_") or propagation_pairwise_kind.startswith("multihead_max_"))
+        and not _native_scan_uses_legacy_low_rank_extension(route_kind_name, propagation_pairwise_kind)
+    ):
+        return _causal_memory_scan_fused_reference(
+            tensor_args,
+            num_levels=num_levels,
+            write_topks=write_topks,
+            propagation_topks=propagation_topks,
+            level_transition_topks=level_transition_topks,
+            skip_topks=skip_topks,
+            route_kind_name=route_kind_name,
+            propagation_pairwise_kind=propagation_pairwise_kind,
+        )
+    if _native_scan_uses_legacy_low_rank_extension(route_kind_name, propagation_pairwise_kind):
         result = _native_module().causal_memory_scan_fused(
             args["aligned_s"],
             list(args["flat_memory"]),
@@ -1589,7 +1650,10 @@ class _CausalMemoryScanFusedFunction(Function):
         checkpoint_stride = _experimental_fused_training_checkpoint_stride(tensor_args[0].shape[1])
         checkpoint_tensors: tuple[Tensor, ...] = ()
         trace_tensors: tuple[Tensor, ...] = ()
-        if checkpoint_stride is not None and checkpoint_stride < tensor_args[0].shape[1]:
+        multihead_scan = (
+            route_kind_name.startswith("multihead_max_") or propagation_pairwise_kind.startswith("multihead_max_")
+        ) and not _native_scan_uses_legacy_low_rank_extension(route_kind_name, propagation_pairwise_kind)
+        if not multihead_scan and checkpoint_stride is not None and checkpoint_stride < tensor_args[0].shape[1]:
             query_val, next_memory, checkpoint_tensors = _causal_memory_scan_fused_native_forward_with_checkpoints(
                 *tensor_args,
                 num_levels=num_levels,
@@ -1604,7 +1668,8 @@ class _CausalMemoryScanFusedFunction(Function):
                 checkpoint_stride=checkpoint_stride,
             )
         elif (
-            _experimental_scan_backward_cuda_enabled()
+            not multihead_scan
+            and _experimental_scan_backward_cuda_enabled()
             and native_supports("causal_memory_scan_fused_backward_cuda")
             and tensor_args[0].is_cuda
         ):
