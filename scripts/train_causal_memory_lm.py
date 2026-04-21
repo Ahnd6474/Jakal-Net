@@ -190,6 +190,7 @@ class FlatPretokenizedShard:
     pad_token_id: int
     eos_token_id: int
     cont_token_id: int
+    special_token_ids: dict[str, int]
     vocab_size: int
     tokenizer_label: str | None
     tokenizer_model_path: str | None
@@ -208,7 +209,13 @@ class FlatPretokenizedShard:
         start, end = self.document_chunk_range(document_index)
         return end - start
 
-    def build_chunk_tensors(self, chunk_index: int, *, is_last_chunk: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+    def build_chunk_tensors(
+        self,
+        chunk_index: int,
+        *,
+        document_index: int,
+        is_last_chunk: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
         token_start = int(self.chunk_token_offsets[chunk_index].item())
         token_end = int(self.chunk_token_offsets[chunk_index + 1].item())
         active_context = self.context_flat[token_start:token_end]
@@ -222,8 +229,18 @@ class FlatPretokenizedShard:
         if active_length > 0:
             target[active_length - 1] = self.eos_token_id if is_last_chunk else self.cont_token_id
         loss_mask = torch.zeros(self.seq_len, dtype=torch.float32)
+        document_kind = self.kind[document_index].lower()
         if active_length > 0:
-            loss_mask[:active_length] = self.loss_mask_flat[token_start:token_end].to(dtype=torch.float32)
+            if document_kind in {"dialogue", "instruction"} and active_length > 2:
+                content_ids = active_context[2:].to(dtype=torch.long)
+                content_visibility = _content_target_visibility(
+                    content_ids,
+                    loss_mode="assistant_only",
+                    special_token_ids=self.special_token_ids,
+                )
+                loss_mask[1 : 1 + content_visibility.shape[0]] = content_visibility.to(dtype=torch.float32)
+            else:
+                loss_mask[:active_length] = self.loss_mask_flat[token_start:token_end].to(dtype=torch.float32)
         return context, target, loss_mask, bool(self.is_continuation[chunk_index].item())
 
 
@@ -381,9 +398,17 @@ def _content_target_visibility(
         content_ids == int(special_token_ids["response"])
     )
     assistant_stop_mask = content_ids == int(special_token_ids["eot"])
-    prefix_starts = assistant_start_mask.to(torch.int32).cumsum(dim=0)
-    stops_before = assistant_stop_mask.to(torch.int32).cumsum(dim=0) - assistant_stop_mask.to(torch.int32)
-    return (prefix_starts > stops_before).to(torch.float32)
+    visibility = torch.zeros(content_ids.shape[0], dtype=torch.float32, device=content_ids.device)
+    start_positions = torch.nonzero(assistant_start_mask, as_tuple=False).flatten().tolist()
+    stop_positions = torch.nonzero(assistant_stop_mask, as_tuple=False).flatten().tolist()
+    for start_index in start_positions:
+        stop_index = content_ids.shape[0] - 1
+        for candidate in stop_positions:
+            if candidate >= start_index:
+                stop_index = candidate
+                break
+        visibility[start_index : stop_index + 1] = 1.0
+    return visibility
 
 
 def _tokenize_document_payload_worker(payload: tuple[str, str, str]) -> tuple[str, str, list[int]]:
@@ -845,6 +870,7 @@ class FlatDocumentChunkBatcher:
             chunk_index = chunk_start + self.current_chunk[item_index]
             context, target, loss_mask, _ = shard.build_chunk_tensors(
                 chunk_index,
+                document_index=reference.document_index,
                 is_last_chunk=chunk_index == chunk_end - 1,
             )
             contexts.append(context)
@@ -1541,6 +1567,7 @@ def load_flat_pretokenized_shard(path: Path) -> FlatPretokenizedShard:
         pad_token_id=int(pad_token_id),
         eos_token_id=int(eos_token_id),
         cont_token_id=int(cont_token_id),
+        special_token_ids={key: int(value) for key, value in special_tokens.items()},
         vocab_size=int(bundle["vocab_size"]),
         tokenizer_label=bundle.get("tokenizer_label"),
         tokenizer_model_path=bundle.get("tokenizer_model_path"),
@@ -1677,9 +1704,31 @@ def split_train_val_documents(
 ) -> tuple[list[TokenizedDocument], list[TokenizedDocument]]:
     if len(documents) < 2:
         return list(documents), list(documents)
-    split_index = int(len(documents) * train_fraction)
-    split_index = max(1, min(split_index, len(documents) - 1))
-    return list(documents[:split_index]), list(documents[split_index:])
+    rng = random.Random(1337)
+    bucket_to_documents: dict[str, list[TokenizedDocument]] = {}
+    for document in documents:
+        bucket_to_documents.setdefault(document_sampling_bucket(document), []).append(document)
+    train_documents: list[TokenizedDocument] = []
+    val_documents: list[TokenizedDocument] = []
+    for bucket in SCHEDULED_BUCKET_ORDER:
+        bucket_docs = bucket_to_documents.get(bucket)
+        if not bucket_docs:
+            continue
+        bucket_docs = list(bucket_docs)
+        rng.shuffle(bucket_docs)
+        if len(bucket_docs) < 2:
+            train_documents.extend(bucket_docs)
+            continue
+        split_index = int(len(bucket_docs) * train_fraction)
+        split_index = max(1, min(split_index, len(bucket_docs) - 1))
+        train_documents.extend(bucket_docs[:split_index])
+        val_documents.extend(bucket_docs[split_index:])
+    rng.shuffle(train_documents)
+    rng.shuffle(val_documents)
+    if not val_documents:
+        val_documents = train_documents[-1:]
+        train_documents = train_documents[:-1] or val_documents
+    return train_documents, val_documents
 
 
 def split_train_val_flat_documents(
@@ -1689,9 +1738,42 @@ def split_train_val_flat_documents(
 ) -> tuple[list[FlatDocumentRef], list[FlatDocumentRef]]:
     if len(documents) < 2:
         return list(documents), list(documents)
-    split_index = int(len(documents) * train_fraction)
-    split_index = max(1, min(split_index, len(documents) - 1))
-    return list(documents[:split_index]), list(documents[split_index:])
+    raise RuntimeError("split_train_val_flat_documents requires flat collection-aware splitting.")
+
+
+def split_train_val_flat_documents_with_collection(
+    collection: FlatPretokenizedDirectory,
+    documents: Sequence[FlatDocumentRef],
+    *,
+    train_fraction: float,
+) -> tuple[list[FlatDocumentRef], list[FlatDocumentRef]]:
+    if len(documents) < 2:
+        return list(documents), list(documents)
+    rng = random.Random(1337)
+    bucket_to_documents: dict[str, list[FlatDocumentRef]] = {}
+    for reference in documents:
+        bucket_to_documents.setdefault(flat_document_ref_bucket(collection, reference), []).append(reference)
+    train_documents: list[FlatDocumentRef] = []
+    val_documents: list[FlatDocumentRef] = []
+    for bucket in SCHEDULED_BUCKET_ORDER:
+        bucket_docs = bucket_to_documents.get(bucket)
+        if not bucket_docs:
+            continue
+        bucket_docs = list(bucket_docs)
+        rng.shuffle(bucket_docs)
+        if len(bucket_docs) < 2:
+            train_documents.extend(bucket_docs)
+            continue
+        split_index = int(len(bucket_docs) * train_fraction)
+        split_index = max(1, min(split_index, len(bucket_docs) - 1))
+        train_documents.extend(bucket_docs[:split_index])
+        val_documents.extend(bucket_docs[split_index:])
+    rng.shuffle(train_documents)
+    rng.shuffle(val_documents)
+    if not val_documents:
+        val_documents = train_documents[-1:]
+        train_documents = train_documents[:-1] or val_documents
+    return train_documents, val_documents
 
 
 def compute_masked_loss(logits: torch.Tensor, target: torch.Tensor, loss_mask: torch.Tensor) -> torch.Tensor:
@@ -2040,7 +2122,11 @@ def log_eval_samples_to_tensorboard_flat(
         for index, reference in enumerate(selected, start=1):
             shard = collection.shards[reference.shard_index]
             chunk_start, _ = shard.document_chunk_range(reference.document_index)
-            context, target, loss_mask, _ = shard.build_chunk_tensors(chunk_start, is_last_chunk=shard.chunk_count(reference.document_index) == 1)
+            context, target, loss_mask, _ = shard.build_chunk_tensors(
+                chunk_start,
+                document_index=reference.document_index,
+                is_last_chunk=shard.chunk_count(reference.document_index) == 1,
+            )
             output = model(
                 context.unsqueeze(0).to(device),
                 reset_mask=torch.tensor([True], device=device, dtype=torch.bool),
@@ -2165,6 +2251,7 @@ def estimate_eval_loss_flat(
         for chunk_index in range(chunk_start, chunk_end):
             context, target, loss_mask, _ = shard.build_chunk_tensors(
                 chunk_index,
+                document_index=reference.document_index,
                 is_last_chunk=chunk_index == chunk_end - 1,
             )
             batch = DocumentBatch(
@@ -2498,7 +2585,8 @@ def main() -> None:
             print(f"saved_pretokenized | path={args.pretokenized_path}", flush=True)
 
     if flat_collection is not None:
-        train_documents_flat, val_documents_flat = split_train_val_flat_documents(
+        train_documents_flat, val_documents_flat = split_train_val_flat_documents_with_collection(
+            flat_collection,
             flat_collection.document_refs,
             train_fraction=args.train_fraction,
         )
