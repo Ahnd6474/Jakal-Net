@@ -2145,6 +2145,15 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_low_rank_transition_pairwise_
       core_shape[3] = cast_core.size(1);
       weighted_projected_source = (projected_source * cast_core.view(core_shape)).contiguous();
       projected_target = torch::einsum("bkd,hrd->bhkr", {dst_val, cast_target}).contiguous();
+      if (bias.defined() && bias.numel() != 0) {
+        auto head_bias = bias.to(weighted_projected_source.scalar_type()).reshape({1, bias.numel(), 1, 1});
+        auto bias_column = head_bias.expand({weighted_projected_source.size(0), weighted_projected_source.size(1), weighted_projected_source.size(2), 1});
+        auto target_ones = torch::ones(
+            {projected_target.size(0), projected_target.size(1), projected_target.size(2), 1},
+            projected_target.options());
+        weighted_projected_source = torch::cat({weighted_projected_source, bias_column}, -1).contiguous();
+        projected_target = torch::cat({projected_target, target_ones}, -1).contiguous();
+      }
     } else {
       auto projected_source = torch::matmul(src_val, source_weight.to(src_val.scalar_type()).transpose(0, 1)).contiguous();
       weighted_projected_source = (projected_source * core_weight.to(projected_source.scalar_type()).view({1, 1, -1})).contiguous();
@@ -2160,7 +2169,7 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_low_rank_transition_pairwise_
         weighted_projected_state,
         weighted_projected_val,
         topk,
-        (bias.defined() && bias.numel() != 0) ? bias.item<double>() : 0.0,
+        (!multihead && bias.defined() && bias.numel() != 0) ? bias.item<double>() : 0.0,
         compress_name == "signed_abs_softmax"
             ? kCompressSignedAbsSoftmax
             : (compress_name == "signed_entmax15" ? kCompressSignedEntmax15 : kCompressSoftmax));
@@ -2265,6 +2274,15 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_low_rank_propagation_topk(
       core_shape[3] = cast_core.size(1);
       weighted_projected_source = (projected_source * cast_core.view(core_shape)).contiguous();
       projected_target = torch::einsum("bid,hrd->bhir", {layer_val, cast_target}).contiguous();
+      if (bias.defined() && bias.numel() != 0) {
+        auto head_bias = bias.to(weighted_projected_source.scalar_type()).reshape({1, bias.numel(), 1, 1});
+        auto bias_column = head_bias.expand({weighted_projected_source.size(0), weighted_projected_source.size(1), weighted_projected_source.size(2), 1});
+        auto target_ones = torch::ones(
+            {projected_target.size(0), projected_target.size(1), projected_target.size(2), 1},
+            projected_target.options());
+        weighted_projected_source = torch::cat({weighted_projected_source, bias_column}, -1).contiguous();
+        projected_target = torch::cat({projected_target, target_ones}, -1).contiguous();
+      }
     } else {
       auto projected_target_single = torch::matmul(layer_val, target_weight.to(layer_val.scalar_type()).transpose(0, 1)).contiguous();
       auto projected_source_single = torch::matmul(layer_val, source_weight.to(layer_val.scalar_type()).transpose(0, 1)).contiguous();
@@ -2282,7 +2300,7 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_low_rank_propagation_topk(
         weighted_projected_state,
         weighted_projected_val,
         topk,
-        score_bias,
+        multihead ? 0.0 : score_bias,
         compress_name == "signed_abs_softmax" ? kCompressSignedAbsSoftmax : 0);
     return {
         std::get<0>(fused).to(layer_state.scalar_type()),
