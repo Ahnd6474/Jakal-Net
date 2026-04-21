@@ -419,6 +419,64 @@ PYTHONPATH=src python scripts/train_progressive_b_lm.py \
   --save-checkpoint
 ```
 
+Reduced-data causal-memory bootstrap with a pretrained Qwen tokenizer and
+embedding:
+
+```bash
+PYTHONPATH=src:scripts python scripts/train_causal_memory_lm.py \
+  --device cuda \
+  --jsonl-source artifacts/data_qwen_small/plain_dialogue_20k.jsonl \
+  --tokenizer hf_auto \
+  --hf-tokenizer-model Qwen/Qwen2.5-Coder-0.5B-Instruct \
+  --hf-embedding-model Qwen/Qwen2.5-Coder-0.5B-Instruct \
+  --dim 896 \
+  --seq-len 512 \
+  --s-layers 6 \
+  --prediction-layers 3 \
+  --memory-slots 384 96 24 \
+  --memory-topk 24 \
+  --pairwise-rank 96 \
+  --route-rank 64 \
+  --pairwise-kind low_rank_bilinear \
+  --route-kind low_rank_bilinear \
+  --implementation native \
+  --scan-backend native \
+  --optimizer adamw_fused \
+  --batch-size 3 \
+  --stage1-batch-size 3 \
+  --stage2-batch-size 3 \
+  --stage3-batch-size 3 \
+  --curriculum-stage1-span 1 \
+  --curriculum-stage2-span 2 \
+  --curriculum-stage3-span 4 \
+  --embedding-lr-mult 0.1 \
+  --rnn-pretrain-steps 0 \
+  --eval-interval 200 \
+  --eval-documents 4 \
+  --tensorboard \
+  --run-name qwen896_small_v1
+```
+
+Notes for the Qwen path:
+
+- `hf_auto` uses the upstream Hugging Face tokenizer directly instead of the
+  repository byte-BPE tokenizer.
+- No extra special tokens are added. Dialogue structure is rendered through the
+  existing Qwen chat markers and plain-text section labels.
+- `Qwen/Qwen2.5-Coder-0.5B-Instruct` is currently the practical pretrained
+  tokenizer/embedding source for this codebase. Larger Qwen hidden sizes such
+  as `1536+` were measured as too slow or OOM-prone in the current native scan
+  implementation.
+- The currently validated `qwen896_a` causal-memory configuration is:
+  - params: about `143.6M`
+  - `dim=896`
+  - `s_layers=6`
+  - `prediction_layers=3`
+  - `memory_slots=[384, 96, 24]`
+  - `pairwise_rank=96`
+  - `route_rank=64`
+  - safe bootstrap batch: `3`
+
 Default document-chunked causal-memory run:
 
 `scripts/train_causal_memory_lm.py` is pinned to `byte_bpe` for the document-chunked causal-memory path.
