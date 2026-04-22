@@ -255,6 +255,64 @@ The roles are intentionally separated:
 - `B`: document-persistent latent memory, updated one token step at a time
 - prediction stack: causal decoder head over the readout sequence
 
+### `B` inter-level interactions
+
+`B` is no longer just an isolated per-level memory stack. The current causal
+memory path includes explicit **inter-level routed interaction**:
+
+- per-level `write` from `S` into each `B` level
+- per-level same-level propagation inside `B`
+- `level_transition` routes between adjacent `B` levels
+- `skip_transition` routes across non-adjacent `B` levels
+- final readout aggregates all `B` levels back into the prediction path
+
+That means `B` now behaves more like a sparse routed latent workspace with
+both:
+
+- **within-level communication** via propagation
+- **across-level communication** via routed transitions
+
+This is important when using multi-head route/edge kernels: the heads do not
+only affect `S -> B` writes, but also `B`'s internal same-level and cross-level
+communication.
+
+## RoBERTa-base Embedding + Large Body Configuration
+
+For an English-first setup where code and math are added on top of a stable
+English embedding space, `roberta-base` is currently the most practical
+pretrained tokenizer/embedding source.
+
+Reference dimensions:
+
+- hidden size: `768`
+- vocab size: `50,265`
+- embedding parameters: about `38.6M`
+
+If the body is too small, almost all parameters end up in the embedding table.
+The current recommended **large-body** target is therefore:
+
+```text
+tokenizer / embedding source: roberta-base
+dim=768
+s_layers=20
+prediction_layers=6
+memory_slots=[3072, 768, 192]
+memory_topk=32
+pairwise_rank=320
+route_rank=224
+pairwise_heads=4
+route_heads=4
+```
+
+Measured parameter counts for this configuration:
+
+- total params: `115,538,275`
+- embedding params: `38,603,520`
+- non-embedding body params: `76,934,755`
+
+This is the first currently verified `RoBERTa-base`-compatible configuration
+in this repo where the **body is much larger than the imported embedding**.
+
 The default memory recipe matches the current design discussion:
 
 - `max_seq_len=2048`
