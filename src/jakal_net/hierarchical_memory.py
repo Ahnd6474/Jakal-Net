@@ -250,6 +250,20 @@ class BModule(nn.Module):
             for level in self.memory_levels
         )
 
+    def constrain_layer(self, level_index: int, layer: Layer) -> Layer:
+        level_module = self.memory_levels[level_index]
+        state = signed_softmax_state(layer.state)
+        val = level_module.val_norm(layer.val)
+        if self.unit_norm_values:
+            val = unit_normalize_values(val)
+        return layer.with_tensors(state=state, val=val)
+
+    def constrain_memory_state(self, memory_state: Sequence[Layer]) -> tuple[Layer, ...]:
+        return tuple(
+            self.constrain_layer(level_index, layer)
+            for level_index, layer in enumerate(memory_state)
+        )
+
     def reset_state(
         self,
         memory_state: Sequence[Layer],
@@ -272,7 +286,7 @@ class BModule(nn.Module):
             state = torch.where(mask, fresh.state, current.state)
             val = torch.where(mask.unsqueeze(-1), fresh.val, current.val)
             reset_layers.append(current.with_tensors(state=state, val=val))
-        return tuple(reset_layers)
+        return self.constrain_memory_state(tuple(reset_layers))
 
     def update(
         self,
@@ -490,6 +504,8 @@ class BModule(nn.Module):
 
         for time_index in range(seq_len):
             token_val = aligned_s.narrow(1, time_index, 1)
+            if self.unit_norm_values:
+                token_val = unit_normalize_values(token_val)
             token_layer = Layer(
                 dim=self.dim,
                 num_nodes=1,

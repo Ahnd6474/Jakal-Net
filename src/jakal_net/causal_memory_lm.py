@@ -309,7 +309,14 @@ class CausalHierarchicalMemoryLM(nn.Module):
                     unit_norm_values=self.unit_norm_values,
                 )
 
-        logits = self.lm_head(self.output_norm(query_layer.val))
+        output_val = self.output_norm(query_layer.val)
+        if self.unit_norm_values:
+            output_val = unit_normalize_values(output_val)
+            query_layer = query_layer.with_tensors(
+                state=self.value_to_state(output_val).squeeze(-1),
+                val=output_val,
+            )
+        logits = self.lm_head(output_val)
         if not (return_memory_state or return_layers):
             return logits
         return MemoryScanOutput(
@@ -406,8 +413,6 @@ class CausalHierarchicalMemoryLM(nn.Module):
             )
 
         if not isinstance(self.value_to_state, nn.Linear):
-            return False
-        if self.unit_norm_values:
             return False
         if not all(_is_supported_route(level.write) for level in self.b_module.memory_levels):
             return False
@@ -590,11 +595,14 @@ class CausalHierarchicalMemoryLM(nn.Module):
         packed = self._pack_native_scan_inputs(aligned_s, memory_state)
         query_val, flat_memory = causal_memory_scan_fused_native(**packed)
         if self.unit_norm_values:
-            query_val = unit_normalize_values(query_val)
+            query_val = unit_normalize_values(self.prediction_input_norm(query_val))
         query_state = self.value_to_state(query_val).squeeze(-1)
+        constrained_memory = self.b_module.constrain_memory_state(
+            self.b_module.unflatten_memory_state(flat_memory)
+        )
         return BScanOutput(
             query_layer=Layer(dim=self.dim, num_nodes=aligned_s.shape[1], state=query_state, val=query_val),
-            memory_state=self.b_module.unflatten_memory_state(flat_memory),
+            memory_state=constrained_memory,
             bridge_layer=None,
             knowledge_state=None,
             knowledge_output=None,
