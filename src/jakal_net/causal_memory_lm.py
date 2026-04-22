@@ -311,7 +311,14 @@ class CausalHierarchicalMemoryLM(nn.Module):
             return reference.new_empty((0,))
         if any(tensor is None for tensor in tensors):
             raise RuntimeError("Native scan multi-head specs must be uniformly present or absent.")
-        return torch.stack([tensor for tensor in tensors if tensor is not None], dim=0)
+        return torch.stack(
+            [
+                tensor.to(device=reference.device, dtype=reference.dtype)
+                for tensor in tensors
+                if tensor is not None
+            ],
+            dim=0,
+        )
 
     @staticmethod
     def _route_kernel_kind(route_fn: nn.Module) -> str | None:
@@ -351,7 +358,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
     def _tensor_or_empty(tensor: Tensor | None, reference: Tensor) -> Tensor:
         if tensor is None:
             return reference.new_empty((0,))
-        return tensor
+        return tensor.to(device=reference.device, dtype=reference.dtype)
 
     def _native_scan_supported_config(self) -> bool:
         supported_route_compress = {"softmax", "signed_abs_softmax", "signed_entmax15"}
@@ -434,14 +441,20 @@ class CausalHierarchicalMemoryLM(nn.Module):
                 return (
                     self._stack_optional_specs([spec.source_weight for spec in specs], aligned_s),
                     self._stack_optional_specs([spec.target_weight for spec in specs], aligned_s),
-                    torch.stack([spec.core_weight for spec in specs], dim=0),
+                    torch.stack(
+                        [
+                            spec.core_weight.to(device=aligned_s.device, dtype=aligned_s.dtype)
+                            for spec in specs
+                        ],
+                        dim=0,
+                    ),
                     self._stack_optional_specs([spec.bias for spec in specs], aligned_s),
                 )
             spec = pairwise_route_kernel_spec(route_fn)
             return (
                 self._tensor_or_empty(spec.source_weight, aligned_s),
                 self._tensor_or_empty(spec.target_weight, aligned_s),
-                spec.core_weight,
+                spec.core_weight.to(device=aligned_s.device, dtype=aligned_s.dtype),
                 self._tensor_or_empty(spec.bias, aligned_s),
             )
 
@@ -451,14 +464,20 @@ class CausalHierarchicalMemoryLM(nn.Module):
                 return (
                     self._stack_optional_specs([spec.in_weight for spec in specs], aligned_s),
                     self._stack_optional_specs([spec.out_weight for spec in specs], aligned_s),
-                    torch.stack([spec.weight for spec in specs], dim=0),
+                    torch.stack(
+                        [
+                            spec.weight.to(device=aligned_s.device, dtype=aligned_s.dtype)
+                            for spec in specs
+                        ],
+                        dim=0,
+                    ),
                     self._stack_optional_specs([spec.bias for spec in specs], aligned_s),
                 )
             spec = pairwise_kernel_spec(pairwise_fn)
             return (
                 self._tensor_or_empty(spec.in_weight, aligned_s),
                 self._tensor_or_empty(spec.out_weight, aligned_s),
-                spec.weight,
+                spec.weight.to(device=aligned_s.device, dtype=aligned_s.dtype),
                 self._tensor_or_empty(spec.bias, aligned_s),
             )
 
