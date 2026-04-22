@@ -175,14 +175,14 @@ __global__ void low_rank_pairwise_topk_forward_kernel(
 
   extern __shared__ unsigned char shared_storage[];
   auto* shared_scores = reinterpret_cast<float*>(shared_storage);
-  auto* shared_indices = reinterpret_cast<int64_t*>(shared_scores + blockDim.x * k);
+  auto* shared_indices = reinterpret_cast<int32_t*>(shared_scores + blockDim.x * k);
   auto* shared_routes = reinterpret_cast<float*>(shared_indices + blockDim.x * k);
   auto* selected_indices = reinterpret_cast<int32_t*>(shared_routes + k);
 
   const int64_t thread_base = static_cast<int64_t>(tid) * k;
   for (int64_t rank = 0; rank < k; ++rank) {
     shared_scores[thread_base + rank] = local_scores[rank];
-    shared_indices[thread_base + rank] = local_indices[rank];
+    shared_indices[thread_base + rank] = static_cast<int32_t>(local_indices[rank]);
   }
   __syncthreads();
 
@@ -200,7 +200,7 @@ __global__ void low_rank_pairwise_topk_forward_kernel(
       for (int64_t rank = 0; rank < k; ++rank) {
         insert_descending_topk(
             shared_scores[base + rank],
-            shared_indices[base + rank],
+            static_cast<int64_t>(shared_indices[base + rank]),
             merged_scores,
             merged_indices,
             k);
@@ -323,14 +323,14 @@ __global__ void low_rank_pairwise_topk_forward_multihead_kernel(
 
   extern __shared__ unsigned char shared_storage[];
   auto* shared_scores = reinterpret_cast<float*>(shared_storage);
-  auto* shared_indices = reinterpret_cast<int64_t*>(shared_scores + blockDim.x * k);
+  auto* shared_indices = reinterpret_cast<int32_t*>(shared_scores + blockDim.x * k);
   auto* shared_routes = reinterpret_cast<float*>(shared_indices + blockDim.x * k);
   auto* selected_indices = reinterpret_cast<int32_t*>(shared_routes + k);
 
   const int64_t thread_base = static_cast<int64_t>(tid) * k;
   for (int64_t rank = 0; rank < k; ++rank) {
     shared_scores[thread_base + rank] = local_scores[rank];
-    shared_indices[thread_base + rank] = local_indices[rank];
+    shared_indices[thread_base + rank] = static_cast<int32_t>(local_indices[rank]);
   }
   __syncthreads();
 
@@ -348,7 +348,7 @@ __global__ void low_rank_pairwise_topk_forward_multihead_kernel(
       for (int64_t rank = 0; rank < k; ++rank) {
         insert_descending_topk(
             shared_scores[base + rank],
-            shared_indices[base + rank],
+            static_cast<int64_t>(shared_indices[base + rank]),
             merged_scores,
             merged_indices,
             k);
@@ -461,14 +461,14 @@ __global__ void low_rank_propagation_topk_forward_kernel(
 
   extern __shared__ unsigned char shared_storage[];
   auto* shared_scores = reinterpret_cast<float*>(shared_storage);
-  auto* shared_indices = reinterpret_cast<int64_t*>(shared_scores + blockDim.x * k);
+  auto* shared_indices = reinterpret_cast<int32_t*>(shared_scores + blockDim.x * k);
   auto* shared_edges = reinterpret_cast<float*>(shared_indices + blockDim.x * k);
   auto* selected_indices = reinterpret_cast<int32_t*>(shared_edges + k);
 
   const int64_t thread_base = static_cast<int64_t>(tid) * k;
   for (int64_t rank = 0; rank < k; ++rank) {
     shared_scores[thread_base + rank] = local_scores[rank];
-    shared_indices[thread_base + rank] = local_indices[rank];
+    shared_indices[thread_base + rank] = static_cast<int32_t>(local_indices[rank]);
   }
   __syncthreads();
 
@@ -486,7 +486,7 @@ __global__ void low_rank_propagation_topk_forward_kernel(
       for (int64_t rank = 0; rank < k; ++rank) {
         insert_descending_topk(
             shared_scores[base + rank],
-            shared_indices[base + rank],
+            static_cast<int64_t>(shared_indices[base + rank]),
             merged_scores,
             merged_indices,
             k);
@@ -625,14 +625,14 @@ __global__ void low_rank_propagation_topk_forward_multihead_kernel(
 
   extern __shared__ unsigned char shared_storage[];
   auto* shared_scores = reinterpret_cast<float*>(shared_storage);
-  auto* shared_indices = reinterpret_cast<int64_t*>(shared_scores + blockDim.x * k);
+  auto* shared_indices = reinterpret_cast<int32_t*>(shared_scores + blockDim.x * k);
   auto* shared_edges = reinterpret_cast<float*>(shared_indices + blockDim.x * k);
   auto* selected_indices = reinterpret_cast<int32_t*>(shared_edges + k);
 
   const int64_t thread_base = static_cast<int64_t>(tid) * k;
   for (int64_t rank = 0; rank < k; ++rank) {
     shared_scores[thread_base + rank] = local_scores[rank];
-    shared_indices[thread_base + rank] = local_indices[rank];
+    shared_indices[thread_base + rank] = static_cast<int32_t>(local_indices[rank]);
   }
   __syncthreads();
 
@@ -650,7 +650,7 @@ __global__ void low_rank_propagation_topk_forward_multihead_kernel(
       for (int64_t rank = 0; rank < k; ++rank) {
         insert_descending_topk(
             shared_scores[base + rank],
-            shared_indices[base + rank],
+            static_cast<int64_t>(shared_indices[base + rank]),
             merged_scores,
             merged_indices,
             k);
@@ -1307,7 +1307,7 @@ jakal_net_low_rank_pairwise_topk_forward_cuda(
   const auto blocks = batch_flat * src_nodes;
   constexpr int threads = kPairwiseTopkForwardThreads;
   const auto shmem =
-      threads * k * (sizeof(float) + sizeof(int64_t)) + k * (sizeof(float) + sizeof(int32_t));
+      threads * k * (sizeof(float) + sizeof(int32_t)) + k * (sizeof(float) + sizeof(int32_t));
   const auto stream = at::cuda::getCurrentCUDAStream();
 
   AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -1429,7 +1429,7 @@ jakal_net_low_rank_propagation_topk_forward_cuda(
   const auto blocks = batch_flat * target_nodes;
   constexpr int threads = kPairwiseTopkForwardThreads;
   const auto shmem =
-      threads * k * (sizeof(float) + sizeof(int64_t)) + k * (sizeof(float) + sizeof(int32_t));
+      threads * k * (sizeof(float) + sizeof(int32_t)) + k * (sizeof(float) + sizeof(int32_t));
   const auto stream = at::cuda::getCurrentCUDAStream();
 
   AT_DISPATCH_FLOATING_TYPES_AND2(
