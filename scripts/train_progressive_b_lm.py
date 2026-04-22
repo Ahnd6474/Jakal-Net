@@ -151,6 +151,7 @@ _SUBWORD_WORKER_PROCESSOR: Any | None = None
 _BYTE_BPE_WORKER_TOKENIZER: Any | None = None
 _BYTE_BPE_WORKER_SPECIAL_TOKENS: tuple[str, ...] = ()
 _BYTE_BPE_WORKER_SPECIAL_PATTERN: re.Pattern[str] | None = None
+_HF_WORKER_TOKENIZER: Any | None = None
 
 
 DEFAULT_TEXT = """
@@ -1036,6 +1037,33 @@ def _encode_byte_bpe_text_batch_worker(texts: Sequence[str]) -> list[list[int]]:
         )
         for text in texts
     ]
+
+
+def _init_hf_encode_worker(model_path: str) -> None:
+    global _HF_WORKER_TOKENIZER
+    if AutoTokenizer is None:
+        raise ImportError("transformers is required for parallel hf_auto encoding.")
+    _HF_WORKER_TOKENIZER = AutoTokenizer.from_pretrained(
+        model_path,
+        use_fast=True,
+        local_files_only=True,
+    )
+
+
+def _encode_hf_text_batch_worker(texts: Sequence[str]) -> list[list[int]]:
+    if _HF_WORKER_TOKENIZER is None:
+        raise RuntimeError("HF tokenizer worker was not initialized.")
+    if not texts:
+        return []
+    encoded = _HF_WORKER_TOKENIZER(
+        list(texts),
+        add_special_tokens=False,
+        padding=False,
+        truncation=False,
+        return_attention_mask=False,
+        return_token_type_ids=False,
+    )
+    return [list(map(int, token_ids)) for token_ids in encoded["input_ids"]]
 
 
 def _encode_byte_bpe_dialogue_pair_worker(pair: tuple[str, str]) -> tuple[list[int], list[int]]:

@@ -43,20 +43,34 @@ def _make_single_pairwise(
     raise ValueError(f"Unsupported pairwise kind: {kind!r}.")
 
 
+def _freeze_module_parameters(module: nn.Module) -> nn.Module:
+    for parameter in module.parameters():
+        parameter.requires_grad_(False)
+    return module
+
+
 def make_pairwise(
     kind: str,
     *,
     dim: int,
     rank: int,
     heads: int = 1,
+    frozen_heads: int = 0,
 ) -> nn.Module:
     if heads <= 0:
         raise ValueError("heads must be positive.")
+    if frozen_heads < 0 or frozen_heads > heads:
+        raise ValueError("frozen_heads must be between 0 and heads.")
     if heads == 1:
-        return _make_single_pairwise(kind, dim=dim, rank=rank)
-    return MultiHeadPairwise(
-        [_make_single_pairwise(kind, dim=dim, rank=rank) for _ in range(heads)]
-    )
+        module = _make_single_pairwise(kind, dim=dim, rank=rank)
+        return _freeze_module_parameters(module) if frozen_heads == 1 else module
+    head_modules = []
+    for head_index in range(heads):
+        module = _make_single_pairwise(kind, dim=dim, rank=rank)
+        if head_index < frozen_heads:
+            module = _freeze_module_parameters(module)
+        head_modules.append(module)
+    return MultiHeadPairwise(head_modules)
 
 
 def _make_single_route(
@@ -84,14 +98,22 @@ def make_route(
     dim: int,
     rank: int,
     heads: int = 1,
+    frozen_heads: int = 0,
 ) -> nn.Module:
     if heads <= 0:
         raise ValueError("heads must be positive.")
+    if frozen_heads < 0 or frozen_heads > heads:
+        raise ValueError("frozen_heads must be between 0 and heads.")
     if heads == 1:
-        return _make_single_route(kind, dim=dim, rank=rank)
-    return MultiHeadRoute(
-        [_make_single_route(kind, dim=dim, rank=rank) for _ in range(heads)]
-    )
+        module = _make_single_route(kind, dim=dim, rank=rank)
+        return _freeze_module_parameters(module) if frozen_heads == 1 else module
+    head_modules = []
+    for head_index in range(heads):
+        module = _make_single_route(kind, dim=dim, rank=rank)
+        if head_index < frozen_heads:
+            module = _freeze_module_parameters(module)
+        head_modules.append(module)
+    return MultiHeadRoute(head_modules)
 
 
 def layer_with_val_norm(layer: Layer, norm: nn.LayerNorm) -> Layer:
