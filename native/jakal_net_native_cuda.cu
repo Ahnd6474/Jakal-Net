@@ -2293,7 +2293,7 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_low_rank_propagation_topk(
     auto weighted_projected_val =
         (layer_state.to(torch::kFloat32).unsqueeze(-1) * layer_val.to(torch::kFloat32)).contiguous();
     const auto score_bias =
-        (bias.defined() && bias.numel() != 0) ? bias.item<double>() : 0.0;
+        (!multihead && bias.defined() && bias.numel() != 0) ? bias.item<double>() : 0.0;
     auto fused = jakal_net_low_rank_propagation_topk_forward_cuda(
         weighted_projected_source,
         projected_target,
