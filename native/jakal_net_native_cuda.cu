@@ -1287,7 +1287,7 @@ jakal_net_low_rank_pairwise_topk_forward_cuda(
     throw std::runtime_error("weighted projected state/val must be float32 accumulators.");
   }
   if (weighted_projected_source.scalar_type() != projected_target.scalar_type()) {
-    throw std::runtime_error("Route projection tensors must share dtype.");
+    projected_target = projected_target.to(weighted_projected_source.scalar_type());
   }
 
   const auto batch_flat = weighted_projected_source.size(0);
@@ -1412,7 +1412,7 @@ jakal_net_low_rank_propagation_topk_forward_cuda(
     throw std::runtime_error("projected_state and projected_val must be float32 accumulators.");
   }
   if (weighted_projected_source.scalar_type() != projected_target.scalar_type()) {
-    throw std::runtime_error("Route projection tensors must share dtype.");
+    projected_target = projected_target.to(weighted_projected_source.scalar_type());
   }
 
   const auto batch_flat = weighted_projected_source.size(0);
@@ -1520,7 +1520,7 @@ jakal_net_low_rank_propagation_window_forward_cuda(
     throw std::runtime_error("projected_state and projected_val must be float32 accumulators.");
   }
   if (weighted_projected_source.scalar_type() != projected_target.scalar_type()) {
-    throw std::runtime_error("Route projection tensors must share dtype.");
+    projected_target = projected_target.to(weighted_projected_source.scalar_type());
   }
 
   const auto batch_flat = weighted_projected_source.size(0);
@@ -1603,7 +1603,7 @@ jakal_net_low_rank_propagation_window_entmax15_forward_cuda(
     throw std::runtime_error("projected_state and projected_val must be float32 accumulators.");
   }
   if (weighted_projected_source.scalar_type() != projected_target.scalar_type()) {
-    throw std::runtime_error("Route projection tensors must share dtype.");
+    projected_target = projected_target.to(weighted_projected_source.scalar_type());
   }
 
   const auto batch_flat = weighted_projected_source.size(0);
