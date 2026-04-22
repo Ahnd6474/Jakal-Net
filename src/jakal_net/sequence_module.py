@@ -9,6 +9,7 @@ from jakal_net._architectural_common import (
     layer_with_val_norm,
     make_pairwise,
     signed_abs_softmax_edges,
+    unit_normalize_values,
 )
 from jakal_net.core import Layer
 from jakal_net.modules import LearnedPositionEncoding
@@ -31,6 +32,7 @@ class SModule(nn.Module):
         s_window: int | None = None,
         s_microbatch_size: int | None = None,
         checkpoint_sequence_layers: bool = False,
+        unit_norm_values: bool = False,
     ) -> None:
         super().__init__()
         if vocab_size <= 0:
@@ -49,6 +51,7 @@ class SModule(nn.Module):
         self.max_seq_len = max_seq_len
         self.s_microbatch_size = s_microbatch_size
         self.checkpoint_sequence_layers = checkpoint_sequence_layers
+        self.unit_norm_values = unit_norm_values
 
         self.token_embedding = nn.Embedding(vocab_size, dim)
         self.position_encoding = LearnedPositionEncoding(dim)
@@ -105,6 +108,8 @@ class SModule(nn.Module):
         *,
         state_projection: nn.Module,
     ) -> Layer:
+        if self.unit_norm_values:
+            token_val = unit_normalize_values(token_val)
         return Layer(
             dim=self.dim,
             num_nodes=token_val.shape[-2],
@@ -134,11 +139,15 @@ class SModule(nn.Module):
             dtype=token_val.dtype,
         ).unsqueeze(0)
         token_val = self.sequence_input_norm(token_val)
+        if self.unit_norm_values:
+            token_val = unit_normalize_values(token_val)
 
         anchor_val = self.anchor_val.expand(batch_size, 1, -1).to(
             device=token_val.device,
             dtype=token_val.dtype,
         )
+        if self.unit_norm_values:
+            anchor_val = unit_normalize_values(anchor_val)
         anchor_state = self.anchor_state.expand(batch_size, 1).to(
             device=token_val.device,
             dtype=token_val.dtype,
@@ -152,9 +161,16 @@ class SModule(nn.Module):
                     current_layer = Layer(dim=self.dim, num_nodes=seq_len + 1, state=state, val=val)
                     next_layer = apply_delta(
                         current_layer,
-                        propagation.compute_delta(layer_with_val_norm(current_layer, norm)),
+                        propagation.compute_delta(
+                            layer_with_val_norm(
+                                current_layer,
+                                norm,
+                                unit_norm_values=self.unit_norm_values,
+                            )
+                        ),
                         residual=True,
                         val_norm=norm,
+                        unit_norm_values=self.unit_norm_values,
                     )
                     return next_layer.state, next_layer.val
 
@@ -168,8 +184,15 @@ class SModule(nn.Module):
             else:
                 layer = apply_delta(
                     layer,
-                    propagation.compute_delta(layer_with_val_norm(layer, norm)),
+                    propagation.compute_delta(
+                        layer_with_val_norm(
+                            layer,
+                            norm,
+                            unit_norm_values=self.unit_norm_values,
+                        )
+                    ),
                     residual=True,
                     val_norm=norm,
+                    unit_norm_values=self.unit_norm_values,
                 )
         return layer

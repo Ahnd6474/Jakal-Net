@@ -3140,6 +3140,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pairwise-frozen-heads", type=int, default=0)
     parser.add_argument("--route-heads", type=int, default=1)
     parser.add_argument("--route-frozen-heads", type=int, default=0)
+    parser.add_argument("--unit-norm-values", action="store_true")
     parser.add_argument("--implementation", choices=("reference", "streaming", "kernel", "native"), default="streaming")
     parser.add_argument("--knowledge-nodes", type=int, default=0)
     parser.add_argument("--knowledge-route-topk", type=int, default=0)
@@ -3735,6 +3736,7 @@ def main() -> None:
         route_heads=args.route_heads,
         route_frozen_heads=args.route_frozen_heads,
         implementation=args.implementation,
+        unit_norm_values=args.unit_norm_values,
         knowledge_nodes=args.knowledge_nodes,
         knowledge_route_topk=None if args.knowledge_route_topk <= 0 else args.knowledge_route_topk,
         knowledge_propagation_topk=None if args.knowledge_propagation_topk <= 0 else args.knowledge_propagation_topk,
@@ -3770,6 +3772,7 @@ def main() -> None:
         f"s_window={args.s_window} | s_microbatch_size={args.s_microbatch_size} | "
         f"scan_backend={args.scan_backend} | scan_checkpoint_chunk_size={args.scan_checkpoint_chunk_size} | "
         f"memory_slots={args.memory_slots} | knowledge_nodes={args.knowledge_nodes} | "
+        f"unit_norm_values={args.unit_norm_values} | "
         f"optimizer={args.optimizer} | checkpoint_sequence={args.checkpoint_sequence_layers} | "
         f"checkpoint_prediction={args.checkpoint_prediction_layers}",
         flush=True,

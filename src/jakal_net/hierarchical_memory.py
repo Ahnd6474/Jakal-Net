@@ -16,6 +16,7 @@ from jakal_net._architectural_common import (
     make_route,
     signed_abs_softmax_edges,
     signed_softmax_state,
+    unit_normalize_values,
 )
 from jakal_net.core import Layer, LayerDelta
 from jakal_net.propagation import SparsePropagation
@@ -47,10 +48,12 @@ class _MemoryLevel(nn.Module):
         route_frozen_heads: int,
         memory_topk: int,
         implementation: str,
+        unit_norm_values: bool,
     ) -> None:
         super().__init__()
         self.dim = dim
         self.num_slots = num_slots
+        self.unit_norm_values = unit_norm_values
         self.init_state = nn.Parameter(torch.empty(num_slots))
         self.init_val = nn.Parameter(torch.empty(num_slots, dim))
         nn.init.normal_(self.init_state, mean=0.0, std=0.02)
@@ -95,11 +98,14 @@ class _MemoryLevel(nn.Module):
     ) -> Layer:
         state = self.init_state.unsqueeze(0).expand(batch_size, -1).to(device=device, dtype=dtype)
         val = self.init_val.unsqueeze(0).expand(batch_size, -1, -1).to(device=device, dtype=dtype)
+        val = self.val_norm(val.clone())
+        if self.unit_norm_values:
+            val = unit_normalize_values(val)
         return Layer(
             dim=self.dim,
             num_nodes=self.num_slots,
             state=signed_softmax_state(state.clone()),
-            val=self.val_norm(val.clone()),
+            val=val,
         )
 
 
@@ -119,6 +125,7 @@ class BModule(nn.Module):
         pairwise_frozen_heads: int = 0,
         route_frozen_heads: int = 0,
         implementation: str,
+        unit_norm_values: bool = False,
     ) -> None:
         super().__init__()
         if dim <= 0:
@@ -133,6 +140,7 @@ class BModule(nn.Module):
         self.dim = dim
         self.memory_slots = tuple(int(slots) for slots in memory_slots)
         self.num_memory_levels = len(self.memory_slots)
+        self.unit_norm_values = unit_norm_values
 
         self.memory_levels = nn.ModuleList(
             _MemoryLevel(
@@ -148,6 +156,7 @@ class BModule(nn.Module):
                 route_frozen_heads=route_frozen_heads,
                 memory_topk=memory_topk,
                 implementation=implementation,
+                unit_norm_values=unit_norm_values,
             )
             for slots in self.memory_slots
         )
@@ -277,18 +286,28 @@ class BModule(nn.Module):
             level,
             first_level_module.write.compute_delta(
                 token_layer,
-                layer_with_val_norm(level, first_level_module.val_norm),
+                layer_with_val_norm(
+                    level,
+                    first_level_module.val_norm,
+                    unit_norm_values=self.unit_norm_values,
+                ),
             ),
             residual=True,
             val_norm=first_level_module.val_norm,
+            unit_norm_values=self.unit_norm_values,
         )
         level = apply_delta(
             level,
             first_level_module.propagation.compute_delta(
-                layer_with_val_norm(level, first_level_module.val_norm)
+                layer_with_val_norm(
+                    level,
+                    first_level_module.val_norm,
+                    unit_norm_values=self.unit_norm_values,
+                )
             ),
             residual=True,
             val_norm=first_level_module.val_norm,
+            unit_norm_values=self.unit_norm_values,
         )
         next_levels.append(level)
 
@@ -296,8 +315,16 @@ class BModule(nn.Module):
             level_module = self.memory_levels[level_index]
             level = memory_state[level_index]
             parent = next_levels[level_index - 1]
-            normalized_level = layer_with_val_norm(level, level_module.val_norm)
-            normalized_parent = layer_with_val_norm(parent, self.level_norms[level_index - 1])
+            normalized_level = layer_with_val_norm(
+                level,
+                level_module.val_norm,
+                unit_norm_values=self.unit_norm_values,
+            )
+            normalized_parent = layer_with_val_norm(
+                parent,
+                self.level_norms[level_index - 1],
+                unit_norm_values=self.unit_norm_values,
+            )
             level = apply_delta(
                 level,
                 self.level_transitions[level_index - 1].compute_delta(
@@ -306,6 +333,7 @@ class BModule(nn.Module):
                 ),
                 residual=True,
                 val_norm=level_module.val_norm,
+                unit_norm_values=self.unit_norm_values,
             )
             if level_index == 1 and "token_to_1" in self.skip_transitions:
                 gate = torch.sigmoid(self.skip_gates["token_to_1"])
@@ -321,6 +349,7 @@ class BModule(nn.Module):
                     ),
                     residual=True,
                     val_norm=level_module.val_norm,
+                    unit_norm_values=self.unit_norm_values,
                 )
             key = f"{level_index - 2}_to_{level_index}"
             if key in self.skip_transitions:
@@ -328,6 +357,7 @@ class BModule(nn.Module):
                 normalized_skip_source = layer_with_val_norm(
                     next_levels[level_index - 2],
                     self.level_norms[level_index - 2],
+                    unit_norm_values=self.unit_norm_values,
                 )
                 skip_delta = self.skip_transitions[key].compute_delta(
                     normalized_skip_source,
@@ -341,14 +371,20 @@ class BModule(nn.Module):
                     ),
                     residual=True,
                     val_norm=level_module.val_norm,
+                    unit_norm_values=self.unit_norm_values,
                 )
             level = apply_delta(
                 level,
                 level_module.propagation.compute_delta(
-                    layer_with_val_norm(level, level_module.val_norm)
+                    layer_with_val_norm(
+                        level,
+                        level_module.val_norm,
+                        unit_norm_values=self.unit_norm_values,
+                    )
                 ),
                 residual=True,
                 val_norm=level_module.val_norm,
+                unit_norm_values=self.unit_norm_values,
             )
             next_levels.append(level)
         return tuple(next_levels)
@@ -361,7 +397,11 @@ class BModule(nn.Module):
             self.read_projections,
             self.read_gates,
         ):
-            read_layer = layer_with_val_norm(level, level_module.val_norm)
+            read_layer = layer_with_val_norm(
+                level,
+                level_module.val_norm,
+                unit_norm_values=self.unit_norm_values,
+            )
             sender_strength = F.softplus(read_layer.state).unsqueeze(-1)
             read_summary = (sender_strength * read_layer.val).sum(dim=-2)
             read_summary = read_summary + self.read_template_val.to(
@@ -396,6 +436,8 @@ class BModule(nn.Module):
     ) -> Layer:
         summary = self.read(memory_state) if bridge_val is None else bridge_val
         bridge_val_tensor = self.bridge_input_norm(summary).unsqueeze(-2)
+        if self.unit_norm_values:
+            bridge_val_tensor = unit_normalize_values(bridge_val_tensor)
         bridge_state = state_projection(bridge_val_tensor).squeeze(-1)
         return Layer(dim=self.dim, num_nodes=1, state=bridge_state, val=bridge_val_tensor)
 
@@ -410,7 +452,11 @@ class BModule(nn.Module):
             self.memory_levels,
             self.bridge_to_levels,
         ):
-            normalized_level = layer_with_val_norm(level, level_module.val_norm)
+            normalized_level = layer_with_val_norm(
+                level,
+                level_module.val_norm,
+                unit_norm_values=self.unit_norm_values,
+            )
             delta = transition.compute_delta(bridge_layer, normalized_level)
             next_levels.append(
                 apply_delta(
@@ -418,6 +464,7 @@ class BModule(nn.Module):
                     delta,
                     residual=True,
                     val_norm=level_module.val_norm,
+                    unit_norm_values=self.unit_norm_values,
                 )
             )
         return tuple(next_levels)
@@ -480,6 +527,8 @@ class BModule(nn.Module):
             query_val[:, time_index, :] = query_input_norm(
                 projected_s[:, time_index, :] + read_vector
             )
+            if self.unit_norm_values:
+                query_val[:, time_index, :] = unit_normalize_values(query_val[:, time_index, :])
 
         query_state = state_projection(query_val).squeeze(-1)
         return BScanOutput(

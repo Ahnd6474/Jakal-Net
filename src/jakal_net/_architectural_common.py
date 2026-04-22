@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
 
 from jakal_net.core import Layer, LayerDelta
 from jakal_net.modules import (
@@ -22,6 +23,7 @@ from jakal_net.modules import (
 STATE_MASS_PER_NODE = 1.0
 PARAM_INIT_STD = 0.02
 LOW_RANK_SCALE_INIT = 0.1
+UNIT_NORM_EPS = 1e-6
 
 
 def _make_single_pairwise(
@@ -116,12 +118,25 @@ def make_route(
     return MultiHeadRoute(head_modules)
 
 
-def layer_with_val_norm(layer: Layer, norm: nn.LayerNorm) -> Layer:
-    return layer.with_tensors(val=norm(layer.val))
+def unit_normalize_values(val: Tensor, *, eps: float = UNIT_NORM_EPS) -> Tensor:
+    return F.normalize(torch.nan_to_num(val), p=2.0, dim=-1, eps=eps)
+
+
+def layer_with_val_norm(
+    layer: Layer,
+    norm: nn.LayerNorm,
+    *,
+    unit_norm_values: bool = False,
+) -> Layer:
+    val = norm(layer.val)
+    if unit_norm_values:
+        val = unit_normalize_values(val)
+    return layer.with_tensors(val=val)
 
 
 def signed_softmax_state(state: Tensor) -> Tensor:
     clean_state = torch.nan_to_num(state)
+    clean_state = F.layer_norm(clean_state, (clean_state.shape[-1],))
     magnitude = torch.softmax(clean_state.abs(), dim=-1)
     state_mass = float(state.size(-1)) * STATE_MASS_PER_NODE
     return torch.sign(clean_state) * magnitude * state_mass
@@ -142,10 +157,13 @@ def apply_delta(
     *,
     residual: bool = True,
     val_norm: nn.LayerNorm | None = None,
+    unit_norm_values: bool = False,
 ) -> Layer:
     updated = layer.apply_delta(delta, merge_mode="add" if residual else "replace")
     state = signed_softmax_state(updated.state)
     val = updated.val if val_norm is None else val_norm(updated.val)
+    if unit_norm_values:
+        val = unit_normalize_values(val)
     return updated.with_tensors(state=state, val=val)
 
 

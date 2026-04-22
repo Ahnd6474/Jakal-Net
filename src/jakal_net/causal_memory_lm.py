@@ -16,6 +16,7 @@ from jakal_net._architectural_common import (
     layer_with_val_norm,
     make_pairwise,
     signed_abs_softmax_edges,
+    unit_normalize_values,
 )
 from jakal_net.core import Layer
 from jakal_net.hierarchical_memory import BModule, BScanOutput
@@ -85,6 +86,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
         scan_backend: str = "auto",
         scan_checkpoint_chunk_size: int | None = None,
         implementation: str = "streaming",
+        unit_norm_values: bool = False,
         tie_embedding_head: bool = True,
         knowledge_nodes: int = 0,
         knowledge_route_topk: int | None = None,
@@ -123,6 +125,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
         self.scan_backend = scan_backend
         self.scan_checkpoint_chunk_size = scan_checkpoint_chunk_size
         self.checkpoint_prediction_layers = checkpoint_prediction_layers
+        self.unit_norm_values = unit_norm_values
         if knowledge_module is None and knowledge_nodes > 0:
             knowledge_module = KModule(
                 dim=dim,
@@ -156,6 +159,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
             s_window=s_window,
             s_microbatch_size=s_microbatch_size,
             checkpoint_sequence_layers=checkpoint_sequence_layers,
+            unit_norm_values=unit_norm_values,
         )
         self.b_module = BModule(
             dim=dim,
@@ -170,6 +174,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
             pairwise_frozen_heads=pairwise_frozen_heads,
             route_frozen_heads=route_frozen_heads,
             implementation=implementation,
+            unit_norm_values=unit_norm_values,
         )
 
         self.s_prediction_proj = nn.Linear(dim, dim, bias=False)
@@ -264,9 +269,16 @@ class CausalHierarchicalMemoryLM(nn.Module):
                     current_layer = Layer(dim=self.dim, num_nodes=query_layer.num_nodes, state=state, val=val)
                     next_layer = apply_delta(
                         current_layer,
-                        propagation.compute_delta(layer_with_val_norm(current_layer, norm)),
+                        propagation.compute_delta(
+                            layer_with_val_norm(
+                                current_layer,
+                                norm,
+                                unit_norm_values=self.unit_norm_values,
+                            )
+                        ),
                         residual=True,
                         val_norm=norm,
+                        unit_norm_values=self.unit_norm_values,
                     )
                     return next_layer.state, next_layer.val
 
@@ -285,9 +297,16 @@ class CausalHierarchicalMemoryLM(nn.Module):
             else:
                 query_layer = apply_delta(
                     query_layer,
-                    propagation.compute_delta(layer_with_val_norm(query_layer, norm)),
+                    propagation.compute_delta(
+                        layer_with_val_norm(
+                            query_layer,
+                            norm,
+                            unit_norm_values=self.unit_norm_values,
+                        )
+                    ),
                     residual=True,
                     val_norm=norm,
+                    unit_norm_values=self.unit_norm_values,
                 )
 
         logits = self.lm_head(self.output_norm(query_layer.val))
@@ -387,6 +406,8 @@ class CausalHierarchicalMemoryLM(nn.Module):
             )
 
         if not isinstance(self.value_to_state, nn.Linear):
+            return False
+        if self.unit_norm_values:
             return False
         if not all(_is_supported_route(level.write) for level in self.b_module.memory_levels):
             return False
@@ -568,6 +589,8 @@ class CausalHierarchicalMemoryLM(nn.Module):
     ) -> BScanOutput:
         packed = self._pack_native_scan_inputs(aligned_s, memory_state)
         query_val, flat_memory = causal_memory_scan_fused_native(**packed)
+        if self.unit_norm_values:
+            query_val = unit_normalize_values(query_val)
         query_state = self.value_to_state(query_val).squeeze(-1)
         return BScanOutput(
             query_layer=Layer(dim=self.dim, num_nodes=aligned_s.shape[1], state=query_state, val=query_val),
