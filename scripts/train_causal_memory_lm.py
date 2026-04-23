@@ -4378,21 +4378,12 @@ def main() -> None:
                     stage1_cuda_graph_runner is None
                     or tuple(stage1_cuda_graph_runner.static_batch.context.shape) != tuple(batch.context.shape)
                 ):
-                    try:
-                        stage1_cuda_graph_runner = Stage1CudaGraphRunner(
-                            model=model,
-                            batch=batch,
-                            precision=args.precision,
-                        )
-                        print("cuda_graph | mode=forward_backward", flush=True)
-                    except RuntimeError as exc:
-                        print(f"cuda_graph | forward_backward_capture_failed | falling back to forward_only | {exc}", flush=True)
-                        stage1_cuda_graph_runner = Stage1ForwardCudaGraphRunner(
-                            model=model,
-                            batch=batch,
-                            precision=args.precision,
-                        )
-                        print("cuda_graph | mode=forward_only", flush=True)
+                    stage1_cuda_graph_runner = Stage1ForwardCudaGraphRunner(
+                        model=model,
+                        batch=batch,
+                        precision=args.precision,
+                    )
+                    print("cuda_graph | mode=forward_only", flush=True)
                 loss, main_loss_value, next_memory_state = stage1_cuda_graph_runner.replay(
                     batch,
                     memory_state=current_memory_state,
