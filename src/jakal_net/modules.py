@@ -102,6 +102,41 @@ class ScaledCosinePairwise(nn.Module):
         return torch.einsum("...id,...jd->...ij", normalized_target, normalized_source) * self.scale
 
 
+class FixedProjectionRoute(nn.Module):
+    expects_pairwise_inputs = True
+
+    def __init__(
+        self,
+        src_dim: int,
+        dst_dim: int | None = None,
+        *,
+        proj_dim: int,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        target_dim = src_dim if dst_dim is None else dst_dim
+        if proj_dim <= 0:
+            raise ValueError("proj_dim must be positive.")
+        source_weight = torch.empty(proj_dim, src_dim)
+        target_weight = torch.empty(proj_dim, target_dim)
+        nn.init.orthogonal_(source_weight)
+        nn.init.orthogonal_(target_weight)
+        self.register_buffer("source_weight", source_weight)
+        self.register_buffer("target_weight", target_weight)
+        self.eps = float(eps)
+        self.scale = float(proj_dim**-0.5)
+
+    def forward(self, source_val: Tensor, target_val: Tensor) -> Tensor:
+        projected_source = F.linear(source_val, self.source_weight)
+        projected_target = F.linear(target_val, self.target_weight)
+        normalized_source = F.normalize(projected_source, dim=-1, eps=self.eps)
+        normalized_target = F.normalize(projected_target, dim=-1, eps=self.eps)
+        return (
+            torch.einsum("...ir,...kr->...ik", normalized_source, normalized_target)
+            * self.scale
+        )
+
+
 class MultiHeadPairwise(nn.Module):
     def __init__(self, heads: Sequence[nn.Module], *, aggregate: str = "max") -> None:
         super().__init__()

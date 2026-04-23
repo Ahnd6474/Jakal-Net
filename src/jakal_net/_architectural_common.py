@@ -12,6 +12,7 @@ from jakal_net.modules import (
     BilinearPairwiseRoute,
     DiagonalBilinearPairwise,
     DiagonalBilinearRoute,
+    FixedProjectionRoute,
     LowRankBilinearPairwise,
     LowRankBilinearRoute,
     MultiHeadPairwise,
@@ -45,6 +46,17 @@ def _make_single_pairwise(
     raise ValueError(f"Unsupported pairwise kind: {kind!r}.")
 
 
+def _make_anchor_pairwise(
+    kind: str,
+    *,
+    dim: int,
+    rank: int,
+) -> nn.Module:
+    if kind == "scaled_cosine":
+        return ScaledCosinePairwise(dim=dim)
+    raise ValueError(f"Unsupported pairwise anchor kind: {kind!r}.")
+
+
 def _freeze_module_parameters(module: nn.Module) -> nn.Module:
     for parameter in module.parameters():
         parameter.requires_grad_(False)
@@ -58,18 +70,29 @@ def make_pairwise(
     rank: int,
     heads: int = 1,
     frozen_heads: int = 0,
+    anchor_heads: int = 0,
+    anchor_kind: str = "scaled_cosine",
 ) -> nn.Module:
     if heads <= 0:
         raise ValueError("heads must be positive.")
     if frozen_heads < 0 or frozen_heads > heads:
         raise ValueError("frozen_heads must be between 0 and heads.")
+    if anchor_heads < 0 or anchor_heads > heads:
+        raise ValueError("anchor_heads must be between 0 and heads.")
+    if anchor_heads + frozen_heads > heads:
+        raise ValueError("anchor_heads + frozen_heads must be <= heads.")
     if heads == 1:
+        if anchor_heads == 1:
+            return _make_anchor_pairwise(anchor_kind, dim=dim, rank=rank)
         module = _make_single_pairwise(kind, dim=dim, rank=rank)
         return _freeze_module_parameters(module) if frozen_heads == 1 else module
     head_modules = []
     for head_index in range(heads):
-        module = _make_single_pairwise(kind, dim=dim, rank=rank)
-        if head_index < frozen_heads:
+        if head_index < anchor_heads:
+            module = _make_anchor_pairwise(anchor_kind, dim=dim, rank=rank)
+        else:
+            module = _make_single_pairwise(kind, dim=dim, rank=rank)
+        if anchor_heads <= head_index < anchor_heads + frozen_heads:
             module = _freeze_module_parameters(module)
         head_modules.append(module)
     return MultiHeadPairwise(head_modules)
@@ -94,6 +117,19 @@ def _make_single_route(
     raise ValueError(f"Unsupported route kind: {kind!r}.")
 
 
+def _make_anchor_route(
+    kind: str,
+    *,
+    dim: int,
+    rank: int,
+) -> nn.Module:
+    if kind == "fixed_projection":
+        return FixedProjectionRoute(src_dim=dim, dst_dim=dim, proj_dim=rank)
+    if kind == "query_norm_dot":
+        return QueryNormalizedDotRoute(src_dim=dim, dst_dim=dim)
+    raise ValueError(f"Unsupported route anchor kind: {kind!r}.")
+
+
 def make_route(
     kind: str,
     *,
@@ -101,18 +137,29 @@ def make_route(
     rank: int,
     heads: int = 1,
     frozen_heads: int = 0,
+    anchor_heads: int = 0,
+    anchor_kind: str = "fixed_projection",
 ) -> nn.Module:
     if heads <= 0:
         raise ValueError("heads must be positive.")
     if frozen_heads < 0 or frozen_heads > heads:
         raise ValueError("frozen_heads must be between 0 and heads.")
+    if anchor_heads < 0 or anchor_heads > heads:
+        raise ValueError("anchor_heads must be between 0 and heads.")
+    if anchor_heads + frozen_heads > heads:
+        raise ValueError("anchor_heads + frozen_heads must be <= heads.")
     if heads == 1:
+        if anchor_heads == 1:
+            return _make_anchor_route(anchor_kind, dim=dim, rank=rank)
         module = _make_single_route(kind, dim=dim, rank=rank)
         return _freeze_module_parameters(module) if frozen_heads == 1 else module
     head_modules = []
     for head_index in range(heads):
-        module = _make_single_route(kind, dim=dim, rank=rank)
-        if head_index < frozen_heads:
+        if head_index < anchor_heads:
+            module = _make_anchor_route(anchor_kind, dim=dim, rank=rank)
+        else:
+            module = _make_single_route(kind, dim=dim, rank=rank)
+        if anchor_heads <= head_index < anchor_heads + frozen_heads:
             module = _freeze_module_parameters(module)
         head_modules.append(module)
     return MultiHeadRoute(head_modules)

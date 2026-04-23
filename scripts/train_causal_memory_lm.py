@@ -3138,8 +3138,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--route-rank", type=int, default=64)
     parser.add_argument("--pairwise-heads", type=int, default=1)
     parser.add_argument("--pairwise-frozen-heads", type=int, default=0)
+    parser.add_argument("--pairwise-anchor-heads", type=int, default=0)
+    parser.add_argument("--pairwise-anchor-kind", choices=("scaled_cosine",), default="scaled_cosine")
     parser.add_argument("--route-heads", type=int, default=1)
     parser.add_argument("--route-frozen-heads", type=int, default=0)
+    parser.add_argument("--route-anchor-heads", type=int, default=0)
+    parser.add_argument("--route-anchor-kind", choices=("fixed_projection", "query_norm_dot"), default="fixed_projection")
     parser.add_argument("--unit-norm-values", action="store_true")
     parser.add_argument("--implementation", choices=("reference", "streaming", "kernel", "native"), default="streaming")
     parser.add_argument("--knowledge-nodes", type=int, default=0)
@@ -3733,8 +3737,12 @@ def main() -> None:
         route_rank=args.route_rank,
         pairwise_heads=args.pairwise_heads,
         pairwise_frozen_heads=args.pairwise_frozen_heads,
+        pairwise_anchor_heads=args.pairwise_anchor_heads,
+        pairwise_anchor_kind=args.pairwise_anchor_kind,
         route_heads=args.route_heads,
         route_frozen_heads=args.route_frozen_heads,
+        route_anchor_heads=args.route_anchor_heads,
+        route_anchor_kind=args.route_anchor_kind,
         implementation=args.implementation,
         unit_norm_values=args.unit_norm_values,
         knowledge_nodes=args.knowledge_nodes,
