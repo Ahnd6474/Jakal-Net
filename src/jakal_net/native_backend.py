@@ -1793,6 +1793,12 @@ class _CausalMemoryScanFusedFunction(Function):
         checkpoint_end = ctx.tensor_arg_count + ctx.checkpoint_tensor_count
         checkpoint_tensors = saved_tensors[ctx.tensor_arg_count: checkpoint_end]
         trace_tensors = saved_tensors[checkpoint_end : checkpoint_end + ctx.trace_tensor_count]
+        stream_capturing = False
+        if tensor_args and isinstance(tensor_args[0], torch.Tensor) and tensor_args[0].is_cuda:
+            try:
+                stream_capturing = bool(torch.cuda.is_current_stream_capturing())
+            except Exception:
+                stream_capturing = False
         if checkpoint_tensors and ctx.checkpoint_stride > 0:
             return _chunked_causal_memory_scan_backward(
                 ctx,
@@ -1805,6 +1811,7 @@ class _CausalMemoryScanFusedFunction(Function):
             _experimental_scan_backward_cuda_enabled()
             and native_supports("causal_memory_scan_fused_backward_cuda")
             and tensor_args[0].is_cuda
+            and not stream_capturing
         ):
             if grad_outputs[0] is None:
                 with torch.no_grad():
