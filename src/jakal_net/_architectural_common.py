@@ -212,9 +212,27 @@ def apply_delta(
 ) -> Layer:
     updated = layer.apply_delta(delta, merge_mode="add" if residual else "replace")
     state = signed_softmax_state(updated.state)
-    val = updated.val if val_norm is None else val_norm(updated.val)
-    if unit_norm_values:
-        val = unit_normalize_values(val)
+    if val_norm is None and not unit_norm_values:
+        val = updated.val
+    elif residual:
+        touched = delta.delta_val.detach().abs().amax(dim=-1) > 0
+        if touched.any():
+            flat_touched = touched.reshape(-1)
+            flat_input = updated.val.reshape(-1, updated.val.shape[-1])
+            flat_output = flat_input.clone()
+            selected = flat_input[flat_touched]
+            if val_norm is not None:
+                selected = val_norm(selected)
+            if unit_norm_values:
+                selected = unit_normalize_values(selected)
+            flat_output[flat_touched] = selected
+            val = flat_output.view_as(updated.val)
+        else:
+            val = updated.val
+    else:
+        val = updated.val if val_norm is None else val_norm(updated.val)
+        if unit_norm_values:
+            val = unit_normalize_values(val)
     return updated.with_tensors(state=state, val=val)
 
 

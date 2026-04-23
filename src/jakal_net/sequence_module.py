@@ -6,7 +6,6 @@ from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from jakal_net._architectural_common import (
     apply_delta,
-    layer_with_val_norm,
     make_pairwise,
     signed_abs_softmax_edges,
     unit_normalize_values,
@@ -165,13 +164,7 @@ class SModule(nn.Module):
                     current_layer = Layer(dim=self.dim, num_nodes=seq_len + 1, state=state, val=val)
                     next_layer = apply_delta(
                         current_layer,
-                        propagation.compute_delta(
-                            layer_with_val_norm(
-                                current_layer,
-                                norm,
-                                unit_norm_values=self.unit_norm_values,
-                            )
-                        ),
+                        propagation.compute_delta(current_layer),
                         residual=True,
                         val_norm=norm,
                         unit_norm_values=self.unit_norm_values,
@@ -188,13 +181,7 @@ class SModule(nn.Module):
             else:
                 layer = apply_delta(
                     layer,
-                    propagation.compute_delta(
-                        layer_with_val_norm(
-                            layer,
-                            norm,
-                            unit_norm_values=self.unit_norm_values,
-                        )
-                    ),
+                    propagation.compute_delta(layer),
                     residual=True,
                     val_norm=norm,
                     unit_norm_values=self.unit_norm_values,

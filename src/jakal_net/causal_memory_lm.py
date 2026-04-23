@@ -13,7 +13,6 @@ from jakal_net._architectural_common import (
     clone_layer,
     init_linear,
     init_pairwise_or_route_scales,
-    layer_with_val_norm,
     make_pairwise,
     signed_abs_softmax_edges,
     unit_normalize_values,
@@ -287,13 +286,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
                     current_layer = Layer(dim=self.dim, num_nodes=query_layer.num_nodes, state=state, val=val)
                     next_layer = apply_delta(
                         current_layer,
-                        propagation.compute_delta(
-                            layer_with_val_norm(
-                                current_layer,
-                                norm,
-                                unit_norm_values=self.unit_norm_values,
-                            )
-                        ),
+                        propagation.compute_delta(current_layer),
                         residual=True,
                         val_norm=norm,
                         unit_norm_values=self.unit_norm_values,
@@ -315,13 +308,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
             else:
                 query_layer = apply_delta(
                     query_layer,
-                    propagation.compute_delta(
-                        layer_with_val_norm(
-                            query_layer,
-                            norm,
-                            unit_norm_values=self.unit_norm_values,
-                        )
-                    ),
+                    propagation.compute_delta(query_layer),
                     residual=True,
                     val_norm=norm,
                     unit_norm_values=self.unit_norm_values,
