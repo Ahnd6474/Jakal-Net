@@ -42,6 +42,7 @@ from jakal_net.native_backend import (
     propagation_window_native,
 )
 from jakal_net.modules import MultiHeadPairwise
+from jakal_net._architectural_common import unit_normalize_values
 
 
 def _cuda_graph_capture_active(device_type: str) -> bool:
@@ -111,6 +112,7 @@ class Propagation(nn.Module):
         target_block_size: int | None = 128,
         source_block_size: int | None = 128,
         accumulator_dtype: torch.dtype | None = None,
+        use_direction_only: bool = False,
     ) -> None:
         super().__init__()
         validate_implementation(implementation)
@@ -126,9 +128,16 @@ class Propagation(nn.Module):
         self.target_block_size = target_block_size
         self.source_block_size = source_block_size
         self.accumulator_dtype = accumulator_dtype
+        self.use_direction_only = use_direction_only
+
+    def _directional_val(self, val: Tensor) -> Tensor:
+        if not self.use_direction_only:
+            return val
+        return unit_normalize_values(val)
 
     def compute_scores(self, layer: Layer) -> Tensor:
-        scores = self.pairwise_fn(layer.val, layer.val)
+        directional_val = self._directional_val(layer.val)
+        scores = self.pairwise_fn(directional_val, directional_val)
         validate_pairwise_scores(scores, layer)
         return scores
 
@@ -145,7 +154,7 @@ class Propagation(nn.Module):
 
     def _project_inputs(self, layer: Layer) -> tuple[Tensor, Tensor]:
         projected_state = self.state_proj_fn(layer.state)
-        projected_val = self.val_proj_fn(layer.val)
+        projected_val = self.val_proj_fn(self._directional_val(layer.val))
         validate_projected_state(projected_state, layer)
         validate_projected_val(projected_val, layer)
         return projected_state, projected_val
@@ -191,8 +200,8 @@ class Propagation(nn.Module):
             for source_start, source_end in iter_blocks(
                 layer.num_nodes, self.source_block_size, name="source_block_size"
             ):
-                source_val = layer.val[..., source_start:source_end, :]
-                scores = self.pairwise_fn(target_val, source_val)
+                source_val = self._directional_val(layer.val[..., source_start:source_end, :])
+                scores = self.pairwise_fn(self._directional_val(target_val), source_val)
                 validate_pairwise_block_scores(
                     scores=scores,
                     batch_shape=layer.batch_shape,
@@ -224,6 +233,7 @@ class Propagation(nn.Module):
 
     def _compute_delta_kernel_preferred(self, layer: Layer) -> LayerDelta:
         edge_compress_name = _native_edge_compress_name(self.edge_compress_fn)
+        directional_layer_val = self._directional_val(layer.val)
         if (
             not self.state_weight_edges
             and edge_compress_name is not None
@@ -235,7 +245,7 @@ class Propagation(nn.Module):
             return propagation_dense_native(
                 pairwise_fn=self.pairwise_fn,
                 edge_compress_name=edge_compress_name,
-                layer_val=layer.val,
+                layer_val=directional_layer_val,
                 projected_state=projected_state,
                 projected_val=projected_val,
                 target_block_size=self.target_block_size or layer.num_nodes,
@@ -249,7 +259,7 @@ class Propagation(nn.Module):
             return propagation_dense_kernel(
                 pairwise_fn=self.pairwise_fn,
                 edge_compress_fn=self.edge_compress_fn,
-                layer_val=layer.val,
+                layer_val=directional_layer_val,
                 projected_state=projected_state,
                 projected_val=projected_val,
                 source_state=layer.state if self.state_weight_edges else None,
@@ -279,6 +289,7 @@ class Propagation(nn.Module):
             return self._compute_delta_reference(layer)
         if self.implementation == "native":
             edge_compress_name = _native_edge_compress_name(self.edge_compress_fn)
+            directional_layer_val = self._directional_val(layer.val)
             if (
                 not self.state_weight_edges
                 and edge_compress_name is not None
@@ -290,7 +301,7 @@ class Propagation(nn.Module):
                 return propagation_dense_native(
                     pairwise_fn=self.pairwise_fn,
                     edge_compress_name=edge_compress_name,
-                    layer_val=layer.val,
+                    layer_val=directional_layer_val,
                     projected_state=projected_state,
                     projected_val=projected_val,
                     target_block_size=self.target_block_size or layer.num_nodes,
@@ -334,6 +345,7 @@ class SparsePropagation(Propagation):
         target_block_size: int | None = 128,
         source_block_size: int | None = 128,
         accumulator_dtype: torch.dtype | None = None,
+        use_direction_only: bool = False,
     ) -> None:
         super().__init__(
             pairwise_fn=pairwise_fn,
@@ -348,6 +360,7 @@ class SparsePropagation(Propagation):
             target_block_size=target_block_size,
             source_block_size=source_block_size,
             accumulator_dtype=accumulator_dtype,
+            use_direction_only=use_direction_only,
         )
         if sparse_type not in {"window", "topk"}:
             raise ValueError(f"Unsupported sparse_type: {sparse_type!r}.")
@@ -397,7 +410,7 @@ class SparsePropagation(Propagation):
         for target_start, target_end in iter_blocks(
             layer.num_nodes, self.target_block_size, name="target_block_size"
         ):
-            target_val = layer.val[..., target_start:target_end, :]
+            target_val = self._directional_val(layer.val[..., target_start:target_end, :])
             source_floor = max(0, target_start - window)
             source_ceiling = target_end
 
@@ -408,7 +421,9 @@ class SparsePropagation(Propagation):
             ):
                 global_source_start = source_floor + source_start
                 global_source_end = source_floor + source_end
-                source_val = layer.val[..., global_source_start:global_source_end, :]
+                source_val = self._directional_val(
+                    layer.val[..., global_source_start:global_source_end, :]
+                )
                 scores = self.pairwise_fn(target_val, source_val)
                 validate_pairwise_block_scores(
                     scores=scores,
@@ -466,7 +481,7 @@ class SparsePropagation(Propagation):
         for target_start, target_end in iter_blocks(
             layer.num_nodes, self.target_block_size, name="target_block_size"
         ):
-            target_val = layer.val[..., target_start:target_end, :]
+            target_val = self._directional_val(layer.val[..., target_start:target_end, :])
             target_nodes = target_end - target_start
             best_scores: Tensor | None = None
             best_indices: Tensor | None = None
@@ -474,7 +489,7 @@ class SparsePropagation(Propagation):
             for source_start, source_end in iter_blocks(
                 layer.num_nodes, self.source_block_size, name="source_block_size"
             ):
-                source_val = layer.val[..., source_start:source_end, :]
+                source_val = self._directional_val(layer.val[..., source_start:source_end, :])
                 scores = self.pairwise_fn(target_val, source_val)
                 validate_pairwise_block_scores(
                     scores=scores,
@@ -542,6 +557,7 @@ class SparsePropagation(Propagation):
 
     def _compute_delta_kernel_preferred(self, layer: Layer) -> LayerDelta:
         edge_compress_name = _native_edge_compress_name(self.edge_compress_fn)
+        directional_layer_val = self._directional_val(layer.val)
         if (
             not self.state_weight_edges
             and edge_compress_name is not None
@@ -553,7 +569,7 @@ class SparsePropagation(Propagation):
                 return propagation_window_native(
                     pairwise_fn=self.pairwise_fn,
                     edge_compress_name=edge_compress_name,
-                    layer_val=layer.val,
+                    layer_val=directional_layer_val,
                     projected_state=projected_state,
                     projected_val=projected_val,
                     window=self.window or 0,
@@ -564,7 +580,7 @@ class SparsePropagation(Propagation):
                 return propagation_topk_native(
                     pairwise_fn=self.pairwise_fn,
                     edge_compress_name=edge_compress_name,
-                    layer_val=layer.val,
+                    layer_val=directional_layer_val,
                     projected_state=projected_state,
                     projected_val=projected_val,
                     topk=self.topk or layer.num_nodes,
@@ -579,7 +595,7 @@ class SparsePropagation(Propagation):
                 return propagation_window_kernel(
                     pairwise_fn=self.pairwise_fn,
                     edge_compress_fn=self.edge_compress_fn,
-                    layer_val=layer.val,
+                    layer_val=directional_layer_val,
                     projected_state=projected_state,
                     projected_val=projected_val,
                     source_state=layer.state if self.state_weight_edges else None,
@@ -591,7 +607,7 @@ class SparsePropagation(Propagation):
             return propagation_topk_kernel(
                 pairwise_fn=self.pairwise_fn,
                 edge_compress_fn=self.edge_compress_fn,
-                layer_val=layer.val,
+                layer_val=directional_layer_val,
                 projected_state=projected_state,
                 projected_val=projected_val,
                 source_state=layer.state if self.state_weight_edges else None,
@@ -606,7 +622,7 @@ class SparsePropagation(Propagation):
                 return propagation_window_kernel(
                     pairwise_fn=self.pairwise_fn,
                     edge_compress_fn=self.edge_compress_fn,
-                    layer_val=layer.val,
+                    layer_val=directional_layer_val,
                     projected_state=projected_state,
                     projected_val=projected_val,
                     source_state=layer.state if self.state_weight_edges else None,
@@ -618,7 +634,7 @@ class SparsePropagation(Propagation):
             return propagation_topk_kernel(
                 pairwise_fn=self.pairwise_fn,
                 edge_compress_fn=self.edge_compress_fn,
-                layer_val=layer.val,
+                layer_val=directional_layer_val,
                 projected_state=projected_state,
                 projected_val=projected_val,
                 source_state=layer.state if self.state_weight_edges else None,
@@ -636,6 +652,7 @@ class SparsePropagation(Propagation):
             return self._compute_delta_reference(layer)
         if self.implementation == "native":
             edge_compress_name = _native_edge_compress_name(self.edge_compress_fn)
+            directional_layer_val = self._directional_val(layer.val)
             if (
                 not self.state_weight_edges
                 and edge_compress_name is not None
@@ -647,7 +664,7 @@ class SparsePropagation(Propagation):
                     return propagation_window_native(
                         pairwise_fn=self.pairwise_fn,
                         edge_compress_name=edge_compress_name,
-                        layer_val=layer.val,
+                        layer_val=directional_layer_val,
                         projected_state=projected_state,
                         projected_val=projected_val,
                         window=self.window or 0,
@@ -658,7 +675,7 @@ class SparsePropagation(Propagation):
                     return propagation_topk_native(
                         pairwise_fn=self.pairwise_fn,
                         edge_compress_name=edge_compress_name,
-                        layer_val=layer.val,
+                        layer_val=directional_layer_val,
                         projected_state=projected_state,
                         projected_val=projected_val,
                         topk=self.topk or layer.num_nodes,

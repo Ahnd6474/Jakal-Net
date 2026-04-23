@@ -221,6 +221,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
                 state_weight_edges=True,
                 implementation=implementation,
                 residual=True,
+                use_direction_only=unit_norm_values,
             )
             for _ in range(prediction_layers)
         )

@@ -105,6 +105,7 @@ class KModule(nn.Module):
             route_compress_name=route_compress_name,
             implementation=implementation,
             merge_mode="add",
+            use_direction_only=True,
         )
         self.k_to_b = SparseTransition(
             route_fn=make_route(
@@ -121,6 +122,7 @@ class KModule(nn.Module):
             route_compress_name=route_compress_name,
             implementation=implementation,
             merge_mode="add",
+            use_direction_only=True,
         )
         self.propagation_layers = nn.ModuleList(
             SparsePropagation(
@@ -139,6 +141,7 @@ class KModule(nn.Module):
                 state_weight_edges=True,
                 implementation=implementation,
                 residual=propagation_residual,
+                use_direction_only=True,
             )
             for _ in range(propagation_layers)
         )

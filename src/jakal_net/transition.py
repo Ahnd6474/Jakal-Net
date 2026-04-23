@@ -38,6 +38,7 @@ from jakal_net.native_backend import (
     transition_topk_native,
 )
 from jakal_net.modules import MultiHeadRoute
+from jakal_net._architectural_common import unit_normalize_values
 
 
 def _cuda_graph_capture_active(device_type: str) -> bool:
@@ -135,6 +136,7 @@ class Transition(nn.Module):
         src_block_size: int | None = 128,
         dst_block_size: int | None = 128,
         accumulator_dtype: torch.dtype | None = None,
+        use_direction_only: bool = False,
     ) -> None:
         super().__init__()
         validate_merge_mode(merge_mode)
@@ -152,10 +154,18 @@ class Transition(nn.Module):
         self.src_block_size = src_block_size
         self.dst_block_size = dst_block_size
         self.accumulator_dtype = accumulator_dtype
+        self.use_direction_only = use_direction_only
         self.track_stats = False
         self.last_stats: dict[str, float] | None = None
 
+    def _directional_val(self, val: Tensor) -> Tensor:
+        if not self.use_direction_only:
+            return val
+        return unit_normalize_values(val)
+
     def _route_logits(self, src_val: Tensor, dst_val: Tensor) -> Tensor:
+        src_val = self._directional_val(src_val)
+        dst_val = self._directional_val(dst_val)
         if _route_uses_pairwise_inputs(self.route_fn):
             return self.route_fn(src_val, dst_val)
         return self.route_fn(src_val)
@@ -184,7 +194,8 @@ class Transition(nn.Module):
     def _project_inputs(
         self, src_layer: Layer, dst_layer: Layer
     ) -> tuple[Tensor, Tensor, Tensor]:
-        projected_val = self.val_proj_fn(src_layer.val)
+        source_val = self._directional_val(src_layer.val)
+        projected_val = self.val_proj_fn(source_val)
         projected_state = self.state_proj_fn(src_layer.state)
         sender_strength = self.state_activation_fn(src_layer.state)
 
@@ -272,6 +283,7 @@ class Transition(nn.Module):
     def _compute_delta_kernel_preferred(
         self, src_layer: Layer, dst_layer: Layer
     ) -> LayerDelta:
+        directional_src_val = self._directional_val(src_layer.val)
         if src_layer.val.device.type == "privateuseone":
             return self._compute_delta_reference(src_layer, dst_layer)
         if not _route_uses_pairwise_inputs(self.route_fn) and supports_route_kernel(
@@ -283,7 +295,7 @@ class Transition(nn.Module):
             return transition_dense_kernel(
                 route_fn=self.route_fn,
                 sender_strength=sender_strength,
-                src_val=src_layer.val,
+                src_val=directional_src_val,
                 projected_state=projected_state,
                 projected_val=projected_val,
                 dst_nodes=dst_layer.num_nodes,
@@ -304,6 +316,8 @@ class Transition(nn.Module):
         if self._supports_multihead_vectorized_fast_path() and self.implementation != "native":
             return self._compute_delta_reference(src_layer, dst_layer)
         if self.implementation == "native":
+            directional_src_val = self._directional_val(src_layer.val)
+            directional_dst_val = self._directional_val(dst_layer.val)
             if (
                 self.route_compress_name in {"softmax", "signed_entmax15"}
                 and
@@ -317,8 +331,8 @@ class Transition(nn.Module):
                 return transition_pairwise_dense_native(
                     route_fn=self.route_fn,
                     sender_strength=sender_strength,
-                    src_val=src_layer.val,
-                    dst_val=dst_layer.val,
+                    src_val=directional_src_val,
+                    dst_val=directional_dst_val,
                     projected_state=projected_state,
                     projected_val=projected_val,
                     src_block_size=self.src_block_size or src_layer.num_nodes,
@@ -339,7 +353,7 @@ class Transition(nn.Module):
                 return transition_dense_native(
                     route_fn=self.route_fn,
                     sender_strength=sender_strength,
-                    src_val=src_layer.val,
+                    src_val=directional_src_val,
                     projected_state=projected_state,
                     projected_val=projected_val,
                     dst_nodes=dst_layer.num_nodes,
@@ -376,6 +390,7 @@ class SparseTransition(Transition):
         src_block_size: int | None = 128,
         dst_block_size: int | None = 128,
         accumulator_dtype: torch.dtype | None = None,
+        use_direction_only: bool = False,
     ) -> None:
         super().__init__(
             route_fn=route_fn,
@@ -389,6 +404,7 @@ class SparseTransition(Transition):
             src_block_size=src_block_size,
             dst_block_size=dst_block_size,
             accumulator_dtype=accumulator_dtype,
+            use_direction_only=use_direction_only,
         )
         if topk <= 0:
             raise ValueError("topk must be positive.")

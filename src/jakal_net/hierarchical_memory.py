@@ -77,6 +77,7 @@ class _MemoryLevel(nn.Module):
             route_compress_name="signed_abs_softmax",
             implementation=implementation,
             merge_mode="add",
+            use_direction_only=unit_norm_values,
         )
         self.propagation = SparsePropagation(
             pairwise_fn=make_pairwise(
@@ -94,6 +95,7 @@ class _MemoryLevel(nn.Module):
             state_weight_edges=True,
             implementation=implementation,
             residual=True,
+            use_direction_only=unit_norm_values,
         )
         self.val_norm = nn.Identity() if disable_val_norm else nn.LayerNorm(dim)
 
@@ -201,6 +203,7 @@ class BModule(nn.Module):
                 route_compress_name="signed_abs_softmax",
                 implementation=implementation,
                 merge_mode="add",
+                use_direction_only=unit_norm_values,
             )
             for index in range(len(self.memory_slots) - 1)
         )
@@ -227,6 +230,7 @@ class BModule(nn.Module):
                 route_compress_name="signed_abs_softmax",
                 implementation=implementation,
                 merge_mode="add",
+                use_direction_only=unit_norm_values,
             )
             self.skip_gates["token_to_1"] = nn.Parameter(torch.tensor(-1.5))
         for level_index in range(2, len(self.memory_slots)):
@@ -246,6 +250,7 @@ class BModule(nn.Module):
                 route_compress_name="signed_abs_softmax",
                 implementation=implementation,
                 merge_mode="add",
+                use_direction_only=unit_norm_values,
             )
             self.skip_gates[key] = nn.Parameter(torch.tensor(-1.5))
 
@@ -270,6 +275,7 @@ class BModule(nn.Module):
                 route_compress_name="signed_abs_softmax",
                 implementation=implementation,
                 merge_mode="add",
+                use_direction_only=unit_norm_values,
             )
             for slots in self.memory_slots
         )
