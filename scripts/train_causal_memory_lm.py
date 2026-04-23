@@ -3194,6 +3194,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-fraction", type=float, default=0.9)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--eval-interval", type=int, default=200)
+    parser.add_argument(
+        "--eval-start-step",
+        type=int,
+        default=200,
+        help="First training step to run evaluation. Use >1 to avoid expensive startup eval.",
+    )
+    parser.add_argument(
+        "--eval-sample-interval",
+        type=int,
+        default=1000,
+        help="Interval for TensorBoard eval sample text logging. Set larger than eval-interval to reduce overhead.",
+    )
     parser.add_argument("--eval-documents", type=int, default=8)
     parser.add_argument("--curriculum-stage1-ratio", type=float, default=0.1)
     parser.add_argument("--curriculum-stage2-ratio", type=float, default=0.4)
@@ -4279,7 +4291,14 @@ def main() -> None:
 
         val_loss = None
         val_rnn_aux_loss = None
-        if step == 1 or step % args.eval_interval == 0 or step == total_steps:
+        should_eval = (
+            step == total_steps
+            or (
+                step >= max(1, int(args.eval_start_step))
+                and step % args.eval_interval == 0
+            )
+        )
+        if should_eval:
             if flat_collection is not None:
                 val_loss, val_rnn_aux_loss = estimate_eval_loss_flat(
                     model,
@@ -4311,29 +4330,38 @@ def main() -> None:
                 if val_rnn_aux_loss is not None:
                     writer.add_scalar("eval/rnn_aux_loss", float(val_rnn_aux_loss), step)
                 writer.add_scalar("eval/val_ppl", val_ppl, step)
-                if flat_collection is not None:
-                    log_eval_samples_to_tensorboard_flat(
-                        writer,
-                        model,
-                        flat_collection,
-                        fixed_eval_sample_documents_flat,
-                        vocab=decode_vocab,
-                        device=device,
-                        precision=args.precision,
-                        step=step,
-                        max_samples=1,
+                should_log_eval_samples = (
+                    step == total_steps
+                    or (
+                        args.eval_sample_interval > 0
+                        and step >= max(1, int(args.eval_start_step))
+                        and step % args.eval_sample_interval == 0
                     )
-                else:
-                    log_eval_samples_to_tensorboard(
-                        writer,
-                        model,
-                        fixed_eval_sample_documents,
-                        vocab=decode_vocab,
-                        device=device,
-                        precision=args.precision,
-                        step=step,
-                        max_samples=1,
-                    )
+                )
+                if should_log_eval_samples:
+                    if flat_collection is not None:
+                        log_eval_samples_to_tensorboard_flat(
+                            writer,
+                            model,
+                            flat_collection,
+                            fixed_eval_sample_documents_flat,
+                            vocab=decode_vocab,
+                            device=device,
+                            precision=args.precision,
+                            step=step,
+                            max_samples=1,
+                        )
+                    else:
+                        log_eval_samples_to_tensorboard(
+                            writer,
+                            model,
+                            fixed_eval_sample_documents,
+                            vocab=decode_vocab,
+                            device=device,
+                            precision=args.precision,
+                            step=step,
+                            max_samples=1,
+                        )
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 save_checkpoint(
