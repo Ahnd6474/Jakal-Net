@@ -1251,7 +1251,7 @@ jakal_net_low_rank_pairwise_topk_forward_cuda(
   require_cuda_contiguous(weighted_projected_state, "weighted_projected_state");
   require_cuda_contiguous(weighted_projected_val, "weighted_projected_val");
   if (topk <= 0 || topk > kPairwiseTopkForwardMaxK) {
-    throw std::runtime_error("topk must be in the supported fused range [1, 32].");
+    throw std::runtime_error("topk must be in the supported fused range [1, 64].");
   }
   if (compress_kind < kCompressSoftmax || compress_kind > kCompressSignedEntmax15) {
     throw std::runtime_error("compress_kind must be 0 (softmax), 1 (signed_abs_softmax), or 2 (signed_entmax15).");
@@ -1376,7 +1376,7 @@ jakal_net_low_rank_propagation_topk_forward_cuda(
   require_cuda_contiguous(projected_state, "projected_state");
   require_cuda_contiguous(projected_val, "projected_val");
   if (topk <= 0 || topk > kPairwiseTopkForwardMaxK) {
-    throw std::runtime_error("topk must be in the supported fused range [1, 32].");
+    throw std::runtime_error("topk must be in the supported fused range [1, 64].");
   }
   if (compress_kind < 0 || compress_kind > 2) {
     throw std::runtime_error("compress_kind must be 0 (softsign), 1 (signed_abs_softmax), or 2 (signed_entmax15).");

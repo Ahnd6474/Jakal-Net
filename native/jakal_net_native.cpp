@@ -93,6 +93,20 @@ bool experimental_cuda_scan_fastpath_enabled() {
   return false;
 }
 
+std::tuple<torch::Tensor, torch::Tensor> merge_topk_scores_indices(
+    const torch::Tensor& best_scores,
+    const torch::Tensor& best_indices,
+    const torch::Tensor& block_scores,
+    const torch::Tensor& block_indices,
+    int64_t k) {
+  auto candidate_scores = torch::cat({best_scores, block_scores}, -1);
+  auto candidate_indices = torch::cat({best_indices, block_indices}, -1);
+  auto topk_result = candidate_scores.topk(k, -1, true, true);
+  auto merged_scores = std::get<0>(topk_result);
+  auto merged_indices = candidate_indices.gather(-1, std::get<1>(topk_result));
+  return {merged_scores, merged_indices};
+}
+
 std::tuple<torch::Tensor, torch::Tensor> query_topk_reduce_cuda_wrapper(
     const torch::Tensor& edges,
     const torch::Tensor& indices,
@@ -3151,7 +3165,7 @@ std::tuple<torch::Tensor, torch::Tensor> propagation_topk(
       !in_weight.value().requires_grad() &&
       !out_weight.value().requires_grad() &&
       !weight.requires_grad() &&
-      k <= 32) {
+      k <= 64) {
     auto projected_target = torch::matmul(flat_val, out_weight.value().transpose(0, 1)).contiguous();
     auto projected_source = torch::matmul(flat_val, in_weight.value().transpose(0, 1)).contiguous();
     auto weighted_projected_source =
@@ -3197,17 +3211,19 @@ std::tuple<torch::Tensor, torch::Tensor> propagation_topk(
       auto source_val = flat_val.slice(1, source_start, source_end);
       auto scores = pairwise_scores(
           pairwise_kind, target_val, source_val, weight, bias, in_weight, in_bias, out_weight, out_bias);
+      const auto block_k = std::min<int64_t>(k, source_end - source_start);
       auto source_indices = torch::arange(
                                 source_start,
                                 source_end,
                                 flat_val.options().dtype(torch::kLong))
                                 .view({1, 1, source_end - source_start})
                                 .expand({batch_flat, target_nodes, source_end - source_start});
-      auto candidate_scores = torch::cat({best_scores, scores}, -1);
-      auto candidate_indices = torch::cat({best_indices, source_indices}, -1);
-      auto topk_result = candidate_scores.topk(k, -1, true, true);
-      best_scores = std::get<0>(topk_result);
-      best_indices = candidate_indices.gather(-1, std::get<1>(topk_result));
+      auto block_topk = scores.topk(block_k, -1, true, true);
+      auto block_scores = std::get<0>(block_topk);
+      auto block_indices = source_indices.gather(-1, std::get<1>(block_topk));
+      auto merged = merge_topk_scores_indices(best_scores, best_indices, block_scores, block_indices, k);
+      best_scores = std::get<0>(merged);
+      best_indices = std::get<1>(merged);
     }
 
     auto gathered = gather_by_indices(flat_projected_state, flat_projected_val, best_indices);
@@ -3437,17 +3453,19 @@ std::tuple<torch::Tensor, torch::Tensor> transition_topk(
       const auto dst_end = std::min(dst_start + dst_step, dst_nodes);
       auto logits = route_block_logits(
           route_kind, route_context, in_weight, in_bias, out_weight, out_bias, dst_start, dst_end);
+      const auto block_k = std::min<int64_t>(k, dst_end - dst_start);
       auto block_indices = torch::arange(
                                dst_start,
                                dst_end,
                                flat_src_val.options().dtype(torch::kLong))
                                .view({1, 1, dst_end - dst_start})
                                .expand({batch_flat, block_nodes, dst_end - dst_start});
-      auto candidate_values = torch::cat({best_values, logits}, -1);
-      auto candidate_indices = torch::cat({best_indices, block_indices}, -1);
-      auto topk_result = candidate_values.topk(k, -1, true, true);
-      best_values = std::get<0>(topk_result);
-      best_indices = candidate_indices.gather(-1, std::get<1>(topk_result));
+      auto block_topk = logits.topk(block_k, -1, true, true);
+      auto block_values = std::get<0>(block_topk);
+      auto block_index_values = block_indices.gather(-1, std::get<1>(block_topk));
+      auto merged = merge_topk_scores_indices(best_values, best_indices, block_values, block_index_values, k);
+      best_values = std::get<0>(merged);
+      best_indices = std::get<1>(merged);
     }
 
     auto routes = torch::softmax(best_values, -1);
@@ -3702,7 +3720,7 @@ std::tuple<torch::Tensor, torch::Tensor> transition_pairwise_topk(
       !source_weight.value().requires_grad() &&
       !target_weight.value().requires_grad() &&
       !core_weight.requires_grad() &&
-      k <= 32) {
+      k <= 64) {
     auto projected_source =
         torch::matmul(flat_src_val, source_weight.value().transpose(0, 1)).contiguous();
     auto weighted_projected_source =
@@ -3774,17 +3792,19 @@ std::tuple<torch::Tensor, torch::Tensor> transition_pairwise_topk(
           out_weight,
           out_bias,
           temperature);
+      const auto block_k = std::min<int64_t>(k, dst_end - dst_start);
       auto block_indices = torch::arange(
                                dst_start,
                                dst_end,
                                flat_src_val.options().dtype(torch::kLong))
                                .view({1, 1, dst_end - dst_start})
                                .expand({batch_flat, block_nodes, dst_end - dst_start});
-      auto candidate_values = torch::cat({best_values, logits}, -1);
-      auto candidate_indices = torch::cat({best_indices, block_indices}, -1);
-      auto topk_result = candidate_values.topk(k, -1, true, true);
-      best_values = std::get<0>(topk_result);
-      best_indices = candidate_indices.gather(-1, std::get<1>(topk_result));
+      auto block_topk = logits.topk(block_k, -1, true, true);
+      auto block_values = std::get<0>(block_topk);
+      auto block_index_values = block_indices.gather(-1, std::get<1>(block_topk));
+      auto merged = merge_topk_scores_indices(best_values, best_indices, block_values, block_index_values, k);
+      best_values = std::get<0>(merged);
+      best_indices = std::get<1>(merged);
     }
 
     auto routes = torch::softmax(best_values, -1);
@@ -3902,17 +3922,19 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> transitio
                         temperature)
                         .transpose(1, 2)
                         .contiguous();
+      const auto block_k = std::min<int64_t>(k, source_end - source_start);
       auto block_indices = torch::arange(
                                source_start,
                                source_end,
                                flat_query_val.options().dtype(torch::kLong))
                                .view({1, 1, source_end - source_start})
                                .expand({batch_flat, block_nodes, source_end - source_start});
-      auto candidate_values = torch::cat({best_values, logits}, -1);
-      auto candidate_indices = torch::cat({best_indices, block_indices}, -1);
-      auto topk_result = candidate_values.topk(k, -1, true, true);
-      best_values = std::get<0>(topk_result);
-      best_indices = candidate_indices.gather(-1, std::get<1>(topk_result));
+      auto block_topk = logits.topk(block_k, -1, true, true);
+      auto block_values = std::get<0>(block_topk);
+      auto block_index_values = block_indices.gather(-1, std::get<1>(block_topk));
+      auto merged = merge_topk_scores_indices(best_values, best_indices, block_values, block_index_values, k);
+      best_values = std::get<0>(merged);
+      best_indices = std::get<1>(merged);
     }
 
     selected_scores.slice(1, query_start, query_end).copy_(best_values);

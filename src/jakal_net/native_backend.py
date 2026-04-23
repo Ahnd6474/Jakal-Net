@@ -1070,18 +1070,35 @@ def _native_scan_read_memory(
     read_template_val: Tensor,
     read_projection_weights: tuple[Tensor, ...],
     read_gates: tuple[Tensor, ...],
+    *,
+    gates_are_sigmoid: bool = False,
 ) -> Tensor:
     read_sum: Tensor | None = None
     cached_template: Tensor | None = None
+    cached_projection_weights: list[Tensor | None] = [None] * len(read_projection_weights)
+    cached_gates: list[Tensor | None] = [None] * len(read_gates)
     for index, (state, val) in enumerate(memory_state):
         read_val = _native_scan_layer_norm(val, val_norm_weights[index], val_norm_biases[index])
         sender_strength = F.softplus(state).unsqueeze(-1)
         read_summary = (sender_strength * read_val).sum(dim=-2)
         if cached_template is None or cached_template.dtype != read_summary.dtype or cached_template.device != read_summary.device:
             cached_template = read_template_val.to(device=read_summary.device, dtype=read_summary.dtype).unsqueeze(0)
-        read_summary = read_summary + cached_template
-        projected = F.linear(read_summary, read_projection_weights[index].to(device=read_summary.device, dtype=read_summary.dtype), None)
-        term = torch.sigmoid(read_gates[index].to(device=read_summary.device, dtype=read_summary.dtype)) * projected
+        projection_weight = cached_projection_weights[index]
+        if (
+            projection_weight is None
+            or projection_weight.dtype != read_summary.dtype
+            or projection_weight.device != read_summary.device
+        ):
+            projection_weight = read_projection_weights[index].to(device=read_summary.device, dtype=read_summary.dtype)
+            cached_projection_weights[index] = projection_weight
+        gate = cached_gates[index]
+        if gate is None or gate.dtype != read_summary.dtype or gate.device != read_summary.device:
+            gate = read_gates[index].to(device=read_summary.device, dtype=read_summary.dtype)
+            if not gates_are_sigmoid:
+                gate = torch.sigmoid(gate)
+            cached_gates[index] = gate
+        projected = F.linear(read_summary + cached_template, projection_weight, None)
+        term = gate * projected
         read_sum = term if read_sum is None else read_sum + term
     if read_sum is None:
         raise RuntimeError("_native_scan_read_memory requires at least one memory level.")
@@ -1107,6 +1124,16 @@ def _causal_memory_scan_fused_reference(
     ]
     query_val = torch.empty_like(projected_s)
     prediction_input_norm_bias = args["prediction_input_norm_bias"]
+
+    read_template_cast = args["read_template_val"].to(device=aligned_s.device, dtype=aligned_s.dtype)
+    read_projection_weights_cast = tuple(
+        weight.to(device=aligned_s.device, dtype=aligned_s.dtype)
+        for weight in args["read_projection_weights"]
+    )
+    read_gates_sigmoid = tuple(
+        torch.sigmoid(gate.to(device=aligned_s.device, dtype=aligned_s.dtype))
+        for gate in args["read_gates"]
+    )
 
     for time_index in range(aligned_s.shape[1]):
         token_val = aligned_s.narrow(1, time_index, 1).contiguous()
@@ -1282,9 +1309,10 @@ def _causal_memory_scan_fused_reference(
             current_memory,
             args["val_norm_weights"],
             args["val_norm_biases"],
-            args["read_template_val"],
-            args["read_projection_weights"],
-            args["read_gates"],
+            read_template_cast,
+            read_projection_weights_cast,
+            read_gates_sigmoid,
+            gates_are_sigmoid=True,
         )
         query_input = projected_s[:, time_index, :] + read_vector
         query_val[:, time_index, :].copy_(

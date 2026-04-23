@@ -441,6 +441,7 @@ class BModule(nn.Module):
                 pass
         read_sum: Tensor | None = None
         template = self.read_template_val
+        cached_template: Tensor | None = None
         for level, projection, gate in zip(
             memory_state,
             self.read_projections,
@@ -448,13 +449,13 @@ class BModule(nn.Module):
         ):
             sender_strength = F.softplus(level.state).unsqueeze(-1)
             read_summary = (sender_strength * level.val).sum(dim=-2)
-            projected = projection(read_summary)
-            projected = projected + projection(
-                template.to(
-                device=level.val.device,
-                dtype=level.val.dtype,
-                ).unsqueeze(0)
-            )
+            if (
+                cached_template is None
+                or cached_template.device != level.val.device
+                or cached_template.dtype != level.val.dtype
+            ):
+                cached_template = template.to(device=level.val.device, dtype=level.val.dtype).unsqueeze(0)
+            projected = F.linear(read_summary + cached_template, projection.weight, None)
             term = torch.sigmoid(gate) * projected
             read_sum = term if read_sum is None else read_sum + term
         if read_sum is None:
