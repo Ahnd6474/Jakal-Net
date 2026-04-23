@@ -3469,6 +3469,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stop-on-nonfinite-grad", action="store_true")
     parser.add_argument("--eval-interval", type=int, default=200)
     parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=100,
+        help="Save last.pt/last.json every N training steps.",
+    )
+    parser.add_argument(
         "--eval-start-step",
         type=int,
         default=200,
@@ -4414,7 +4420,7 @@ def main() -> None:
                     {"step": step, "train_loss": train_loss, "val_loss": val_loss},
                 )
 
-        if step == total_steps or step % args.eval_interval == 0:
+        if step == total_steps or step % args.checkpoint_interval == 0:
             save_checkpoint(
                 checkpoints_dir / "last.pt",
                 model=model,
