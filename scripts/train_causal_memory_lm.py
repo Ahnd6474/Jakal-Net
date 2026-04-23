@@ -837,6 +837,31 @@ class DocumentChunkBatcher:
         self.active_buckets = tuple(bucket for bucket, _ in active)
         self.active_bucket_weights = tuple(weight for _, weight in active)
 
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "batch_size": self.batch_size,
+            "current_doc": list(self.current_doc),
+            "current_chunk": list(self.current_chunk),
+            "needs_reset": list(self.needs_reset),
+            "active_buckets": list(self.active_buckets),
+            "active_bucket_weights": list(self.active_bucket_weights),
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        self.set_batch_size(int(state.get("batch_size", self.batch_size)))
+        self.current_doc = [int(value) for value in state.get("current_doc", self.current_doc)]
+        self.current_chunk = [int(value) for value in state.get("current_chunk", self.current_chunk)]
+        self.needs_reset = [bool(value) for value in state.get("needs_reset", self.needs_reset)]
+        active_buckets = [
+            str(bucket)
+            for bucket in state.get("active_buckets", self.active_buckets)
+            if str(bucket) in self.bucket_to_indices
+        ]
+        active_weights = [float(weight) for weight in state.get("active_bucket_weights", self.active_bucket_weights)]
+        if active_buckets and len(active_buckets) == len(active_weights):
+            self.active_buckets = tuple(active_buckets)
+            self.active_bucket_weights = tuple(active_weights)
+
     def next_batch(self) -> DocumentBatch:
         contexts: list[torch.Tensor] = []
         targets: list[torch.Tensor] = []
@@ -1049,6 +1074,55 @@ class FlatDocumentChunkBatcher:
         self.active_bucket_weights = tuple(weight for _, weight in active)
         self._refresh_active_bucket_shards(force=True)
 
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "batch_size": self.batch_size,
+            "current_doc": list(self.current_doc),
+            "current_chunk": list(self.current_chunk),
+            "needs_reset": list(self.needs_reset),
+            "active_buckets": list(self.active_buckets),
+            "active_bucket_weights": list(self.active_bucket_weights),
+            "active_bucket_shards": {
+                bucket: list(shards) for bucket, shards in self.active_bucket_shards.items()
+            },
+            "rng_state": self._rng.getstate(),
+            "batches_served": self._batches_served,
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        self.set_batch_size(int(state.get("batch_size", self.batch_size)))
+        self.current_doc = [int(value) for value in state.get("current_doc", self.current_doc)]
+        self.current_chunk = [int(value) for value in state.get("current_chunk", self.current_chunk)]
+        self.needs_reset = [bool(value) for value in state.get("needs_reset", self.needs_reset)]
+        active_buckets = [
+            str(bucket)
+            for bucket in state.get("active_buckets", self.active_buckets)
+            if str(bucket) in self.bucket_to_indices
+        ]
+        active_weights = [float(weight) for weight in state.get("active_bucket_weights", self.active_bucket_weights)]
+        if active_buckets and len(active_buckets) == len(active_weights):
+            self.active_buckets = tuple(active_buckets)
+            self.active_bucket_weights = tuple(active_weights)
+        active_bucket_shards = state.get("active_bucket_shards")
+        if isinstance(active_bucket_shards, dict):
+            restored_bucket_shards: dict[str, tuple[int, ...]] = {}
+            for bucket, shard_indices in active_bucket_shards.items():
+                if bucket not in self.bucket_to_shard_indices:
+                    continue
+                valid = tuple(
+                    int(shard_index)
+                    for shard_index in shard_indices
+                    if int(shard_index) in self.bucket_to_shard_indices[bucket]
+                )
+                if valid:
+                    restored_bucket_shards[str(bucket)] = valid
+            if restored_bucket_shards:
+                self.active_bucket_shards = restored_bucket_shards
+        rng_state = state.get("rng_state")
+        if rng_state is not None:
+            self._rng.setstate(rng_state)
+        self._batches_served = int(state.get("batches_served", self._batches_served))
+
     def next_batch(self) -> DocumentBatch:
         self._batches_served += 1
         self._refresh_active_bucket_shards()
@@ -1134,6 +1208,22 @@ class FlatSequentialDocumentBatcher:
         document_index = self._next_document_cursor
         self._next_document_cursor = (self._next_document_cursor + 1) % len(self.documents)
         return document_index
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "batch_size": self.batch_size,
+            "current_doc": list(self.current_doc),
+            "current_chunk": list(self.current_chunk),
+            "needs_reset": list(self.needs_reset),
+            "next_document_cursor": self._next_document_cursor,
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        self.set_batch_size(int(state.get("batch_size", self.batch_size)))
+        self.current_doc = [int(value) for value in state.get("current_doc", self.current_doc)]
+        self.current_chunk = [int(value) for value in state.get("current_chunk", self.current_chunk)]
+        self.needs_reset = [bool(value) for value in state.get("needs_reset", self.needs_reset)]
+        self._next_document_cursor = int(state.get("next_document_cursor", self._next_document_cursor)) % len(self.documents)
 
     def next_batch(self) -> DocumentBatch:
         contexts: list[torch.Tensor] = []
@@ -2569,6 +2659,41 @@ def clone_memory_state(memory_state: Any | None) -> Any | None:
     return tuple(layer.clone() for layer in memory_state)
 
 
+def move_memory_state(memory_state: Any | None, *, device: torch.device) -> Any | None:
+    if memory_state is None:
+        return None
+    if isinstance(memory_state, ModelRecurrentState):
+        moved_knowledge = None
+        if memory_state.knowledge_state is not None:
+            moved_knowledge = memory_state.knowledge_state.with_tensors(
+                state=memory_state.knowledge_state.state.to(device=device),
+                val=memory_state.knowledge_state.val.to(device=device),
+            )
+        return ModelRecurrentState(
+            memory_state=tuple(
+                layer.with_tensors(
+                    state=layer.state.to(device=device),
+                    val=layer.val.to(device=device),
+                )
+                for layer in memory_state.memory_state
+            ),
+            knowledge_state=moved_knowledge,
+        )
+    return tuple(
+        layer.with_tensors(
+            state=layer.state.to(device=device),
+            val=layer.val.to(device=device),
+        )
+        for layer in memory_state
+    )
+
+
+def cpu_clone_memory_state(memory_state: Any | None) -> Any | None:
+    if memory_state is None:
+        return None
+    return move_memory_state(clone_memory_state(memory_state), device=torch.device("cpu"))
+
+
 def copy_memory_state_(destination: Any | None, source: Any | None) -> Any | None:
     if destination is None or source is None:
         return destination
@@ -3334,6 +3459,12 @@ def save_checkpoint(
     val_loss: float | None,
     tokenizer_label: str,
     tokenizer_model_path: str | None,
+    train_memory_state: Any | None,
+    batcher_state: dict[str, Any] | None,
+    active_stage_name: str | None,
+    python_rng_state: object,
+    torch_rng_state: Tensor,
+    cuda_rng_state: list[Tensor] | None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -3348,6 +3479,12 @@ def save_checkpoint(
             "val_loss": val_loss,
             "tokenizer_label": tokenizer_label,
             "tokenizer_model_path": tokenizer_model_path,
+            "train_memory_state": cpu_clone_memory_state(train_memory_state),
+            "batcher_state": batcher_state,
+            "active_stage_name": active_stage_name,
+            "python_rng_state": python_rng_state,
+            "torch_rng_state": torch_rng_state.detach().cpu(),
+            "cuda_rng_state": None if cuda_rng_state is None else [state.detach().cpu() for state in cuda_rng_state],
         },
         path,
     )
@@ -4087,13 +4224,6 @@ def main() -> None:
     else:
         batcher = DocumentChunkBatcher(train_documents, batch_size=stage1_batch_size, device=device)
     print("startup | batcher_done", flush=True)
-    prefetcher = AsyncDocumentBatchPrefetcher(
-        batcher,
-        device=device,
-        prefetch_batches=max(1, int(args.prefetch_batches)),
-    )
-    print("startup | prefetcher_done", flush=True)
-
     history_rows: list[dict[str, Any]] = []
     train_memory_state: tuple[Any, ...] | None = None
     active_stage_name: str | None = None
@@ -4108,11 +4238,36 @@ def main() -> None:
         checkpoint_val_loss = checkpoint.get("val_loss")
         if checkpoint_val_loss is not None:
             best_val_loss = float(checkpoint_val_loss)
+        if checkpoint.get("train_memory_state") is not None:
+            train_memory_state = move_memory_state(checkpoint["train_memory_state"], device=device)
+        batcher_state = checkpoint.get("batcher_state")
+        if isinstance(batcher_state, dict):
+            batcher.load_state_dict(batcher_state)
+        active_stage_name = checkpoint.get("active_stage_name")
+        python_rng_state = checkpoint.get("python_rng_state")
+        if python_rng_state is not None:
+            random.setstate(python_rng_state)
+        torch_rng_state = checkpoint.get("torch_rng_state")
+        if isinstance(torch_rng_state, torch.Tensor):
+            torch.set_rng_state(torch_rng_state.to(dtype=torch.uint8, device="cpu"))
+        cuda_rng_state = checkpoint.get("cuda_rng_state")
+        if device.type == "cuda" and isinstance(cuda_rng_state, list) and cuda_rng_state:
+            torch.cuda.set_rng_state_all([
+                state.to(dtype=torch.uint8, device="cpu")
+                for state in cuda_rng_state
+                if isinstance(state, torch.Tensor)
+            ])
         print(
             f"resumed_checkpoint | path={checkpoint_path} | step={start_step} | "
             f"train_loss={checkpoint.get('train_loss')} | val_loss={checkpoint.get('val_loss')}",
             flush=True,
         )
+    prefetcher = AsyncDocumentBatchPrefetcher(
+        batcher,
+        device=device,
+        prefetch_batches=max(1, int(args.prefetch_batches)),
+    )
+    print("startup | prefetcher_done", flush=True)
     optimizer.zero_grad(set_to_none=True)
     start_time = time.time()
     grad_clip_parameters = list(model.parameters())
@@ -4122,6 +4277,41 @@ def main() -> None:
         if parameter.requires_grad
     ]
     stage1_cuda_graph_runner: Stage1CudaGraphRunner | Stage1ForwardCudaGraphRunner | None = None
+
+    def save_training_checkpoint(
+        path: Path,
+        *,
+        step: int,
+        train_loss: float,
+        val_loss: float | None,
+    ) -> None:
+        nonlocal prefetcher
+        prefetcher.close()
+        batcher_state = batcher.state_dict()
+        save_checkpoint(
+            path,
+            model=model,
+            rnn_aux_head=None,
+            optimizer=optimizer,
+            rnn_aux_optimizer=None,
+            step=step,
+            args=args,
+            train_loss=train_loss,
+            val_loss=val_loss,
+            tokenizer_label=tokenizer_label,
+            tokenizer_model_path=tokenizer_model_path,
+            train_memory_state=train_memory_state,
+            batcher_state=batcher_state,
+            active_stage_name=active_stage_name,
+            python_rng_state=random.getstate(),
+            torch_rng_state=torch.get_rng_state(),
+            cuda_rng_state=(torch.cuda.get_rng_state_all() if device.type == "cuda" else None),
+        )
+        prefetcher = AsyncDocumentBatchPrefetcher(
+            batcher,
+            device=device,
+            prefetch_batches=max(1, int(args.prefetch_batches)),
+        )
 
     for step in range(start_step + 1, total_steps + 1):
         stage = resolve_curriculum_stage(
@@ -4402,18 +4592,11 @@ def main() -> None:
                         )
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                save_checkpoint(
+                save_training_checkpoint(
                     checkpoints_dir / "best.pt",
-                    model=model,
-                    rnn_aux_head=None,
-                    optimizer=optimizer,
-                    rnn_aux_optimizer=None,
                     step=step,
-                    args=args,
                     train_loss=train_loss,
                     val_loss=val_loss,
-                    tokenizer_label=tokenizer_label,
-                    tokenizer_model_path=tokenizer_model_path,
                 )
                 write_json(
                     checkpoints_dir / "best.json",
@@ -4421,18 +4604,11 @@ def main() -> None:
                 )
 
         if step == total_steps or step % args.checkpoint_interval == 0:
-            save_checkpoint(
+            save_training_checkpoint(
                 checkpoints_dir / "last.pt",
-                model=model,
-                rnn_aux_head=None,
-                optimizer=optimizer,
-                rnn_aux_optimizer=None,
                 step=step,
-                args=args,
                 train_loss=train_loss,
                 val_loss=val_loss,
-                tokenizer_label=tokenizer_label,
-                tokenizer_model_path=tokenizer_model_path,
             )
             write_json(
                 checkpoints_dir / "last.json",
