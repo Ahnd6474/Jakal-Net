@@ -225,7 +225,9 @@ class CausalHierarchicalMemoryLM(nn.Module):
         nn.init.normal_(self.s_module.token_embedding.weight, mean=0.0, std=PARAM_INIT_STD)
         nn.init.normal_(self.s_module.anchor_val, mean=0.0, std=PARAM_INIT_STD)
         nn.init.zeros_(self.s_module.anchor_state)
-        init_linear(self.value_to_state)
+        nn.init.zeros_(self.value_to_state.weight)
+        if self.value_to_state.bias is not None:
+            nn.init.zeros_(self.value_to_state.bias)
         init_linear(self.s_prediction_proj)
         self.b_module.reset_projection_parameters()
         if not tie_embedding_head:
