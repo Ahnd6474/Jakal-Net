@@ -522,7 +522,7 @@ class BModule(nn.Module):
         batch_size, seq_len, _ = aligned_s.shape
         current_memory = tuple(memory_state)
         projected_s = query_projection(aligned_s)
-        query_val = aligned_s.new_empty(batch_size, seq_len, self.dim)
+        query_steps: list[Tensor] = []
         latest_bridge_layer: Layer | None = None
         latest_knowledge_output: Any | None = None
 
@@ -564,12 +564,12 @@ class BModule(nn.Module):
                 )
             latest_bridge_layer = bridge_layer
             read_vector = self.read(current_memory)
-            query_val[:, time_index, :] = query_input_norm(
-                projected_s[:, time_index, :] + read_vector
-            )
+            query_step = query_input_norm(projected_s[:, time_index, :] + read_vector)
             if self.unit_norm_values:
-                query_val[:, time_index, :] = unit_normalize_values(query_val[:, time_index, :])
+                query_step = unit_normalize_values(query_step)
+            query_steps.append(query_step)
 
+        query_val = torch.stack(query_steps, dim=1)
         query_state = state_projection(query_val).squeeze(-1)
         return BScanOutput(
             query_layer=Layer(dim=self.dim, num_nodes=seq_len, state=query_state, val=query_val),
