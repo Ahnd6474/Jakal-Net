@@ -2551,6 +2551,57 @@ def detach_memory_state(memory_state: Any | None) -> Any | None:
     )
 
 
+def clone_memory_state(memory_state: Any | None) -> Any | None:
+    if memory_state is None:
+        return None
+    if isinstance(memory_state, ModelRecurrentState):
+        cloned_knowledge = None
+        if memory_state.knowledge_state is not None:
+            cloned_knowledge = memory_state.knowledge_state.clone()
+        return ModelRecurrentState(
+            memory_state=tuple(layer.clone() for layer in memory_state.memory_state),
+            knowledge_state=cloned_knowledge,
+        )
+    return tuple(layer.clone() for layer in memory_state)
+
+
+def copy_memory_state_(destination: Any | None, source: Any | None) -> Any | None:
+    if destination is None or source is None:
+        return destination
+    if isinstance(destination, ModelRecurrentState):
+        if not isinstance(source, ModelRecurrentState):
+            raise TypeError("source memory state type does not match destination.")
+        for dst_layer, src_layer in zip(destination.memory_state, source.memory_state, strict=True):
+            dst_layer.state.copy_(src_layer.state)
+            dst_layer.val.copy_(src_layer.val)
+        if destination.knowledge_state is not None and source.knowledge_state is not None:
+            destination.knowledge_state.state.copy_(source.knowledge_state.state)
+            destination.knowledge_state.val.copy_(source.knowledge_state.val)
+        return destination
+    if isinstance(source, ModelRecurrentState):
+        raise TypeError("source memory state type does not match destination.")
+    for dst_layer, src_layer in zip(destination, source, strict=True):
+        dst_layer.state.copy_(src_layer.state)
+        dst_layer.val.copy_(src_layer.val)
+    return destination
+
+
+def make_static_document_batch(batch: DocumentBatch) -> DocumentBatch:
+    return DocumentBatch(
+        context=torch.empty_like(batch.context),
+        target=torch.empty_like(batch.target),
+        loss_mask=torch.empty_like(batch.loss_mask),
+        reset_mask=torch.empty_like(batch.reset_mask),
+    )
+
+
+def copy_document_batch_(destination: DocumentBatch, source: DocumentBatch) -> None:
+    destination.context.copy_(source.context)
+    destination.target.copy_(source.target)
+    destination.loss_mask.copy_(source.loss_mask)
+    destination.reset_mask.copy_(source.reset_mask)
+
+
 def memory_state_is_finite(memory_state: Any | None) -> bool:
     if memory_state is None:
         return True
@@ -2881,6 +2932,110 @@ def run_model(
             assert isinstance(output, MemoryScanOutput)
             main_loss = compute_masked_loss(output.logits, batch.target, batch.loss_mask)
     return main_loss, float(main_loss.detach().item()), output.recurrent_state
+
+
+def run_model_loss_tensor(
+    model: CausalHierarchicalMemoryLM,
+    batch: DocumentBatch,
+    *,
+    memory_state: Any | None,
+    precision: str,
+) -> tuple[torch.Tensor, Any | None]:
+    autocast_dtype = resolve_autocast_dtype(precision)
+    autocast_supported = (
+        autocast_dtype is not None
+        and (
+            batch.context.device.type == "cuda"
+            or (batch.context.device.type == "cpu" and autocast_dtype == torch.bfloat16)
+        )
+    )
+    autocast_context = (
+        torch.autocast(device_type=batch.context.device.type, dtype=autocast_dtype)
+        if autocast_supported
+        else nullcontext()
+    )
+    with torch.enable_grad():
+        with autocast_context:
+            output = model(
+                batch.context,
+                memory_state=memory_state,
+                reset_mask=batch.reset_mask,
+                return_memory_state=True,
+            )
+            assert isinstance(output, MemoryScanOutput)
+            main_loss = compute_masked_loss(output.logits, batch.target, batch.loss_mask)
+    return main_loss, output.recurrent_state
+
+
+class Stage1CudaGraphRunner:
+    def __init__(
+        self,
+        *,
+        model: CausalHierarchicalMemoryLM,
+        batch: DocumentBatch,
+        precision: str,
+    ) -> None:
+        if batch.context.device.type != "cuda":
+            raise ValueError("CUDA graph runner requires CUDA tensors.")
+        self.model = model
+        self.precision = precision
+        self.static_batch = make_static_document_batch(batch)
+        copy_document_batch_(self.static_batch, batch)
+        zero_memory = model.initialize_memory_state(
+            batch.context.shape[0],
+            device=batch.context.device,
+            dtype=model.s_module.token_embedding.weight.dtype,
+        )
+        self.zero_memory_state = clone_memory_state(zero_memory)
+        self.static_memory_state = clone_memory_state(zero_memory)
+        self.graph = torch.cuda.CUDAGraph()
+        self.loss_tensor: torch.Tensor | None = None
+        self.output_memory_state: Any | None = None
+        self._capture()
+
+    def _capture(self) -> None:
+        warmup_stream = torch.cuda.Stream(device=self.static_batch.context.device)
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(2):
+                self.model.zero_grad(set_to_none=True)
+                loss, _ = run_model_loss_tensor(
+                    self.model,
+                    self.static_batch,
+                    memory_state=self.static_memory_state,
+                    precision=self.precision,
+                )
+                loss.backward()
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+        self.model.zero_grad(set_to_none=True)
+        with torch.cuda.graph(self.graph):
+            self.loss_tensor, self.output_memory_state = run_model_loss_tensor(
+                self.model,
+                self.static_batch,
+                memory_state=self.static_memory_state,
+                precision=self.precision,
+            )
+            self.loss_tensor.backward()
+
+    def replay(
+        self,
+        batch: DocumentBatch,
+        *,
+        memory_state: Any | None,
+    ) -> tuple[torch.Tensor, float, Any | None]:
+        copy_document_batch_(self.static_batch, batch)
+        if memory_state is None:
+            copy_memory_state_(self.static_memory_state, self.zero_memory_state)
+        else:
+            copy_memory_state_(self.static_memory_state, memory_state)
+        self.graph.replay()
+        assert self.loss_tensor is not None
+        loss_tensor = self.loss_tensor
+        return (
+            loss_tensor,
+            float(loss_tensor.detach().item()),
+            detach_memory_state(self.output_memory_state),
+        )
 
 
 def run_rnn_aux_model(
@@ -3217,6 +3372,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name")
     parser.add_argument("--resume-checkpoint")
     parser.add_argument("--tensorboard", action="store_true")
+    parser.add_argument(
+        "--cuda-graph-stage1",
+        action="store_true",
+        help="Capture stage1 forward+backward into a CUDA graph when shapes are static.",
+    )
     return parser.parse_args()
 
 
@@ -4026,6 +4186,8 @@ def main() -> None:
         rnn_prefetcher = None
         print("rnn_pretrain | complete", flush=True)
 
+    stage1_cuda_graph_runner: Stage1CudaGraphRunner | None = None
+
     for step in range(start_step + 1, total_steps + 1):
         stage = resolve_curriculum_stage(
             step=step,
@@ -4055,6 +4217,7 @@ def main() -> None:
             apply_training_curriculum(model, stage)
             train_memory_state = None
             active_stage_name = stage.name
+            stage1_cuda_graph_runner = None
             print(
                 f"curriculum | step={step} | stage={stage.name} | span={stage.document_span} | "
                 f"batch_size={stage.batch_size} | grad_accum_steps={stage.grad_accum_steps} | "
@@ -4127,18 +4290,46 @@ def main() -> None:
         span_losses: list[float] = []
         last_span_loss_tensor: torch.Tensor | None = None
         loss_is_finite = True
+        used_cuda_graph = False
         for span_index in range(stage.document_span):
             batch = override_batch_reset(
                 prefetcher.next_batch(),
                 reset_all=stage.freeze_memory,
             )
-            loss, main_loss_value, next_memory_state = run_model(
-                model,
-                batch,
-                memory_state=current_memory_state,
-                precision=args.precision,
-                grad_enabled=True,
+            use_stage1_cuda_graph = (
+                args.cuda_graph_stage1
+                and device.type == "cuda"
+                and scaler is None
+                and not run_concurrent_rnn
+                and stage.name == "stage1"
+                and stage.document_span == 1
+                and stage.grad_accum_steps == 1
+                and not stage.freeze_memory
+                and span_index == 0
             )
+            if use_stage1_cuda_graph:
+                if (
+                    stage1_cuda_graph_runner is None
+                    or tuple(stage1_cuda_graph_runner.static_batch.context.shape) != tuple(batch.context.shape)
+                ):
+                    stage1_cuda_graph_runner = Stage1CudaGraphRunner(
+                        model=model,
+                        batch=batch,
+                        precision=args.precision,
+                    )
+                loss, main_loss_value, next_memory_state = stage1_cuda_graph_runner.replay(
+                    batch,
+                    memory_state=current_memory_state,
+                )
+                used_cuda_graph = True
+            else:
+                loss, main_loss_value, next_memory_state = run_model(
+                    model,
+                    batch,
+                    memory_state=current_memory_state,
+                    precision=args.precision,
+                    grad_enabled=True,
+                )
             loss_is_finite = bool(torch.isfinite(loss.detach()).item())
             if not loss_is_finite:
                 print(
@@ -4150,7 +4341,7 @@ def main() -> None:
             last_span_loss_tensor = loss
             current_memory_state = None if stage.freeze_memory else next_memory_state
 
-        if loss_is_finite and last_span_loss_tensor is not None:
+        if loss_is_finite and last_span_loss_tensor is not None and not used_cuda_graph:
             total_span_loss = last_span_loss_tensor / stage.grad_accum_steps
             if scaler is not None:
                 scaler.scale(total_span_loss).backward()
@@ -4158,6 +4349,11 @@ def main() -> None:
                 total_span_loss.backward()
             del total_span_loss
             train_memory_state = None if stage.freeze_memory else detach_memory_state(current_memory_state)
+            if not memory_state_is_finite(train_memory_state):
+                print(f"warning | step={step} | non-finite memory state; resetting memory", flush=True)
+                train_memory_state = None
+        elif loss_is_finite and used_cuda_graph:
+            train_memory_state = detach_memory_state(current_memory_state)
             if not memory_state_is_finite(train_memory_state):
                 print(f"warning | step={step} | non-finite memory state; resetting memory", flush=True)
                 train_memory_state = None
