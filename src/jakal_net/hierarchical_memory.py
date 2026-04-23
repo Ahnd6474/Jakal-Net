@@ -316,8 +316,6 @@ class BModule(nn.Module):
         if reset_mask.ndim != 1:
             raise ValueError("reset_mask must have shape [batch].")
         batch_size = reset_mask.shape[0]
-        if not torch.any(reset_mask):
-            return tuple(memory_state)
         fresh_state = self.initialize_state(batch_size, device=device, dtype=dtype)
         mask = reset_mask.to(device=device, dtype=torch.bool).view(batch_size, 1)
         reset_layers: list[Layer] = []
