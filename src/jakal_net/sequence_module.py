@@ -60,8 +60,12 @@ class SModule(nn.Module):
         self.anchor_val = nn.Parameter(torch.empty(dim))
         nn.init.normal_(self.anchor_val, mean=0.0, std=0.02)
 
-        self.sequence_input_norm = nn.LayerNorm(dim)
-        self.sequence_norms = nn.ModuleList(nn.LayerNorm(dim) for _ in range(s_layers))
+        if unit_norm_values:
+            self.sequence_input_norm = nn.Identity()
+            self.sequence_norms = nn.ModuleList(nn.Identity() for _ in range(s_layers))
+        else:
+            self.sequence_input_norm = nn.LayerNorm(dim)
+            self.sequence_norms = nn.ModuleList(nn.LayerNorm(dim) for _ in range(s_layers))
         self.sequence_layers = nn.ModuleList(
             SparsePropagation(
                 pairwise_fn=make_pairwise(
