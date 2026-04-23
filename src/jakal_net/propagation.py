@@ -44,6 +44,15 @@ from jakal_net.native_backend import (
 from jakal_net.modules import MultiHeadPairwise
 
 
+def _cuda_graph_capture_active(device_type: str) -> bool:
+    if device_type != "cuda":
+        return False
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
 def _edge_compress_name(edge_compress_fn: Callable[[Tensor], Tensor]) -> str | None:
     name = getattr(edge_compress_fn, "__name__", "")
     if edge_compress_fn is F.softsign or name == "softsign":
@@ -264,6 +273,8 @@ class Propagation(nn.Module):
         return self._compute_delta_streaming(layer)
 
     def compute_delta(self, layer: Layer) -> LayerDelta:
+        if self.implementation == "native" and _cuda_graph_capture_active(layer.val.device.type):
+            return self._compute_delta_reference(layer)
         if self._supports_multihead_vectorized_fast_path() and self.implementation != "native":
             return self._compute_delta_reference(layer)
         if self.implementation == "native":
@@ -619,6 +630,8 @@ class SparsePropagation(Propagation):
         return self._compute_delta_streaming(layer)
 
     def compute_delta(self, layer: Layer) -> LayerDelta:
+        if self.implementation == "native" and _cuda_graph_capture_active(layer.val.device.type):
+            return self._compute_delta_reference(layer)
         if self._supports_multihead_vectorized_fast_path():
             return self._compute_delta_reference(layer)
         if self.implementation == "native":

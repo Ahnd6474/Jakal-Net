@@ -621,8 +621,15 @@ class CausalHierarchicalMemoryLM(nn.Module):
         knowledge_state: Layer | None,
         reset_mask: Tensor | None,
     ) -> Any:
+        stream_capturing = False
+        if aligned_s.device.type == "cuda":
+            try:
+                stream_capturing = bool(torch.cuda.is_current_stream_capturing())
+            except Exception:
+                stream_capturing = False
         use_native_scan = (
             self.knowledge_module is None
+            and not stream_capturing
             and self.scan_backend != "python"
             and self._native_scan_supported_config()
             and native_supports("causal_memory_scan_fused")

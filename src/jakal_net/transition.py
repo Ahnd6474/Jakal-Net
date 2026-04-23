@@ -40,6 +40,15 @@ from jakal_net.native_backend import (
 from jakal_net.modules import MultiHeadRoute
 
 
+def _cuda_graph_capture_active(device_type: str) -> bool:
+    if device_type != "cuda":
+        return False
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
 def signed_abs_softmax(
     logits: Tensor,
     *,
@@ -290,6 +299,8 @@ class Transition(nn.Module):
             logits = self.compute_route_logits(src_layer, dst_layer)
             routes = self._compress_routes(logits)
             self.last_stats = _summarize_routes(routes)
+        if self.implementation == "native" and _cuda_graph_capture_active(src_layer.val.device.type):
+            return self._compute_delta_reference(src_layer, dst_layer)
         if self._supports_multihead_vectorized_fast_path() and self.implementation != "native":
             return self._compute_delta_reference(src_layer, dst_layer)
         if self.implementation == "native":
@@ -596,6 +607,8 @@ class SparseTransition(Transition):
                 dense_routes.scatter_(-1, topk_indices, routes)
                 routes = dense_routes
             self.last_stats = _summarize_routes(routes, topk_indices=topk_indices)
+        if self.implementation == "native" and _cuda_graph_capture_active(src_layer.val.device.type):
+            return self._compute_delta_reference(src_layer, dst_layer)
         if self._supports_multihead_vectorized_fast_path():
             return self._compute_delta_reference(src_layer, dst_layer)
         if self.implementation == "native":
