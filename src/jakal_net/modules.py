@@ -40,9 +40,14 @@ class DiagonalBilinearPairwise(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
         self.bias = nn.Parameter(torch.zeros(())) if bias else None
+        self._scale = float(dim**0.5)
+
+    def normalized_weight(self) -> Tensor:
+        denom = self.weight.norm(p=2).clamp_min(1e-6)
+        return self.weight * (self._scale / denom)
 
     def forward(self, target_val: Tensor, source_val: Tensor) -> Tensor:
-        weighted_source = source_val * self.weight
+        weighted_source = source_val * self.normalized_weight()
         scores = torch.einsum("...id,...jd->...ij", target_val, weighted_source)
         if self.bias is not None:
             scores = scores + self.bias
@@ -260,9 +265,14 @@ class DiagonalBilinearRoute(nn.Module):
             raise ValueError("DiagonalBilinearRoute requires matching src/dst dimensions.")
         self.weight = nn.Parameter(torch.ones(src_dim))
         self.bias = nn.Parameter(torch.zeros(())) if bias else None
+        self._scale = float(src_dim**0.5)
+
+    def normalized_weight(self) -> Tensor:
+        denom = self.weight.norm(p=2).clamp_min(1e-6)
+        return self.weight * (self._scale / denom)
 
     def forward(self, source_val: Tensor, target_val: Tensor) -> Tensor:
-        projected_source = source_val * self.weight
+        projected_source = source_val * self.normalized_weight()
         scores = torch.einsum("...id,...kd->...ik", projected_source, target_val)
         if self.bias is not None:
             scores = scores + self.bias

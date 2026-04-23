@@ -136,7 +136,7 @@ def pairwise_kernel_spec(pairwise_fn: object) -> PairwiseKernelSpec:
     if isinstance(pairwise_fn, DiagonalBilinearPairwise):
         return PairwiseKernelSpec(
             kind="diagonal_bilinear",
-            weight=pairwise_fn.weight,
+            weight=pairwise_fn.normalized_weight(),
             bias=pairwise_fn.bias,
         )
     if isinstance(pairwise_fn, LowRankBilinearPairwise):
@@ -201,7 +201,7 @@ def pairwise_route_kernel_spec(route_fn: object) -> PairwiseRouteKernelSpec:
             source_bias=None,
             target_weight=None,
             target_bias=None,
-            core_weight=inner.weight,
+            core_weight=inner.normalized_weight(),
             bias=inner.bias,
             temperature=temperature,
         )
@@ -260,7 +260,7 @@ def pairwise_scores_dense(
     pairwise_fn: object, target_val: Tensor, source_val: Tensor
 ) -> Tensor:
     if isinstance(pairwise_fn, DiagonalBilinearPairwise):
-        target_proj = target_val * pairwise_fn.weight.view(1, 1, -1)
+        target_proj = target_val * pairwise_fn.normalized_weight().view(1, 1, -1)
         scores = torch.bmm(target_proj, source_val.transpose(1, 2))
         if pairwise_fn.bias is not None:
             scores = scores + pairwise_fn.bias

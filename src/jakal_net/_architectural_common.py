@@ -54,6 +54,8 @@ def _make_anchor_pairwise(
 ) -> nn.Module:
     if kind == "scaled_cosine":
         return ScaledCosinePairwise(dim=dim)
+    if kind == "diagonal_bilinear":
+        return _freeze_module_parameters(DiagonalBilinearPairwise(dim=dim))
     raise ValueError(f"Unsupported pairwise anchor kind: {kind!r}.")
 
 
@@ -123,6 +125,8 @@ def _make_anchor_route(
     dim: int,
     rank: int,
 ) -> nn.Module:
+    if kind == "diagonal_bilinear":
+        return _freeze_module_parameters(DiagonalBilinearRoute(src_dim=dim, dst_dim=dim))
     if kind == "fixed_projection":
         return FixedProjectionRoute(src_dim=dim, dst_dim=dim, proj_dim=rank)
     if kind == "query_norm_dot":
