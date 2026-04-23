@@ -152,9 +152,14 @@ class Propagation(nn.Module):
             return edges
         return edges * source_state.unsqueeze(-2)
 
-    def _project_inputs(self, layer: Layer) -> tuple[Tensor, Tensor]:
+    def _project_inputs(
+        self,
+        layer: Layer,
+        *,
+        directional_val: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
         projected_state = self.state_proj_fn(layer.state)
-        projected_val = self.val_proj_fn(self._directional_val(layer.val))
+        projected_val = self.val_proj_fn(self._directional_val(layer.val) if directional_val is None else directional_val)
         validate_projected_state(projected_state, layer)
         validate_projected_val(projected_val, layer)
         return projected_state, projected_val
@@ -177,16 +182,20 @@ class Propagation(nn.Module):
         return delta_state, delta_val
 
     def _compute_delta_reference(self, layer: Layer) -> LayerDelta:
-        edges = self.compute_edges(layer)
+        directional_val = self._directional_val(layer.val)
+        scores = self.pairwise_fn(directional_val, directional_val)
+        validate_pairwise_scores(scores, layer)
+        edges = self.edge_compress_fn(scores)
         edges = self._weight_edges(edges, layer.state)
-        projected_state, projected_val = self._project_inputs(layer)
+        projected_state, projected_val = self._project_inputs(layer, directional_val=directional_val)
 
         delta_state = torch.einsum("...ij,...j->...i", edges, projected_state)
         delta_val = torch.einsum("...ij,...jd->...id", edges, projected_val)
         return LayerDelta(delta_state=delta_state, delta_val=delta_val)
 
     def _compute_delta_streaming(self, layer: Layer) -> LayerDelta:
-        projected_state, projected_val = self._project_inputs(layer)
+        directional_val = self._directional_val(layer.val)
+        projected_state, projected_val = self._project_inputs(layer, directional_val=directional_val)
         delta_state, delta_val = self._allocate_delta_buffers(
             layer, projected_state, projected_val
         )
@@ -196,12 +205,12 @@ class Propagation(nn.Module):
         for target_start, target_end in iter_blocks(
             layer.num_nodes, self.target_block_size, name="target_block_size"
         ):
-            target_val = layer.val[..., target_start:target_end, :]
+            target_val = directional_val[..., target_start:target_end, :]
             for source_start, source_end in iter_blocks(
                 layer.num_nodes, self.source_block_size, name="source_block_size"
             ):
-                source_val = self._directional_val(layer.val[..., source_start:source_end, :])
-                scores = self.pairwise_fn(self._directional_val(target_val), source_val)
+                source_val = directional_val[..., source_start:source_end, :]
+                scores = self.pairwise_fn(target_val, source_val)
                 validate_pairwise_block_scores(
                     scores=scores,
                     batch_shape=layer.batch_shape,
@@ -241,7 +250,7 @@ class Propagation(nn.Module):
             and native_supports("propagation_dense")
             and native_supports_device(layer.val.device.type)
         ):
-            projected_state, projected_val = self._project_inputs(layer)
+            projected_state, projected_val = self._project_inputs(layer, directional_val=directional_layer_val)
             return propagation_dense_native(
                 pairwise_fn=self.pairwise_fn,
                 edge_compress_name=edge_compress_name,
@@ -255,7 +264,7 @@ class Propagation(nn.Module):
             layer.val.device.type == "privateuseone"
             and supports_pairwise_kernel(self.pairwise_fn)
         ):
-            projected_state, projected_val = self._project_inputs(layer)
+            projected_state, projected_val = self._project_inputs(layer, directional_val=directional_layer_val)
             return propagation_dense_kernel(
                 pairwise_fn=self.pairwise_fn,
                 edge_compress_fn=self.edge_compress_fn,
@@ -268,7 +277,7 @@ class Propagation(nn.Module):
                 accumulator_dtype=self.accumulator_dtype,
             )
         if supports_pairwise_kernel(self.pairwise_fn):
-            projected_state, projected_val = self._project_inputs(layer)
+            projected_state, projected_val = self._project_inputs(layer, directional_val=directional_layer_val)
             return propagation_dense_kernel(
                 pairwise_fn=self.pairwise_fn,
                 edge_compress_fn=self.edge_compress_fn,
@@ -297,7 +306,7 @@ class Propagation(nn.Module):
                 and native_supports("propagation_dense")
                 and native_supports_device(layer.val.device.type)
             ):
-                projected_state, projected_val = self._project_inputs(layer)
+                projected_state, projected_val = self._project_inputs(layer, directional_val=directional_layer_val)
                 return propagation_dense_native(
                     pairwise_fn=self.pairwise_fn,
                     edge_compress_name=edge_compress_name,
@@ -373,8 +382,10 @@ class SparsePropagation(Propagation):
         self.window = window
 
     def _compute_delta_reference(self, layer: Layer) -> LayerDelta:
-        projected_state, projected_val = self._project_inputs(layer)
-        scores = self.compute_scores(layer)
+        directional_val = self._directional_val(layer.val)
+        projected_state, projected_val = self._project_inputs(layer, directional_val=directional_val)
+        scores = self.pairwise_fn(directional_val, directional_val)
+        validate_pairwise_scores(scores, layer)
 
         if self.sparse_type == "window":
             mask_2d = causal_window_mask(
@@ -399,7 +410,8 @@ class SparsePropagation(Propagation):
     def _compute_window_delta_streaming(self, layer: Layer) -> LayerDelta:
         if _edge_compress_name(self.edge_compress_fn) == "signed_abs_softmax":
             return self._compute_delta_reference(layer)
-        projected_state, projected_val = self._project_inputs(layer)
+        directional_val = self._directional_val(layer.val)
+        projected_state, projected_val = self._project_inputs(layer, directional_val=directional_val)
         delta_state, delta_val = self._allocate_delta_buffers(
             layer, projected_state, projected_val
         )
@@ -410,7 +422,7 @@ class SparsePropagation(Propagation):
         for target_start, target_end in iter_blocks(
             layer.num_nodes, self.target_block_size, name="target_block_size"
         ):
-            target_val = self._directional_val(layer.val[..., target_start:target_end, :])
+            target_val = directional_val[..., target_start:target_end, :]
             source_floor = max(0, target_start - window)
             source_ceiling = target_end
 
@@ -421,9 +433,7 @@ class SparsePropagation(Propagation):
             ):
                 global_source_start = source_floor + source_start
                 global_source_end = source_floor + source_end
-                source_val = self._directional_val(
-                    layer.val[..., global_source_start:global_source_end, :]
-                )
+                source_val = directional_val[..., global_source_start:global_source_end, :]
                 scores = self.pairwise_fn(target_val, source_val)
                 validate_pairwise_block_scores(
                     scores=scores,
@@ -467,7 +477,8 @@ class SparsePropagation(Propagation):
         )
 
     def _compute_topk_delta_streaming(self, layer: Layer) -> LayerDelta:
-        projected_state, projected_val = self._project_inputs(layer)
+        directional_val = self._directional_val(layer.val)
+        projected_state, projected_val = self._project_inputs(layer, directional_val=directional_val)
         delta_state, delta_val = self._allocate_delta_buffers(
             layer, projected_state, projected_val
         )
@@ -481,7 +492,7 @@ class SparsePropagation(Propagation):
         for target_start, target_end in iter_blocks(
             layer.num_nodes, self.target_block_size, name="target_block_size"
         ):
-            target_val = self._directional_val(layer.val[..., target_start:target_end, :])
+            target_val = directional_val[..., target_start:target_end, :]
             target_nodes = target_end - target_start
             best_scores: Tensor | None = None
             best_indices: Tensor | None = None
@@ -489,7 +500,7 @@ class SparsePropagation(Propagation):
             for source_start, source_end in iter_blocks(
                 layer.num_nodes, self.source_block_size, name="source_block_size"
             ):
-                source_val = self._directional_val(layer.val[..., source_start:source_end, :])
+                source_val = directional_val[..., source_start:source_end, :]
                 scores = self.pairwise_fn(target_val, source_val)
                 validate_pairwise_block_scores(
                     scores=scores,
@@ -564,7 +575,7 @@ class SparsePropagation(Propagation):
             and supports_pairwise_kernel(self.pairwise_fn)
             and native_supports_device(layer.val.device.type)
         ):
-            projected_state, projected_val = self._project_inputs(layer)
+            projected_state, projected_val = self._project_inputs(layer, directional_val=directional_layer_val)
             if self.sparse_type == "window" and native_supports("propagation_window"):
                 return propagation_window_native(
                     pairwise_fn=self.pairwise_fn,
@@ -590,7 +601,7 @@ class SparsePropagation(Propagation):
         if layer.val.device.type == "privateuseone" and supports_pairwise_kernel(
             self.pairwise_fn
         ):
-            projected_state, projected_val = self._project_inputs(layer)
+            projected_state, projected_val = self._project_inputs(layer, directional_val=directional_layer_val)
             if self.sparse_type == "window":
                 return propagation_window_kernel(
                     pairwise_fn=self.pairwise_fn,
@@ -617,7 +628,7 @@ class SparsePropagation(Propagation):
                 accumulator_dtype=self.accumulator_dtype,
             )
         if supports_pairwise_kernel(self.pairwise_fn):
-            projected_state, projected_val = self._project_inputs(layer)
+            projected_state, projected_val = self._project_inputs(layer, directional_val=directional_layer_val)
             if self.sparse_type == "window":
                 return propagation_window_kernel(
                     pairwise_fn=self.pairwise_fn,
@@ -659,7 +670,7 @@ class SparsePropagation(Propagation):
                 and supports_pairwise_kernel(self.pairwise_fn)
                 and native_supports_device(layer.val.device.type)
             ):
-                projected_state, projected_val = self._project_inputs(layer)
+                projected_state, projected_val = self._project_inputs(layer, directional_val=directional_layer_val)
                 if self.sparse_type == "window" and native_supports("propagation_window"):
                     return propagation_window_native(
                         pairwise_fn=self.pairwise_fn,

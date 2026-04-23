@@ -1001,7 +1001,7 @@ std::tuple<torch::Tensor, torch::Tensor> low_rank_transition_pairwise_topk_signe
       !c10::GradMode::is_enabled() &&
       experimental_cuda_scan_fastpath_enabled() &&
       jakal_net_low_rank_pairwise_topk_forward_cuda_available() &&
-      topk > 0 && topk <= 32) {
+      topk > 0 && topk <= 64) {
     const bool multihead = source_weight.dim() >= 3 || target_weight.dim() >= 3 || core_weight.dim() >= 2;
     torch::Tensor weighted_projected_source;
     torch::Tensor projected_target;
@@ -1136,7 +1136,7 @@ std::tuple<torch::Tensor, torch::Tensor> low_rank_propagation_topk_signed_abs(
       !c10::GradMode::is_enabled() &&
       experimental_cuda_scan_fastpath_enabled() &&
       jakal_net_low_rank_propagation_topk_forward_cuda_available() &&
-      topk > 0 && topk <= 32) {
+      topk > 0 && topk <= 64) {
     const bool multihead = source_weight.dim() >= 3 || target_weight.dim() >= 3 || core_weight.dim() >= 2;
     torch::Tensor weighted_projected_source;
     torch::Tensor projected_target;
@@ -1244,17 +1244,62 @@ torch::Tensor read_memory_vector(
     const torch::Tensor& read_template_val,
     const std::vector<torch::Tensor>& read_projection_weights,
     const std::vector<torch::Tensor>& read_gates) {
-  std::vector<torch::Tensor> read_terms;
-  read_terms.reserve(memory_state.size());
+  torch::Tensor read_sum;
+  bool has_term = false;
   for (size_t index = 0; index < memory_state.size(); ++index) {
     auto sender_strength = torch::softplus(memory_state[index].state).unsqueeze(-1);
     auto read_summary = (sender_strength * memory_state[index].val).sum(1);
     read_summary = read_summary + cast_tensor_like(read_template_val, read_summary).unsqueeze(0);
     auto projected = linear2d(read_summary, read_projection_weights[index], c10::nullopt);
     auto gate = torch::sigmoid(cast_tensor_like(read_gates[index], read_summary));
-    read_terms.push_back(gate * projected);
+    auto term = gate * projected;
+    if (!has_term) {
+      read_sum = term;
+      has_term = true;
+    } else {
+      read_sum = read_sum + term;
+    }
   }
-  return torch::stack(read_terms, 0).sum(0);
+  if (!has_term) {
+    throw std::runtime_error("read_memory_vector requires at least one memory level.");
+  }
+  return read_sum;
+}
+
+void require_vector_size(
+    const std::vector<torch::Tensor>& tensors,
+    size_t expected,
+    const std::string& name);
+
+torch::Tensor read_memory_vector_public(
+    const std::vector<torch::Tensor>& flat_memory,
+    const torch::Tensor& read_template_val,
+    const std::vector<torch::Tensor>& read_projection_weights,
+    const std::vector<torch::Tensor>& read_gates) {
+  if (flat_memory.size() % 2 != 0) {
+    throw std::runtime_error("flat_memory must contain alternating state/value tensors.");
+  }
+  const auto num_levels = flat_memory.size() / 2;
+  require_vector_size(read_projection_weights, num_levels, "read_projection_weights");
+  require_vector_size(read_gates, num_levels, "read_gates");
+  std::vector<NativeLayerState> memory_state;
+  memory_state.reserve(num_levels);
+  std::vector<torch::Tensor> empty_norm_weights;
+  std::vector<torch::Tensor> empty_norm_biases;
+  empty_norm_weights.reserve(num_levels);
+  empty_norm_biases.reserve(num_levels);
+  for (size_t index = 0; index < num_levels; ++index) {
+    memory_state.push_back({flat_memory[index * 2], flat_memory[index * 2 + 1]});
+    empty_norm_weights.push_back(torch::Tensor());
+    empty_norm_biases.push_back(torch::Tensor());
+  }
+  return read_memory_vector(
+      memory_state,
+      empty_norm_weights,
+      empty_norm_biases,
+      read_template_val,
+      read_projection_weights,
+      read_gates);
 }
 
 void require_vector_size(
@@ -1408,9 +1453,8 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> causal_memory_scan_fused(
     current_memory.push_back({flat_memory[index * 2], flat_memory[index * 2 + 1]});
   }
 
-  auto projected_s = linear3d(aligned_s, s_prediction_weight, c10::nullopt);
-  std::vector<torch::Tensor> query_steps;
-  query_steps.reserve(aligned_s.size(1));
+  auto projected_s = linear3d(aligned_s, s_prediction_weight, c10::nullopt).contiguous();
+  auto query_val = torch::empty_like(projected_s);
 
   for (int64_t time_index = 0; time_index < aligned_s.size(1); ++time_index) {
     auto token_val = aligned_s.slice(1, time_index, time_index + 1);
@@ -1548,18 +1592,10 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> causal_memory_scan_fused(
         read_projection_weights,
         read_gates);
     auto query_input = projected_s.select(1, time_index) + read_vector;
-    query_steps.push_back(layer_norm_last_dim(
+    query_val.select(1, time_index).copy_(layer_norm_last_dim(
         query_input,
         prediction_input_norm_weight,
-        cast_optional_like(prediction_input_norm_bias, query_input))
-        .unsqueeze(1));
-  }
-
-  torch::Tensor query_val;
-  if (query_steps.empty()) {
-    query_val = aligned_s.new_empty({aligned_s.size(0), 0, aligned_s.size(2)});
-  } else {
-    query_val = torch::cat(query_steps, 1);
+        cast_optional_like(prediction_input_norm_bias, query_input)));
   }
 
   std::vector<torch::Tensor> next_memory_flat;
@@ -1703,9 +1739,8 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>, std::vector<torch::Tensor>
   std::vector<std::vector<torch::Tensor>> trace_states(num_levels);
   std::vector<std::vector<torch::Tensor>> trace_vals(num_levels);
 
-  auto projected_s = linear3d(aligned_s, s_prediction_weight, c10::nullopt);
-  std::vector<torch::Tensor> query_steps;
-  query_steps.reserve(aligned_s.size(1));
+  auto projected_s = linear3d(aligned_s, s_prediction_weight, c10::nullopt).contiguous();
+  auto query_val = torch::empty_like(projected_s);
 
   for (int64_t time_index = 0; time_index < aligned_s.size(1); ++time_index) {
     for (size_t trace_index = 0; trace_index < num_levels; ++trace_index) {
@@ -1865,18 +1900,10 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>, std::vector<torch::Tensor>
         read_projection_weights,
         read_gates);
     auto query_input = projected_s.select(1, time_index) + read_vector;
-    query_steps.push_back(layer_norm_last_dim(
+    query_val.select(1, time_index).copy_(layer_norm_last_dim(
         query_input,
         prediction_input_norm_weight,
-        cast_optional_like(prediction_input_norm_bias, query_input))
-        .unsqueeze(1));
-  }
-
-  torch::Tensor query_val;
-  if (query_steps.empty()) {
-    query_val = aligned_s.new_empty({aligned_s.size(0), 0, aligned_s.size(2)});
-  } else {
-    query_val = torch::cat(query_steps, 1);
+        cast_optional_like(prediction_input_norm_bias, query_input)));
   }
 
   std::vector<torch::Tensor> next_memory_flat;
@@ -1984,9 +2011,8 @@ causal_memory_scan_fused_checkpoints(
   std::vector<std::vector<torch::Tensor>> checkpoint_states(num_levels);
   std::vector<std::vector<torch::Tensor>> checkpoint_vals(num_levels);
 
-  auto projected_s = linear3d(aligned_s, s_prediction_weight, c10::nullopt);
-  std::vector<torch::Tensor> query_steps;
-  query_steps.reserve(aligned_s.size(1));
+  auto projected_s = linear3d(aligned_s, s_prediction_weight, c10::nullopt).contiguous();
+  auto query_val = torch::empty_like(projected_s);
 
   for (int64_t time_index = 0; time_index < aligned_s.size(1); ++time_index) {
     if (time_index % checkpoint_stride == 0) {
@@ -2149,18 +2175,10 @@ causal_memory_scan_fused_checkpoints(
         read_projection_weights,
         read_gates);
     auto query_input = projected_s.select(1, time_index) + read_vector;
-    query_steps.push_back(layer_norm_last_dim(
+    query_val.select(1, time_index).copy_(layer_norm_last_dim(
         query_input,
         prediction_input_norm_weight,
-        cast_optional_like(prediction_input_norm_bias, query_input))
-        .unsqueeze(1));
-  }
-
-  torch::Tensor query_val;
-  if (query_steps.empty()) {
-    query_val = aligned_s.new_empty({aligned_s.size(0), 0, aligned_s.size(2)});
-  } else {
-    query_val = torch::cat(query_steps, 1);
+        cast_optional_like(prediction_input_norm_bias, query_input)));
   }
 
   std::vector<torch::Tensor> next_memory_flat;
@@ -2680,6 +2698,7 @@ std::vector<std::string> supported_ops() {
       "transition_topk",
       "transition_query_topk",
       "transition_query_topk_select",
+      "read_memory_vector",
       "causal_memory_scan_fused",
       "causal_memory_scan_fused_trace",
       "causal_memory_scan_fused_checkpoints",
@@ -4122,6 +4141,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       &transition_query_topk_select,
       "Native query-conditioned sparse transition top-k selection");
   m.def("transition_topk", &transition_topk, "Native sparse transition");
+  m.def("read_memory_vector", &read_memory_vector_public, "Native memory read reduction");
   m.def(
       "diagonal_pairwise_topk_backward_cuda",
       &diagonal_pairwise_topk_backward_cuda_wrapper,

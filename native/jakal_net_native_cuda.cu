@@ -36,7 +36,7 @@ bool jakal_net_low_rank_propagation_window_entmax15_forward_cuda_available() {
 namespace {
 
 constexpr int kPairwiseTopkForwardThreads = 128;
-constexpr int kPairwiseTopkForwardMaxK = 32;
+constexpr int kPairwiseTopkForwardMaxK = 64;
 constexpr float kNegativeInfinity = -INFINITY;
 constexpr int64_t kCompressSoftmax = 0;
 constexpr int64_t kCompressSignedAbsSoftmax = 1;
@@ -2150,7 +2150,7 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_low_rank_transition_pairwise_
   if (use_fused_topk &&
       allow_fastpath &&
       !diagonal &&
-      topk > 0 && topk <= 32) {
+      topk > 0 && topk <= 64) {
     torch::Tensor weighted_projected_source;
     torch::Tensor projected_target;
     if (multihead) {
@@ -2300,7 +2300,7 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_low_rank_propagation_topk(
   if (use_fused_topk &&
       allow_fastpath &&
       !diagonal &&
-      topk > 0 && topk <= 32) {
+      topk > 0 && topk <= 64) {
     torch::Tensor weighted_projected_source;
     torch::Tensor projected_target;
     if (multihead) {
@@ -2428,17 +2428,26 @@ torch::Tensor scan_cuda_read_memory_vector(
     const torch::Tensor& read_template_val,
     const std::vector<torch::Tensor>& read_projection_weights,
     const std::vector<torch::Tensor>& read_gates) {
-  std::vector<torch::Tensor> read_terms;
-  read_terms.reserve(memory_state.size());
+  torch::Tensor read_sum;
+  bool has_term = false;
   for (size_t index = 0; index < memory_state.size(); ++index) {
     auto sender_strength = torch::softplus(memory_state[index].state).unsqueeze(-1);
     auto read_summary = (sender_strength * memory_state[index].val).sum(1);
     read_summary = read_summary + read_template_val.to(read_summary.scalar_type()).unsqueeze(0);
     auto projected = scan_cuda_linear2d(read_summary, read_projection_weights[index], torch::Tensor());
     auto gate = torch::sigmoid(read_gates[index].to(read_summary.scalar_type()));
-    read_terms.push_back(gate * projected);
+    auto term = gate * projected;
+    if (!has_term) {
+      read_sum = term;
+      has_term = true;
+    } else {
+      read_sum = read_sum + term;
+    }
   }
-  return torch::stack(read_terms, 0).sum(0);
+  if (!has_term) {
+    throw std::runtime_error("scan_cuda_read_memory_vector requires at least one memory level.");
+  }
+  return read_sum;
 }
 
 void scan_cuda_require_vector_size(
@@ -2550,9 +2559,8 @@ scan_cuda_forward_impl(
 
   std::vector<std::vector<torch::Tensor>> trace_states(num_levels);
   std::vector<std::vector<torch::Tensor>> trace_vals(num_levels);
-  auto projected_s = scan_cuda_linear3d(aligned_s, s_prediction_weight, torch::Tensor());
-  std::vector<torch::Tensor> query_steps;
-  query_steps.reserve(aligned_s.size(1));
+  auto projected_s = scan_cuda_linear3d(aligned_s, s_prediction_weight, torch::Tensor()).contiguous();
+  auto query_val = torch::empty_like(projected_s);
 
   for (int64_t time_index = 0; time_index < aligned_s.size(1); ++time_index) {
     if (collect_trace) {
@@ -2702,19 +2710,11 @@ scan_cuda_forward_impl(
         read_projection_weights,
         read_gates);
     auto query_input = projected_s.select(1, time_index) + read_vector;
-    query_steps.push_back(
+    query_val.select(1, time_index).copy_(
         scan_cuda_layer_norm_last_dim(
             query_input,
             prediction_input_norm_weight,
-            prediction_input_norm_bias)
-            .unsqueeze(1));
-  }
-
-  torch::Tensor query_val;
-  if (query_steps.empty()) {
-    query_val = aligned_s.new_empty({aligned_s.size(0), 0, aligned_s.size(2)});
-  } else {
-    query_val = torch::cat(query_steps, 1);
+            prediction_input_norm_bias));
   }
   std::vector<torch::Tensor> next_memory_flat;
   next_memory_flat.reserve(current_memory.size() * 2);

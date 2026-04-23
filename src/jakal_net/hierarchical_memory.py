@@ -163,6 +163,7 @@ class BModule(nn.Module):
         self.memory_update_intervals = tuple(int(interval) for interval in memory_update_intervals)
         self.num_memory_levels = len(self.memory_slots)
         self.unit_norm_values = unit_norm_values
+        self.implementation = implementation
 
         self.memory_levels = nn.ModuleList(
             _MemoryLevel(
@@ -423,21 +424,42 @@ class BModule(nn.Module):
         return tuple(next_levels)
 
     def read(self, memory_state: Sequence[Layer]) -> Tensor:
-        read_terms: list[Tensor] = []
-        for level, level_module, projection, gate in zip(
+        if self.implementation == "native":
+            try:
+                from jakal_net.native_backend import native_supports, read_memory_vector_native
+
+                if native_supports("read_memory_vector"):
+                    return read_memory_vector_native(
+                        flat_memory=self.flatten_memory_state(memory_state),
+                        read_template_val=self.read_template_val,
+                        read_projection_weights=tuple(
+                            projection.weight for projection in self.read_projections
+                        ),
+                        read_gates=tuple(self.read_gates),
+                    )
+            except Exception:
+                pass
+        read_sum: Tensor | None = None
+        template = self.read_template_val
+        for level, projection, gate in zip(
             memory_state,
-            self.memory_levels,
             self.read_projections,
             self.read_gates,
         ):
             sender_strength = F.softplus(level.state).unsqueeze(-1)
             read_summary = (sender_strength * level.val).sum(dim=-2)
-            read_summary = read_summary + self.read_template_val.to(
+            projected = projection(read_summary)
+            projected = projected + projection(
+                template.to(
                 device=level.val.device,
                 dtype=level.val.dtype,
-            ).unsqueeze(0)
-            read_terms.append(torch.sigmoid(gate) * projection(read_summary))
-        return torch.stack(read_terms, dim=0).sum(dim=0)
+                ).unsqueeze(0)
+            )
+            term = torch.sigmoid(gate) * projected
+            read_sum = term if read_sum is None else read_sum + term
+        if read_sum is None:
+            raise RuntimeError("BModule.read requires at least one memory level.")
+        return read_sum
 
     def flatten_memory_state(self, memory_state: Sequence[Layer]) -> tuple[Tensor, ...]:
         flat: list[Tensor] = []
@@ -506,15 +528,16 @@ class BModule(nn.Module):
         knowledge_reset_mask: Tensor | None = None,
     ) -> BScanOutput:
         batch_size, seq_len, _ = aligned_s.shape
+        aligned_s = aligned_s.contiguous()
         current_memory = tuple(memory_state)
-        projected_s = query_projection(aligned_s)
-        query_steps: list[Tensor] = []
-        query_state_steps: list[Tensor] = []
+        projected_s = query_projection(aligned_s).contiguous()
+        query_val = torch.empty_like(projected_s)
+        query_state_source = torch.empty_like(projected_s)
         latest_bridge_layer: Layer | None = None
         latest_knowledge_output: Any | None = None
 
         for time_index in range(seq_len):
-            token_val = aligned_s.narrow(1, time_index, 1)
+            token_val = aligned_s.narrow(1, time_index, 1).contiguous()
             token_layer = Layer(
                 dim=self.dim,
                 num_nodes=1,
@@ -550,13 +573,12 @@ class BModule(nn.Module):
             latest_bridge_layer = bridge_layer
             read_vector = self.read(current_memory)
             query_step = query_input_norm(projected_s[:, time_index, :] + read_vector)
-            query_state_steps.append(query_step)
+            query_state_source[:, time_index, :] = query_step
             if self.unit_norm_values:
                 query_step = unit_normalize_values(query_step)
-            query_steps.append(query_step)
+            query_val[:, time_index, :] = query_step
 
-        query_val = torch.stack(query_steps, dim=1)
-        query_state = state_projection(torch.stack(query_state_steps, dim=1)).squeeze(-1)
+        query_state = state_projection(query_state_source).squeeze(-1)
         return BScanOutput(
             query_layer=Layer(dim=self.dim, num_nodes=seq_len, state=query_state, val=query_val),
             memory_state=current_memory,

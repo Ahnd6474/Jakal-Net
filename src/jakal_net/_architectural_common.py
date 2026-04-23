@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
@@ -25,6 +27,34 @@ STATE_MASS_PER_NODE = 1.0
 PARAM_INIT_STD = 0.02
 LOW_RANK_SCALE_INIT = 0.1
 UNIT_NORM_EPS = 1e-6
+
+
+def _maybe_compile(fn):
+    if os.environ.get("JAKAL_COMPILE_SMALL_OPS", "0") != "1":
+        return fn
+    compiler = getattr(torch, "compile", None)
+    if compiler is None:
+        return fn
+    try:
+        return compiler(fn, fullgraph=False, dynamic=True)
+    except Exception:
+        return fn
+
+
+def _unit_normalize_values_impl(val: Tensor, *, eps: float = UNIT_NORM_EPS) -> Tensor:
+    return F.normalize(torch.nan_to_num(val), p=2.0, dim=-1, eps=eps)
+
+
+def _signed_softmax_state_impl(state: Tensor) -> Tensor:
+    clean_state = torch.nan_to_num(state)
+    clean_state = F.layer_norm(clean_state, (clean_state.shape[-1],))
+    magnitude = torch.softmax(clean_state.abs(), dim=-1)
+    state_mass = float(state.size(-1)) * STATE_MASS_PER_NODE
+    return torch.sign(clean_state) * magnitude * state_mass
+
+
+_COMPILED_UNIT_NORMALIZE_VALUES = _maybe_compile(_unit_normalize_values_impl)
+_COMPILED_SIGNED_SOFTMAX_STATE = _maybe_compile(_signed_softmax_state_impl)
 
 
 def _make_single_pairwise(
@@ -170,7 +200,7 @@ def make_route(
 
 
 def unit_normalize_values(val: Tensor, *, eps: float = UNIT_NORM_EPS) -> Tensor:
-    return F.normalize(torch.nan_to_num(val), p=2.0, dim=-1, eps=eps)
+    return _COMPILED_UNIT_NORMALIZE_VALUES(val, eps=eps)
 
 
 def layer_with_val_norm(
@@ -186,11 +216,7 @@ def layer_with_val_norm(
 
 
 def signed_softmax_state(state: Tensor) -> Tensor:
-    clean_state = torch.nan_to_num(state)
-    clean_state = F.layer_norm(clean_state, (clean_state.shape[-1],))
-    magnitude = torch.softmax(clean_state.abs(), dim=-1)
-    state_mass = float(state.size(-1)) * STATE_MASS_PER_NODE
-    return torch.sign(clean_state) * magnitude * state_mass
+    return _COMPILED_SIGNED_SOFTMAX_STATE(state)
 
 
 def signed_abs_softmax_edges(scores: Tensor) -> Tensor:

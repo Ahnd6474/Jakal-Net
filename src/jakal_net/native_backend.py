@@ -37,6 +37,8 @@ EXPERIMENTAL_FUSED_TRAINING_ENV = "JAKAL_NET_ENABLE_EXPERIMENTAL_FUSED_TRAINING"
 EXPERIMENTAL_FUSED_TRAINING_CHECKPOINT_STRIDE_ENV = "JAKAL_NET_FUSED_TRAINING_CHECKPOINT_STRIDE"
 EXPERIMENTAL_SCAN_BACKWARD_CUDA_ENV = "JAKAL_NET_ENABLE_EXPERIMENTAL_SCAN_BACKWARD_CUDA"
 
+_FULL_TOPK_INDEX_CACHE: dict[tuple[str, tuple[int, ...]], Tensor] = {}
+
 
 @dataclass(frozen=True, slots=True)
 class NativeStatus:
@@ -965,7 +967,17 @@ def _native_scan_route_scores(
 
 
 def _native_scan_full_topk_indices(scores: Tensor) -> Tensor:
-    return torch.arange(scores.shape[-1], device=scores.device, dtype=torch.long).view(1, 1, -1).expand(scores.shape[0], scores.shape[1], scores.shape[2])
+    key = (str(scores.device), tuple(scores.shape))
+    cached = _FULL_TOPK_INDEX_CACHE.get(key)
+    if cached is None or cached.device != scores.device:
+        cached = (
+            torch.arange(scores.shape[-1], device=scores.device, dtype=torch.long)
+            .view(1, 1, -1)
+            .expand(scores.shape[0], scores.shape[1], scores.shape[2])
+            .contiguous()
+        )
+        _FULL_TOPK_INDEX_CACHE[key] = cached
+    return cached
 
 
 def _native_scan_gather_state(source: Tensor, indices: Tensor) -> Tensor:
@@ -1059,15 +1071,21 @@ def _native_scan_read_memory(
     read_projection_weights: tuple[Tensor, ...],
     read_gates: tuple[Tensor, ...],
 ) -> Tensor:
-    read_terms: list[Tensor] = []
+    read_sum: Tensor | None = None
+    cached_template: Tensor | None = None
     for index, (state, val) in enumerate(memory_state):
         read_val = _native_scan_layer_norm(val, val_norm_weights[index], val_norm_biases[index])
         sender_strength = F.softplus(state).unsqueeze(-1)
         read_summary = (sender_strength * read_val).sum(dim=-2)
-        read_summary = read_summary + read_template_val.to(dtype=read_summary.dtype).unsqueeze(0)
-        projected = F.linear(read_summary, read_projection_weights[index].to(dtype=read_summary.dtype), None)
-        read_terms.append(torch.sigmoid(read_gates[index].to(dtype=read_summary.dtype)) * projected)
-    return torch.stack(read_terms, dim=0).sum(dim=0)
+        if cached_template is None or cached_template.dtype != read_summary.dtype or cached_template.device != read_summary.device:
+            cached_template = read_template_val.to(device=read_summary.device, dtype=read_summary.dtype).unsqueeze(0)
+        read_summary = read_summary + cached_template
+        projected = F.linear(read_summary, read_projection_weights[index].to(device=read_summary.device, dtype=read_summary.dtype), None)
+        term = torch.sigmoid(read_gates[index].to(device=read_summary.device, dtype=read_summary.dtype)) * projected
+        read_sum = term if read_sum is None else read_sum + term
+    if read_sum is None:
+        raise RuntimeError("_native_scan_read_memory requires at least one memory level.")
+    return read_sum
 
 
 def _causal_memory_scan_fused_reference(
@@ -1081,19 +1099,17 @@ def _causal_memory_scan_fused_reference(
     propagation_pairwise_kind: str,
 ) -> tuple[Tensor, tuple[Tensor, ...]]:
     args = _unpack_causal_memory_scan_tensor_args(tensor_args, num_levels)
-    aligned_s = args["aligned_s"]
-    projected_s = F.linear(aligned_s, args["s_prediction_weight"].to(dtype=aligned_s.dtype), None)
+    aligned_s = args["aligned_s"].contiguous()
+    projected_s = F.linear(aligned_s, args["s_prediction_weight"].to(dtype=aligned_s.dtype), None).contiguous()
     current_memory = [
         (args["flat_memory"][index * 2], args["flat_memory"][index * 2 + 1])
         for index in range(num_levels)
     ]
-    query_steps: list[Tensor] = []
-
-    value_to_state_bias = _load_optional_tensor(args["value_to_state_bias"])
+    query_val = torch.empty_like(projected_s)
     prediction_input_norm_bias = args["prediction_input_norm_bias"]
 
     for time_index in range(aligned_s.shape[1]):
-        token_val = aligned_s[:, time_index : time_index + 1, :]
+        token_val = aligned_s.narrow(1, time_index, 1).contiguous()
         token_state = _native_scan_value_to_state(
             token_val,
             args["value_to_state_weight"],
@@ -1271,15 +1287,14 @@ def _causal_memory_scan_fused_reference(
             args["read_gates"],
         )
         query_input = projected_s[:, time_index, :] + read_vector
-        query_steps.append(
+        query_val[:, time_index, :].copy_(
             _native_scan_layer_norm(
                 query_input,
                 args["prediction_input_norm_weight"],
                 prediction_input_norm_bias,
-            ).unsqueeze(1)
+            )
         )
 
-    query_val = torch.cat(query_steps, dim=1) if query_steps else aligned_s.new_empty((aligned_s.shape[0], 0, aligned_s.shape[2]))
     flat_next_memory: list[Tensor] = []
     for state, val in current_memory:
         flat_next_memory.extend((state, val))
@@ -4196,7 +4211,7 @@ def propagation_topk_native(
         and native_supports("low_rank_propagation_topk_forward_cuda")
         and native_supports("low_rank_pairwise_topk_backward_cuda")
         and isinstance(pairwise_fn, LowRankBilinearPairwise)
-        and topk <= 32
+        and topk <= 64
         and _cuda_float_tensor(layer_val)
         and _cuda_float_tensor(projected_state)
         and _cuda_float_tensor(projected_val)
@@ -4558,7 +4573,7 @@ def transition_pairwise_topk_native(
         and isinstance(inner, LowRankBilinearRoute)
         and compress_kind is not None
         and (compress_kind != 2 or _signed_entmax15_ops_available())
-        and topk <= 32
+        and topk <= 64
         and _cuda_float_tensor(sender_strength)
         and _cuda_float_tensor(src_val)
         and _cuda_float_tensor(dst_val)
@@ -4611,3 +4626,20 @@ def transition_pairwise_topk_native(
         src_block_size,
         dst_block_size,
     ))
+
+
+def read_memory_vector_native(
+    *,
+    flat_memory: tuple[Tensor, ...],
+    read_template_val: Tensor,
+    read_projection_weights: tuple[Tensor, ...],
+    read_gates: tuple[Tensor, ...],
+) -> Tensor:
+    if not native_supports("read_memory_vector"):
+        raise RuntimeError("Native read_memory_vector is not available.")
+    return _native_module().read_memory_vector(
+        list(flat_memory),
+        read_template_val,
+        list(read_projection_weights),
+        list(read_gates),
+    )

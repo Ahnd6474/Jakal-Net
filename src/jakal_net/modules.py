@@ -160,10 +160,20 @@ class MultiHeadPairwise(nn.Module):
         return torch.stack(stacked, dim=-1)
 
     def forward(self, target_val: Tensor, source_val: Tensor) -> Tensor:
-        head_scores = self.head_scores(target_val, source_val)
         if self.aggregate == "max":
-            return head_scores.max(dim=-1).values
-        combined = head_scores.sum(dim=-1)
+            running: Tensor | None = None
+            for head in self.heads:
+                scores = head(target_val, source_val)
+                running = scores if running is None else torch.maximum(running, scores)
+            if running is None:
+                raise RuntimeError("MultiHeadPairwise requires at least one head.")
+            return running
+        combined: Tensor | None = None
+        for head in self.heads:
+            scores = head(target_val, source_val)
+            combined = scores if combined is None else combined + scores
+        if combined is None:
+            raise RuntimeError("MultiHeadPairwise requires at least one head.")
         if self.aggregate == "mean":
             combined = combined / float(self.num_heads)
         return combined
@@ -364,10 +374,34 @@ class MultiHeadRoute(nn.Module):
         return torch.stack(stacked, dim=-1)
 
     def forward(self, source_val: Tensor, target_val: Tensor | None = None) -> Tensor:
-        head_logits = self.head_logits(source_val, target_val)
         if self.aggregate == "max":
-            return head_logits.max(dim=-1).values
-        combined = head_logits.sum(dim=-1)
+            running: Tensor | None = None
+            for head in self.heads:
+                if getattr(head, "expects_pairwise_inputs", False):
+                    if target_val is None:
+                        raise ValueError(
+                            "target_val is required for MultiHeadRoute heads with pairwise inputs."
+                        )
+                    logits = head(source_val, target_val)
+                else:
+                    logits = head(source_val)
+                running = logits if running is None else torch.maximum(running, logits)
+            if running is None:
+                raise RuntimeError("MultiHeadRoute requires at least one head.")
+            return running
+        combined: Tensor | None = None
+        for head in self.heads:
+            if getattr(head, "expects_pairwise_inputs", False):
+                if target_val is None:
+                    raise ValueError(
+                        "target_val is required for MultiHeadRoute heads with pairwise inputs."
+                    )
+                logits = head(source_val, target_val)
+            else:
+                logits = head(source_val)
+            combined = logits if combined is None else combined + logits
+        if combined is None:
+            raise RuntimeError("MultiHeadRoute requires at least one head.")
         if self.aggregate == "mean":
             combined = combined / float(self.num_heads)
         return combined
