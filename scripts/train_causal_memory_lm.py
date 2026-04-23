@@ -2619,6 +2619,53 @@ def memory_state_is_finite(memory_state: Any | None) -> bool:
     )
 
 
+def summarize_nonfinite_memory_state(memory_state: Any | None) -> list[str]:
+    if memory_state is None:
+        return []
+    layers: list[tuple[str, Any]] = []
+    if isinstance(memory_state, ModelRecurrentState):
+        layers.extend((f"memory[{index}]", layer) for index, layer in enumerate(memory_state.memory_state))
+        if memory_state.knowledge_state is not None:
+            layers.append(("knowledge", memory_state.knowledge_state))
+    else:
+        layers.extend((f"memory[{index}]", layer) for index, layer in enumerate(memory_state))
+    diagnostics: list[str] = []
+    for layer_name, layer in layers:
+        for tensor_name, tensor in (("state", layer.state), ("val", layer.val)):
+            finite_mask = torch.isfinite(tensor)
+            if bool(finite_mask.all().item()):
+                continue
+            nonfinite_count = int((~finite_mask).sum().item())
+            diagnostics.append(
+                f"{layer_name}.{tensor_name}:shape={tuple(tensor.shape)} nonfinite={nonfinite_count}"
+            )
+    return diagnostics
+
+
+def summarize_nonfinite_gradients(
+    named_parameters: Sequence[tuple[str, torch.nn.Parameter]],
+    *,
+    limit: int,
+) -> list[str]:
+    diagnostics: list[tuple[int, str]] = []
+    for parameter_name, parameter in named_parameters:
+        gradient = parameter.grad
+        if gradient is None:
+            continue
+        finite_mask = torch.isfinite(gradient)
+        if bool(finite_mask.all().item()):
+            continue
+        nonfinite_count = int((~finite_mask).sum().item())
+        diagnostics.append(
+            (
+                nonfinite_count,
+                f"{parameter_name}:shape={tuple(parameter.shape)} grad_nonfinite={nonfinite_count}",
+            )
+        )
+    diagnostics.sort(key=lambda item: item[0], reverse=True)
+    return [message for _, message in diagnostics[: max(1, int(limit))]]
+
+
 def load_decode_vocab(*, tokenizer_label: str, tokenizer_model_path: str | None) -> object | None:
     if tokenizer_model_path is None:
         return None
@@ -3414,6 +3461,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=float, default=1.0)
     parser.add_argument("--train-fraction", type=float, default=0.9)
     parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--diagnose-nonfinite-grad", action="store_true")
+    parser.add_argument("--diagnose-nonfinite-limit", type=int, default=12)
+    parser.add_argument("--stop-on-nonfinite-grad", action="store_true")
     parser.add_argument("--eval-interval", type=int, default=200)
     parser.add_argument(
         "--eval-start-step",
@@ -4195,6 +4245,11 @@ def main() -> None:
         rnn_aux_optimizer.zero_grad(set_to_none=True)
     start_time = time.time()
     grad_clip_parameters = list(model.parameters())
+    grad_clip_named_parameters = [
+        (parameter_name, parameter)
+        for parameter_name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    ]
     rnn_grad_clip_parameters: list[torch.nn.Parameter] = []
     if rnn_aux_head is not None:
         rnn_grad_clip_parameters.extend(parameter for parameter in rnn_aux_head.parameters() if parameter.requires_grad)
@@ -4445,8 +4500,30 @@ def main() -> None:
             except RuntimeError as exc:
                 grad_norm = float("nan")
                 print(f"warning | step={step} | non-finite grad norm; skipping optimizer step | {exc}", flush=True)
+                if args.diagnose_nonfinite_grad:
+                    gradient_diagnostics = summarize_nonfinite_gradients(
+                        grad_clip_named_parameters,
+                        limit=args.diagnose_nonfinite_limit,
+                    )
+                    if gradient_diagnostics:
+                        print(
+                            "diagnose_nonfinite_grad | "
+                            + " | ".join(gradient_diagnostics),
+                            flush=True,
+                        )
+                    memory_diagnostics = summarize_nonfinite_memory_state(current_memory_state)
+                    if memory_diagnostics:
+                        print(
+                            "diagnose_nonfinite_memory | "
+                            + " | ".join(memory_diagnostics),
+                            flush=True,
+                        )
+                    else:
+                        print("diagnose_nonfinite_memory | all_finite", flush=True)
                 optimizer.zero_grad(set_to_none=True)
                 train_memory_state = None
+                if args.stop_on_nonfinite_grad:
+                    raise
             else:
                 if scaler is not None:
                     scaler.step(optimizer)
