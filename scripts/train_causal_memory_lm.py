@@ -2666,6 +2666,29 @@ def summarize_nonfinite_gradients(
     return [message for _, message in diagnostics[: max(1, int(limit))]]
 
 
+def summarize_gradient_extremes(
+    named_parameters: Sequence[tuple[str, torch.nn.Parameter]],
+    *,
+    limit: int,
+) -> list[str]:
+    diagnostics: list[tuple[float, str]] = []
+    for parameter_name, parameter in named_parameters:
+        gradient = parameter.grad
+        if gradient is None:
+            continue
+        detached_gradient = gradient.detach()
+        max_abs = float(detached_gradient.abs().max().item())
+        grad_norm = float(torch.linalg.vector_norm(detached_gradient.float()).item())
+        diagnostics.append(
+            (
+                grad_norm,
+                f"{parameter_name}:shape={tuple(parameter.shape)} grad_norm={grad_norm:.6g} grad_max_abs={max_abs:.6g}",
+            )
+        )
+    diagnostics.sort(key=lambda item: item[0], reverse=True)
+    return [message for _, message in diagnostics[: max(1, int(limit))]]
+
+
 def load_decode_vocab(*, tokenizer_label: str, tokenizer_model_path: str | None) -> object | None:
     if tokenizer_model_path is None:
         return None
@@ -4511,6 +4534,17 @@ def main() -> None:
                             + " | ".join(gradient_diagnostics),
                             flush=True,
                         )
+                    else:
+                        gradient_extremes = summarize_gradient_extremes(
+                            grad_clip_named_parameters,
+                            limit=args.diagnose_nonfinite_limit,
+                        )
+                        if gradient_extremes:
+                            print(
+                                "diagnose_grad_extremes | "
+                                + " | ".join(gradient_extremes),
+                                flush=True,
+                            )
                     memory_diagnostics = summarize_nonfinite_memory_state(current_memory_state)
                     if memory_diagnostics:
                         print(
