@@ -413,6 +413,13 @@ class CausalHierarchicalMemoryLM(nn.Module):
             return reference.new_empty((0,))
         return tensor.to(device=reference.device, dtype=reference.dtype)
 
+    @staticmethod
+    def _norm_param_or_empty(module: nn.Module, name: str, reference: Tensor) -> Tensor:
+        tensor = getattr(module, name, None)
+        if isinstance(tensor, Tensor):
+            return tensor.to(device=reference.device, dtype=reference.dtype)
+        return reference.new_empty((0,))
+
     def _native_scan_supported_config(self) -> bool:
         supported_route_compress = {"softmax", "signed_abs_softmax", "signed_entmax15"}
         supported_edge_compress = {"softsign", "signed_abs_softmax", "signed_entmax15"}
@@ -597,15 +604,27 @@ class CausalHierarchicalMemoryLM(nn.Module):
             "propagation_biases": tuple(spec[3] for spec in propagation_specs),
             "propagation_topks": tuple(int(level.propagation.topk or level.num_slots) for level in self.b_module.memory_levels),
             "propagation_compress_name": propagation_compress_name,
-            "val_norm_weights": tuple(level.val_norm.weight for level in self.b_module.memory_levels),
-            "val_norm_biases": tuple(level.val_norm.bias for level in self.b_module.memory_levels),
+            "val_norm_weights": tuple(
+                self._norm_param_or_empty(level.val_norm, "weight", aligned_s)
+                for level in self.b_module.memory_levels
+            ),
+            "val_norm_biases": tuple(
+                self._norm_param_or_empty(level.val_norm, "bias", aligned_s)
+                for level in self.b_module.memory_levels
+            ),
             "level_transition_source_weights": tuple(spec[0] for spec in level_transition_specs),
             "level_transition_target_weights": tuple(spec[1] for spec in level_transition_specs),
             "level_transition_core_weights": tuple(spec[2] for spec in level_transition_specs),
             "level_transition_biases": tuple(spec[3] for spec in level_transition_specs),
             "level_transition_topks": tuple(int(transition.topk) for transition in self.b_module.level_transitions),
-            "level_norm_weights": tuple(norm.weight for norm in self.b_module.level_norms),
-            "level_norm_biases": tuple(norm.bias for norm in self.b_module.level_norms),
+            "level_norm_weights": tuple(
+                self._norm_param_or_empty(norm, "weight", aligned_s)
+                for norm in self.b_module.level_norms
+            ),
+            "level_norm_biases": tuple(
+                self._norm_param_or_empty(norm, "bias", aligned_s)
+                for norm in self.b_module.level_norms
+            ),
             "skip_source_weights": tuple(skip_source_weights),
             "skip_target_weights": tuple(skip_target_weights),
             "skip_core_weights": tuple(skip_core_weights),

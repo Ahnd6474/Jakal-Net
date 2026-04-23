@@ -52,6 +52,7 @@ class _MemoryLevel(nn.Module):
         memory_topk: int,
         implementation: str,
         unit_norm_values: bool,
+        disable_val_norm: bool = False,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -94,7 +95,7 @@ class _MemoryLevel(nn.Module):
             implementation=implementation,
             residual=True,
         )
-        self.val_norm = nn.LayerNorm(dim)
+        self.val_norm = nn.Identity() if disable_val_norm else nn.LayerNorm(dim)
 
     def initialize(
         self,
@@ -180,6 +181,7 @@ class BModule(nn.Module):
                 memory_topk=memory_topk,
                 implementation=implementation,
                 unit_norm_values=unit_norm_values,
+                disable_val_norm=unit_norm_values,
             )
             for slots in self.memory_slots
         )
@@ -202,7 +204,10 @@ class BModule(nn.Module):
             )
             for index in range(len(self.memory_slots) - 1)
         )
-        self.level_norms = nn.ModuleList(nn.LayerNorm(dim) for _ in self.memory_slots)
+        if unit_norm_values:
+            self.level_norms = nn.ModuleList(nn.Identity() for _ in self.memory_slots)
+        else:
+            self.level_norms = nn.ModuleList(nn.LayerNorm(dim) for _ in self.memory_slots)
 
         self.skip_transitions = nn.ModuleDict()
         self.skip_gates = nn.ParameterDict()
@@ -248,7 +253,7 @@ class BModule(nn.Module):
         nn.init.normal_(self.read_template_val, mean=0.0, std=0.02)
         self.read_projections = nn.ModuleList(nn.Linear(dim, dim, bias=False) for _ in self.memory_slots)
         self.read_gates = nn.ParameterList(nn.Parameter(torch.zeros(())) for _ in self.memory_slots)
-        self.bridge_input_norm = nn.LayerNorm(dim)
+        self.bridge_input_norm = nn.Identity() if unit_norm_values else nn.LayerNorm(dim)
         self.bridge_to_levels = nn.ModuleList(
             SparseTransition(
                 route_fn=make_route(

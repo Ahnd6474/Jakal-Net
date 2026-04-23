@@ -818,6 +818,9 @@ torch::Tensor layer_norm_last_dim(
     const torch::Tensor& input,
     const torch::Tensor& weight,
     const c10::optional<torch::Tensor>& bias) {
+  if (!weight.defined() || weight.numel() == 0) {
+    return input;
+  }
   return torch::layer_norm(
       input,
       {input.size(-1)},

@@ -1971,6 +1971,9 @@ torch::Tensor scan_cuda_layer_norm_last_dim(
     const torch::Tensor& input,
     const torch::Tensor& weight,
     const torch::Tensor& bias) {
+  if (!weight.defined() || weight.numel() == 0) {
+    return input;
+  }
   auto optional_bias = scan_cuda_optional_tensor(bias);
   return torch::layer_norm(
       input,

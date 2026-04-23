@@ -780,6 +780,8 @@ def _unpack_causal_memory_scan_tensor_args(
 
 
 def _native_scan_layer_norm(input: Tensor, weight: Tensor, packed_bias: Tensor) -> Tensor:
+    if weight.numel() == 0:
+        return input
     return F.layer_norm(
         input,
         (input.shape[-1],),
