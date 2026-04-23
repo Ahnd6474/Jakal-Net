@@ -20,6 +20,8 @@ from jakal_net.modules import (
     QueryNormalizedDotRoute,
     ScaledCosinePairwise,
     SourceTargetHadamardMLPRoute,
+    MultiHeadPairwise,
+    MultiHeadRoute,
 )
 
 
@@ -96,6 +98,13 @@ def reshape_val(
 
 
 def supports_pairwise_kernel(pairwise_fn: object) -> bool:
+    if isinstance(pairwise_fn, MultiHeadPairwise):
+        return (
+            pairwise_fn.aggregate == "max"
+            and len(pairwise_fn.heads) > 0
+            and all(supports_pairwise_kernel(head) for head in pairwise_fn.heads)
+            and len({pairwise_kernel_spec(head).kind for head in pairwise_fn.heads}) == 1
+        )
     return isinstance(
         pairwise_fn,
         (
@@ -120,6 +129,13 @@ def _unwrap_temperature_scaled_route(route_fn: object) -> tuple[object, float]:
 
 def supports_pairwise_route_kernel(route_fn: object) -> bool:
     inner, _ = _unwrap_temperature_scaled_route(route_fn)
+    if isinstance(inner, MultiHeadRoute):
+        return (
+            inner.aggregate == "max"
+            and len(inner.heads) > 0
+            and all(supports_pairwise_route_kernel(head) for head in inner.heads)
+            and len({pairwise_route_kernel_spec(head).kind for head in inner.heads}) == 1
+        )
     return isinstance(
         inner,
         (
@@ -133,6 +149,33 @@ def supports_pairwise_route_kernel(route_fn: object) -> bool:
 
 
 def pairwise_kernel_spec(pairwise_fn: object) -> PairwiseKernelSpec:
+    if isinstance(pairwise_fn, MultiHeadPairwise):
+        if pairwise_fn.aggregate != "max":
+            raise TypeError("Only max-aggregated MultiHeadPairwise is supported for native/kernel spec.")
+        head_specs = [pairwise_kernel_spec(head) for head in pairwise_fn.heads]
+        if not head_specs:
+            raise TypeError("MultiHeadPairwise requires at least one head.")
+        base_kind = head_specs[0].kind
+        if any(spec.kind != base_kind for spec in head_specs[1:]):
+            raise TypeError("All MultiHeadPairwise heads must share the same kernel kind.")
+
+        def _stack_optional(name: str) -> Tensor | None:
+            values = [getattr(spec, name) for spec in head_specs]
+            if all(value is None for value in values):
+                return None
+            if any(value is None for value in values):
+                raise TypeError(f"MultiHeadPairwise head specs disagree on optional field {name!r}.")
+            return torch.stack(values)
+
+        return PairwiseKernelSpec(
+            kind=f"multihead_max_{base_kind}",
+            weight=torch.stack([spec.weight for spec in head_specs]),
+            bias=_stack_optional("bias"),
+            in_weight=_stack_optional("in_weight"),
+            in_bias=_stack_optional("in_bias"),
+            out_weight=_stack_optional("out_weight"),
+            out_bias=_stack_optional("out_bias"),
+        )
     if isinstance(pairwise_fn, DiagonalBilinearPairwise):
         return PairwiseKernelSpec(
             kind="diagonal_bilinear",
@@ -194,6 +237,40 @@ def route_kernel_spec(route_fn: object) -> RouteKernelSpec:
 
 def pairwise_route_kernel_spec(route_fn: object) -> PairwiseRouteKernelSpec:
     inner, temperature = _unwrap_temperature_scaled_route(route_fn)
+    if isinstance(inner, MultiHeadRoute):
+        if inner.aggregate != "max":
+            raise TypeError("Only max-aggregated MultiHeadRoute is supported for native/kernel spec.")
+        head_specs = [pairwise_route_kernel_spec(head) for head in inner.heads]
+        if not head_specs:
+            raise TypeError("MultiHeadRoute requires at least one head.")
+        base_kind = head_specs[0].kind
+        if any(spec.kind != base_kind for spec in head_specs[1:]):
+            raise TypeError("All MultiHeadRoute heads must share the same kernel kind.")
+        if any(spec.temperature != temperature for spec in head_specs):
+            raise TypeError("All MultiHeadRoute heads must share the same temperature.")
+
+        def _stack_optional(name: str) -> Tensor | None:
+            values = [getattr(spec, name) for spec in head_specs]
+            if all(value is None for value in values):
+                return None
+            if any(value is None for value in values):
+                raise TypeError(f"MultiHeadRoute head specs disagree on optional field {name!r}.")
+            return torch.stack(values)
+
+        return PairwiseRouteKernelSpec(
+            kind=f"multihead_max_{base_kind}",
+            source_weight=_stack_optional("source_weight"),
+            source_bias=_stack_optional("source_bias"),
+            target_weight=_stack_optional("target_weight"),
+            target_bias=_stack_optional("target_bias"),
+            core_weight=torch.stack([spec.core_weight for spec in head_specs]),
+            bias=_stack_optional("bias"),
+            hidden_weight=_stack_optional("hidden_weight"),
+            hidden_bias=_stack_optional("hidden_bias"),
+            out_weight=_stack_optional("out_weight"),
+            out_bias=_stack_optional("out_bias"),
+            temperature=temperature,
+        )
     if isinstance(inner, DiagonalBilinearRoute):
         return PairwiseRouteKernelSpec(
             kind="diagonal_bilinear_route",

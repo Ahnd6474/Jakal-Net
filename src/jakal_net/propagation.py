@@ -264,7 +264,7 @@ class Propagation(nn.Module):
         return self._compute_delta_streaming(layer)
 
     def compute_delta(self, layer: Layer) -> LayerDelta:
-        if self._supports_multihead_vectorized_fast_path():
+        if self._supports_multihead_vectorized_fast_path() and self.implementation != "native":
             return self._compute_delta_reference(layer)
         if self.implementation == "native":
             edge_compress_name = _native_edge_compress_name(self.edge_compress_fn)

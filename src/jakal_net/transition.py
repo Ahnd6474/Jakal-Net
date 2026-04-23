@@ -290,7 +290,7 @@ class Transition(nn.Module):
             logits = self.compute_route_logits(src_layer, dst_layer)
             routes = self._compress_routes(logits)
             self.last_stats = _summarize_routes(routes)
-        if self._supports_multihead_vectorized_fast_path():
+        if self._supports_multihead_vectorized_fast_path() and self.implementation != "native":
             return self._compute_delta_reference(src_layer, dst_layer)
         if self.implementation == "native":
             if (
