@@ -2124,14 +2124,19 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_low_rank_transition_pairwise_
     int64_t topk,
     const std::string& compress_name,
     bool allow_fastpath) {
+  const bool diagonal =
+      (!source_weight.defined() || source_weight.numel() == 0) &&
+      (!target_weight.defined() || target_weight.numel() == 0);
   const bool multihead =
-      source_weight.dim() >= 3 || target_weight.dim() >= 3 || core_weight.dim() >= 2;
+      diagonal ? core_weight.dim() >= 2
+               : (source_weight.dim() >= 3 || target_weight.dim() >= 3 || core_weight.dim() >= 2);
   const bool use_fused_topk =
       compress_name == "softmax" ||
       compress_name == "signed_abs_softmax" ||
       compress_name == "signed_entmax15";
   if (use_fused_topk &&
       allow_fastpath &&
+      !diagonal &&
       topk > 0 && topk <= 32) {
     torch::Tensor weighted_projected_source;
     torch::Tensor projected_target;
@@ -2180,7 +2185,23 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_low_rank_transition_pairwise_
   }
 
   torch::Tensor logits;
-  if (multihead) {
+  if (diagonal && multihead) {
+    auto cast_core = core_weight.to(src_val.scalar_type());
+    auto weighted_source = src_val.unsqueeze(1) * cast_core.view({1, cast_core.size(0), 1, cast_core.size(1)});
+    logits = torch::einsum("bhid,bkd->bhik", {weighted_source, dst_val});
+    if (bias.defined() && bias.numel() != 0) {
+      std::vector<int64_t> bias_shape(logits.dim(), 1);
+      bias_shape[logits.dim() - 3] = bias.size(0);
+      logits = logits + bias.to(logits.scalar_type()).view(bias_shape);
+    }
+    logits = std::get<0>(logits.max(1));
+  } else if (diagonal) {
+    auto weighted_source = src_val * core_weight.to(src_val.scalar_type()).view({1, 1, -1});
+    logits = torch::matmul(weighted_source, dst_val.transpose(1, 2));
+    if (bias.defined() && bias.numel() != 0) {
+      logits = logits + bias.to(logits.scalar_type());
+    }
+  } else if (multihead) {
     auto cast_source = source_weight.to(src_val.scalar_type());
     auto cast_target = target_weight.to(dst_val.scalar_type());
     auto cast_core = core_weight.to(src_val.scalar_type());
@@ -2254,13 +2275,18 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_low_rank_propagation_topk(
     int64_t topk,
     const std::string& compress_name,
     bool allow_fastpath) {
+  const bool diagonal =
+      (!source_weight.defined() || source_weight.numel() == 0) &&
+      (!target_weight.defined() || target_weight.numel() == 0);
   const bool multihead =
-      source_weight.dim() >= 3 || target_weight.dim() >= 3 || core_weight.dim() >= 2;
+      diagonal ? core_weight.dim() >= 2
+               : (source_weight.dim() >= 3 || target_weight.dim() >= 3 || core_weight.dim() >= 2);
   const bool use_fused_topk =
       compress_name == "softsign" ||
       compress_name == "signed_abs_softmax";
   if (use_fused_topk &&
       allow_fastpath &&
+      !diagonal &&
       topk > 0 && topk <= 32) {
     torch::Tensor weighted_projected_source;
     torch::Tensor projected_target;
@@ -2309,7 +2335,23 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_low_rank_propagation_topk(
   }
 
   torch::Tensor scores;
-  if (multihead) {
+  if (diagonal && multihead) {
+    auto cast_core = core_weight.to(layer_val.scalar_type());
+    auto weighted_source = layer_val.unsqueeze(1) * cast_core.view({1, cast_core.size(0), 1, cast_core.size(1)});
+    scores = torch::einsum("bhid,bjd->bhij", {weighted_source, layer_val});
+    if (bias.defined() && bias.numel() != 0) {
+      std::vector<int64_t> bias_shape(scores.dim(), 1);
+      bias_shape[scores.dim() - 3] = bias.size(0);
+      scores = scores + bias.to(scores.scalar_type()).view(bias_shape);
+    }
+    scores = std::get<0>(scores.max(1));
+  } else if (diagonal) {
+    auto weighted_source = layer_val * core_weight.to(layer_val.scalar_type()).view({1, 1, -1});
+    scores = torch::matmul(weighted_source, layer_val.transpose(1, 2));
+    if (bias.defined() && bias.numel() != 0) {
+      scores = scores + bias.to(scores.scalar_type());
+    }
+  } else if (multihead) {
     auto cast_source = source_weight.to(layer_val.scalar_type());
     auto cast_target = target_weight.to(layer_val.scalar_type());
     auto cast_core = core_weight.to(layer_val.scalar_type());

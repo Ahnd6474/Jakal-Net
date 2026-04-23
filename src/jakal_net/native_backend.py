@@ -180,6 +180,12 @@ def _native_scan_uses_legacy_low_rank_extension(
     ) or (
         route_kind_name == "multihead_max_low_rank_bilinear_route"
         and propagation_pairwise_kind == "multihead_max_low_rank_bilinear"
+    ) or (
+        route_kind_name == "diagonal_bilinear_route"
+        and propagation_pairwise_kind == "diagonal_bilinear"
+    ) or (
+        route_kind_name == "multihead_max_diagonal_bilinear_route"
+        and propagation_pairwise_kind == "multihead_max_diagonal_bilinear"
     )
 
 

@@ -975,11 +975,15 @@ std::tuple<torch::Tensor, torch::Tensor> low_rank_transition_pairwise_topk_signe
     const torch::Tensor& bias,
     int64_t topk,
     const std::string& compress_name) {
+  const bool diagonal =
+      (!source_weight.defined() || source_weight.numel() == 0) &&
+      (!target_weight.defined() || target_weight.numel() == 0);
 #ifdef WITH_CUDA
   if (src_val.is_cuda() &&
       sender_strength.is_cuda() &&
       projected_state.is_cuda() &&
       projected_val.is_cuda() &&
+      !diagonal &&
       compress_name == "signed_abs_softmax" &&
       !c10::GradMode::is_enabled() &&
       experimental_cuda_scan_fastpath_enabled() &&
@@ -1030,18 +1034,22 @@ std::tuple<torch::Tensor, torch::Tensor> low_rank_transition_pairwise_topk_signe
     };
   }
 #endif
-  const bool multihead = source_weight.dim() >= 3 || target_weight.dim() >= 3 || core_weight.dim() >= 2;
-  auto cast_source_weight = cast_tensor_like(source_weight, src_val);
-  auto cast_target_weight = cast_tensor_like(target_weight, src_val);
+  const bool multihead =
+      diagonal ? core_weight.dim() >= 2
+               : (source_weight.dim() >= 3 || target_weight.dim() >= 3 || core_weight.dim() >= 2);
+  auto cast_source_weight = diagonal ? src_val.new_empty({0}) : cast_tensor_like(source_weight, src_val);
+  auto cast_target_weight = diagonal ? src_val.new_empty({0}) : cast_tensor_like(target_weight, src_val);
   auto cast_core_weight = cast_tensor_like(core_weight, src_val);
   auto cast_bias = cast_packed_optional_like(bias, src_val);
   auto logits = pairwise_route_block_logits(
-      multihead ? "multihead_max_low_rank_bilinear_route" : "low_rank_bilinear_route",
+      diagonal
+          ? (multihead ? "multihead_max_diagonal_bilinear_route" : "diagonal_bilinear_route")
+          : (multihead ? "multihead_max_low_rank_bilinear_route" : "low_rank_bilinear_route"),
       src_val,
       dst_val,
-      cast_source_weight,
+      diagonal ? c10::nullopt : c10::optional<torch::Tensor>(cast_source_weight),
       c10::nullopt,
-      cast_target_weight,
+      diagonal ? c10::nullopt : c10::optional<torch::Tensor>(cast_target_weight),
       c10::nullopt,
       cast_core_weight,
       cast_bias,
@@ -1104,9 +1112,13 @@ std::tuple<torch::Tensor, torch::Tensor> low_rank_propagation_topk_signed_abs(
     const torch::Tensor& bias,
     int64_t topk,
     const std::string& compress_name) {
+  const bool diagonal =
+      (!source_weight.defined() || source_weight.numel() == 0) &&
+      (!target_weight.defined() || target_weight.numel() == 0);
 #ifdef WITH_CUDA
   if (layer_val.is_cuda() &&
       layer_state.is_cuda() &&
+      !diagonal &&
       compress_name == "signed_abs_softmax" &&
       !c10::GradMode::is_enabled() &&
       experimental_cuda_scan_fastpath_enabled() &&
@@ -1162,20 +1174,24 @@ std::tuple<torch::Tensor, torch::Tensor> low_rank_propagation_topk_signed_abs(
     };
   }
 #endif
-  const bool multihead = source_weight.dim() >= 3 || target_weight.dim() >= 3 || core_weight.dim() >= 2;
-  auto cast_source_weight = cast_tensor_like(source_weight, layer_val);
-  auto cast_target_weight = cast_tensor_like(target_weight, layer_val);
+  const bool multihead =
+      diagonal ? core_weight.dim() >= 2
+               : (source_weight.dim() >= 3 || target_weight.dim() >= 3 || core_weight.dim() >= 2);
+  auto cast_source_weight = diagonal ? layer_val.new_empty({0}) : cast_tensor_like(source_weight, layer_val);
+  auto cast_target_weight = diagonal ? layer_val.new_empty({0}) : cast_tensor_like(target_weight, layer_val);
   auto cast_core_weight = cast_tensor_like(core_weight, layer_val);
   auto cast_bias = cast_packed_optional_like(bias, layer_val);
   auto scores = pairwise_scores(
-      multihead ? "multihead_max_low_rank_bilinear" : "low_rank_bilinear",
+      diagonal
+          ? (multihead ? "multihead_max_diagonal_bilinear" : "diagonal_bilinear")
+          : (multihead ? "multihead_max_low_rank_bilinear" : "low_rank_bilinear"),
       layer_val,
       layer_val,
       cast_core_weight,
       cast_bias,
-      cast_source_weight,
+      diagonal ? c10::nullopt : c10::optional<torch::Tensor>(cast_source_weight),
       c10::nullopt,
-      cast_target_weight,
+      diagonal ? c10::nullopt : c10::optional<torch::Tensor>(cast_target_weight),
       c10::nullopt);
   const auto nodes = layer_val.size(1);
   const auto k = std::min<int64_t>(std::max<int64_t>(1, topk), nodes);
