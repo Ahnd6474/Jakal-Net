@@ -2478,13 +2478,17 @@ def compute_learning_rate(
     step: int,
     total_steps: int,
     base_lr: float,
+    warmup_start_lr: float,
     warmup_steps: int,
     min_ratio: float,
 ) -> float:
     if total_steps <= 1:
         return base_lr
     if warmup_steps > 0 and step <= warmup_steps:
-        return base_lr * (step / warmup_steps)
+        if warmup_steps == 1:
+            return base_lr
+        progress = max(0.0, min(1.0, (step - 1) / (warmup_steps - 1)))
+        return warmup_start_lr + progress * (base_lr - warmup_start_lr)
     denom = max(1, total_steps - warmup_steps)
     progress = max(0.0, min(1.0, (step - warmup_steps) / denom))
     cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
@@ -3451,36 +3455,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage1-grad-accum-steps", type=int, default=0)
     parser.add_argument("--stage2-grad-accum-steps", type=int, default=0)
     parser.add_argument("--stage3-grad-accum-steps", type=int, default=0)
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--learning-rate", type=float, default=5e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--optimizer", choices=("adamw", "adamw_fused", "adamw8bit"), default="adamw_fused")
-    parser.add_argument("--embedding-lr-mult", type=float, default=1.0)
-    parser.add_argument("--embedding-warmup-start", type=int, default=1500)
-    parser.add_argument("--embedding-warmup-end", type=int, default=2000)
-    parser.add_argument("--b-lr-mult", type=float, default=0.4)
-    parser.add_argument("--b-propagation-lr-mult", type=float, default=0.15)
-    parser.add_argument("--b-propagation-warmup-start", type=int, default=0)
-    parser.add_argument("--b-propagation-warmup-end", type=int, default=1500)
-    parser.add_argument("--b-route-lr-mult", type=float, default=0.05)
-    parser.add_argument("--b-route-warmup-start", type=int, default=0)
-    parser.add_argument("--b-route-warmup-end", type=int, default=1500)
-    parser.add_argument("--rnn-aux-head", action="store_true")
-    parser.add_argument("--rnn-aux-hidden-dim", type=int, default=1024)
-    parser.add_argument("--rnn-aux-layers", type=int, default=2)
-    parser.add_argument("--rnn-aux-loss-weight", type=float, default=1.0)
-    parser.add_argument("--rnn-aux-loss-weight-final", type=float, default=0.05)
-    parser.add_argument("--rnn-aux-decay-start", type=int, default=2000)
-    parser.add_argument("--rnn-aux-decay-end", type=int, default=5000)
-    parser.add_argument("--rnn-aux-lr-mult", type=float, default=1.0)
-    parser.add_argument("--rnn-aux-lr-final-ratio", type=float, default=0.1)
-    parser.add_argument("--rnn-aux-batch-size", type=int, default=128)
-    parser.add_argument("--rnn-aux-prefetch-batches", type=int, default=32)
-    parser.add_argument("--rnn-aux-updates-per-step", type=int, default=1)
-    parser.add_argument("--rnn-aux-max-chunks-per-doc", type=int, default=0)
-    parser.add_argument("--rnn-pretrain-steps", type=int, default=0)
-    parser.add_argument("--rnn-pretrain-log-interval", type=int, default=10)
-    parser.add_argument("--warmup-steps", type=int, default=200)
-    parser.add_argument("--lr-min-ratio", type=float, default=0.1)
+    parser.add_argument("--warmup-start-lr", type=float, default=1e-4)
+    parser.add_argument("--warmup-steps", type=int, default=100)
+    parser.add_argument("--lr-min-ratio", type=float, default=0.0)
     parser.add_argument("--epochs", type=float, default=1.0)
     parser.add_argument("--train-fraction", type=float, default=0.9)
     parser.add_argument("--grad-clip", type=float, default=1.0)
@@ -3588,70 +3568,30 @@ def configure_native_runtime_flags(args: argparse.Namespace) -> None:
         os.environ.pop(EXPERIMENTAL_SCAN_BACKWARD_CUDA_ENV, None)
 
 
-def _parameter_group_name(name: str) -> str:
-    if name.startswith("rnn_aux_head."):
-        return "rnn_aux"
-    if name.startswith("s_module.token_embedding."):
-        return "embedding"
-    if name.startswith("b_module."):
-        if ".route_fn." in name:
-            return "b_route"
-        if ".pairwise_fn." in name:
-            return "b_propagation"
-        return "b_module"
-    return "default"
-
-
 def build_parameter_groups(
     model: CausalHierarchicalMemoryLM,
     *,
     learning_rate: float,
     weight_decay: float,
-    embedding_lr_mult: float,
-    b_lr_mult: float,
-    b_propagation_lr_mult: float,
-    b_route_lr_mult: float,
 ) -> tuple[list[dict[str, Any]], tuple[OptimizerParameterGroupConfig, ...]]:
-    lr_scales = {
-        "default": 1.0,
-        "embedding": float(embedding_lr_mult),
-        "b_module": float(b_lr_mult),
-        "b_propagation": float(b_propagation_lr_mult),
-        "b_route": float(b_route_lr_mult),
-    }
-    grouped: dict[str, dict[str, Any]] = {
-        group_name: {
-            "params": [],
-            "lr": learning_rate * scale,
+    parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    parameter_count = sum(int(parameter.numel()) for parameter in parameters)
+    param_groups = [
+        {
+            "params": parameters,
+            "lr": learning_rate,
             "weight_decay": weight_decay,
-            "group_name": group_name,
-            "lr_scale": scale,
+            "group_name": "model",
+            "lr_scale": 1.0,
         }
-        for group_name, scale in lr_scales.items()
-    }
-    counts = {group_name: 0 for group_name in lr_scales}
-    seen: set[int] = set()
-    named_parameter_sources: list[tuple[str, torch.nn.Parameter]] = list(model.named_parameters())
-    for parameter_name, parameter in named_parameter_sources:
-        if not parameter.requires_grad:
-            continue
-        parameter_id = id(parameter)
-        if parameter_id in seen:
-            continue
-        seen.add(parameter_id)
-        group_name = _parameter_group_name(parameter_name)
-        grouped[group_name]["params"].append(parameter)
-        counts[group_name] += int(parameter.numel())
-    param_groups = [group for group in grouped.values() if group["params"]]
-    group_configs = tuple(
+    ]
+    group_configs = (
         OptimizerParameterGroupConfig(
-            name=group_name,
-            lr_scale=lr_scales[group_name],
+            name="model",
+            lr_scale=1.0,
             weight_decay=weight_decay,
-            parameter_count=counts[group_name],
-        )
-        for group_name in ("default", "embedding", "b_module", "b_propagation", "b_route", "rnn_aux")
-        if group_name in counts and counts[group_name] > 0
+            parameter_count=parameter_count,
+        ),
     )
     return param_groups, group_configs
 
@@ -3772,50 +3712,14 @@ def main() -> None:
         raise ValueError("curriculum-stage2-ratio must be greater than or equal to curriculum-stage1-ratio.")
     if args.curriculum_stage1_span <= 0 or args.curriculum_stage2_span <= 0 or args.curriculum_stage3_span <= 0:
         raise ValueError("curriculum-stage spans must be positive.")
-    if min(
-        args.embedding_lr_mult,
-        args.b_lr_mult,
-        args.b_propagation_lr_mult,
-        args.b_route_lr_mult,
-        args.rnn_aux_lr_mult,
-        args.rnn_aux_lr_final_ratio,
-        args.rnn_aux_loss_weight,
-        args.rnn_aux_loss_weight_final,
-    ) < 0.0:
-        raise ValueError("Learning-rate multipliers must be non-negative.")
-    if args.rnn_aux_layers <= 0:
-        raise ValueError("rnn-aux-layers must be positive.")
-    if args.rnn_aux_batch_size <= 0:
-        raise ValueError("rnn-aux-batch-size must be positive.")
-    if args.rnn_aux_prefetch_batches <= 0:
-        raise ValueError("rnn-aux-prefetch-batches must be positive.")
-    if args.rnn_aux_updates_per_step <= 0:
-        raise ValueError("rnn-aux-updates-per-step must be positive.")
-    if args.rnn_aux_max_chunks_per_doc < 0:
-        raise ValueError("rnn-aux-max-chunks-per-doc must be non-negative.")
-    if args.rnn_pretrain_steps < 0:
-        raise ValueError("rnn-pretrain-steps must be non-negative.")
-    if args.rnn_pretrain_log_interval <= 0:
-        raise ValueError("rnn-pretrain-log-interval must be positive.")
     if args.tokenizer == "hf_auto" and not args.hf_tokenizer_model and not (args.pretokenized_dir or args.pretokenized_path):
         raise ValueError("--hf-tokenizer-model is required when --tokenizer hf_auto is used without pretokenized input.")
     if args.hf_embedding_model and args.tokenizer != "hf_auto" and not (args.pretokenized_dir or args.pretokenized_path):
         raise ValueError("--hf-embedding-model currently requires --tokenizer hf_auto.")
-    if args.embedding_warmup_start < 0 or args.embedding_warmup_end < 0:
-        raise ValueError("embedding warmup steps must be non-negative.")
-    if args.embedding_warmup_end < args.embedding_warmup_start:
-        raise ValueError("embedding-warmup-end must be greater than or equal to embedding-warmup-start.")
-    if min(
-        args.b_propagation_warmup_start,
-        args.b_propagation_warmup_end,
-        args.b_route_warmup_start,
-        args.b_route_warmup_end,
-    ) < 0:
-        raise ValueError("B warmup steps must be non-negative.")
-    if args.b_propagation_warmup_end < args.b_propagation_warmup_start:
-        raise ValueError("b-propagation-warmup-end must be greater than or equal to b-propagation-warmup-start.")
-    if args.b_route_warmup_end < args.b_route_warmup_start:
-        raise ValueError("b-route-warmup-end must be greater than or equal to b-route-warmup-start.")
+    if args.warmup_start_lr < 0.0 or args.learning_rate < 0.0:
+        raise ValueError("learning rates must be non-negative.")
+    if args.warmup_steps < 0:
+        raise ValueError("warmup-steps must be non-negative.")
     if any(
         value < 0
         for value in (
@@ -4078,16 +3982,8 @@ def main() -> None:
         )
     print("startup | model_init_done", flush=True)
     rnn_aux_head = None
-    if args.rnn_aux_head:
-        rnn_aux_head = SharedEmbeddingRnnAuxHead(
-            embedding_dim=args.dim,
-            vocab_size=vocab_size,
-            hidden_dim=None if args.rnn_aux_hidden_dim <= 0 else args.rnn_aux_hidden_dim,
-            num_layers=args.rnn_aux_layers,
-        ).to(device)
-    print("startup | rnn_aux_init_done", flush=True)
     parameter_count = count_parameters(model)
-    rnn_aux_parameter_count = 0 if rnn_aux_head is None else count_parameters(rnn_aux_head)
+    rnn_aux_parameter_count = 0
     print(
         f"model=causal_memory_doc | params={parameter_count:,} | dim={args.dim} | seq_len={args.seq_len} | "
         f"s_window={args.s_window} | s_microbatch_size={args.s_microbatch_size} | "
@@ -4098,15 +3994,6 @@ def main() -> None:
         f"checkpoint_prediction={args.checkpoint_prediction_layers}",
         flush=True,
     )
-    if rnn_aux_head is not None:
-        print(
-            f"rnn_aux | params={rnn_aux_parameter_count:,} | hidden_dim={rnn_aux_head.hidden_dim} | "
-            f"layers={rnn_aux_head.num_layers} | batch_size={args.rnn_aux_batch_size} | "
-            f"updates_per_step={args.rnn_aux_updates_per_step} | loss_weight={args.rnn_aux_loss_weight} | "
-            f"loss_weight_final={args.rnn_aux_loss_weight_final} | decay_start={args.rnn_aux_decay_start} | "
-            f"decay_end={args.rnn_aux_decay_end}",
-            flush=True,
-        )
     print(
         f"native_runtime | fused_training={args.enable_fused_training} | "
         f"fused_training_checkpoint_stride={args.fused_training_checkpoint_stride} | "
@@ -4164,25 +4051,12 @@ def main() -> None:
         model,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
-        embedding_lr_mult=args.embedding_lr_mult,
-        b_lr_mult=args.b_lr_mult,
-        b_propagation_lr_mult=args.b_propagation_lr_mult,
-        b_route_lr_mult=args.b_route_lr_mult,
-    )
-    rnn_aux_optimizer, rnn_aux_group_configs = build_rnn_aux_optimizer(
-        model,
-        rnn_aux_head,
-        name=args.optimizer,
-        learning_rate=args.learning_rate,
-        weight_decay=args.weight_decay,
-        rnn_aux_lr_mult=args.rnn_aux_lr_mult,
-        device=device,
     )
     print(
         "optimizer_groups | "
         + " | ".join(
             f"{group.name}:count={group.parameter_count:,},lr_scale={group.lr_scale:.4f}"
-            for group in (param_group_configs + rnn_aux_group_configs)
+            for group in param_group_configs
         ),
         flush=True,
     )
@@ -4213,32 +4087,6 @@ def main() -> None:
         prefetch_batches=max(1, int(args.prefetch_batches)),
     )
     print("startup | prefetcher_done", flush=True)
-    rnn_prefetcher: AsyncDocumentBatchPrefetcher | None = None
-    if rnn_aux_head is not None:
-        if flat_collection is not None:
-            rnn_batcher = FlatSequentialDocumentBatcher(
-                flat_collection,
-                train_documents_flat,
-                batch_size=args.rnn_aux_batch_size,
-                device=device,
-                max_chunks_per_document=args.rnn_aux_max_chunks_per_doc,
-                full_loss=True,
-            )
-        else:
-            rnn_batcher = DocumentChunkBatcher(
-                train_documents,
-                batch_size=args.rnn_aux_batch_size,
-                device=device,
-            )
-        rnn_prefetcher = AsyncDocumentBatchPrefetcher(
-            rnn_batcher,
-            device=device,
-            prefetch_batches=max(1, int(args.rnn_aux_prefetch_batches)),
-        )
-        print("startup | rnn_prefetcher_done", flush=True)
-
-    run_rnn_pretrain = rnn_aux_head is not None and args.rnn_pretrain_steps > 0
-    run_concurrent_rnn = rnn_aux_head is not None and not run_rnn_pretrain
 
     history_rows: list[dict[str, Any]] = []
     train_memory_state: tuple[Any, ...] | None = None
@@ -4249,11 +4097,7 @@ def main() -> None:
         checkpoint_path = Path(args.resume_checkpoint)
         checkpoint = load_checkpoint(checkpoint_path, device=device)
         model.load_state_dict(checkpoint["model_state_dict"])
-        if rnn_aux_head is not None and checkpoint.get("rnn_aux_state_dict") is not None:
-            rnn_aux_head.load_state_dict(checkpoint["rnn_aux_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        if rnn_aux_optimizer is not None and checkpoint.get("rnn_aux_optimizer_state_dict") is not None:
-            rnn_aux_optimizer.load_state_dict(checkpoint["rnn_aux_optimizer_state_dict"])
         start_step = int(checkpoint.get("step", 0))
         checkpoint_val_loss = checkpoint.get("val_loss")
         if checkpoint_val_loss is not None:
@@ -4264,8 +4108,6 @@ def main() -> None:
             flush=True,
         )
     optimizer.zero_grad(set_to_none=True)
-    if rnn_aux_optimizer is not None:
-        rnn_aux_optimizer.zero_grad(set_to_none=True)
     start_time = time.time()
     grad_clip_parameters = list(model.parameters())
     grad_clip_named_parameters = [
@@ -4273,63 +4115,6 @@ def main() -> None:
         for parameter_name, parameter in model.named_parameters()
         if parameter.requires_grad
     ]
-    rnn_grad_clip_parameters: list[torch.nn.Parameter] = []
-    if rnn_aux_head is not None:
-        rnn_grad_clip_parameters.extend(parameter for parameter in rnn_aux_head.parameters() if parameter.requires_grad)
-        rnn_grad_clip_parameters.extend(
-            parameter for parameter in model.s_module.token_embedding.parameters() if parameter.requires_grad
-        )
-
-    if run_rnn_pretrain and rnn_aux_optimizer is not None and rnn_prefetcher is not None:
-        print(
-            f"rnn_pretrain | steps={args.rnn_pretrain_steps} | batch_size={args.rnn_aux_batch_size} | "
-            f"log_interval={args.rnn_pretrain_log_interval}",
-            flush=True,
-        )
-        for rnn_pretrain_step in range(1, args.rnn_pretrain_steps + 1):
-            rnn_batch = rnn_prefetcher.next_batch()
-            rnn_aux_optimizer.zero_grad(set_to_none=True)
-            rnn_loss, rnn_loss_value = run_rnn_aux_model(
-                model,
-                rnn_aux_head,
-                rnn_batch,
-                precision=args.precision,
-                grad_enabled=True,
-            )
-            if not bool(torch.isfinite(rnn_loss.detach()).item()):
-                raise RuntimeError(f"Non-finite RNN pretrain loss at step {rnn_pretrain_step}.")
-            if scaler is not None:
-                scaler.scale(rnn_loss).backward()
-                scaler.unscale_(rnn_aux_optimizer)
-            else:
-                rnn_loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                rnn_grad_clip_parameters,
-                args.grad_clip,
-                error_if_nonfinite=True,
-            )
-            if scaler is not None:
-                scaler.step(rnn_aux_optimizer)
-                scaler.update()
-            else:
-                rnn_aux_optimizer.step()
-            if writer is not None:
-                writer.add_scalar("pretrain/rnn_loss", float(rnn_loss_value), rnn_pretrain_step)
-            if (
-                rnn_pretrain_step == 1
-                or rnn_pretrain_step == args.rnn_pretrain_steps
-                or rnn_pretrain_step % args.rnn_pretrain_log_interval == 0
-            ):
-                print(
-                    f"rnn_pretrain_progress | step={rnn_pretrain_step}/{args.rnn_pretrain_steps} | "
-                    f"loss={rnn_loss_value:.4f}",
-                    flush=True,
-                )
-        rnn_aux_optimizer.zero_grad(set_to_none=True)
-        rnn_prefetcher.close()
-        rnn_prefetcher = None
-        print("rnn_pretrain | complete", flush=True)
-
     stage1_cuda_graph_runner: Stage1CudaGraphRunner | Stage1ForwardCudaGraphRunner | None = None
 
     for step in range(start_step + 1, total_steps + 1):
@@ -4374,61 +4159,12 @@ def main() -> None:
             step=step,
             total_steps=total_steps,
             base_lr=args.learning_rate,
+            warmup_start_lr=args.warmup_start_lr,
             warmup_steps=args.warmup_steps,
             min_ratio=args.lr_min_ratio,
         )
-        rnn_aux_lr_scale = 0.0
-        rnn_aux_weight = 0.0
-        if run_concurrent_rnn:
-            rnn_aux_lr_scale = compute_decayed_scalar(
-                step=step,
-                start_step=max(0, int(args.rnn_aux_decay_start)),
-                end_step=max(int(args.rnn_aux_decay_start), int(args.rnn_aux_decay_end)),
-                initial_value=1.0,
-                final_value=float(args.rnn_aux_lr_final_ratio),
-            )
-            rnn_aux_weight = compute_decayed_scalar(
-                step=step,
-                start_step=max(0, int(args.rnn_aux_decay_start)),
-                end_step=max(int(args.rnn_aux_decay_start), int(args.rnn_aux_decay_end)),
-                initial_value=float(args.rnn_aux_loss_weight),
-                final_value=float(args.rnn_aux_loss_weight_final),
-            )
-        embedding_lr_scale = compute_warmup_scalar(
-            step=step,
-            start_step=max(0, int(args.embedding_warmup_start)),
-            end_step=max(int(args.embedding_warmup_start), int(args.embedding_warmup_end)),
-            initial_value=0.0,
-            final_value=1.0,
-        )
-        b_propagation_lr_scale = compute_warmup_scalar(
-            step=step,
-            start_step=max(0, int(args.b_propagation_warmup_start)),
-            end_step=max(int(args.b_propagation_warmup_start), int(args.b_propagation_warmup_end)),
-            initial_value=0.0,
-            final_value=1.0,
-        )
-        b_route_lr_scale = compute_warmup_scalar(
-            step=step,
-            start_step=max(0, int(args.b_route_warmup_start)),
-            end_step=max(int(args.b_route_warmup_start), int(args.b_route_warmup_end)),
-            initial_value=0.0,
-            final_value=1.0,
-        )
         for param_group in optimizer.param_groups:
-            group_lr = lr * float(param_group.get("lr_scale", 1.0))
-            if param_group.get("group_name") == "embedding":
-                group_lr *= embedding_lr_scale
-            elif param_group.get("group_name") == "b_propagation":
-                group_lr *= b_propagation_lr_scale
-            elif param_group.get("group_name") == "b_route":
-                group_lr *= b_route_lr_scale
-            param_group["lr"] = group_lr
-        if rnn_aux_optimizer is not None:
-            for param_group in rnn_aux_optimizer.param_groups:
-                group_lr = args.learning_rate * float(param_group.get("lr_scale", 1.0))
-                group_lr *= rnn_aux_lr_scale
-                param_group["lr"] = group_lr
+            param_group["lr"] = lr
 
         current_memory_state = None if stage.freeze_memory else train_memory_state
         span_losses: list[float] = []
@@ -4444,7 +4180,6 @@ def main() -> None:
                 args.cuda_graph_stage1
                 and device.type == "cuda"
                 and scaler is None
-                and not run_concurrent_rnn
                 and stage.name == "stage1"
                 and stage.document_span == 1
                 and stage.grad_accum_steps == 1
@@ -4504,8 +4239,6 @@ def main() -> None:
                 train_memory_state = None
         else:
             optimizer.zero_grad(set_to_none=True)
-            if rnn_aux_optimizer is not None:
-                rnn_aux_optimizer.zero_grad(set_to_none=True)
             train_memory_state = None
 
         should_step_optimizer = step % stage.grad_accum_steps == 0 or step == total_steps
@@ -4572,79 +4305,13 @@ def main() -> None:
         train_aux_loss = 0.0
         avg_rnn_batch_seconds = 0.0
         rnn_prefetch_queue_size = 0
-        if (
-            run_concurrent_rnn
-            and rnn_aux_head is not None
-            and rnn_aux_optimizer is not None
-            and rnn_prefetcher is not None
-            and rnn_aux_weight > 0.0
-        ):
-            rnn_aux_optimizer.zero_grad(set_to_none=True)
-            rnn_losses: list[float] = []
-            rnn_loss_tensors: list[torch.Tensor] = []
-            rnn_loss_is_finite = True
-            for _ in range(max(1, int(args.rnn_aux_updates_per_step))):
-                rnn_batch = rnn_prefetcher.next_batch()
-                rnn_loss, rnn_loss_value = run_rnn_aux_model(
-                    model,
-                    rnn_aux_head,
-                    rnn_batch,
-                    precision=args.precision,
-                    grad_enabled=True,
-                )
-                if not bool(torch.isfinite(rnn_loss.detach()).item()):
-                    rnn_loss_is_finite = False
-                    print(
-                        f"warning | step={step} | non-finite rnn aux loss; skipping rnn optimizer step",
-                        flush=True,
-                    )
-                    break
-                rnn_losses.append(rnn_loss_value)
-                rnn_loss_tensors.append(rnn_loss * float(rnn_aux_weight))
-            if rnn_loss_is_finite and rnn_loss_tensors:
-                total_rnn_aux_loss = sum(rnn_loss_tensors) / max(1, len(rnn_loss_tensors))
-                if scaler is not None:
-                    scaler.scale(total_rnn_aux_loss).backward()
-                    scaler.unscale_(rnn_aux_optimizer)
-                else:
-                    total_rnn_aux_loss.backward()
-                try:
-                    torch.nn.utils.clip_grad_norm_(
-                        rnn_grad_clip_parameters,
-                        args.grad_clip,
-                        error_if_nonfinite=True,
-                    )
-                except RuntimeError as exc:
-                    print(
-                        f"warning | step={step} | non-finite rnn grad norm; skipping rnn optimizer step | {exc}",
-                        flush=True,
-                    )
-                    rnn_aux_optimizer.zero_grad(set_to_none=True)
-                else:
-                    if scaler is not None:
-                        scaler.step(rnn_aux_optimizer)
-                    else:
-                        rnn_aux_optimizer.step()
-                    rnn_aux_optimizer.zero_grad(set_to_none=True)
-                    train_aux_loss = float(sum(rnn_losses) / max(1, len(rnn_losses)))
-            else:
-                rnn_aux_optimizer.zero_grad(set_to_none=True)
-            avg_rnn_batch_seconds, rnn_prefetch_queue_size = rnn_prefetcher.stats()
         avg_cpu_batch_seconds, prefetch_queue_size = prefetcher.stats()
         if writer is not None:
             writer.add_scalar("train/loss", train_loss, step)
-            writer.add_scalar("train/rnn_aux_loss", train_aux_loss, step)
             writer.add_scalar("train/lr", lr, step)
-            writer.add_scalar("train/embedding_lr_scale", embedding_lr_scale, step)
-            writer.add_scalar("train/b_propagation_lr_scale", b_propagation_lr_scale, step)
-            writer.add_scalar("train/b_route_lr_scale", b_route_lr_scale, step)
-            writer.add_scalar("train/rnn_aux_lr_scale", rnn_aux_lr_scale, step)
-            writer.add_scalar("train/rnn_aux_weight", rnn_aux_weight, step)
             writer.add_scalar("train/document_span", stage.document_span, step)
             writer.add_scalar("train/cpu_batch_ms", avg_cpu_batch_seconds * 1000.0, step)
             writer.add_scalar("train/prefetch_queue_size", prefetch_queue_size, step)
-            writer.add_scalar("train/rnn_cpu_batch_ms", avg_rnn_batch_seconds * 1000.0, step)
-            writer.add_scalar("train/rnn_prefetch_queue_size", rnn_prefetch_queue_size, step)
             if not math.isnan(grad_norm):
                 writer.add_scalar("train/grad_norm", grad_norm, step)
             for bucket_name, bucket_weight in bucket_weights.items():
@@ -4654,17 +4321,13 @@ def main() -> None:
             elapsed = time.time() - start_time
             print(
                 f"progress | step={step:5d}/{total_steps} | stage={stage.name} | span={stage.document_span} | "
-                f"train_loss={train_loss:.4f} | rnn_aux_loss={train_aux_loss:.4f} | lr={lr:.6g} | "
-                f"embed_lr_scale={embedding_lr_scale:.3f} | "
-                f"edge_lr_scale={b_propagation_lr_scale:.3f} | route_lr_scale={b_route_lr_scale:.3f} | "
+                f"train_loss={train_loss:.4f} | lr={lr:.6g} | "
                 f"cpu_batch_ms={avg_cpu_batch_seconds * 1000.0:.1f} | prefetch_q={prefetch_queue_size} | "
-                f"rnn_cpu_batch_ms={avg_rnn_batch_seconds * 1000.0:.1f} | rnn_prefetch_q={rnn_prefetch_queue_size} | "
                 f"elapsed={elapsed:.1f}s",
                 flush=True,
             )
 
         val_loss = None
-        val_rnn_aux_loss = None
         should_eval = (
             step == total_steps
             or (
@@ -4674,35 +4337,30 @@ def main() -> None:
         )
         if should_eval:
             if flat_collection is not None:
-                val_loss, val_rnn_aux_loss = estimate_eval_loss_flat(
+                val_loss, _ = estimate_eval_loss_flat(
                     model,
                     flat_collection,
                     fixed_eval_documents_flat,
                     eval_documents=len(fixed_eval_documents_flat),
                     device=device,
                     precision=args.precision,
-                    rnn_aux_head=rnn_aux_head if run_concurrent_rnn else None,
                 )
             else:
-                val_loss, val_rnn_aux_loss = estimate_eval_loss(
+                val_loss, _ = estimate_eval_loss(
                     model,
                     fixed_eval_documents,
                     eval_documents=len(fixed_eval_documents),
                     device=device,
                     precision=args.precision,
-                    rnn_aux_head=rnn_aux_head if run_concurrent_rnn else None,
                 )
             val_ppl = perplexity_from_loss(val_loss)
-            val_rnn_aux_text = "n/a" if val_rnn_aux_loss is None else f"{val_rnn_aux_loss:.4f}"
             print(
                 f"eval | step={step} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
-                f"val_rnn_aux_loss={val_rnn_aux_text} | val_ppl={val_ppl:.2f}",
+                f"val_ppl={val_ppl:.2f}",
                 flush=True,
             )
             if writer is not None:
                 writer.add_scalar("eval/val_loss", val_loss, step)
-                if val_rnn_aux_loss is not None:
-                    writer.add_scalar("eval/rnn_aux_loss", float(val_rnn_aux_loss), step)
                 writer.add_scalar("eval/val_ppl", val_ppl, step)
                 should_log_eval_samples = (
                     step == total_steps
@@ -4741,9 +4399,9 @@ def main() -> None:
                 save_checkpoint(
                     checkpoints_dir / "best.pt",
                     model=model,
-                    rnn_aux_head=rnn_aux_head,
+                    rnn_aux_head=None,
                     optimizer=optimizer,
-                    rnn_aux_optimizer=rnn_aux_optimizer,
+                    rnn_aux_optimizer=None,
                     step=step,
                     args=args,
                     train_loss=train_loss,
@@ -4760,9 +4418,9 @@ def main() -> None:
             save_checkpoint(
                 checkpoints_dir / "last.pt",
                 model=model,
-                rnn_aux_head=rnn_aux_head,
+                rnn_aux_head=None,
                 optimizer=optimizer,
-                rnn_aux_optimizer=rnn_aux_optimizer,
+                rnn_aux_optimizer=None,
                 step=step,
                 args=args,
                 train_loss=train_loss,
@@ -4780,16 +4438,9 @@ def main() -> None:
             "stage": stage.name,
             "document_span": stage.document_span,
             "train_loss": train_loss,
-            "train_rnn_aux_loss": train_aux_loss,
             "grad_norm": grad_norm,
             "lr": lr,
-            "embedding_lr_scale": embedding_lr_scale,
-            "b_propagation_lr_scale": b_propagation_lr_scale,
-            "b_route_lr_scale": b_route_lr_scale,
-            "rnn_aux_lr_scale": rnn_aux_lr_scale,
-            "rnn_aux_weight": rnn_aux_weight,
             "val_loss": val_loss,
-            "val_rnn_aux_loss": val_rnn_aux_loss,
             "val_ppl": None if val_loss is None else perplexity_from_loss(val_loss),
         }
         history_rows.append(row)
@@ -4797,8 +4448,6 @@ def main() -> None:
 
     write_csv_rows(run_dir / "history.csv", history_rows)
     prefetcher.close()
-    if rnn_prefetcher is not None:
-        rnn_prefetcher.close()
     if writer is not None:
         writer.flush()
         writer.close()
