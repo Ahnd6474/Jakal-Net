@@ -295,6 +295,14 @@ class BModule(nn.Module):
             for level_index, layer in enumerate(memory_state)
         )
 
+    def unit_normalize_memory_values(self, memory_state: Sequence[Layer]) -> tuple[Layer, ...]:
+        if not self.unit_norm_values:
+            return tuple(memory_state)
+        return tuple(
+            layer.with_tensors(val=unit_normalize_values(layer.val))
+            for layer in memory_state
+        )
+
     def reset_state(
         self,
         memory_state: Sequence[Layer],

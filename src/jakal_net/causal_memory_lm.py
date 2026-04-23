@@ -600,14 +600,14 @@ class CausalHierarchicalMemoryLM(nn.Module):
         packed = self._pack_native_scan_inputs(aligned_s, memory_state)
         query_val, flat_memory = causal_memory_scan_fused_native(**packed)
         if self.unit_norm_values:
-            query_val = unit_normalize_values(self.prediction_input_norm(query_val))
+            query_val = unit_normalize_values(query_val)
         query_state = self.value_to_state(query_val).squeeze(-1)
-        constrained_memory = self.b_module.constrain_memory_state(
-            self.b_module.unflatten_memory_state(flat_memory)
-        )
+        next_memory = self.b_module.unflatten_memory_state(flat_memory)
+        if self.unit_norm_values:
+            next_memory = self.b_module.unit_normalize_memory_values(next_memory)
         return BScanOutput(
             query_layer=Layer(dim=self.dim, num_nodes=aligned_s.shape[1], state=query_state, val=query_val),
-            memory_state=constrained_memory,
+            memory_state=tuple(next_memory),
             bridge_layer=None,
             knowledge_state=None,
             knowledge_output=None,

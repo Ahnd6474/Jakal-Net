@@ -1218,9 +1218,8 @@ torch::Tensor read_memory_vector(
   std::vector<torch::Tensor> read_terms;
   read_terms.reserve(memory_state.size());
   for (size_t index = 0; index < memory_state.size(); ++index) {
-    auto read_layer = layer_with_val_norm(memory_state[index], val_norm_weights[index], val_norm_biases[index]);
-    auto sender_strength = torch::softplus(read_layer.state).unsqueeze(-1);
-    auto read_summary = (sender_strength * read_layer.val).sum(1);
+    auto sender_strength = torch::softplus(memory_state[index].state).unsqueeze(-1);
+    auto read_summary = (sender_strength * memory_state[index].val).sum(1);
     read_summary = read_summary + cast_tensor_like(read_template_val, read_summary).unsqueeze(0);
     auto projected = linear2d(read_summary, read_projection_weights[index], c10::nullopt);
     auto gate = torch::sigmoid(cast_tensor_like(read_gates[index], read_summary));
@@ -1392,13 +1391,12 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> causal_memory_scan_fused(
     std::vector<NativeLayerState> next_memory;
     next_memory.reserve(num_levels);
 
-    auto first_level_normed = layer_with_val_norm(current_memory[0], val_norm_weights[0], val_norm_biases[0]);
     auto first_write_delta = low_rank_transition_pairwise_topk_signed_abs(
         torch::softplus(token_layer.state),
         token_layer.state,
         token_layer.val,
         token_layer.val,
-        first_level_normed.val,
+        current_memory[0].val,
         write_source_weights[0],
         write_target_weights[0],
         write_core_weights[0],
@@ -1411,10 +1409,9 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> causal_memory_scan_fused(
         std::get<1>(first_write_delta),
         val_norm_weights[0],
         val_norm_biases[0]);
-    auto level_for_propagation = layer_with_val_norm(level, val_norm_weights[0], val_norm_biases[0]);
     auto first_prop_delta = low_rank_propagation_topk_signed_abs(
-        level_for_propagation.state,
-        level_for_propagation.val,
+        level.state,
+        level.val,
         propagation_source_weights[0],
         propagation_target_weights[0],
         propagation_core_weights[0],
@@ -1431,20 +1428,12 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> causal_memory_scan_fused(
 
     for (size_t level_index = 1; level_index < num_levels; ++level_index) {
       auto current_level = current_memory[level_index];
-      auto normalized_level = layer_with_val_norm(
-          current_level,
-          val_norm_weights[level_index],
-          val_norm_biases[level_index]);
-      auto normalized_parent = layer_with_val_norm(
-          next_memory[level_index - 1],
-          level_norm_weights[level_index - 1],
-          level_norm_biases[level_index - 1]);
       auto parent_delta = low_rank_transition_pairwise_topk_signed_abs(
-          torch::softplus(normalized_parent.state),
-          normalized_parent.state,
-          normalized_parent.val,
-          normalized_parent.val,
-          normalized_level.val,
+          torch::softplus(next_memory[level_index - 1].state),
+          next_memory[level_index - 1].state,
+          next_memory[level_index - 1].val,
+          next_memory[level_index - 1].val,
+          current_level.val,
           level_transition_source_weights[level_index - 1],
           level_transition_target_weights[level_index - 1],
           level_transition_core_weights[level_index - 1],
@@ -1465,7 +1454,7 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> causal_memory_scan_fused(
             token_layer.state,
             token_layer.val,
             token_layer.val,
-            normalized_level.val,
+            current_level.val,
             skip_source_weights[0],
             skip_target_weights[0],
             skip_core_weights[0],
@@ -1482,17 +1471,13 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> causal_memory_scan_fused(
 
       if (level_index >= 2) {
         const auto skip_index = level_index - 1;
-        auto normalized_skip_source = layer_with_val_norm(
-            next_memory[level_index - 2],
-            level_norm_weights[level_index - 2],
-            level_norm_biases[level_index - 2]);
-        auto skip_gate = torch::sigmoid(cast_tensor_like(skip_gates[skip_index], normalized_skip_source.val));
+        auto skip_gate = torch::sigmoid(cast_tensor_like(skip_gates[skip_index], next_memory[level_index - 2].val));
         auto skip_delta = low_rank_transition_pairwise_topk_signed_abs(
-            torch::softplus(normalized_skip_source.state),
-            normalized_skip_source.state,
-            normalized_skip_source.val,
-            normalized_skip_source.val,
-            normalized_level.val,
+            torch::softplus(next_memory[level_index - 2].state),
+            next_memory[level_index - 2].state,
+            next_memory[level_index - 2].val,
+            next_memory[level_index - 2].val,
+            current_level.val,
             skip_source_weights[skip_index],
             skip_target_weights[skip_index],
             skip_core_weights[skip_index],
@@ -1507,13 +1492,9 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> causal_memory_scan_fused(
             val_norm_biases[level_index]);
       }
 
-      auto updated_level_for_prop = layer_with_val_norm(
-          updated_level,
-          val_norm_weights[level_index],
-          val_norm_biases[level_index]);
       auto propagation_delta = low_rank_propagation_topk_signed_abs(
-          updated_level_for_prop.state,
-          updated_level_for_prop.val,
+          updated_level.state,
+          updated_level.val,
           propagation_source_weights[level_index],
           propagation_target_weights[level_index],
           propagation_core_weights[level_index],
@@ -2417,13 +2398,12 @@ std::vector<torch::Tensor> causal_memory_scan_fused_backward_cuda(
 
     std::vector<NativeLayerState> next_memory;
     next_memory.reserve(current_memory.size());
-    auto first_level_normed = layer_with_val_norm(current_memory[0], val_norm_weights_leaves[0], val_norm_biases_leaves[0]);
     auto first_write_delta = low_rank_transition_pairwise_topk_signed_abs(
         torch::softplus(token_state),
         token_state,
         token_val_leaf,
         token_val_leaf,
-        first_level_normed.val,
+        current_memory[0].val,
         write_source_weights_leaves[0],
         write_target_weights_leaves[0],
         write_core_weights_leaves[0],
@@ -2436,10 +2416,9 @@ std::vector<torch::Tensor> causal_memory_scan_fused_backward_cuda(
         std::get<1>(first_write_delta),
         val_norm_weights_leaves[0],
         val_norm_biases_leaves[0]);
-    auto level_for_propagation = layer_with_val_norm(level, val_norm_weights_leaves[0], val_norm_biases_leaves[0]);
     auto first_prop_delta = low_rank_propagation_topk_signed_abs(
-        level_for_propagation.state,
-        level_for_propagation.val,
+        level.state,
+        level.val,
         propagation_source_weights_leaves[0],
         propagation_target_weights_leaves[0],
         propagation_core_weights_leaves[0],
@@ -2456,14 +2435,12 @@ std::vector<torch::Tensor> causal_memory_scan_fused_backward_cuda(
 
     for (size_t level_index = 1; level_index < current_memory.size(); ++level_index) {
       auto current_level = current_memory[level_index];
-      auto normalized_level = layer_with_val_norm(current_level, val_norm_weights_leaves[level_index], val_norm_biases_leaves[level_index]);
-      auto normalized_parent = layer_with_val_norm(next_memory[level_index - 1], level_norm_weights_leaves[level_index - 1], level_norm_biases_leaves[level_index - 1]);
       auto parent_delta = low_rank_transition_pairwise_topk_signed_abs(
-          torch::softplus(normalized_parent.state),
-          normalized_parent.state,
-          normalized_parent.val,
-          normalized_parent.val,
-          normalized_level.val,
+          torch::softplus(next_memory[level_index - 1].state),
+          next_memory[level_index - 1].state,
+          next_memory[level_index - 1].val,
+          next_memory[level_index - 1].val,
+          current_level.val,
           level_transition_source_weights_leaves[level_index - 1],
           level_transition_target_weights_leaves[level_index - 1],
           level_transition_core_weights_leaves[level_index - 1],
@@ -2484,7 +2461,7 @@ std::vector<torch::Tensor> causal_memory_scan_fused_backward_cuda(
             token_state,
             token_val_leaf,
             token_val_leaf,
-            normalized_level.val,
+            current_level.val,
             skip_source_weights_leaves[0],
             skip_target_weights_leaves[0],
             skip_core_weights_leaves[0],
@@ -2501,14 +2478,13 @@ std::vector<torch::Tensor> causal_memory_scan_fused_backward_cuda(
 
       if (level_index >= 2) {
         const auto skip_index = level_index - 1;
-        auto normalized_skip_source = layer_with_val_norm(next_memory[level_index - 2], level_norm_weights_leaves[level_index - 2], level_norm_biases_leaves[level_index - 2]);
-        auto skip_gate = torch::sigmoid(cast_tensor_like(skip_gates_leaves[skip_index], normalized_skip_source.val));
+        auto skip_gate = torch::sigmoid(cast_tensor_like(skip_gates_leaves[skip_index], next_memory[level_index - 2].val));
         auto skip_delta = low_rank_transition_pairwise_topk_signed_abs(
-            torch::softplus(normalized_skip_source.state),
-            normalized_skip_source.state,
-            normalized_skip_source.val,
-            normalized_skip_source.val,
-            normalized_level.val,
+            torch::softplus(next_memory[level_index - 2].state),
+            next_memory[level_index - 2].state,
+            next_memory[level_index - 2].val,
+            next_memory[level_index - 2].val,
+            current_level.val,
             skip_source_weights_leaves[skip_index],
             skip_target_weights_leaves[skip_index],
             skip_core_weights_leaves[skip_index],
@@ -2523,10 +2499,9 @@ std::vector<torch::Tensor> causal_memory_scan_fused_backward_cuda(
             val_norm_biases_leaves[level_index]);
       }
 
-      auto updated_level_for_prop = layer_with_val_norm(updated_level, val_norm_weights_leaves[level_index], val_norm_biases_leaves[level_index]);
       auto propagation_delta = low_rank_propagation_topk_signed_abs(
-          updated_level_for_prop.state,
-          updated_level_for_prop.val,
+          updated_level.state,
+          updated_level.val,
           propagation_source_weights_leaves[level_index],
           propagation_target_weights_leaves[level_index],
           propagation_core_weights_leaves[level_index],
