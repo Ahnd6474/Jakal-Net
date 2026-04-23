@@ -2997,16 +2997,16 @@ class Stage1CudaGraphRunner:
         warmup_stream = torch.cuda.Stream(device=self.static_batch.context.device)
         warmup_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(warmup_stream):
-            for _ in range(2):
-                self.model.zero_grad(set_to_none=True)
-                loss, _ = run_model_loss_tensor(
-                    self.model,
-                    self.static_batch,
-                    memory_state=self.static_memory_state,
-                    precision=self.precision,
-                )
-                loss.backward()
+            self.model.zero_grad(set_to_none=True)
+            loss, _ = run_model_loss_tensor(
+                self.model,
+                self.static_batch,
+                memory_state=self.static_memory_state,
+                precision=self.precision,
+            )
+            loss.backward()
         torch.cuda.current_stream().wait_stream(warmup_stream)
+        copy_memory_state_(self.static_memory_state, self.zero_memory_state)
         self.model.zero_grad(set_to_none=True)
         with torch.cuda.graph(self.graph):
             self.loss_tensor, self.output_memory_state = run_model_loss_tensor(
