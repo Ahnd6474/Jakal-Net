@@ -216,19 +216,12 @@ def apply_delta(
         val = updated.val
     elif residual:
         touched = delta.delta_val.detach().abs().amax(dim=-1) > 0
-        if touched.any():
-            flat_touched = touched.reshape(-1)
-            flat_input = updated.val.reshape(-1, updated.val.shape[-1])
-            flat_output = flat_input.clone()
-            selected = flat_input[flat_touched]
-            if val_norm is not None:
-                selected = val_norm(selected)
-            if unit_norm_values:
-                selected = unit_normalize_values(selected)
-            flat_output[flat_touched] = selected
-            val = flat_output.view_as(updated.val)
-        else:
-            val = updated.val
+        normalized_val = updated.val
+        if val_norm is not None:
+            normalized_val = val_norm(normalized_val)
+        if unit_norm_values:
+            normalized_val = unit_normalize_values(normalized_val)
+        val = torch.where(touched.unsqueeze(-1), normalized_val, updated.val)
     else:
         val = updated.val if val_norm is None else val_norm(updated.val)
         if unit_norm_values:
