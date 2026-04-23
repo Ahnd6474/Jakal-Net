@@ -68,6 +68,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
         max_seq_len: int = 2048,
         s_layers: int = 2,
         memory_slots: Sequence[int] = (256, 64, 16),
+        memory_update_intervals: Sequence[int] | None = None,
         prediction_layers: int = 2,
         s_window: int | None = None,
         s_microbatch_size: int | None = None,
@@ -174,6 +175,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
         self.b_module = BModule(
             dim=dim,
             memory_slots=self.memory_slots,
+            memory_update_intervals=memory_update_intervals,
             memory_topk=memory_topk,
             pairwise_kind=pairwise_kind,
             route_kind=route_kind,

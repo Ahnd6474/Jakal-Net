@@ -3112,6 +3112,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dim", type=int, default=512)
     parser.add_argument("--s-layers", type=int, default=2)
     parser.add_argument("--memory-slots", type=int, nargs="+", default=[256, 64, 16])
+    parser.add_argument("--memory-update-intervals", type=int, nargs="+")
     parser.add_argument("--prediction-layers", type=int, default=2)
     parser.add_argument("--s-window", type=int, default=256)
     parser.add_argument("--s-microbatch-size", type=int, default=0)
@@ -3722,6 +3723,7 @@ def main() -> None:
         max_seq_len=args.seq_len,
         s_layers=args.s_layers,
         memory_slots=tuple(args.memory_slots),
+        memory_update_intervals=None if args.memory_update_intervals is None else tuple(args.memory_update_intervals),
         prediction_layers=args.prediction_layers,
         s_window=args.s_window,
         s_microbatch_size=None if args.s_microbatch_size <= 0 else args.s_microbatch_size,
@@ -3779,7 +3781,7 @@ def main() -> None:
         f"model=causal_memory_doc | params={parameter_count:,} | dim={args.dim} | seq_len={args.seq_len} | "
         f"s_window={args.s_window} | s_microbatch_size={args.s_microbatch_size} | "
         f"scan_backend={args.scan_backend} | scan_checkpoint_chunk_size={args.scan_checkpoint_chunk_size} | "
-        f"memory_slots={args.memory_slots} | knowledge_nodes={args.knowledge_nodes} | "
+        f"memory_slots={args.memory_slots} | memory_update_intervals={args.memory_update_intervals} | knowledge_nodes={args.knowledge_nodes} | "
         f"unit_norm_values={args.unit_norm_values} | "
         f"optimizer={args.optimizer} | checkpoint_sequence={args.checkpoint_sequence_layers} | "
         f"checkpoint_prediction={args.checkpoint_prediction_layers}",

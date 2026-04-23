@@ -123,6 +123,7 @@ class BModule(nn.Module):
         *,
         dim: int,
         memory_slots: Sequence[int],
+        memory_update_intervals: Sequence[int] | None = None,
         memory_topk: int,
         pairwise_kind: str,
         route_kind: str,
@@ -146,11 +147,18 @@ class BModule(nn.Module):
             raise ValueError("memory_slots must contain at least one level.")
         if any(slots <= 0 for slots in memory_slots):
             raise ValueError("memory_slots must be positive.")
+        if memory_update_intervals is None:
+            memory_update_intervals = tuple(2**level_index for level_index in range(len(memory_slots)))
+        if len(memory_update_intervals) != len(memory_slots):
+            raise ValueError("memory_update_intervals must match memory_slots length.")
+        if any(interval <= 0 for interval in memory_update_intervals):
+            raise ValueError("memory_update_intervals must be positive.")
         if memory_topk <= 0:
             raise ValueError("memory_topk must be positive.")
 
         self.dim = dim
         self.memory_slots = tuple(int(slots) for slots in memory_slots)
+        self.memory_update_intervals = tuple(int(interval) for interval in memory_update_intervals)
         self.num_memory_levels = len(self.memory_slots)
         self.unit_norm_values = unit_norm_values
 
@@ -316,6 +324,8 @@ class BModule(nn.Module):
         self,
         token_layer: Layer,
         memory_state: Sequence[Layer],
+        *,
+        time_index: int,
     ) -> tuple[Layer, ...]:
         next_levels: list[Layer] = []
         first_level_module = self.memory_levels[0]
@@ -352,6 +362,9 @@ class BModule(nn.Module):
         for level_index in range(1, self.num_memory_levels):
             level_module = self.memory_levels[level_index]
             level = memory_state[level_index]
+            if (time_index + 1) % self.memory_update_intervals[level_index] != 0:
+                next_levels.append(level)
+                continue
             parent = next_levels[level_index - 1]
             normalized_level = layer_with_val_norm(
                 level,
@@ -536,7 +549,7 @@ class BModule(nn.Module):
                 state=state_projection(token_val).squeeze(-1),
                 val=token_val,
             )
-            current_memory = self.update(token_layer, current_memory)
+            current_memory = self.update(token_layer, current_memory, time_index=time_index)
             bridge_layer = self.build_bridge_layer(
                 current_memory,
                 state_projection=state_projection,
