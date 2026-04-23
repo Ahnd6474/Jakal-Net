@@ -3038,6 +3038,72 @@ class Stage1CudaGraphRunner:
         )
 
 
+class Stage1ForwardCudaGraphRunner:
+    def __init__(
+        self,
+        *,
+        model: CausalHierarchicalMemoryLM,
+        batch: DocumentBatch,
+        precision: str,
+    ) -> None:
+        if batch.context.device.type != "cuda":
+            raise ValueError("CUDA graph runner requires CUDA tensors.")
+        self.model = model
+        self.precision = precision
+        self.static_batch = make_static_document_batch(batch)
+        copy_document_batch_(self.static_batch, batch)
+        zero_memory = model.initialize_memory_state(
+            batch.context.shape[0],
+            device=batch.context.device,
+            dtype=model.s_module.token_embedding.weight.dtype,
+        )
+        self.zero_memory_state = clone_memory_state(zero_memory)
+        self.static_memory_state = clone_memory_state(zero_memory)
+        self.graph = torch.cuda.CUDAGraph()
+        self.loss_tensor: torch.Tensor | None = None
+        self.output_memory_state: Any | None = None
+        self._capture()
+
+    def _capture(self) -> None:
+        warmup_stream = torch.cuda.Stream(device=self.static_batch.context.device)
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            _ = run_model_loss_tensor(
+                self.model,
+                self.static_batch,
+                memory_state=self.static_memory_state,
+                precision=self.precision,
+            )
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+        copy_memory_state_(self.static_memory_state, self.zero_memory_state)
+        with torch.cuda.graph(self.graph):
+            self.loss_tensor, self.output_memory_state = run_model_loss_tensor(
+                self.model,
+                self.static_batch,
+                memory_state=self.static_memory_state,
+                precision=self.precision,
+            )
+
+    def replay(
+        self,
+        batch: DocumentBatch,
+        *,
+        memory_state: Any | None,
+    ) -> tuple[torch.Tensor, float, Any | None]:
+        copy_document_batch_(self.static_batch, batch)
+        if memory_state is None:
+            copy_memory_state_(self.static_memory_state, self.zero_memory_state)
+        else:
+            copy_memory_state_(self.static_memory_state, memory_state)
+        self.graph.replay()
+        assert self.loss_tensor is not None
+        return (
+            self.loss_tensor,
+            float(self.loss_tensor.detach().item()),
+            detach_memory_state(self.output_memory_state),
+        )
+
+
 def run_rnn_aux_model(
     model: CausalHierarchicalMemoryLM,
     rnn_aux_head: SharedEmbeddingRnnAuxHead,
@@ -4186,7 +4252,7 @@ def main() -> None:
         rnn_prefetcher = None
         print("rnn_pretrain | complete", flush=True)
 
-    stage1_cuda_graph_runner: Stage1CudaGraphRunner | None = None
+    stage1_cuda_graph_runner: Stage1CudaGraphRunner | Stage1ForwardCudaGraphRunner | None = None
 
     for step in range(start_step + 1, total_steps + 1):
         stage = resolve_curriculum_stage(
@@ -4312,16 +4378,26 @@ def main() -> None:
                     stage1_cuda_graph_runner is None
                     or tuple(stage1_cuda_graph_runner.static_batch.context.shape) != tuple(batch.context.shape)
                 ):
-                    stage1_cuda_graph_runner = Stage1CudaGraphRunner(
-                        model=model,
-                        batch=batch,
-                        precision=args.precision,
-                    )
+                    try:
+                        stage1_cuda_graph_runner = Stage1CudaGraphRunner(
+                            model=model,
+                            batch=batch,
+                            precision=args.precision,
+                        )
+                        print("cuda_graph | mode=forward_backward", flush=True)
+                    except RuntimeError as exc:
+                        print(f"cuda_graph | forward_backward_capture_failed | falling back to forward_only | {exc}", flush=True)
+                        stage1_cuda_graph_runner = Stage1ForwardCudaGraphRunner(
+                            model=model,
+                            batch=batch,
+                            precision=args.precision,
+                        )
+                        print("cuda_graph | mode=forward_only", flush=True)
                 loss, main_loss_value, next_memory_state = stage1_cuda_graph_runner.replay(
                     batch,
                     memory_state=current_memory_state,
                 )
-                used_cuda_graph = True
+                used_cuda_graph = isinstance(stage1_cuda_graph_runner, Stage1CudaGraphRunner)
             else:
                 loss, main_loss_value, next_memory_state = run_model(
                     model,
