@@ -799,6 +799,20 @@ def _native_scan_signed_abs_softmax(scores: Tensor) -> Tensor:
     return torch.nan_to_num(torch.sign(clean_scores) * torch.softmax(clean_scores.abs(), dim=-1))
 
 
+def _native_scan_value_to_state(
+    val: Tensor,
+    weight: Tensor,
+    packed_bias: Tensor,
+) -> Tensor:
+    if weight.numel() == 0:
+        return torch.linalg.vector_norm(val, ord=2, dim=-1)
+    return F.linear(
+        val,
+        weight.to(dtype=val.dtype),
+        None if packed_bias.numel() == 0 else packed_bias.to(dtype=val.dtype),
+    ).squeeze(-1)
+
+
 def _native_scan_pairwise_scores(
     pairwise_kind: str,
     src_val: Tensor,
@@ -1078,11 +1092,11 @@ def _causal_memory_scan_fused_reference(
 
     for time_index in range(aligned_s.shape[1]):
         token_val = aligned_s[:, time_index : time_index + 1, :]
-        token_state = F.linear(
+        token_state = _native_scan_value_to_state(
             token_val,
-            args["value_to_state_weight"].to(dtype=token_val.dtype),
-            None if value_to_state_bias is None else value_to_state_bias.to(dtype=token_val.dtype),
-        ).squeeze(-1)
+            args["value_to_state_weight"],
+            args["value_to_state_bias"],
+        )
         next_memory: list[tuple[Tensor, Tensor]] = []
 
         first_normed_val = _native_scan_layer_norm(

@@ -16,7 +16,12 @@ from train_causal_memory_lm import (  # noqa: E402
     save_pretokenized_bundle,
 )
 
-from jakal_net.causal_memory_lm import CausalHierarchicalMemoryLM, MemoryScanOutput, ModelRecurrentState  # noqa: E402
+from jakal_net.causal_memory_lm import (  # noqa: E402
+    CausalHierarchicalMemoryLM,
+    MemoryScanOutput,
+    ModelRecurrentState,
+    ValueNormStateProjection,
+)
 from jakal_net.latent_graph import KModule  # noqa: E402
 from jakal_net.native_backend import _native_scan_uses_legacy_low_rank_extension  # noqa: E402
 
@@ -180,6 +185,14 @@ class CausalMemoryLMTests(unittest.TestCase):
         )
 
         self.assertTrue(model._native_scan_supported_config())
+
+    def test_value_norm_state_projection_uses_vector_norm(self) -> None:
+        projection = ValueNormStateProjection()
+        val = torch.tensor([[[3.0, 4.0], [5.0, 12.0]]])
+
+        state = projection(val)
+
+        self.assertTrue(torch.allclose(state, torch.tensor([[[5.0], [13.0]]])))
 
     def test_multi_head_low_rank_scan_uses_legacy_extension_path(self) -> None:
         self.assertTrue(

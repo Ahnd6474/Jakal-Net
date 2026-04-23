@@ -111,12 +111,13 @@ class SModule(nn.Module):
         *,
         state_projection: nn.Module,
     ) -> Layer:
+        token_state_source = token_val
         if self.unit_norm_values:
             token_val = unit_normalize_values(token_val)
         return Layer(
             dim=self.dim,
             num_nodes=token_val.shape[-2],
-            state=state_projection(token_val).squeeze(-1),
+            state=state_projection(token_state_source).squeeze(-1),
             val=token_val,
         )
 
@@ -142,6 +143,7 @@ class SModule(nn.Module):
             dtype=token_val.dtype,
         ).unsqueeze(0)
         token_val = self.sequence_input_norm(token_val)
+        token_state_source = token_val
         if self.unit_norm_values:
             token_val = unit_normalize_values(token_val)
 
@@ -156,7 +158,7 @@ class SModule(nn.Module):
             dtype=token_val.dtype,
         )
         seq_val = torch.cat((anchor_val, token_val), dim=1)
-        seq_state = torch.cat((anchor_state, state_projection(token_val).squeeze(-1)), dim=1)
+        seq_state = torch.cat((anchor_state, state_projection(token_state_source).squeeze(-1)), dim=1)
         layer = Layer(dim=self.dim, num_nodes=seq_len + 1, state=seq_state, val=seq_val)
         for propagation, norm in zip(self.sequence_layers, self.sequence_norms):
             if self.checkpoint_sequence_layers and torch.is_grad_enabled():

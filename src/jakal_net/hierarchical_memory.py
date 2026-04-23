@@ -453,9 +453,10 @@ class BModule(nn.Module):
     ) -> Layer:
         summary = self.read(memory_state) if bridge_val is None else bridge_val
         bridge_val_tensor = self.bridge_input_norm(summary).unsqueeze(-2)
+        bridge_state_source = bridge_val_tensor
         if self.unit_norm_values:
             bridge_val_tensor = unit_normalize_values(bridge_val_tensor)
-        bridge_state = state_projection(bridge_val_tensor).squeeze(-1)
+        bridge_state = state_projection(bridge_state_source).squeeze(-1)
         return Layer(dim=self.dim, num_nodes=1, state=bridge_state, val=bridge_val_tensor)
 
     def inject_bridge(
@@ -497,6 +498,7 @@ class BModule(nn.Module):
         current_memory = tuple(memory_state)
         projected_s = query_projection(aligned_s)
         query_steps: list[Tensor] = []
+        query_state_steps: list[Tensor] = []
         latest_bridge_layer: Layer | None = None
         latest_knowledge_output: Any | None = None
 
@@ -537,12 +539,13 @@ class BModule(nn.Module):
             latest_bridge_layer = bridge_layer
             read_vector = self.read(current_memory)
             query_step = query_input_norm(projected_s[:, time_index, :] + read_vector)
+            query_state_steps.append(query_step)
             if self.unit_norm_values:
                 query_step = unit_normalize_values(query_step)
             query_steps.append(query_step)
 
         query_val = torch.stack(query_steps, dim=1)
-        query_state = state_projection(query_val).squeeze(-1)
+        query_state = state_projection(torch.stack(query_state_steps, dim=1)).squeeze(-1)
         return BScanOutput(
             query_layer=Layer(dim=self.dim, num_nodes=seq_len, state=query_state, val=query_val),
             memory_state=current_memory,

@@ -1946,6 +1946,16 @@ torch::Tensor scan_cuda_linear3d(
   return output;
 }
 
+torch::Tensor scan_cuda_value_to_state3d(
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias) {
+  if (!weight.defined() || weight.numel() == 0) {
+    return torch::linalg_vector_norm(input, 2, std::vector<int64_t>{-1}, false);
+  }
+  return scan_cuda_linear3d(input, weight, bias).squeeze(-1);
+}
+
 torch::Tensor scan_cuda_linear2d(
     const torch::Tensor& input,
     const torch::Tensor& weight,
@@ -2549,7 +2559,7 @@ scan_cuda_forward_impl(
       }
     }
     auto token_val = aligned_s.slice(1, time_index, time_index + 1);
-    auto token_state = scan_cuda_linear3d(token_val, value_to_state_weight, value_to_state_bias).squeeze(-1);
+    auto token_state = scan_cuda_value_to_state3d(token_val, value_to_state_weight, value_to_state_bias);
     ScanCudaLayerState token_layer{token_state, token_val};
 
     std::vector<ScanCudaLayerState> next_memory;
@@ -3059,10 +3069,10 @@ std::vector<torch::Tensor> jakal_net_causal_memory_scan_fused_backward_cuda(
       current_memory_leaves.push_back(val_leaf);
     }
 
-    auto token_state = scan_cuda_linear3d(
+    auto token_state = scan_cuda_value_to_state3d(
         token_val_leaf,
         value_to_state_weight_leaf,
-        value_to_state_bias_leaf).squeeze(-1);
+        value_to_state_bias_leaf);
     auto projected_s_t = scan_cuda_linear3d(token_val_leaf, s_prediction_weight_leaf, torch::Tensor()).squeeze(1);
 
     std::vector<ScanCudaLayerState> next_memory;

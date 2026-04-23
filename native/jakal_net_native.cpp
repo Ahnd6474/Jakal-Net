@@ -360,6 +360,16 @@ torch::Tensor linear3d(
   return output;
 }
 
+torch::Tensor value_to_state3d(
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    const c10::optional<torch::Tensor>& bias) {
+  if (!weight.defined() || weight.numel() == 0) {
+    return torch::linalg_vector_norm(input, 2, std::vector<int64_t>{-1}, false);
+  }
+  return linear3d(input, weight, bias).squeeze(-1);
+}
+
 torch::Tensor linear4d(
     const torch::Tensor& input,
     const torch::Tensor& weight,
@@ -1401,7 +1411,7 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> causal_memory_scan_fused(
 
   for (int64_t time_index = 0; time_index < aligned_s.size(1); ++time_index) {
     auto token_val = aligned_s.slice(1, time_index, time_index + 1);
-    auto token_state = linear3d(token_val, value_to_state_weight, cast_optional_like(value_to_state_bias, token_val)).squeeze(-1);
+    auto token_state = value_to_state3d(token_val, value_to_state_weight, cast_optional_like(value_to_state_bias, token_val));
     NativeLayerState token_layer{token_state, token_val};
 
     std::vector<NativeLayerState> next_memory;
@@ -1700,7 +1710,7 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>, std::vector<torch::Tensor>
       trace_vals[trace_index].push_back(current_memory[trace_index].val);
     }
     auto token_val = aligned_s.slice(1, time_index, time_index + 1);
-    auto token_state = linear3d(token_val, value_to_state_weight, cast_optional_like(value_to_state_bias, token_val)).squeeze(-1);
+    auto token_state = value_to_state3d(token_val, value_to_state_weight, cast_optional_like(value_to_state_bias, token_val));
     NativeLayerState token_layer{token_state, token_val};
 
     std::vector<NativeLayerState> next_memory;
@@ -1984,7 +1994,7 @@ causal_memory_scan_fused_checkpoints(
     }
 
     auto token_val = aligned_s.slice(1, time_index, time_index + 1);
-    auto token_state = linear3d(token_val, value_to_state_weight, cast_optional_like(value_to_state_bias, token_val)).squeeze(-1);
+    auto token_state = value_to_state3d(token_val, value_to_state_weight, cast_optional_like(value_to_state_bias, token_val));
     NativeLayerState token_layer{token_state, token_val};
 
     std::vector<NativeLayerState> next_memory;
@@ -2406,10 +2416,10 @@ std::vector<torch::Tensor> causal_memory_scan_fused_backward_cuda(
       current_memory_leaves.push_back(val_leaf);
     }
 
-    auto token_state = linear3d(
+    auto token_state = value_to_state3d(
         token_val_leaf,
         value_to_state_weight_leaf,
-        cast_packed_optional_like(value_to_state_bias_leaf, token_val_leaf)).squeeze(-1);
+        cast_packed_optional_like(value_to_state_bias_leaf, token_val_leaf));
     auto projected_s_t = linear3d(token_val_leaf, s_prediction_weight_leaf, c10::nullopt).squeeze(1);
 
     std::vector<NativeLayerState> next_memory;

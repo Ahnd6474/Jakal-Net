@@ -58,6 +58,15 @@ class MemoryScanOutput:
         )
 
 
+class ValueNormStateProjection(nn.Module):
+    def __init__(self, *, eps: float = 1e-8) -> None:
+        super().__init__()
+        self.eps = float(eps)
+
+    def forward(self, val: Tensor) -> Tensor:
+        return torch.linalg.vector_norm(val, ord=2, dim=-1, keepdim=True).clamp_min(self.eps)
+
+
 class CausalHierarchicalMemoryLM(nn.Module):
     def __init__(
         self,
@@ -153,7 +162,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
             )
         self.knowledge_module = knowledge_module
 
-        self.value_to_state = nn.Linear(dim, 1)
+        self.value_to_state = ValueNormStateProjection()
         self.s_module = SModule(
             vocab_size=vocab_size,
             dim=dim,
@@ -225,9 +234,6 @@ class CausalHierarchicalMemoryLM(nn.Module):
         nn.init.normal_(self.s_module.token_embedding.weight, mean=0.0, std=PARAM_INIT_STD)
         nn.init.normal_(self.s_module.anchor_val, mean=0.0, std=PARAM_INIT_STD)
         nn.init.zeros_(self.s_module.anchor_state)
-        nn.init.zeros_(self.value_to_state.weight)
-        if self.value_to_state.bias is not None:
-            nn.init.zeros_(self.value_to_state.bias)
         init_linear(self.s_prediction_proj)
         self.b_module.reset_projection_parameters()
         if not tie_embedding_head:
@@ -316,11 +322,17 @@ class CausalHierarchicalMemoryLM(nn.Module):
                     unit_norm_values=self.unit_norm_values,
                 )
 
-        output_val = self.output_norm(query_layer.val)
+        output_state_source = self.output_norm(query_layer.val)
+        output_val = output_state_source
         if self.unit_norm_values:
             output_val = unit_normalize_values(output_val)
             query_layer = query_layer.with_tensors(
-                state=self.value_to_state(output_val).squeeze(-1),
+                state=self.value_to_state(output_state_source).squeeze(-1),
+                val=output_val,
+            )
+        else:
+            query_layer = query_layer.with_tensors(
+                state=self.value_to_state(output_state_source).squeeze(-1),
                 val=output_val,
             )
         logits = self.lm_head(output_val)
@@ -419,7 +431,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
                 and self._native_edge_compress_name(propagation.edge_compress_fn) in supported_edge_compress
             )
 
-        if not isinstance(self.value_to_state, nn.Linear):
+        if not isinstance(self.value_to_state, (nn.Linear, ValueNormStateProjection)):
             return False
         if not all(_is_supported_route(level.write) for level in self.b_module.memory_levels):
             return False
@@ -555,8 +567,16 @@ class CausalHierarchicalMemoryLM(nn.Module):
         return {
             "aligned_s": aligned_s,
             "flat_memory": self.b_module.flatten_memory_state(tuple(memory_state)),
-            "value_to_state_weight": self.value_to_state.weight,
-            "value_to_state_bias": self.value_to_state.bias,
+            "value_to_state_weight": (
+                self.value_to_state.weight
+                if isinstance(self.value_to_state, nn.Linear)
+                else aligned_s.new_empty((0,))
+            ),
+            "value_to_state_bias": (
+                self.value_to_state.bias
+                if isinstance(self.value_to_state, nn.Linear)
+                else None
+            ),
             "s_prediction_weight": self.s_prediction_proj.weight,
             "prediction_input_norm_weight": self.prediction_input_norm.weight,
             "prediction_input_norm_bias": self.prediction_input_norm.bias,
@@ -601,9 +621,10 @@ class CausalHierarchicalMemoryLM(nn.Module):
     ) -> BScanOutput:
         packed = self._pack_native_scan_inputs(aligned_s, memory_state)
         query_val, flat_memory = causal_memory_scan_fused_native(**packed)
+        query_state_source = query_val
         if self.unit_norm_values:
             query_val = unit_normalize_values(query_val)
-        query_state = self.value_to_state(query_val).squeeze(-1)
+        query_state = self.value_to_state(query_state_source).squeeze(-1)
         next_memory = self.b_module.unflatten_memory_state(flat_memory)
         if self.unit_norm_values:
             next_memory = self.b_module.unit_normalize_memory_values(next_memory)
