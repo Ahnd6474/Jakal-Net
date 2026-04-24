@@ -212,6 +212,30 @@ class CausalMemoryLMTests(unittest.TestCase):
 
         self.assertTrue(model._native_scan_supported_config())
 
+    def test_diagonal_anchor_heads_are_supported_by_native_fused_wrapper(self) -> None:
+        model = CausalHierarchicalMemoryLM(
+            vocab_size=64,
+            dim=16,
+            max_seq_len=16,
+            s_layers=1,
+            memory_slots=(8, 4, 2),
+            prediction_layers=1,
+            memory_topk=2,
+            pairwise_kind="diagonal_bilinear",
+            route_kind="diagonal_bilinear",
+            pairwise_rank=8,
+            route_rank=8,
+            pairwise_heads=4,
+            route_heads=4,
+            pairwise_anchor_heads=1,
+            route_anchor_heads=1,
+            pairwise_anchor_kind="diagonal_bilinear",
+            route_anchor_kind="diagonal_bilinear",
+            scan_backend="native",
+        )
+
+        self.assertTrue(model._native_scan_supported_config())
+
     def test_value_norm_state_projection_uses_vector_norm(self) -> None:
         projection = ValueNormStateProjection()
         val = torch.tensor([[[3.0, 4.0], [5.0, 12.0]]])
