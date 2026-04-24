@@ -86,6 +86,16 @@ def _make_anchor_pairwise(
         return ScaledCosinePairwise(dim=dim)
     if kind == "diagonal_bilinear":
         return _freeze_module_parameters(DiagonalBilinearPairwise(dim=dim))
+    if kind == "constant_one":
+        module = LowRankBilinearPairwise(dim=dim, rank=rank, bias=True)
+        module._constant_one_anchor = True
+        with torch.no_grad():
+            module.source_proj.weight.zero_()
+            module.target_proj.weight.zero_()
+            module.weight.fill_(1.0)
+            assert module.bias is not None
+            module.bias.fill_(1.0)
+        return _freeze_module_parameters(module)
     raise ValueError(f"Unsupported pairwise anchor kind: {kind!r}.")
 
 
@@ -161,6 +171,16 @@ def _make_anchor_route(
         return FixedProjectionRoute(src_dim=dim, dst_dim=dim, proj_dim=rank)
     if kind == "query_norm_dot":
         return QueryNormalizedDotRoute(src_dim=dim, dst_dim=dim)
+    if kind == "constant_one":
+        module = LowRankBilinearRoute(src_dim=dim, dst_dim=dim, rank=rank, bias=True)
+        module._constant_one_anchor = True
+        with torch.no_grad():
+            module.source_proj.weight.zero_()
+            module.target_proj.weight.zero_()
+            module.weight.fill_(1.0)
+            assert module.bias is not None
+            module.bias.fill_(1.0)
+        return _freeze_module_parameters(module)
     raise ValueError(f"Unsupported route anchor kind: {kind!r}.")
 
 
@@ -271,6 +291,8 @@ def init_linear(linear: nn.Linear, *, std: float = PARAM_INIT_STD) -> None:
 
 
 def init_pairwise_or_route_scales(module: nn.Module) -> None:
+    if getattr(module, "_constant_one_anchor", False):
+        return
     if isinstance(module, (LowRankBilinearPairwise, LowRankBilinearRoute)):
         module.weight.data.fill_(LOW_RANK_SCALE_INIT)
         init_linear(module.source_proj)

@@ -235,6 +235,50 @@ class CausalMemoryLMTests(unittest.TestCase):
         )
 
         self.assertTrue(model._native_scan_supported_config())
+        self.assertFalse(
+            _native_scan_uses_legacy_low_rank_extension(
+                "multihead_max_diagonal_bilinear_route",
+                "multihead_max_diagonal_bilinear",
+            )
+        )
+
+    def test_constant_one_anchor_heads_stay_on_low_rank_native_path(self) -> None:
+        model = CausalHierarchicalMemoryLM(
+            vocab_size=64,
+            dim=16,
+            max_seq_len=16,
+            s_layers=1,
+            memory_slots=(8, 4, 2),
+            prediction_layers=1,
+            memory_topk=2,
+            pairwise_rank=8,
+            route_rank=8,
+            pairwise_heads=4,
+            route_heads=4,
+            pairwise_anchor_heads=1,
+            route_anchor_heads=1,
+            pairwise_anchor_kind="constant_one",
+            route_anchor_kind="constant_one",
+            scan_backend="native",
+        )
+        aligned_s = torch.randn(2, 4, 16)
+        memory_state = model.initialize_memory_state(2, device=aligned_s.device, dtype=aligned_s.dtype)
+
+        packed = model._pack_native_scan_inputs(aligned_s, memory_state)
+
+        self.assertTrue(model._native_scan_supported_config())
+        self.assertEqual(packed["route_kind_name"], "multihead_max_low_rank_bilinear_route")
+        self.assertEqual(packed["propagation_pairwise_kind"], "multihead_max_low_rank_bilinear")
+        self.assertTrue(
+            _native_scan_uses_legacy_low_rank_extension(
+                packed["route_kind_name"],
+                packed["propagation_pairwise_kind"],
+            )
+        )
+        write_source = packed["write_source_weights"][0]
+        write_source_by_head = write_source.reshape(write_source.shape[0], -1).abs().amax(dim=1)
+        self.assertTrue(torch.any(write_source_by_head == 0).item())
+        self.assertTrue(torch.any(torch.isclose(packed["write_biases"][0].reshape(-1), torch.ones(()))).item())
 
     def test_value_norm_state_projection_uses_vector_norm(self) -> None:
         projection = ValueNormStateProjection()

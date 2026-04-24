@@ -182,12 +182,6 @@ def _native_scan_uses_legacy_low_rank_extension(
     ) or (
         route_kind_name == "multihead_max_low_rank_bilinear_route"
         and propagation_pairwise_kind == "multihead_max_low_rank_bilinear"
-    ) or (
-        route_kind_name == "diagonal_bilinear_route"
-        and propagation_pairwise_kind == "diagonal_bilinear"
-    ) or (
-        route_kind_name == "multihead_max_diagonal_bilinear_route"
-        and propagation_pairwise_kind == "multihead_max_diagonal_bilinear"
     )
 
 
@@ -537,7 +531,11 @@ def causal_memory_scan_fused_native(
         skip_gates=skip_gates,
         skip_topks=skip_topks,
     )
-    if torch.is_grad_enabled() and _experimental_fused_training_enabled():
+    if (
+        torch.is_grad_enabled()
+        and _experimental_fused_training_enabled()
+        and _native_scan_uses_legacy_low_rank_extension(route_kind_name, propagation_pairwise_kind)
+    ):
         outputs = _CausalMemoryScanFusedFunction.apply(*tensor_args, *meta_args)
         return outputs[0], tuple(outputs[1:])
 
@@ -1343,10 +1341,7 @@ def _causal_memory_scan_fused_native_forward(
     propagation_compress_name: str,
 ) -> tuple[Tensor, tuple[Tensor, ...]]:
     args = _unpack_causal_memory_scan_tensor_args(tensor_args, num_levels)
-    if (
-        (route_kind_name.startswith("multihead_max_") or propagation_pairwise_kind.startswith("multihead_max_"))
-        and not _native_scan_uses_legacy_low_rank_extension(route_kind_name, propagation_pairwise_kind)
-    ):
+    if not _native_scan_uses_legacy_low_rank_extension(route_kind_name, propagation_pairwise_kind):
         return _causal_memory_scan_fused_reference(
             tensor_args,
             num_levels=num_levels,
@@ -1357,88 +1352,45 @@ def _causal_memory_scan_fused_native_forward(
             route_kind_name=route_kind_name,
             propagation_pairwise_kind=propagation_pairwise_kind,
         )
-    if _native_scan_uses_legacy_low_rank_extension(route_kind_name, propagation_pairwise_kind):
-        result = _native_module().causal_memory_scan_fused(
-            args["aligned_s"],
-            list(args["flat_memory"]),
-            args["value_to_state_weight"],
-            _load_optional_tensor(args["value_to_state_bias"]),
-            args["s_prediction_weight"],
-            args["prediction_input_norm_weight"],
-            _load_optional_tensor(args["prediction_input_norm_bias"]),
-            args["read_template_val"],
-            list(args["read_projection_weights"]),
-            list(args["read_gates"]),
-            list(args["write_source_weights"]),
-            list(args["write_target_weights"]),
-            list(args["write_core_weights"]),
-            list(args["write_biases"]),
-            list(write_topks),
-            transition_compress_name,
-            list(args["propagation_source_weights"]),
-            list(args["propagation_target_weights"]),
-            list(args["propagation_core_weights"]),
-            list(args["propagation_biases"]),
-            list(propagation_topks),
-            propagation_compress_name,
-            list(args["val_norm_weights"]),
-            list(args["val_norm_biases"]),
-            list(args["level_transition_source_weights"]),
-            list(args["level_transition_target_weights"]),
-            list(args["level_transition_core_weights"]),
-            list(args["level_transition_biases"]),
-            list(level_transition_topks),
-            list(args["level_norm_weights"]),
-            list(args["level_norm_biases"]),
-            list(args["skip_source_weights"]),
-            list(args["skip_target_weights"]),
-            list(args["skip_core_weights"]),
-            list(args["skip_biases"]),
-            list(args["skip_gates"]),
-            list(skip_topks),
-        )
-    else:
-        result = _native_module().causal_memory_scan_fused(
-            args["aligned_s"],
-            list(args["flat_memory"]),
-            args["value_to_state_weight"],
-            _load_optional_tensor(args["value_to_state_bias"]),
-            args["s_prediction_weight"],
-            args["prediction_input_norm_weight"],
-            _load_optional_tensor(args["prediction_input_norm_bias"]),
-            args["read_template_val"],
-            list(args["read_projection_weights"]),
-            list(args["read_gates"]),
-            list(args["write_source_weights"]),
-            list(args["write_target_weights"]),
-            list(args["write_core_weights"]),
-            list(args["write_biases"]),
-            list(write_topks),
-            route_kind_name,
-            transition_compress_name,
-            list(args["propagation_source_weights"]),
-            list(args["propagation_target_weights"]),
-            list(args["propagation_core_weights"]),
-            list(args["propagation_biases"]),
-            list(propagation_topks),
-            propagation_pairwise_kind,
-            propagation_compress_name,
-            list(args["val_norm_weights"]),
-            list(args["val_norm_biases"]),
-            list(args["level_transition_source_weights"]),
-            list(args["level_transition_target_weights"]),
-            list(args["level_transition_core_weights"]),
-            list(args["level_transition_biases"]),
-            list(level_transition_topks),
-            list(args["level_norm_weights"]),
-            list(args["level_norm_biases"]),
-            list(args["skip_source_weights"]),
-            list(args["skip_target_weights"]),
-            list(args["skip_core_weights"]),
-            list(args["skip_biases"]),
-            list(args["skip_gates"]),
-            list(skip_topks),
-        )
+    result = _native_module().causal_memory_scan_fused(
+        args["aligned_s"],
+        list(args["flat_memory"]),
+        args["value_to_state_weight"],
+        _load_optional_tensor(args["value_to_state_bias"]),
+        args["s_prediction_weight"],
+        args["prediction_input_norm_weight"],
+        _load_optional_tensor(args["prediction_input_norm_bias"]),
+        args["read_template_val"],
+        list(args["read_projection_weights"]),
+        list(args["read_gates"]),
+        list(args["write_source_weights"]),
+        list(args["write_target_weights"]),
+        list(args["write_core_weights"]),
+        list(args["write_biases"]),
+        list(write_topks),
+        transition_compress_name,
+        list(args["propagation_source_weights"]),
+        list(args["propagation_target_weights"]),
+        list(args["propagation_core_weights"]),
+        list(args["propagation_biases"]),
+        list(propagation_topks),
+        propagation_compress_name,
+        list(args["val_norm_weights"]),
+        list(args["val_norm_biases"]),
+        list(args["level_transition_source_weights"]),
+        list(args["level_transition_target_weights"]),
+        list(args["level_transition_core_weights"]),
+        list(args["level_transition_biases"]),
+        list(level_transition_topks),
+        list(args["level_norm_weights"]),
+        list(args["level_norm_biases"]),
+        list(args["skip_source_weights"]),
+        list(args["skip_target_weights"]),
+        list(args["skip_core_weights"]),
+        list(args["skip_biases"]),
+        list(args["skip_gates"]),
+        list(skip_topks),
+    )
     if not isinstance(result, tuple) or len(result) != 2:
         raise TypeError("causal_memory_scan_fused must return (query_val, flat_memory_tensors).")
     query_val, next_memory = result
@@ -1596,14 +1548,12 @@ def _causal_memory_scan_fused_backward_cuda(
         list(args["write_core_weights"]),
         list(args["write_biases"]),
         list(write_topks),
-        route_kind_name,
         transition_compress_name,
         list(args["propagation_source_weights"]),
         list(args["propagation_target_weights"]),
         list(args["propagation_core_weights"]),
         list(args["propagation_biases"]),
         list(propagation_topks),
-        propagation_pairwise_kind,
         propagation_compress_name,
         list(args["val_norm_weights"]),
         list(args["val_norm_biases"]),
@@ -1758,10 +1708,8 @@ class _CausalMemoryScanFusedFunction(Function):
         checkpoint_stride = _experimental_fused_training_checkpoint_stride(tensor_args[0].shape[1])
         checkpoint_tensors: tuple[Tensor, ...] = ()
         trace_tensors: tuple[Tensor, ...] = ()
-        multihead_scan = (
-            route_kind_name.startswith("multihead_max_") or propagation_pairwise_kind.startswith("multihead_max_")
-        ) and not _native_scan_uses_legacy_low_rank_extension(route_kind_name, propagation_pairwise_kind)
-        if not multihead_scan and checkpoint_stride is not None and checkpoint_stride < tensor_args[0].shape[1]:
+        legacy_scan = _native_scan_uses_legacy_low_rank_extension(route_kind_name, propagation_pairwise_kind)
+        if legacy_scan and checkpoint_stride is not None and checkpoint_stride < tensor_args[0].shape[1]:
             query_val, next_memory, checkpoint_tensors = _causal_memory_scan_fused_native_forward_with_checkpoints(
                 *tensor_args,
                 num_levels=num_levels,
@@ -1776,7 +1724,7 @@ class _CausalMemoryScanFusedFunction(Function):
                 checkpoint_stride=checkpoint_stride,
             )
         elif (
-            not multihead_scan
+            legacy_scan
             and _experimental_scan_backward_cuda_enabled()
             and native_supports("causal_memory_scan_fused_backward_cuda")
             and tensor_args[0].is_cuda
@@ -1878,6 +1826,7 @@ class _CausalMemoryScanFusedFunction(Function):
             and native_supports("causal_memory_scan_fused_backward_cuda")
             and tensor_args[0].is_cuda
             and not stream_capturing
+            and _native_scan_uses_legacy_low_rank_extension(ctx.route_kind_name, ctx.propagation_pairwise_kind)
         ):
             if grad_outputs[0] is None:
                 with torch.no_grad():
