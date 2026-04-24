@@ -2571,6 +2571,8 @@ def compute_learning_rate(
     warmup_start_lr: float,
     warmup_steps: int,
     min_ratio: float,
+    decay_start_step: int = -1,
+    decay_steps: int = 0,
 ) -> float:
     if total_steps <= 1:
         return base_lr
@@ -2579,6 +2581,13 @@ def compute_learning_rate(
             return base_lr
         progress = max(0.0, min(1.0, (step - 1) / (warmup_steps - 1)))
         return warmup_start_lr + progress * (base_lr - warmup_start_lr)
+    if decay_start_step >= 0:
+        if step <= decay_start_step:
+            return base_lr
+        denom = max(1, decay_steps if decay_steps > 0 else total_steps - decay_start_step)
+        progress = max(0.0, min(1.0, (step - decay_start_step) / denom))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return base_lr * (min_ratio + (1.0 - min_ratio) * cosine)
     denom = max(1, total_steps - warmup_steps)
     progress = max(0.0, min(1.0, (step - warmup_steps) / denom))
     cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
@@ -3598,6 +3607,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-start-lr", type=float, default=1e-4)
     parser.add_argument("--warmup-steps", type=int, default=100)
     parser.add_argument("--lr-min-ratio", type=float, default=0.0)
+    parser.add_argument("--lr-decay-start-step", type=int, default=-1)
+    parser.add_argument("--lr-decay-steps", type=int, default=0)
     parser.add_argument("--epochs", type=float, default=1.0)
     parser.add_argument("--train-fraction", type=float, default=0.9)
     parser.add_argument("--grad-clip", type=float, default=1.0)
@@ -4358,6 +4369,8 @@ def main() -> None:
             warmup_start_lr=args.warmup_start_lr,
             warmup_steps=args.warmup_steps,
             min_ratio=args.lr_min_ratio,
+            decay_start_step=args.lr_decay_start_step,
+            decay_steps=args.lr_decay_steps,
         )
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
