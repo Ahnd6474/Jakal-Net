@@ -292,7 +292,7 @@ class JakalNetModuleTests(unittest.TestCase):
             state_proj_fn=_state_proj_fn,
             val_proj_fn=_val_proj_fn,
             sparse_type="window",
-            window_size=3,
+            window=3,
             implementation="reference",
         )
         kernel = SparsePropagation(
@@ -301,7 +301,7 @@ class JakalNetModuleTests(unittest.TestCase):
             state_proj_fn=_state_proj_fn,
             val_proj_fn=_val_proj_fn,
             sparse_type="window",
-            window_size=3,
+            window=3,
             implementation="kernel",
         )
         kernel.pairwise_fn.load_state_dict(reference.pairwise_fn.state_dict())
@@ -423,6 +423,42 @@ class JakalNetModuleTests(unittest.TestCase):
 
         self.assertTrue(torch.allclose(delta.delta_state, torch.tensor([[0.5, 0.5]])))
         self.assertTrue(torch.allclose(delta.delta_val, torch.tensor([[[2.0], [2.0]]])))
+
+    def test_state_weighted_propagation_does_not_square_state(self) -> None:
+        layer = Layer(
+            dim=1,
+            num_nodes=2,
+            state=torch.tensor([[-1.0, 2.0]]),
+            val=torch.tensor([[[3.0], [5.0]]]),
+        )
+
+        def pairwise_fn(target: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
+            return torch.ones((*target.shape[:-2], target.shape[-2], source.shape[-2]))
+
+        def state_proj_fn(state: torch.Tensor) -> torch.Tensor:
+            return state * 10.0
+
+        reference = Propagation(
+            pairwise_fn=pairwise_fn,
+            state_proj_fn=state_proj_fn,
+            state_weight_edges=True,
+            implementation="reference",
+        )
+        streaming = Propagation(
+            pairwise_fn=pairwise_fn,
+            state_proj_fn=state_proj_fn,
+            state_weight_edges=True,
+            implementation="streaming",
+            target_block_size=1,
+            source_block_size=1,
+        )
+
+        expected_state = torch.tensor([[0.5, 0.5]])
+        expected_val = torch.tensor([[[3.5], [3.5]]])
+        self.assert_delta_close(reference(layer), streaming(layer))
+        delta = reference(layer)
+        self.assertTrue(torch.allclose(delta.delta_state, expected_state))
+        self.assertTrue(torch.allclose(delta.delta_val, expected_val))
 
     def test_dense_transition_streaming_matches_reference(self) -> None:
         torch.manual_seed(3)

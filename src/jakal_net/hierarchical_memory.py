@@ -18,7 +18,7 @@ from jakal_net._architectural_common import (
     unit_normalize_values,
 )
 from jakal_net.core import Layer, LayerDelta
-from jakal_net.propagation import SparsePropagation
+from jakal_net.propagation import Propagation, SparsePropagation
 from jakal_net.transition import SparseTransition
 
 
@@ -79,7 +79,7 @@ class _MemoryLevel(nn.Module):
             merge_mode="add",
             use_direction_only=unit_norm_values,
         )
-        self.propagation = SparsePropagation(
+        self.propagation = Propagation(
             pairwise_fn=make_pairwise(
                 pairwise_kind,
                 dim=dim,
@@ -89,10 +89,8 @@ class _MemoryLevel(nn.Module):
                 anchor_heads=pairwise_anchor_heads,
                 anchor_kind=pairwise_anchor_kind,
             ),
-            sparse_type="topk",
-            topk=min(memory_topk, num_slots),
             edge_compress_fn=signed_abs_softmax_edges,
-            state_weight_edges=True,
+            state_weight_edges=False,
             implementation=implementation,
             residual=True,
             use_direction_only=unit_norm_values,
@@ -335,7 +333,7 @@ class BModule(nn.Module):
             state = torch.where(mask, fresh.state, current.state)
             val = torch.where(mask.unsqueeze(-1), fresh.val, current.val)
             reset_layers.append(current.with_tensors(state=state, val=val))
-        return self.constrain_memory_state(tuple(reset_layers))
+        return tuple(reset_layers)
 
     def update(
         self,

@@ -154,12 +154,12 @@ class SerializedDocument:
 class TrainingCurriculumStage:
     name: str
     document_span: int
-    batch_size: int
-    grad_accum_steps: int
     freeze_memory: bool
     freeze_propagation: bool
     freeze_skip: bool
-    bucket_weights: dict[str, float]
+    batch_size: int = 1
+    grad_accum_steps: int = 1
+    bucket_weights: dict[str, float] = field(default_factory=dict, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2429,15 +2429,15 @@ def resolve_curriculum_stage(
     total_steps: int,
     stage1_ratio: float,
     stage2_ratio: float,
-    stage1_span: int,
-    stage2_span: int,
-    stage3_span: int,
-    stage1_batch_size: int,
-    stage2_batch_size: int,
-    stage3_batch_size: int,
-    stage1_grad_accum_steps: int,
-    stage2_grad_accum_steps: int,
-    stage3_grad_accum_steps: int,
+    stage1_span: int = 1,
+    stage2_span: int = 1,
+    stage3_span: int = 1,
+    stage1_batch_size: int = 1,
+    stage2_batch_size: int = 1,
+    stage3_batch_size: int = 1,
+    stage1_grad_accum_steps: int = 1,
+    stage2_grad_accum_steps: int = 1,
+    stage3_grad_accum_steps: int = 1,
 ) -> TrainingCurriculumStage:
     stage1_end = int(total_steps * stage1_ratio)
     stage2_end = int(total_steps * stage2_ratio)
@@ -2445,32 +2445,32 @@ def resolve_curriculum_stage(
         return TrainingCurriculumStage(
             name="stage1",
             document_span=max(1, stage1_span),
+            freeze_memory=True,
+            freeze_propagation=True,
+            freeze_skip=True,
             batch_size=max(1, stage1_batch_size),
             grad_accum_steps=max(1, stage1_grad_accum_steps),
-            freeze_memory=False,
-            freeze_propagation=False,
-            freeze_skip=False,
             bucket_weights=resolve_stage_bucket_weights(stage_name="stage1"),
         )
     if stage2_end > 0 and step <= stage2_end:
         return TrainingCurriculumStage(
             name="stage2",
             document_span=max(1, stage2_span),
+            freeze_memory=False,
+            freeze_propagation=True,
+            freeze_skip=True,
             batch_size=max(1, stage2_batch_size),
             grad_accum_steps=max(1, stage2_grad_accum_steps),
-            freeze_memory=False,
-            freeze_propagation=False,
-            freeze_skip=False,
             bucket_weights=resolve_stage_bucket_weights(stage_name="stage2"),
         )
     return TrainingCurriculumStage(
         name="stage3",
         document_span=max(1, stage3_span),
-        batch_size=max(1, stage3_batch_size),
-        grad_accum_steps=max(1, stage3_grad_accum_steps),
         freeze_memory=False,
         freeze_propagation=False,
         freeze_skip=False,
+        batch_size=max(1, stage3_batch_size),
+        grad_accum_steps=max(1, stage3_grad_accum_steps),
         bucket_weights=resolve_stage_bucket_weights(stage_name="stage3"),
     )
 
@@ -2487,6 +2487,20 @@ def apply_training_curriculum(model: CausalHierarchicalMemoryLM, stage: Training
         _set_module_requires_grad(level.propagation, True)
     _set_module_requires_grad(b_module.skip_transitions, True)
     _set_parameter_collection_requires_grad(tuple(b_module.skip_gates.values()), True)
+
+    if stage.freeze_memory:
+        _set_module_requires_grad(b_module.memory_levels, False)
+        _set_module_requires_grad(b_module.level_transitions, False)
+        _set_module_requires_grad(b_module.level_norms, False)
+        _set_module_requires_grad(b_module.read_projections, False)
+        _set_parameter_collection_requires_grad(b_module.read_gates, False)
+        b_module.read_template_val.requires_grad_(False)
+    if stage.freeze_propagation:
+        for level in b_module.memory_levels:
+            _set_module_requires_grad(level.propagation, False)
+    if stage.freeze_skip or stage.freeze_memory:
+        _set_module_requires_grad(b_module.skip_transitions, False)
+        _set_parameter_collection_requires_grad(tuple(b_module.skip_gates.values()), False)
 
 
 def override_batch_reset(batch: DocumentBatch, *, reset_all: bool) -> DocumentBatch:
@@ -2825,6 +2839,53 @@ def summarize_gradient_extremes(
         )
     diagnostics.sort(key=lambda item: item[0], reverse=True)
     return [message for _, message in diagnostics[: max(1, int(limit))]]
+
+
+def compute_grad_norm_float64(parameters: Sequence[torch.nn.Parameter]) -> float:
+    gradients = [parameter.grad.detach() for parameter in parameters if parameter.grad is not None]
+    if not gradients:
+        return 0.0
+    total_sq: torch.Tensor | None = None
+    with torch.no_grad():
+        for gradient in gradients:
+            if not bool(torch.isfinite(gradient).all().item()):
+                raise RuntimeError("non-finite gradient value encountered before clipping")
+            grad_norm = torch.linalg.vector_norm(gradient.to(dtype=torch.float64))
+            grad_sq = grad_norm.square()
+            total_sq = grad_sq if total_sq is None else total_sq + grad_sq.to(device=total_sq.device)
+        if total_sq is None:
+            return 0.0
+        total_norm = torch.sqrt(total_sq)
+        if not bool(torch.isfinite(total_norm).item()):
+            raise RuntimeError("non-finite grad norm before clipping")
+        return float(total_norm.item())
+
+
+def clip_grad_norm_float64(
+    parameters: Sequence[torch.nn.Parameter],
+    max_norm: float,
+) -> float:
+    gradients = [parameter.grad.detach() for parameter in parameters if parameter.grad is not None]
+    if not gradients:
+        return 0.0
+    total_sq: torch.Tensor | None = None
+    with torch.no_grad():
+        for gradient in gradients:
+            if not bool(torch.isfinite(gradient).all().item()):
+                raise RuntimeError("non-finite gradient value encountered before clipping")
+            grad_norm = torch.linalg.vector_norm(gradient.to(dtype=torch.float64))
+            grad_sq = grad_norm.square()
+            total_sq = grad_sq if total_sq is None else total_sq + grad_sq.to(device=total_sq.device)
+        if total_sq is None:
+            return 0.0
+        total_norm = torch.sqrt(total_sq)
+        if not bool(torch.isfinite(total_norm).item()):
+            raise RuntimeError("non-finite grad norm after float64 accumulation")
+        clip_coef = float(max_norm) / (float(total_norm.item()) + 1.0e-6)
+        if clip_coef < 1.0:
+            for gradient in gradients:
+                gradient.mul_(clip_coef)
+        return float(total_norm.item())
 
 
 def load_decode_vocab(*, tokenizer_label: str, tokenizer_model_path: str | None) -> object | None:
@@ -4455,12 +4516,25 @@ def main() -> None:
             if scaler is not None:
                 scaler.unscale_(optimizer)
             try:
-                grad_norm = float(
-                    torch.nn.utils.clip_grad_norm_(
-                        grad_clip_parameters,
-                        args.grad_clip,
-                        error_if_nonfinite=True,
-                    ).item()
+                grad_norm = compute_grad_norm_float64(grad_clip_parameters)
+                if (
+                    args.diagnose_nonfinite_grad
+                    and math.isfinite(grad_norm)
+                    and grad_norm >= 1.0e6
+                ):
+                    gradient_extremes = summarize_gradient_extremes(
+                        grad_clip_named_parameters,
+                        limit=args.diagnose_nonfinite_limit,
+                    )
+                    if gradient_extremes:
+                        print(
+                            f"diagnose_large_grad_preclip | step={step} | grad_norm={grad_norm:.6g} | "
+                            + " | ".join(gradient_extremes),
+                            flush=True,
+                        )
+                grad_norm = clip_grad_norm_float64(
+                    grad_clip_parameters,
+                    args.grad_clip,
                 )
             except RuntimeError as exc:
                 grad_norm = float("nan")

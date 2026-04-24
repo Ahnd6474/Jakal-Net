@@ -138,7 +138,7 @@ class KModule(nn.Module):
                 sparse_type="topk",
                 topk=min(propagation_topk, num_nodes),
                 edge_compress_fn=signed_abs_softmax_edges,
-                state_weight_edges=True,
+                state_weight_edges=False,
                 implementation=implementation,
                 residual=propagation_residual,
                 use_direction_only=True,

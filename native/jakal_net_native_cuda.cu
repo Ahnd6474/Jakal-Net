@@ -1,6 +1,9 @@
 #include "jakal_net_native_cuda.h"
 
 #include <cmath>
+#include <string>
+#include <cstdlib>
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 #include <vector>
@@ -38,6 +41,31 @@ namespace {
 constexpr int kPairwiseTopkForwardThreads = 128;
 constexpr int kPairwiseTopkForwardMaxK = 64;
 constexpr float kNegativeInfinity = -INFINITY;
+
+
+int64_t scan_cuda_dense_block_size() {
+  if (const char* raw = std::getenv("JAKAL_NET_FUSED_SCAN_DENSE_BLOCK_SIZE")) {
+    try {
+      return std::max<int64_t>(16, std::stoll(raw));
+    } catch (...) {
+      return 128;
+    }
+  }
+  return 128;
+}
+
+torch::ScalarType scan_cuda_accumulator_dtype(torch::ScalarType input_dtype) {
+  if (const char* raw = std::getenv("JAKAL_NET_DENSE_ACCUMULATOR_DTYPE")) {
+    const std::string value(raw);
+    if (value == "input" || value == "none") {
+      return input_dtype;
+    }
+  }
+  if (input_dtype == torch::kFloat16 || input_dtype == torch::kBFloat16) {
+    return torch::kFloat32;
+  }
+  return input_dtype;
+}
 constexpr int64_t kCompressSoftmax = 0;
 constexpr int64_t kCompressSignedAbsSoftmax = 1;
 constexpr int64_t kCompressSignedEntmax15 = 2;
@@ -2242,16 +2270,24 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_low_rank_transition_pairwise_
   }
   const auto dst_nodes = dst_val.size(1);
   const auto k = std::min<int64_t>(std::max<int64_t>(1, topk), dst_nodes);
-  torch::Tensor selected_scores;
-  torch::Tensor selected_indices;
   if (k == dst_nodes) {
-    selected_scores = logits;
-    selected_indices = scan_cuda_full_topk_indices(logits);
-  } else {
-    auto topk_result = logits.topk(k, -1, true, true);
-    selected_scores = std::get<0>(topk_result);
-    selected_indices = std::get<1>(topk_result);
+    auto routes = scan_cuda_compress_scores(compress_name, logits);
+    auto weighted_routes = routes * sender_strength.unsqueeze(-1);
+    auto routes_t = weighted_routes.transpose(1, 2).to(torch::kFloat32);
+    auto delta_state = torch::bmm(
+        routes_t,
+        projected_state.to(torch::kFloat32).unsqueeze(-1))
+        .squeeze(-1);
+    auto delta_val = torch::bmm(routes_t, projected_val.to(torch::kFloat32));
+    return {
+        delta_state.to(projected_state.scalar_type()),
+        delta_val.to(projected_val.scalar_type()),
+    };
   }
+
+  auto topk_result = logits.topk(k, -1, true, true);
+  auto selected_scores = std::get<0>(topk_result);
+  auto selected_indices = std::get<1>(topk_result);
   auto routes = scan_cuda_compress_scores(compress_name, selected_scores);
   auto weighted_routes = routes * sender_strength.unsqueeze(-1);
   auto delta_state = torch::zeros(
@@ -2328,9 +2364,8 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_low_rank_propagation_topk(
       weighted_projected_source = (projected_source_single * core_weight.to(projected_source_single.scalar_type()).view({1, 1, -1})).contiguous();
       projected_target = projected_target_single;
     }
-    auto weighted_projected_state = (layer_state.to(torch::kFloat32) * layer_state.to(torch::kFloat32)).contiguous();
-    auto weighted_projected_val =
-        (layer_state.to(torch::kFloat32).unsqueeze(-1) * layer_val.to(torch::kFloat32)).contiguous();
+    auto weighted_projected_state = layer_state.to(torch::kFloat32).contiguous();
+    auto weighted_projected_val = layer_val.to(torch::kFloat32).contiguous();
     const auto score_bias =
         (!multihead && bias.defined() && bias.numel() != 0) ? bias.item<double>() : 0.0;
     auto fused = jakal_net_low_rank_propagation_topk_forward_cuda(
@@ -2344,6 +2379,132 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_low_rank_propagation_topk(
     return {
         std::get<0>(fused).to(layer_state.scalar_type()),
         std::get<1>(fused).to(layer_val.scalar_type()),
+    };
+  }
+
+  auto dense_score_block = [&](const torch::Tensor& target_block, const torch::Tensor& source_block) {
+    torch::Tensor block_scores;
+    if (diagonal && multihead) {
+      auto cast_core = core_weight.to(target_block.scalar_type());
+      auto weighted_target = target_block.unsqueeze(1) * cast_core.view({1, cast_core.size(0), 1, cast_core.size(1)});
+      block_scores = torch::einsum("bhid,bjd->bhij", {weighted_target, source_block});
+      if (bias.defined() && bias.numel() != 0) {
+        std::vector<int64_t> bias_shape(block_scores.dim(), 1);
+        bias_shape[block_scores.dim() - 3] = bias.size(0);
+        block_scores = block_scores + bias.to(block_scores.scalar_type()).view(bias_shape);
+      }
+      block_scores = std::get<0>(block_scores.max(1));
+    } else if (diagonal) {
+      auto weighted_target = target_block * core_weight.to(target_block.scalar_type()).view({1, 1, -1});
+      block_scores = torch::matmul(weighted_target, source_block.transpose(1, 2));
+      if (bias.defined() && bias.numel() != 0) {
+        block_scores = block_scores + bias.to(block_scores.scalar_type());
+      }
+    } else if (multihead) {
+      auto cast_source = source_weight.to(source_block.scalar_type());
+      auto cast_target = target_weight.to(target_block.scalar_type());
+      auto cast_core = core_weight.to(source_block.scalar_type());
+      auto projected_target = torch::einsum("bid,hrd->bhir", {target_block, cast_target});
+      auto projected_source = torch::einsum("bid,hrd->bhir", {source_block, cast_source});
+      std::vector<int64_t> core_shape(projected_source.dim(), 1);
+      core_shape[projected_source.dim() - 3] = cast_core.size(0);
+      core_shape[projected_source.dim() - 1] = cast_core.size(1);
+      auto weighted_projected_source = projected_source * cast_core.view(core_shape);
+      block_scores = torch::einsum("bhir,bhkr->bhik", {projected_target, weighted_projected_source});
+      if (bias.defined() && bias.numel() != 0) {
+        std::vector<int64_t> bias_shape(block_scores.dim(), 1);
+        bias_shape[block_scores.dim() - 3] = bias.size(0);
+        block_scores = block_scores + bias.to(block_scores.scalar_type()).view(bias_shape);
+      }
+      block_scores = std::get<0>(block_scores.max(1));
+    } else {
+      auto projected_target = torch::matmul(target_block, target_weight.to(target_block.scalar_type()).transpose(0, 1));
+      auto projected_source = torch::matmul(source_block, source_weight.to(source_block.scalar_type()).transpose(0, 1));
+      auto weighted_projected_source = projected_source * core_weight.to(projected_source.scalar_type()).view({1, 1, -1});
+      block_scores = torch::matmul(projected_target, weighted_projected_source.transpose(1, 2));
+      if (bias.defined() && bias.numel() != 0) {
+        block_scores = block_scores + bias.to(block_scores.scalar_type());
+      }
+    }
+    return block_scores;
+  };
+
+  if (topk <= 0 &&
+      (compress_name == "signed_abs_softmax" ||
+       compress_name == "softmax" ||
+       compress_name == "softsign")) {
+    const auto nodes = layer_val.size(1);
+    const auto block_size = scan_cuda_dense_block_size();
+    const auto state_acc_dtype = scan_cuda_accumulator_dtype(layer_state.scalar_type());
+    const auto val_acc_dtype = scan_cuda_accumulator_dtype(layer_val.scalar_type());
+    auto delta_state = torch::zeros(
+        {layer_state.size(0), nodes},
+        layer_state.options().dtype(state_acc_dtype));
+    auto delta_val = torch::zeros(
+        {layer_val.size(0), nodes, layer_val.size(2)},
+        layer_val.options().dtype(val_acc_dtype));
+    for (int64_t target_start = 0; target_start < nodes; target_start += block_size) {
+      const auto target_end = std::min<int64_t>(target_start + block_size, nodes);
+      auto target_block = layer_val.slice(1, target_start, target_end);
+      auto target_state_acc = torch::zeros(
+          {layer_state.size(0), target_end - target_start},
+          layer_state.options().dtype(state_acc_dtype));
+      auto target_val_acc = torch::zeros(
+          {layer_val.size(0), target_end - target_start, layer_val.size(2)},
+          layer_val.options().dtype(val_acc_dtype));
+      if (compress_name == "softsign") {
+        for (int64_t source_start = 0; source_start < nodes; source_start += block_size) {
+          const auto source_end = std::min<int64_t>(source_start + block_size, nodes);
+          auto edges = scan_cuda_compress_scores(
+              compress_name,
+              dense_score_block(target_block, layer_val.slice(1, source_start, source_end)));
+          target_state_acc = target_state_acc + torch::bmm(
+              edges.to(state_acc_dtype),
+              layer_state.slice(1, source_start, source_end).to(state_acc_dtype).unsqueeze(-1)).squeeze(-1);
+          target_val_acc = target_val_acc + torch::bmm(
+              edges.to(val_acc_dtype),
+              layer_val.slice(1, source_start, source_end).to(val_acc_dtype));
+        }
+      } else {
+        auto running_max = torch::full(
+            {layer_state.size(0), target_end - target_start},
+            -std::numeric_limits<float>::infinity(),
+            layer_state.options().dtype(torch::kFloat32));
+        auto running_sum = torch::zeros_like(running_max);
+        for (int64_t source_start = 0; source_start < nodes; source_start += block_size) {
+          const auto source_end = std::min<int64_t>(source_start + block_size, nodes);
+          auto scores_block = torch::nan_to_num(
+              dense_score_block(target_block, layer_val.slice(1, source_start, source_end))).to(torch::kFloat32);
+          auto stats_block = compress_name == "signed_abs_softmax" ? scores_block.abs() : scores_block;
+          auto block_max = std::get<0>(stats_block.max(-1));
+          auto next_max = torch::maximum(running_max, block_max);
+          running_sum = running_sum * torch::exp(running_max - next_max) +
+              torch::exp(stats_block - next_max.unsqueeze(-1)).sum(-1);
+          running_max = next_max;
+        }
+        for (int64_t source_start = 0; source_start < nodes; source_start += block_size) {
+          const auto source_end = std::min<int64_t>(source_start + block_size, nodes);
+          auto scores_block = torch::nan_to_num(
+              dense_score_block(target_block, layer_val.slice(1, source_start, source_end))).to(torch::kFloat32);
+          auto stats_block = compress_name == "signed_abs_softmax" ? scores_block.abs() : scores_block;
+          auto edges = torch::exp(stats_block - running_max.unsqueeze(-1)) / running_sum.unsqueeze(-1);
+          if (compress_name == "signed_abs_softmax") {
+            edges = edges * torch::sign(scores_block);
+          }
+          target_state_acc = target_state_acc + torch::bmm(
+              edges.to(state_acc_dtype),
+              layer_state.slice(1, source_start, source_end).to(state_acc_dtype).unsqueeze(-1)).squeeze(-1);
+          target_val_acc = target_val_acc + torch::bmm(
+              edges.to(val_acc_dtype),
+              layer_val.slice(1, source_start, source_end).to(val_acc_dtype));
+        }
+      }
+      delta_state.slice(1, target_start, target_end).copy_(target_state_acc);
+      delta_val.slice(1, target_start, target_end).copy_(target_val_acc);
+    }
+    return {
+        delta_state.to(layer_state.scalar_type()),
+        delta_val.to(layer_val.scalar_type()),
     };
   }
 
@@ -2391,17 +2552,24 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_low_rank_propagation_topk(
     }
   }
   const auto nodes = layer_val.size(1);
-  const auto k = std::min<int64_t>(std::max<int64_t>(1, topk), nodes);
-  torch::Tensor selected_scores;
-  torch::Tensor selected_indices;
+  const auto k = topk <= 0 ? nodes : std::min<int64_t>(std::max<int64_t>(1, topk), nodes);
   if (k == nodes) {
-    selected_scores = scores;
-    selected_indices = scan_cuda_full_topk_indices(scores);
-  } else {
-    auto topk_result = scores.topk(k, -1, true, true);
-    selected_scores = std::get<0>(topk_result);
-    selected_indices = std::get<1>(topk_result);
+    auto edges = scan_cuda_compress_scores(compress_name, scores);
+    auto delta_state = torch::bmm(
+        edges.to(torch::kFloat32),
+        layer_state.to(torch::kFloat32).unsqueeze(-1)).squeeze(-1);
+    auto delta_val = torch::bmm(
+        edges.to(torch::kFloat32),
+        layer_val.to(torch::kFloat32));
+    return {
+        delta_state.to(layer_state.scalar_type()),
+        delta_val.to(layer_val.scalar_type()),
+    };
   }
+
+  auto topk_result = scores.topk(k, -1, true, true);
+  auto selected_scores = std::get<0>(topk_result);
+  auto selected_indices = std::get<1>(topk_result);
   auto expanded_state = layer_state.unsqueeze(1).expand({layer_state.size(0), nodes, layer_state.size(1)});
   auto selected_state = torch::gather(expanded_state, 2, selected_indices);
   auto expanded_val = layer_val.unsqueeze(1).expand({layer_val.size(0), nodes, layer_val.size(1), layer_val.size(2)});
@@ -2410,11 +2578,10 @@ std::tuple<torch::Tensor, torch::Tensor> scan_cuda_low_rank_propagation_topk(
       2,
       selected_indices.unsqueeze(-1).expand({selected_indices.size(0), selected_indices.size(1), selected_indices.size(2), layer_val.size(2)}));
   auto edges = scan_cuda_compress_scores(compress_name, selected_scores);
-  auto weighted_edges = edges * selected_state;
   auto delta_state =
-      (weighted_edges.to(torch::kFloat32) * selected_state.to(torch::kFloat32)).sum(-1);
+      (edges.to(torch::kFloat32) * selected_state.to(torch::kFloat32)).sum(-1);
   auto delta_val =
-      (weighted_edges.to(torch::kFloat32).unsqueeze(-1) * selected_val.to(torch::kFloat32)).sum(-2);
+      (edges.to(torch::kFloat32).unsqueeze(-1) * selected_val.to(torch::kFloat32)).sum(-2);
   return {
       delta_state.to(layer_state.scalar_type()),
       delta_val.to(layer_val.scalar_type()),

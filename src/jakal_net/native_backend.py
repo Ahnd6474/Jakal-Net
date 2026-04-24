@@ -1035,20 +1035,21 @@ def _native_scan_propagation_topk_signed_abs(
     topk: int,
 ) -> tuple[Tensor, Tensor]:
     scores = _native_scan_pairwise_scores(pairwise_kind, layer_val, layer_val, source_weight, target_weight, core_weight, packed_bias)
-    k = min(max(1, int(topk)), layer_val.shape[1])
-    if k == layer_val.shape[1]:
-        selected_scores = scores
-        selected_indices = _native_scan_full_topk_indices(scores)
-    else:
-        selected_scores, selected_indices = torch.topk(scores, k, dim=-1)
+    nodes = layer_val.shape[1]
+    k = nodes if int(topk) <= 0 else min(max(1, int(topk)), nodes)
+    if k == nodes:
+        edges = _native_scan_signed_abs_softmax(scores)
+        delta_state = torch.bmm(edges.to(layer_state.dtype), layer_state.unsqueeze(-1)).squeeze(-1)
+        delta_val = torch.bmm(edges.to(layer_val.dtype), layer_val)
+        return delta_state, delta_val
+
+    selected_scores, selected_indices = torch.topk(scores, k, dim=-1)
     edges = _native_scan_signed_abs_softmax(selected_scores)
     selected_state = _native_scan_gather_state(layer_state, selected_indices)
-    weighted_edges = edges * selected_state
     selected_val = _native_scan_gather_val(layer_val, selected_indices)
-    delta_state = (weighted_edges * selected_state).sum(dim=-1)
-    delta_val = (weighted_edges.unsqueeze(-1) * selected_val).sum(dim=-2)
+    delta_state = (edges * selected_state).sum(dim=-1)
+    delta_val = (edges.unsqueeze(-1) * selected_val).sum(dim=-2)
     return delta_state, delta_val
-
 
 def _native_scan_apply_delta(
     layer_state: Tensor,
@@ -2387,6 +2388,7 @@ class _HadamardPropagationDense(Function):
             layer_val,
             projected_state,
             projected_val,
+            None,
             target_block_size,
             source_block_size,
         )
@@ -2779,8 +2781,8 @@ class _HadamardTransitionPairwiseDense(Function):
             _load_optional_tensor(hidden_bias),
             out_weight,
             _load_optional_tensor(out_bias),
+            "softmax",
             float(temperature),
-            route_compress_name,
             sender_strength,
             src_val,
             dst_val,
@@ -4065,12 +4067,13 @@ def propagation_dense_native(
     layer_val: Tensor,
     projected_state: Tensor,
     projected_val: Tensor,
+    source_state: Tensor | None = None,
     target_block_size: int,
     source_block_size: int,
 ) -> Any:
     if not supports_pairwise_kernel(pairwise_fn):
         raise TypeError("Unsupported pairwise_fn for native propagation.")
-    if edge_compress_name == "softsign" and isinstance(pairwise_fn, HadamardMLPPairwise):
+    if source_state is None and edge_compress_name == "softsign" and isinstance(pairwise_fn, HadamardMLPPairwise):
         delta_state, delta_val = _HadamardPropagationDense.apply(
             layer_val,
             projected_state,
@@ -4096,6 +4099,7 @@ def propagation_dense_native(
         layer_val,
         projected_state,
         projected_val,
+        source_state,
         target_block_size,
         source_block_size,
     ))
@@ -4445,8 +4449,8 @@ def transition_pairwise_dense_native(
         spec.hidden_bias,
         spec.out_weight,
         spec.out_bias,
-        spec.temperature,
         route_compress_name,
+        spec.temperature,
         sender_strength,
         src_val,
         dst_val,

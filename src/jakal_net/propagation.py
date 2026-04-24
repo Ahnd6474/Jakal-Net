@@ -91,7 +91,7 @@ def _compress_edges(
 
 def _native_edge_compress_name(edge_compress_fn: Callable[[Tensor], Tensor]) -> str | None:
     name = _edge_compress_name(edge_compress_fn)
-    if name in {"softsign", "signed_entmax15"}:
+    if name in {"softsign", "signed_abs_softmax", "signed_entmax15"}:
         return name
     return None
 
@@ -189,7 +189,10 @@ class Propagation(nn.Module):
         edges = self._weight_edges(edges, layer.state)
         projected_state, projected_val = self._project_inputs(layer, directional_val=directional_val)
 
-        delta_state = torch.einsum("...ij,...j->...i", edges, projected_state)
+        if self.state_weight_edges:
+            delta_state = edges.sum(dim=-1)
+        else:
+            delta_state = torch.einsum("...ij,...j->...i", edges, projected_state)
         delta_val = torch.einsum("...ij,...jd->...id", edges, projected_val)
         return LayerDelta(delta_state=delta_state, delta_val=delta_val)
 
@@ -224,11 +227,14 @@ class Propagation(nn.Module):
                 state_edges = edges.to(dtype=state_acc_dtype)
                 val_edges = edges.to(dtype=val_acc_dtype)
 
-                delta_state[..., target_start:target_end] += torch.einsum(
-                    "...ij,...j->...i",
-                    state_edges,
-                    projected_state[..., source_start:source_end].to(state_acc_dtype),
-                )
+                if self.state_weight_edges:
+                    delta_state[..., target_start:target_end] += state_edges.sum(dim=-1)
+                else:
+                    delta_state[..., target_start:target_end] += torch.einsum(
+                        "...ij,...j->...i",
+                        state_edges,
+                        projected_state[..., source_start:source_end].to(state_acc_dtype),
+                    )
                 delta_val[..., target_start:target_end, :] += torch.einsum(
                     "...ij,...jd->...id",
                     val_edges,
@@ -244,8 +250,7 @@ class Propagation(nn.Module):
         edge_compress_name = _native_edge_compress_name(self.edge_compress_fn)
         directional_layer_val = self._directional_val(layer.val)
         if (
-            not self.state_weight_edges
-            and edge_compress_name is not None
+            edge_compress_name is not None
             and supports_pairwise_kernel(self.pairwise_fn)
             and native_supports("propagation_dense")
             and native_supports_device(layer.val.device.type)
@@ -257,6 +262,7 @@ class Propagation(nn.Module):
                 layer_val=directional_layer_val,
                 projected_state=projected_state,
                 projected_val=projected_val,
+                source_state=layer.state if self.state_weight_edges else None,
                 target_block_size=self.target_block_size or layer.num_nodes,
                 source_block_size=self.source_block_size or layer.num_nodes,
             )
@@ -294,14 +300,13 @@ class Propagation(nn.Module):
     def compute_delta(self, layer: Layer) -> LayerDelta:
         if self.implementation == "native" and _cuda_graph_capture_active(layer.val.device.type):
             return self._compute_delta_reference(layer)
-        if self._supports_multihead_vectorized_fast_path() and self.implementation != "native":
+        if self._supports_multihead_vectorized_fast_path():
             return self._compute_delta_reference(layer)
         if self.implementation == "native":
             edge_compress_name = _native_edge_compress_name(self.edge_compress_fn)
             directional_layer_val = self._directional_val(layer.val)
             if (
-                not self.state_weight_edges
-                and edge_compress_name is not None
+                edge_compress_name is not None
                 and supports_pairwise_kernel(self.pairwise_fn)
                 and native_supports("propagation_dense")
                 and native_supports_device(layer.val.device.type)
@@ -313,6 +318,7 @@ class Propagation(nn.Module):
                     layer_val=directional_layer_val,
                     projected_state=projected_state,
                     projected_val=projected_val,
+                    source_state=layer.state if self.state_weight_edges else None,
                     target_block_size=self.target_block_size or layer.num_nodes,
                     source_block_size=self.source_block_size or layer.num_nodes,
                 )
@@ -403,7 +409,10 @@ class SparsePropagation(Propagation):
 
         masked_edges = _compress_edges(scores, self.edge_compress_fn, mask=mask)
         masked_edges = self._weight_edges(masked_edges, layer.state)
-        delta_state = torch.einsum("...ij,...j->...i", masked_edges, projected_state)
+        if self.state_weight_edges:
+            delta_state = masked_edges.sum(dim=-1)
+        else:
+            delta_state = torch.einsum("...ij,...j->...i", masked_edges, projected_state)
         delta_val = torch.einsum("...ij,...jd->...id", masked_edges, projected_val)
         return LayerDelta(delta_state=delta_state, delta_val=delta_val)
 
@@ -456,13 +465,17 @@ class SparsePropagation(Propagation):
                     layer.state[..., global_source_start:global_source_end],
                 )
 
-                delta_state[..., target_start:target_end] += torch.einsum(
-                    "...ij,...j->...i",
-                    edges.to(dtype=state_acc_dtype),
-                    projected_state[..., global_source_start:global_source_end].to(
-                        state_acc_dtype
-                    ),
-                )
+                state_edges = edges.to(dtype=state_acc_dtype)
+                if self.state_weight_edges:
+                    delta_state[..., target_start:target_end] += state_edges.sum(dim=-1)
+                else:
+                    delta_state[..., target_start:target_end] += torch.einsum(
+                        "...ij,...j->...i",
+                        state_edges,
+                        projected_state[..., global_source_start:global_source_end].to(
+                            state_acc_dtype
+                        ),
+                    )
                 delta_val[..., target_start:target_end, :] += torch.einsum(
                     "...ij,...jd->...id",
                     edges.to(dtype=val_acc_dtype),
@@ -547,10 +560,13 @@ class SparsePropagation(Propagation):
             selected_state = gather_state_by_indices(projected_state, best_indices)
             selected_val = gather_val_by_indices(projected_val, best_indices)
 
-            delta_state[..., target_start:target_end] = (
-                compressed_edges.to(dtype=state_acc_dtype)
-                * selected_state.to(dtype=state_acc_dtype)
-            ).sum(dim=-1)
+            state_edges = compressed_edges.to(dtype=state_acc_dtype)
+            if self.state_weight_edges:
+                delta_state[..., target_start:target_end] = state_edges.sum(dim=-1)
+            else:
+                delta_state[..., target_start:target_end] = (
+                    state_edges * selected_state.to(dtype=state_acc_dtype)
+                ).sum(dim=-1)
             delta_val[..., target_start:target_end, :] = (
                 compressed_edges.to(dtype=val_acc_dtype).unsqueeze(-1)
                 * selected_val.to(dtype=val_acc_dtype)

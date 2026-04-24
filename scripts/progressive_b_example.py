@@ -2254,7 +2254,10 @@ def _sample_next_token_item(
         target = tokens[start + 1 : start + seq_len + 1]
     else:
         future_tokens = tokens[start + seq_len : start + seq_len + target_len]
-        if target_len > 1:
+        if query_block_start_token_id is not None:
+            start_token = torch.tensor([query_block_start_token_id], dtype=tokens.dtype, device=tokens.device)
+            target = torch.cat((start_token, future_tokens), dim=0)
+        elif target_len > 1:
             target = future_tokens
         else:
             target = future_tokens[0]
@@ -2315,7 +2318,15 @@ def sample_next_token_batch(
             [tokens[start + seq_len : start + seq_len + target_len] for start in starts],
             dim=0,
         )
-        if target_len > 1:
+        if query_block_start_token_id is not None:
+            start_tokens = torch.full(
+                (batch_size, 1),
+                int(query_block_start_token_id),
+                dtype=future_tokens.dtype,
+                device=future_tokens.device,
+            )
+            target = torch.cat((start_tokens, future_tokens), dim=1)
+        elif target_len > 1:
             target = future_tokens
         else:
             target = future_tokens[:, 0]
@@ -2965,13 +2976,17 @@ def compute_next_token_loss(
         elif query_next_token:
             logits = model.forward_query_next_token(batch.context)
             compressed_b = None
-        else:
-            logits = model(
+        elif teacher_forcing or full_sequence_causal or teacher_forcing_chunk_size is not None:
+            target_len = batch.target.shape[-1] if batch.target.ndim > 1 else 1
+            feedback = batch.target if batch.target.ndim > 1 else batch.target.unsqueeze(-1)
+            logits = model.forward_query_block(
                 batch.context,
-                teacher_forcing=teacher_forcing,
-                full_sequence_causal=full_sequence_causal,
-                teacher_forcing_chunk_size=teacher_forcing_chunk_size,
+                target_len=target_len,
+                query_feedback_token_ids=feedback,
             )
+            compressed_b = None
+        else:
+            logits = model(batch.context)
             compressed_b = None
         position_weights = None
         if query_block and batch.target.ndim > 1:

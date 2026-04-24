@@ -13,6 +13,7 @@ from jakal_net import (
     HadamardMLPPairwise,
     Layer,
     LinearRoute,
+    LowRankBilinearPairwise,
     LowRankBilinearRoute,
     MLPRoute,
     Propagation,
@@ -33,6 +34,11 @@ def _state_proj_fn(state: torch.Tensor) -> torch.Tensor:
 
 def _val_proj_fn(val: torch.Tensor) -> torch.Tensor:
     return val * 0.5 + 0.25
+
+
+def _signed_abs_softmax_edges(scores: torch.Tensor) -> torch.Tensor:
+    clean_scores = torch.nan_to_num(scores)
+    return torch.sign(clean_scores) * torch.softmax(clean_scores.abs(), dim=-1)
 
 
 class NativeBackendTests(unittest.TestCase):
@@ -237,6 +243,41 @@ class CudaNativeBackendTests(unittest.TestCase):
         reference_delta = reference.compute_delta(layer)
         self.assert_delta_close(reference_delta, kernel.compute_delta(layer))
 
+        module = native_backend._native_module()
+        with mock.patch.object(module, "propagation_dense", wraps=module.propagation_dense) as wrapped:
+            native_delta = native.compute_delta(layer)
+        self.assertGreater(wrapped.call_count, 0)
+        self.assert_delta_close(reference_delta, native_delta)
+
+    def test_dense_propagation_native_signed_abs_state_weighted_matches_reference_on_cuda(self) -> None:
+        torch.manual_seed(302)
+        layer = Layer(
+            dim=4,
+            num_nodes=6,
+            state=torch.randn(2, 6, device=self.device),
+            val=torch.randn(2, 6, 4, device=self.device),
+        )
+        reference = Propagation(
+            pairwise_fn=LowRankBilinearPairwise(dim=4, rank=3).to(self.device),
+            edge_compress_fn=_signed_abs_softmax_edges,
+            state_proj_fn=_state_proj_fn,
+            val_proj_fn=_val_proj_fn,
+            state_weight_edges=True,
+            implementation="reference",
+        )
+        native = Propagation(
+            pairwise_fn=LowRankBilinearPairwise(dim=4, rank=3).to(self.device),
+            edge_compress_fn=_signed_abs_softmax_edges,
+            state_proj_fn=_state_proj_fn,
+            val_proj_fn=_val_proj_fn,
+            state_weight_edges=True,
+            implementation="native",
+            target_block_size=3,
+            source_block_size=2,
+        )
+        native.pairwise_fn.load_state_dict(reference.pairwise_fn.state_dict())
+
+        reference_delta = reference.compute_delta(layer)
         module = native_backend._native_module()
         with mock.patch.object(module, "propagation_dense", wraps=module.propagation_dense) as wrapped:
             native_delta = native.compute_delta(layer)
@@ -540,6 +581,83 @@ class CudaNativeBackendTests(unittest.TestCase):
 
         module = native_backend._native_module()
         with mock.patch.object(module, "transition_dense", wraps=module.transition_dense) as wrapped:
+            native_delta = native.compute_delta(src, dst)
+        self.assertGreater(wrapped.call_count, 0)
+        self.assert_delta_close(reference_delta, native_delta)
+
+    def test_dense_transition_native_signed_abs_route_matches_reference_on_cuda(self) -> None:
+        torch.manual_seed(322)
+        src = Layer(
+            dim=4,
+            num_nodes=7,
+            state=torch.randn(2, 7, device=self.device),
+            val=torch.randn(2, 7, 4, device=self.device),
+        )
+        dst = Layer.zeros(dim=5, num_nodes=6, batch_shape=(2,), device=self.device)
+        reference = Transition(
+            route_fn=MLPRoute(src_dim=4, dst_nodes=6, hidden_dim=9).to(self.device),
+            route_compress_name="signed_abs_softmax",
+            state_activation_fn=lambda x: x + 1.25,
+            val_proj_fn=lambda val: val[..., :3].repeat_interleave(2, dim=-1)[..., :5],
+            state_proj_fn=_state_proj_fn,
+            implementation="reference",
+        )
+        native = Transition(
+            route_fn=MLPRoute(src_dim=4, dst_nodes=6, hidden_dim=9).to(self.device),
+            route_compress_name="signed_abs_softmax",
+            state_activation_fn=lambda x: x + 1.25,
+            val_proj_fn=lambda val: val[..., :3].repeat_interleave(2, dim=-1)[..., :5],
+            state_proj_fn=_state_proj_fn,
+            implementation="native",
+            src_block_size=3,
+            dst_block_size=2,
+        )
+        native.route_fn.load_state_dict(reference.route_fn.state_dict())
+
+        reference_delta = reference.compute_delta(src, dst)
+        module = native_backend._native_module()
+        with mock.patch.object(module, "transition_dense", wraps=module.transition_dense) as wrapped:
+            native_delta = native.compute_delta(src, dst)
+        self.assertGreater(wrapped.call_count, 0)
+        self.assert_delta_close(reference_delta, native_delta)
+
+    def test_dense_transition_native_signed_abs_pairwise_route_matches_reference_on_cuda(self) -> None:
+        torch.manual_seed(323)
+        src = Layer(
+            dim=4,
+            num_nodes=7,
+            state=torch.randn(2, 7, device=self.device),
+            val=torch.randn(2, 7, 4, device=self.device),
+        )
+        dst = Layer(
+            dim=4,
+            num_nodes=6,
+            state=torch.randn(2, 6, device=self.device),
+            val=torch.randn(2, 6, 4, device=self.device),
+        )
+        reference = Transition(
+            route_fn=LowRankBilinearRoute(src_dim=4, dst_dim=4, rank=3).to(self.device),
+            route_compress_name="signed_abs_softmax",
+            state_activation_fn=lambda x: x + 1.25,
+            val_proj_fn=_val_proj_fn,
+            state_proj_fn=_state_proj_fn,
+            implementation="reference",
+        )
+        native = Transition(
+            route_fn=LowRankBilinearRoute(src_dim=4, dst_dim=4, rank=3).to(self.device),
+            route_compress_name="signed_abs_softmax",
+            state_activation_fn=lambda x: x + 1.25,
+            val_proj_fn=_val_proj_fn,
+            state_proj_fn=_state_proj_fn,
+            implementation="native",
+            src_block_size=3,
+            dst_block_size=2,
+        )
+        native.route_fn.load_state_dict(reference.route_fn.state_dict())
+
+        reference_delta = reference.compute_delta(src, dst)
+        module = native_backend._native_module()
+        with mock.patch.object(module, "transition_pairwise_dense", wraps=module.transition_pairwise_dense) as wrapped:
             native_delta = native.compute_delta(src, dst)
         self.assertGreater(wrapped.call_count, 0)
         self.assert_delta_close(reference_delta, native_delta)

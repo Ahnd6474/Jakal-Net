@@ -80,7 +80,7 @@ class SModule(nn.Module):
                 sparse_type="window",
                 window=max_seq_len if s_window is None else max(1, s_window),
                 edge_compress_fn=signed_abs_softmax_edges,
-                state_weight_edges=True,
+                state_weight_edges=False,
                 implementation=implementation,
                 residual=True,
                 use_direction_only=unit_norm_values,

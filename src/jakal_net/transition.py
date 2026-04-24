@@ -337,7 +337,7 @@ class Transition(nn.Module):
             directional_src_val = self._directional_val(src_layer.val)
             directional_dst_val = self._directional_val(dst_layer.val)
             if (
-                self.route_compress_name in {"softmax", "signed_entmax15"}
+                self.route_compress_name in {"softmax", "signed_abs_softmax", "signed_entmax15"}
                 and
                 supports_pairwise_route_kernel(self.route_fn)
                 and native_supports("transition_pairwise_dense")
@@ -358,7 +358,7 @@ class Transition(nn.Module):
                     route_compress_name=self.route_compress_name,
                 )
             if (
-                self.route_compress_name in {"softmax", "signed_entmax15"}
+                self.route_compress_name in {"softmax", "signed_abs_softmax", "signed_entmax15"}
                 and
                 not self._route_expects_pairwise_inputs
                 and supports_route_kernel(self.route_fn)

@@ -218,7 +218,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
                 sparse_type="window",
                 window=max(1, prediction_window),
                 edge_compress_fn=signed_abs_softmax_edges,
-                state_weight_edges=True,
+                state_weight_edges=False,
                 implementation=implementation,
                 residual=True,
                 use_direction_only=unit_norm_values,
@@ -241,6 +241,18 @@ class CausalHierarchicalMemoryLM(nn.Module):
             nn.init.normal_(self.lm_head.weight, mean=0.0, std=PARAM_INIT_STD)
         for module in self.modules():
             init_pairwise_or_route_scales(module)
+
+    @property
+    def memory_levels(self) -> nn.ModuleList:
+        return self.b_module.memory_levels
+
+    @property
+    def read_projections(self) -> nn.ModuleList:
+        return self.b_module.read_projections
+
+    @property
+    def skip_gates(self) -> nn.ParameterDict:
+        return self.b_module.skip_gates
 
     def initialize_memory_state(
         self,
@@ -432,10 +444,11 @@ class CausalHierarchicalMemoryLM(nn.Module):
             )
 
         def _is_supported_propagation(propagation) -> bool:
+            sparse_type = getattr(propagation, "sparse_type", "dense")
             return (
                 self._pairwise_kernel_kind(propagation.pairwise_fn) is not None
-                and propagation.sparse_type in {"topk", "dense"}
-                and propagation.state_weight_edges
+                and sparse_type in {"topk", "dense"}
+                and not propagation.state_weight_edges
                 and self._native_edge_compress_name(propagation.edge_compress_fn) in supported_edge_compress
             )
 
@@ -603,7 +616,12 @@ class CausalHierarchicalMemoryLM(nn.Module):
             "propagation_target_weights": tuple(spec[1] for spec in propagation_specs),
             "propagation_core_weights": tuple(spec[2] for spec in propagation_specs),
             "propagation_biases": tuple(spec[3] for spec in propagation_specs),
-            "propagation_topks": tuple(int(level.propagation.topk or level.num_slots) for level in self.b_module.memory_levels),
+            "propagation_topks": tuple(
+                int(level.propagation.topk)
+                if getattr(level.propagation, "sparse_type", "dense") == "topk"
+                else 0
+                for level in self.b_module.memory_levels
+            ),
             "propagation_compress_name": propagation_compress_name,
             "val_norm_weights": tuple(
                 self._norm_param_or_empty(level.val_norm, "weight", aligned_s)

@@ -232,12 +232,15 @@ def propagation_dense_kernel(
             state_edges = edges.to(dtype=state_acc_dtype)
             val_edges = edges.to(dtype=val_acc_dtype)
 
-            target_state_acc += torch.bmm(
-                state_edges,
-                flat_projected_state[:, source_start:source_end]
-                .to(dtype=state_acc_dtype)
-                .unsqueeze(-1),
-            ).squeeze(-1)
+            if flat_source_state is not None:
+                target_state_acc += state_edges.sum(dim=-1)
+            else:
+                target_state_acc += torch.bmm(
+                    state_edges,
+                    flat_projected_state[:, source_start:source_end]
+                    .to(dtype=state_acc_dtype)
+                    .unsqueeze(-1),
+                ).squeeze(-1)
             target_val_acc += torch.bmm(
                 val_edges,
                 flat_projected_val[:, source_start:source_end, :].to(dtype=val_acc_dtype),
@@ -337,12 +340,15 @@ def propagation_window_kernel(
             state_edges = edges.to(dtype=state_acc_dtype)
             val_edges = edges.to(dtype=val_acc_dtype)
 
-            target_state_acc += torch.bmm(
-                state_edges,
-                flat_projected_state[:, source_start:source_end]
-                .to(dtype=state_acc_dtype)
-                .unsqueeze(-1),
-            ).squeeze(-1)
+            if flat_source_state is not None:
+                target_state_acc += state_edges.sum(dim=-1)
+            else:
+                target_state_acc += torch.bmm(
+                    state_edges,
+                    flat_projected_state[:, source_start:source_end]
+                    .to(dtype=state_acc_dtype)
+                    .unsqueeze(-1),
+                ).squeeze(-1)
             target_val_acc += torch.bmm(
                 val_edges,
                 flat_projected_val[:, source_start:source_end, :].to(dtype=val_acc_dtype),
@@ -461,12 +467,14 @@ def propagation_topk_kernel(
         selected_state = gather_state_by_indices(flat_projected_state, best_indices)
         selected_val = gather_val_by_indices(flat_projected_val, best_indices)
 
-        state_blocks.append(
-            (
+        if source_state is not None:
+            state_block = edges.to(dtype=state_acc_dtype).sum(dim=-1)
+        else:
+            state_block = (
                 edges.to(dtype=state_acc_dtype)
                 * selected_state.to(dtype=state_acc_dtype)
-            ).sum(dim=-1).to(dtype=projected_state.dtype)
-        )
+            ).sum(dim=-1)
+        state_blocks.append(state_block.to(dtype=projected_state.dtype))
         val_blocks.append(
             (
                 edges.to(dtype=val_acc_dtype).unsqueeze(-1)
@@ -525,6 +533,41 @@ def transition_dense_kernel(
         src_block = flat_src_val[:, src_start:src_end, :]
         block_nodes = src_end - src_start
         route_context = prepare_route_context(route_fn, src_block)
+        state_sender = (
+            flat_sender_strength[:, src_start:src_end].to(dtype=state_acc_dtype)
+            * flat_projected_state[:, src_start:src_end].to(dtype=state_acc_dtype)
+        )
+        val_sender = (
+            flat_sender_strength[:, src_start:src_end]
+            .to(dtype=val_acc_dtype)
+            .unsqueeze(-1)
+            * flat_projected_val[:, src_start:src_end, :].to(dtype=val_acc_dtype)
+        )
+
+        if route_compress_name == "signed_entmax15":
+            logits = route_block_logits(
+                route_fn,
+                route_context,
+                start=0,
+                end=dst_nodes,
+            )
+            expected_shape = (batch_flat, block_nodes, dst_nodes)
+            if tuple(logits.shape) != expected_shape:
+                raise ValueError(
+                    "route_fn returned an unexpected block shape in kernel path, "
+                    f"expected {expected_shape}, got {tuple(logits.shape)}."
+                )
+            routes = _compress_routes(logits, route_compress_name=route_compress_name)
+            delta_state += torch.bmm(
+                routes.to(dtype=state_acc_dtype).transpose(1, 2).contiguous(),
+                state_sender.unsqueeze(-1),
+            ).squeeze(-1)
+            delta_val += torch.bmm(
+                routes.to(dtype=val_acc_dtype).transpose(1, 2).contiguous(),
+                val_sender,
+            )
+            continue
+
         softmax_stats = None
 
         for dst_start, dst_end in iter_blocks(

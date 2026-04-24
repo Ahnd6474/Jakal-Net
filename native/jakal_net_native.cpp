@@ -332,16 +332,20 @@ void require_query_source_shapes(
 }
 
 void require_known_edge_compress(const std::string& edge_compress_name) {
-  if (edge_compress_name != "softsign" && edge_compress_name != "signed_entmax15") {
+  if (edge_compress_name != "softsign" &&
+      edge_compress_name != "signed_abs_softmax" &&
+      edge_compress_name != "signed_entmax15") {
     throw std::runtime_error(
-        "Only edge_compress_name in {'softsign', 'signed_entmax15'} is supported by the CPU native backend.");
+        "Only edge_compress_name in {softsign, signed_abs_softmax, signed_entmax15} is supported by the native backend.");
   }
 }
 
 void require_known_route_compress(const std::string& route_compress_name) {
-  if (route_compress_name != "softmax" && route_compress_name != "signed_entmax15") {
+  if (route_compress_name != "softmax" &&
+      route_compress_name != "signed_abs_softmax" &&
+      route_compress_name != "signed_entmax15") {
     throw std::runtime_error(
-        "Only route_compress_name in {'softmax', 'signed_entmax15'} is supported by the CPU native backend.");
+        "Only route_compress_name in {softmax, signed_abs_softmax, signed_entmax15} is supported by the native backend.");
   }
 }
 
@@ -350,6 +354,28 @@ torch::ScalarType accumulator_dtype(torch::ScalarType input_dtype) {
     return torch::kFloat32;
   }
   return input_dtype;
+}
+
+
+int64_t dense_scan_block_size() {
+  if (const char* raw = std::getenv("JAKAL_NET_FUSED_SCAN_DENSE_BLOCK_SIZE")) {
+    try {
+      return std::max<int64_t>(16, std::stoll(raw));
+    } catch (...) {
+      return 128;
+    }
+  }
+  return 128;
+}
+
+torch::ScalarType dense_scan_accumulator_dtype(torch::ScalarType input_dtype) {
+  if (const char* raw = std::getenv("JAKAL_NET_DENSE_ACCUMULATOR_DTYPE")) {
+    const std::string value(raw);
+    if (value == "input" || value == "none") {
+      return input_dtype;
+    }
+  }
+  return accumulator_dtype(input_dtype);
 }
 
 torch::Tensor allocate_accumulator(
@@ -1180,9 +1206,8 @@ std::tuple<torch::Tensor, torch::Tensor> low_rank_propagation_topk_signed_abs(
       weighted_projected_source = projected_source_single * cast_tensor_like(core_weight, projected_source_single).view({1, 1, -1});
       projected_target = projected_target_single;
     }
-    auto weighted_projected_state = (layer_state.to(torch::kFloat32) * layer_state.to(torch::kFloat32)).contiguous();
-    auto weighted_projected_val =
-        (layer_state.to(torch::kFloat32).unsqueeze(-1) * layer_val.to(torch::kFloat32)).contiguous();
+    auto weighted_projected_state = layer_state.to(torch::kFloat32).contiguous();
+    auto weighted_projected_val = layer_val.to(torch::kFloat32).contiguous();
     const auto score_bias =
         (!multihead && packed_optional_tensor(bias).has_value())
             ? packed_optional_tensor(bias).value().item<double>()
@@ -1208,27 +1233,124 @@ std::tuple<torch::Tensor, torch::Tensor> low_rank_propagation_topk_signed_abs(
   auto cast_target_weight = diagonal ? layer_val.new_empty({0}) : cast_tensor_like(target_weight, layer_val);
   auto cast_core_weight = cast_tensor_like(core_weight, layer_val);
   auto cast_bias = cast_packed_optional_like(bias, layer_val);
-  auto scores = pairwise_scores(
+  const auto pairwise_kind =
       diagonal
           ? (multihead ? "multihead_max_diagonal_bilinear" : "diagonal_bilinear")
-          : (multihead ? "multihead_max_low_rank_bilinear" : "low_rank_bilinear"),
-      layer_val,
-      layer_val,
-      cast_core_weight,
-      cast_bias,
-      diagonal ? c10::nullopt : c10::optional<torch::Tensor>(cast_source_weight),
-      c10::nullopt,
-      diagonal ? c10::nullopt : c10::optional<torch::Tensor>(cast_target_weight),
-      c10::nullopt);
+          : (multihead ? "multihead_max_low_rank_bilinear" : "low_rank_bilinear");
+  auto score_block = [&](const torch::Tensor& target_block, const torch::Tensor& source_block) {
+    return pairwise_scores(
+        pairwise_kind,
+        target_block,
+        source_block,
+        cast_core_weight,
+        cast_bias,
+        diagonal ? c10::nullopt : c10::optional<torch::Tensor>(cast_source_weight),
+        c10::nullopt,
+        diagonal ? c10::nullopt : c10::optional<torch::Tensor>(cast_target_weight),
+        c10::nullopt);
+  };
   const auto nodes = layer_val.size(1);
-  const auto k = std::min<int64_t>(std::max<int64_t>(1, topk), nodes);
+  const auto k = topk <= 0 ? nodes : std::min<int64_t>(std::max<int64_t>(1, topk), nodes);
+
+  if (topk <= 0 &&
+      (compress_name == "signed_abs_softmax" ||
+       compress_name == "softmax" ||
+       compress_name == "softsign")) {
+    const auto block_size = dense_scan_block_size();
+    const auto state_acc_dtype = dense_scan_accumulator_dtype(layer_state.scalar_type());
+    const auto val_acc_dtype = dense_scan_accumulator_dtype(layer_val.scalar_type());
+    auto delta_state = torch::zeros(
+        {layer_state.size(0), nodes},
+        layer_state.options().dtype(state_acc_dtype));
+    auto delta_val = torch::zeros(
+        {layer_val.size(0), nodes, layer_val.size(2)},
+        layer_val.options().dtype(val_acc_dtype));
+    for (int64_t target_start = 0; target_start < nodes; target_start += block_size) {
+      const auto target_end = std::min<int64_t>(target_start + block_size, nodes);
+      auto target_block = layer_val.slice(1, target_start, target_end);
+      auto target_state_acc = torch::zeros(
+          {layer_state.size(0), target_end - target_start},
+          layer_state.options().dtype(state_acc_dtype));
+      auto target_val_acc = torch::zeros(
+          {layer_val.size(0), target_end - target_start, layer_val.size(2)},
+          layer_val.options().dtype(val_acc_dtype));
+      if (compress_name == "softsign") {
+        for (int64_t source_start = 0; source_start < nodes; source_start += block_size) {
+          const auto source_end = std::min<int64_t>(source_start + block_size, nodes);
+          auto edges = compress_scores(
+              compress_name,
+              score_block(target_block, layer_val.slice(1, source_start, source_end)));
+          target_state_acc = target_state_acc + torch::bmm(
+              edges.to(state_acc_dtype),
+              layer_state.slice(1, source_start, source_end).to(state_acc_dtype).unsqueeze(-1)).squeeze(-1);
+          target_val_acc = target_val_acc + torch::bmm(
+              edges.to(val_acc_dtype),
+              layer_val.slice(1, source_start, source_end).to(val_acc_dtype));
+        }
+      } else {
+        auto running_max = torch::full(
+            {layer_state.size(0), target_end - target_start},
+            -std::numeric_limits<float>::infinity(),
+            layer_state.options().dtype(torch::kFloat32));
+        auto running_sum = torch::zeros_like(running_max);
+        for (int64_t source_start = 0; source_start < nodes; source_start += block_size) {
+          const auto source_end = std::min<int64_t>(source_start + block_size, nodes);
+          auto scores_block = torch::nan_to_num(
+              score_block(target_block, layer_val.slice(1, source_start, source_end))).to(torch::kFloat32);
+          auto stats_block = compress_name == "signed_abs_softmax" ? scores_block.abs() : scores_block;
+          auto block_max = std::get<0>(stats_block.max(-1));
+          auto next_max = torch::maximum(running_max, block_max);
+          running_sum = running_sum * torch::exp(running_max - next_max) +
+              torch::exp(stats_block - next_max.unsqueeze(-1)).sum(-1);
+          running_max = next_max;
+        }
+        for (int64_t source_start = 0; source_start < nodes; source_start += block_size) {
+          const auto source_end = std::min<int64_t>(source_start + block_size, nodes);
+          auto scores_block = torch::nan_to_num(
+              score_block(target_block, layer_val.slice(1, source_start, source_end))).to(torch::kFloat32);
+          auto stats_block = compress_name == "signed_abs_softmax" ? scores_block.abs() : scores_block;
+          auto edges = torch::exp(stats_block - running_max.unsqueeze(-1)) / running_sum.unsqueeze(-1);
+          if (compress_name == "signed_abs_softmax") {
+            edges = edges * torch::sign(scores_block);
+          }
+          target_state_acc = target_state_acc + torch::bmm(
+              edges.to(state_acc_dtype),
+              layer_state.slice(1, source_start, source_end).to(state_acc_dtype).unsqueeze(-1)).squeeze(-1);
+          target_val_acc = target_val_acc + torch::bmm(
+              edges.to(val_acc_dtype),
+              layer_val.slice(1, source_start, source_end).to(val_acc_dtype));
+        }
+      }
+      delta_state.slice(1, target_start, target_end).copy_(target_state_acc);
+      delta_val.slice(1, target_start, target_end).copy_(target_val_acc);
+    }
+    return {
+        delta_state.to(layer_state.scalar_type()),
+        delta_val.to(layer_val.scalar_type()),
+    };
+  }
+
+  auto scores = score_block(layer_val, layer_val);
+
+  if (k == nodes) {
+    auto edges = compress_scores(compress_name, scores);
+    const auto state_acc_dtype = dense_scan_accumulator_dtype(layer_state.scalar_type());
+    const auto val_acc_dtype = dense_scan_accumulator_dtype(layer_val.scalar_type());
+    auto delta_state = torch::bmm(
+        edges.to(state_acc_dtype),
+        layer_state.to(state_acc_dtype).unsqueeze(-1)).squeeze(-1);
+    auto delta_val = torch::bmm(
+        edges.to(val_acc_dtype),
+        layer_val.to(val_acc_dtype));
+    return {
+        delta_state.to(layer_state.scalar_type()),
+        delta_val.to(layer_val.scalar_type()),
+    };
+  }
 
   torch::Tensor selected_scores;
   torch::Tensor selected_indices;
-  if (k == nodes) {
-    selected_scores = scores;
-    selected_indices = full_topk_indices(scores);
-  } else {
+  {
     auto topk_result = scores.topk(k, -1, true, true);
     selected_scores = std::get<0>(topk_result);
     selected_indices = std::get<1>(topk_result);
@@ -1238,13 +1360,12 @@ std::tuple<torch::Tensor, torch::Tensor> low_rank_propagation_topk_signed_abs(
   auto selected_state = std::get<0>(gathered);
   auto selected_val = std::get<1>(gathered);
   auto edges = compress_scores(compress_name, selected_scores);
-  auto weighted_edges = edges * selected_state;
   const auto state_acc_dtype = accumulator_dtype(layer_state.scalar_type());
   const auto val_acc_dtype = accumulator_dtype(layer_val.scalar_type());
   auto delta_state =
-      (weighted_edges.to(state_acc_dtype) * selected_state.to(state_acc_dtype)).sum(-1);
+      (edges.to(state_acc_dtype) * selected_state.to(state_acc_dtype)).sum(-1);
   auto delta_val =
-      (weighted_edges.to(val_acc_dtype).unsqueeze(-1) * selected_val.to(val_acc_dtype)).sum(-2);
+      (edges.to(val_acc_dtype).unsqueeze(-1) * selected_val.to(val_acc_dtype)).sum(-2);
   return {
       delta_state.to(layer_state.scalar_type()),
       delta_val.to(layer_val.scalar_type()),
@@ -2797,6 +2918,7 @@ std::tuple<torch::Tensor, torch::Tensor> propagation_dense(
     const torch::Tensor& layer_val,
     const torch::Tensor& projected_state,
     const torch::Tensor& projected_val,
+    const c10::optional<torch::Tensor>& source_state,
     int64_t target_block_size,
     int64_t source_block_size) {
   require_known_edge_compress(edge_compress_name);
@@ -2811,6 +2933,16 @@ std::tuple<torch::Tensor, torch::Tensor> propagation_dense(
   const auto batch_flat = flat_val.size(0);
   const auto num_nodes = flat_val.size(1);
   const auto out_dim = flat_projected_val.size(2);
+  const bool state_weighted =
+      source_state.has_value() && source_state.value().defined() && source_state.value().numel() != 0;
+  torch::Tensor flat_source_state;
+  if (state_weighted) {
+    require_supported_device(source_state.value(), "source_state");
+    flat_source_state = flatten_state(source_state.value()).contiguous();
+    if (flat_source_state.size(0) != batch_flat || flat_source_state.size(1) != num_nodes) {
+      throw std::runtime_error("source_state must match layer_val batch shape and node count.");
+    }
+  }
 
   const auto state_acc_dtype = accumulator_dtype(projected_state.scalar_type());
   const auto val_acc_dtype = accumulator_dtype(projected_val.scalar_type());
@@ -2820,12 +2952,21 @@ std::tuple<torch::Tensor, torch::Tensor> propagation_dense(
     auto scores = pairwise_scores(
         pairwise_kind, flat_val, flat_val, weight, bias, in_weight, in_bias, out_weight, out_bias);
     auto edges = compress_scores(edge_compress_name, scores);
-    auto delta_state =
-        torch::bmm(
-            edges.to(state_acc_dtype),
-            flat_projected_state.to(state_acc_dtype).unsqueeze(-1))
-            .squeeze(-1);
-    auto delta_val = torch::bmm(edges.to(val_acc_dtype), flat_projected_val.to(val_acc_dtype));
+    torch::Tensor state_edges = edges.to(state_acc_dtype);
+    torch::Tensor val_edges = edges.to(val_acc_dtype);
+    torch::Tensor delta_state;
+    if (state_weighted) {
+      state_edges = state_edges * flat_source_state.to(state_acc_dtype).unsqueeze(1);
+      val_edges = val_edges * flat_source_state.to(val_acc_dtype).unsqueeze(1);
+      delta_state = state_edges.sum(-1);
+    } else {
+      delta_state =
+          torch::bmm(
+              state_edges,
+              flat_projected_state.to(state_acc_dtype).unsqueeze(-1))
+              .squeeze(-1);
+    }
+    auto delta_val = torch::bmm(val_edges, flat_projected_val.to(val_acc_dtype));
     return {
         reshape_state(delta_state.to(projected_state.scalar_type()), batch_sizes, num_nodes),
         reshape_val(delta_val.to(projected_val.scalar_type()), batch_sizes, num_nodes, out_dim),
@@ -2854,13 +2995,20 @@ std::tuple<torch::Tensor, torch::Tensor> propagation_dense(
       auto edges = compress_scores(edge_compress_name, scores);
       auto state_edges = edges.to(state_acc_dtype);
       auto val_edges = edges.to(val_acc_dtype);
-      auto source_state =
-          flat_projected_state.slice(1, source_start, source_end).to(state_acc_dtype);
       auto source_proj_val =
           flat_projected_val.slice(1, source_start, source_end).to(val_acc_dtype);
 
-      target_state_acc = target_state_acc +
-                         torch::bmm(state_edges, source_state.unsqueeze(-1)).squeeze(-1);
+      if (state_weighted) {
+        auto source_weights = flat_source_state.slice(1, source_start, source_end);
+        state_edges = state_edges * source_weights.to(state_acc_dtype).unsqueeze(1);
+        val_edges = val_edges * source_weights.to(val_acc_dtype).unsqueeze(1);
+        target_state_acc = target_state_acc + state_edges.sum(-1);
+      } else {
+        auto source_state_proj =
+            flat_projected_state.slice(1, source_start, source_end).to(state_acc_dtype);
+        target_state_acc = target_state_acc +
+                           torch::bmm(state_edges, source_state_proj.unsqueeze(-1)).squeeze(-1);
+      }
       target_val_acc = target_val_acc + torch::bmm(val_edges, source_proj_val);
     }
 
@@ -3146,6 +3294,7 @@ std::tuple<torch::Tensor, torch::Tensor> propagation_topk(
         layer_val,
         projected_state,
         projected_val,
+        c10::nullopt,
         target_block_size,
         source_block_size);
   }
@@ -3281,9 +3430,7 @@ std::tuple<torch::Tensor, torch::Tensor> transition_dense(
     auto route_context = prepare_route_context(route_kind, flat_src_val, in_weight, in_bias);
     auto logits = route_block_logits(
         route_kind, route_context, in_weight, in_bias, out_weight, out_bias, 0, dst_nodes);
-    auto routes = route_compress_name == "signed_entmax15"
-                      ? signed_entmax15_scores(logits)
-                      : torch::softmax(logits, -1);
+    auto routes = compress_scores(route_compress_name, logits);
     auto state_sender =
         (flat_sender_strength.to(state_acc_dtype) * flat_projected_state.to(state_acc_dtype));
     auto val_sender =
@@ -3333,6 +3480,7 @@ std::tuple<torch::Tensor, torch::Tensor> transition_dense(
       continue;
     }
 
+    const bool signed_abs_routes = route_compress_name == "signed_abs_softmax";
     torch::Tensor running_max;
     torch::Tensor running_sum;
     bool initialized = false;
@@ -3341,8 +3489,10 @@ std::tuple<torch::Tensor, torch::Tensor> transition_dense(
       const auto dst_end = std::min(dst_start + dst_step, dst_nodes);
       auto logits = route_block_logits(
           route_kind, route_context, in_weight, in_bias, out_weight, out_bias, dst_start, dst_end);
-      auto block_max = std::get<0>(logits.max(-1));
-      auto block_exp = torch::exp(logits - block_max.unsqueeze(-1));
+      auto clean_logits = signed_abs_routes ? torch::nan_to_num(logits) : logits;
+      auto stats_logits = signed_abs_routes ? clean_logits.abs() : clean_logits;
+      auto block_max = std::get<0>(stats_logits.max(-1));
+      auto block_exp = torch::exp(stats_logits - block_max.unsqueeze(-1));
       auto block_sum = block_exp.sum(-1);
 
       if (!initialized) {
@@ -3362,7 +3512,12 @@ std::tuple<torch::Tensor, torch::Tensor> transition_dense(
       const auto dst_end = std::min(dst_start + dst_step, dst_nodes);
       auto logits = route_block_logits(
           route_kind, route_context, in_weight, in_bias, out_weight, out_bias, dst_start, dst_end);
-      auto routes = torch::exp(logits - running_max.unsqueeze(-1)) / running_sum.unsqueeze(-1);
+      auto clean_logits = signed_abs_routes ? torch::nan_to_num(logits) : logits;
+      auto stats_logits = signed_abs_routes ? clean_logits.abs() : clean_logits;
+      auto routes = torch::exp(stats_logits - running_max.unsqueeze(-1)) / running_sum.unsqueeze(-1);
+      if (signed_abs_routes) {
+        routes = torch::sign(clean_logits) * routes;
+      }
       auto transport = routes.transpose(1, 2).contiguous();
       delta_state.slice(1, dst_start, dst_end) =
           delta_state.slice(1, dst_start, dst_end) +
@@ -3506,6 +3661,7 @@ std::tuple<torch::Tensor, torch::Tensor> transition_pairwise_dense(
     const c10::optional<torch::Tensor>& hidden_bias,
     const c10::optional<torch::Tensor>& out_weight,
     const c10::optional<torch::Tensor>& out_bias,
+    const std::string& route_compress_name,
     double temperature,
     const torch::Tensor& sender_strength,
     const torch::Tensor& src_val,
@@ -3514,6 +3670,7 @@ std::tuple<torch::Tensor, torch::Tensor> transition_pairwise_dense(
     const torch::Tensor& projected_val,
     int64_t src_block_size,
     int64_t dst_block_size) {
+  require_known_route_compress(route_compress_name);
   require_supported_device(sender_strength, "sender_strength");
   require_supported_device(src_val, "src_val");
   require_supported_device(dst_val, "dst_val");
@@ -3551,7 +3708,7 @@ std::tuple<torch::Tensor, torch::Tensor> transition_pairwise_dense(
         out_weight,
         out_bias,
         temperature);
-    auto routes = torch::softmax(logits, -1);
+    auto routes = compress_scores(route_compress_name, logits);
     auto state_sender =
         (flat_sender_strength.to(state_acc_dtype) * flat_projected_state.to(state_acc_dtype));
     auto val_sender =
@@ -3579,6 +3736,42 @@ std::tuple<torch::Tensor, torch::Tensor> transition_pairwise_dense(
     const auto src_end = std::min(src_start + src_step, src_nodes);
     auto src_block = flat_src_val.slice(1, src_start, src_end);
 
+    if (route_compress_name == "signed_entmax15") {
+      std::vector<torch::Tensor> logits_blocks;
+      for (int64_t dst_start = 0; dst_start < dst_nodes; dst_start += dst_step) {
+        const auto dst_end = std::min(dst_start + dst_step, dst_nodes);
+        auto dst_block = flat_dst_val.slice(1, dst_start, dst_end);
+        logits_blocks.push_back(pairwise_route_block_logits(
+            route_kind,
+            src_block,
+            dst_block,
+            source_weight,
+            source_bias,
+            target_weight,
+            target_bias,
+            core_weight,
+            bias,
+            hidden_weight,
+            hidden_bias,
+            out_weight,
+            out_bias,
+            temperature));
+      }
+      auto state_sender =
+          (flat_sender_strength.slice(1, src_start, src_end).to(state_acc_dtype) *
+           flat_projected_state.slice(1, src_start, src_end).to(state_acc_dtype));
+      auto val_sender =
+          (flat_sender_strength.slice(1, src_start, src_end).to(val_acc_dtype).unsqueeze(-1) *
+           flat_projected_val.slice(1, src_start, src_end).to(val_acc_dtype));
+      auto routes = signed_entmax15_scores(torch::cat(logits_blocks, -1));
+      auto transport = routes.transpose(1, 2).contiguous();
+      delta_state = delta_state +
+                    torch::bmm(transport.to(state_acc_dtype), state_sender.unsqueeze(-1)).squeeze(-1);
+      delta_val = delta_val + torch::bmm(transport.to(val_acc_dtype), val_sender);
+      continue;
+    }
+
+    const bool signed_abs_routes = route_compress_name == "signed_abs_softmax";
     torch::Tensor running_max;
     torch::Tensor running_sum;
     bool initialized = false;
@@ -3601,8 +3794,10 @@ std::tuple<torch::Tensor, torch::Tensor> transition_pairwise_dense(
           out_weight,
           out_bias,
           temperature);
-      auto block_max = std::get<0>(logits.max(-1));
-      auto block_exp = torch::exp(logits - block_max.unsqueeze(-1));
+      auto clean_logits = signed_abs_routes ? torch::nan_to_num(logits) : logits;
+      auto stats_logits = signed_abs_routes ? clean_logits.abs() : clean_logits;
+      auto block_max = std::get<0>(stats_logits.max(-1));
+      auto block_exp = torch::exp(stats_logits - block_max.unsqueeze(-1));
       auto block_sum = block_exp.sum(-1);
 
       if (!initialized) {
@@ -3643,7 +3838,12 @@ std::tuple<torch::Tensor, torch::Tensor> transition_pairwise_dense(
           out_weight,
           out_bias,
           temperature);
-      auto routes = torch::exp(logits - running_max.unsqueeze(-1)) / running_sum.unsqueeze(-1);
+      auto clean_logits = signed_abs_routes ? torch::nan_to_num(logits) : logits;
+      auto stats_logits = signed_abs_routes ? clean_logits.abs() : clean_logits;
+      auto routes = torch::exp(stats_logits - running_max.unsqueeze(-1)) / running_sum.unsqueeze(-1);
+      if (signed_abs_routes) {
+        routes = torch::sign(clean_logits) * routes;
+      }
       auto transport = routes.transpose(1, 2).contiguous();
       delta_state.slice(1, dst_start, dst_end) =
           delta_state.slice(1, dst_start, dst_end) +
