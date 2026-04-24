@@ -295,7 +295,7 @@ class Propagation(nn.Module):
                 source_block_size=self.source_block_size,
                 accumulator_dtype=self.accumulator_dtype,
             )
-        return self._compute_delta_streaming(layer)
+        return Propagation._compute_delta_streaming(self, layer)
 
     def compute_delta(self, layer: Layer) -> LayerDelta:
         if self.implementation == "native" and _cuda_graph_capture_active(layer.val.device.type):
