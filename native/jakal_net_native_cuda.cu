@@ -2014,6 +2014,13 @@ torch::Tensor scan_cuda_layer_norm_last_dim(
 
 torch::Tensor scan_cuda_signed_softmax_state(const torch::Tensor& state) {
   auto clean_state = torch::nan_to_num(state);
+  clean_state = torch::layer_norm(
+      clean_state,
+      {clean_state.size(-1)},
+      c10::nullopt,
+      c10::nullopt,
+      1e-5,
+      false);
   auto magnitude = torch::softmax(clean_state.abs(), -1);
   const auto state_mass = static_cast<double>(state.size(-1));
   return torch::sign(clean_state) * magnitude * state_mass;
