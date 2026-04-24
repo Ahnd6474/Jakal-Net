@@ -84,6 +84,9 @@ class CausalHierarchicalMemoryLM(nn.Module):
         checkpoint_sequence_layers: bool = False,
         checkpoint_prediction_layers: bool = False,
         memory_topk: int = 16,
+        memory_train_mode: str = "dense",
+        memory_eval_mode: str = "dense",
+        eval_topk: int | None = None,
         pairwise_kind: str = "low_rank_bilinear",
         route_kind: str = "low_rank_bilinear",
         pairwise_rank: int = 64,
@@ -128,6 +131,12 @@ class CausalHierarchicalMemoryLM(nn.Module):
             raise ValueError("knowledge_nodes must be non-negative.")
         if knowledge_propagation_layers <= 0:
             raise ValueError("knowledge_propagation_layers must be positive.")
+        if memory_train_mode not in {"dense", "topk"}:
+            raise ValueError(f"Unsupported memory_train_mode: {memory_train_mode!r}.")
+        if memory_eval_mode not in {"dense", "topk"}:
+            raise ValueError(f"Unsupported memory_eval_mode: {memory_eval_mode!r}.")
+        if eval_topk is not None and eval_topk <= 0:
+            raise ValueError("eval_topk must be positive when provided.")
 
         self.vocab_size = vocab_size
         self.dim = dim
@@ -185,6 +194,9 @@ class CausalHierarchicalMemoryLM(nn.Module):
             memory_slots=self.memory_slots,
             memory_update_intervals=memory_update_intervals,
             memory_topk=memory_topk,
+            memory_train_mode=memory_train_mode,
+            memory_eval_mode=memory_eval_mode,
+            eval_topk=eval_topk,
             pairwise_kind=pairwise_kind,
             route_kind=route_kind,
             pairwise_rank=pairwise_rank,
@@ -617,8 +629,8 @@ class CausalHierarchicalMemoryLM(nn.Module):
             "propagation_core_weights": tuple(spec[2] for spec in propagation_specs),
             "propagation_biases": tuple(spec[3] for spec in propagation_specs),
             "propagation_topks": tuple(
-                int(level.propagation.topk)
-                if getattr(level.propagation, "sparse_type", "dense") == "topk"
+                int(level.current_propagation_topk())
+                if level.current_memory_mode() == "topk"
                 else 0
                 for level in self.b_module.memory_levels
             ),

@@ -50,6 +50,9 @@ class _MemoryLevel(nn.Module):
         pairwise_anchor_kind: str,
         route_anchor_kind: str,
         memory_topk: int,
+        memory_train_mode: str,
+        memory_eval_mode: str,
+        eval_topk: int | None,
         implementation: str,
         unit_norm_values: bool,
         disable_val_norm: bool = False,
@@ -58,6 +61,16 @@ class _MemoryLevel(nn.Module):
         self.dim = dim
         self.num_slots = num_slots
         self.unit_norm_values = unit_norm_values
+        if memory_train_mode not in {"dense", "topk"}:
+            raise ValueError(f"Unsupported memory_train_mode: {memory_train_mode!r}.")
+        if memory_eval_mode not in {"dense", "topk"}:
+            raise ValueError(f"Unsupported memory_eval_mode: {memory_eval_mode!r}.")
+        if eval_topk is not None and eval_topk <= 0:
+            raise ValueError("eval_topk must be positive when provided.")
+        self.memory_train_mode = memory_train_mode
+        self.memory_eval_mode = memory_eval_mode
+        self.memory_topk = min(memory_topk, num_slots)
+        self.eval_topk = min(eval_topk or memory_topk, num_slots)
         self.init_state = nn.Parameter(torch.empty(num_slots))
         self.init_val = nn.Parameter(torch.empty(num_slots, dim))
         nn.init.normal_(self.init_state, mean=0.0, std=0.02)
@@ -79,7 +92,7 @@ class _MemoryLevel(nn.Module):
             merge_mode="add",
             use_direction_only=unit_norm_values,
         )
-        self.propagation = Propagation(
+        self.propagation = SparsePropagation(
             pairwise_fn=make_pairwise(
                 pairwise_kind,
                 dim=dim,
@@ -89,6 +102,8 @@ class _MemoryLevel(nn.Module):
                 anchor_heads=pairwise_anchor_heads,
                 anchor_kind=pairwise_anchor_kind,
             ),
+            sparse_type="topk",
+            topk=self.memory_topk,
             edge_compress_fn=signed_abs_softmax_edges,
             state_weight_edges=False,
             implementation=implementation,
@@ -96,6 +111,28 @@ class _MemoryLevel(nn.Module):
             use_direction_only=unit_norm_values,
         )
         self.val_norm = nn.Identity() if disable_val_norm else nn.LayerNorm(dim)
+
+    def current_memory_mode(self) -> str:
+        return self.memory_train_mode if self.training else self.memory_eval_mode
+
+    def current_propagation_topk(self) -> int:
+        return self.memory_topk if self.training else self.eval_topk
+
+    def compute_propagation_delta(self, layer: Layer) -> LayerDelta:
+        original_topk = self.propagation.topk
+        self.propagation.topk = self.current_propagation_topk()
+        try:
+            if self.current_memory_mode() == "dense":
+                if self.propagation.implementation == "reference":
+                    return Propagation._compute_delta_reference(self.propagation, layer)
+                if self.propagation.implementation in {"kernel", "native"}:
+                    return Propagation._compute_delta_kernel_preferred(self.propagation, layer)
+                if layer.val.device.type == "privateuseone":
+                    return Propagation._compute_delta_reference(self.propagation, layer)
+                return Propagation._compute_delta_streaming(self.propagation, layer)
+            return self.propagation.compute_delta(layer)
+        finally:
+            self.propagation.topk = original_topk
 
     def initialize(
         self,
@@ -125,6 +162,9 @@ class BModule(nn.Module):
         memory_slots: Sequence[int],
         memory_update_intervals: Sequence[int] | None = None,
         memory_topk: int,
+        memory_train_mode: str = "dense",
+        memory_eval_mode: str = "dense",
+        eval_topk: int | None = None,
         pairwise_kind: str,
         route_kind: str,
         pairwise_rank: int,
@@ -180,6 +220,9 @@ class BModule(nn.Module):
                 pairwise_anchor_kind=pairwise_anchor_kind,
                 route_anchor_kind=route_anchor_kind,
                 memory_topk=memory_topk,
+                memory_train_mode=memory_train_mode,
+                memory_eval_mode=memory_eval_mode,
+                eval_topk=eval_topk,
                 implementation=implementation,
                 unit_norm_values=unit_norm_values,
                 disable_val_norm=unit_norm_values,
@@ -354,7 +397,7 @@ class BModule(nn.Module):
         )
         level = apply_delta(
             level,
-            first_level_module.propagation.compute_delta(level),
+            first_level_module.compute_propagation_delta(level),
             residual=True,
             val_norm=first_level_module.val_norm,
             unit_norm_values=self.unit_norm_values,
@@ -413,7 +456,7 @@ class BModule(nn.Module):
                 )
             level = apply_delta(
                 level,
-                level_module.propagation.compute_delta(level),
+                level_module.compute_propagation_delta(level),
                 residual=True,
                 val_norm=level_module.val_norm,
                 unit_norm_values=self.unit_norm_values,

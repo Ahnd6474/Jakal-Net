@@ -1257,6 +1257,63 @@ std::tuple<torch::Tensor, torch::Tensor> low_rank_propagation_topk_signed_abs(
        compress_name == "softmax" ||
        compress_name == "softsign")) {
     const auto block_size = dense_scan_block_size();
+    const bool precompute_low_rank = !diagonal &&
+        (pairwise_kind == "low_rank_bilinear" || pairwise_kind == "multihead_max_low_rank_bilinear");
+    torch::Tensor precomputed_target;
+    torch::Tensor precomputed_weighted_source;
+    if (precompute_low_rank) {
+      if (multihead) {
+        auto projected_source = torch::einsum(
+            "bid,hrd->bhir",
+            std::vector<torch::Tensor>{layer_val, cast_source_weight}).contiguous();
+        std::vector<int64_t> core_shape(projected_source.dim(), 1);
+        core_shape[1] = cast_core_weight.size(0);
+        core_shape[3] = cast_core_weight.size(1);
+        precomputed_weighted_source =
+            (projected_source * cast_core_weight.view(core_shape)).contiguous();
+        precomputed_target = torch::einsum(
+            "bid,hrd->bhir",
+            std::vector<torch::Tensor>{layer_val, cast_target_weight}).contiguous();
+      } else {
+        precomputed_target =
+            torch::matmul(layer_val, cast_target_weight.transpose(0, 1)).contiguous();
+        auto projected_source =
+            torch::matmul(layer_val, cast_source_weight.transpose(0, 1)).contiguous();
+        precomputed_weighted_source =
+            (projected_source *
+             cast_core_weight.view({1, 1, -1}).to(projected_source.scalar_type())).contiguous();
+      }
+    }
+    auto dense_score_block = [&](int64_t target_start,
+                                 int64_t target_end,
+                                 int64_t source_start,
+                                 int64_t source_end,
+                                 const torch::Tensor& target_block,
+                                 const torch::Tensor& source_block) {
+      if (!precompute_low_rank) {
+        return score_block(target_block, source_block);
+      }
+      torch::Tensor scores;
+      if (multihead) {
+        scores = torch::einsum(
+            "bhir,bhjr->bhij",
+            std::vector<torch::Tensor>{
+                precomputed_target.slice(2, target_start, target_end),
+                precomputed_weighted_source.slice(2, source_start, source_end)});
+        if (cast_bias.has_value() && cast_bias.value().numel() != 0) {
+          scores = scores + cast_bias.value().view({1, cast_bias.value().numel(), 1, 1}).to(scores.scalar_type());
+        }
+        scores = std::get<0>(scores.max(1));
+      } else {
+        scores = torch::bmm(
+            precomputed_target.slice(1, target_start, target_end),
+            precomputed_weighted_source.slice(1, source_start, source_end).transpose(1, 2));
+        if (cast_bias.has_value() && cast_bias.value().numel() != 0) {
+          scores = scores + cast_bias.value().to(scores.scalar_type());
+        }
+      }
+      return scores;
+    };
     const auto state_acc_dtype = dense_scan_accumulator_dtype(layer_state.scalar_type());
     const auto val_acc_dtype = dense_scan_accumulator_dtype(layer_val.scalar_type());
     auto delta_state = torch::zeros(
@@ -1279,7 +1336,13 @@ std::tuple<torch::Tensor, torch::Tensor> low_rank_propagation_topk_signed_abs(
           const auto source_end = std::min<int64_t>(source_start + block_size, nodes);
           auto edges = compress_scores(
               compress_name,
-              score_block(target_block, layer_val.slice(1, source_start, source_end)));
+              dense_score_block(
+                  target_start,
+                  target_end,
+                  source_start,
+                  source_end,
+                  target_block,
+                  layer_val.slice(1, source_start, source_end)));
           target_state_acc = target_state_acc + torch::bmm(
               edges.to(state_acc_dtype),
               layer_state.slice(1, source_start, source_end).to(state_acc_dtype).unsqueeze(-1)).squeeze(-1);
@@ -1296,7 +1359,13 @@ std::tuple<torch::Tensor, torch::Tensor> low_rank_propagation_topk_signed_abs(
         for (int64_t source_start = 0; source_start < nodes; source_start += block_size) {
           const auto source_end = std::min<int64_t>(source_start + block_size, nodes);
           auto scores_block = torch::nan_to_num(
-              score_block(target_block, layer_val.slice(1, source_start, source_end))).to(torch::kFloat32);
+              dense_score_block(
+                  target_start,
+                  target_end,
+                  source_start,
+                  source_end,
+                  target_block,
+                  layer_val.slice(1, source_start, source_end))).to(torch::kFloat32);
           auto stats_block = compress_name == "signed_abs_softmax" ? scores_block.abs() : scores_block;
           auto block_max = std::get<0>(stats_block.max(-1));
           auto next_max = torch::maximum(running_max, block_max);
@@ -1307,7 +1376,13 @@ std::tuple<torch::Tensor, torch::Tensor> low_rank_propagation_topk_signed_abs(
         for (int64_t source_start = 0; source_start < nodes; source_start += block_size) {
           const auto source_end = std::min<int64_t>(source_start + block_size, nodes);
           auto scores_block = torch::nan_to_num(
-              score_block(target_block, layer_val.slice(1, source_start, source_end))).to(torch::kFloat32);
+              dense_score_block(
+                  target_start,
+                  target_end,
+                  source_start,
+                  source_end,
+                  target_block,
+                  layer_val.slice(1, source_start, source_end))).to(torch::kFloat32);
           auto stats_block = compress_name == "signed_abs_softmax" ? scores_block.abs() : scores_block;
           auto edges = torch::exp(stats_block - running_max.unsqueeze(-1)) / running_sum.unsqueeze(-1);
           if (compress_name == "signed_abs_softmax") {

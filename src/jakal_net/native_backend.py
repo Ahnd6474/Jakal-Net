@@ -3721,6 +3721,155 @@ class _LowRankTransitionPairwiseTopK(Function):
         )
 
 
+def _low_rank_dense_signed_abs_forward(
+    layer_val: Tensor,
+    projected_state: Tensor,
+    projected_val: Tensor,
+    source_weight: Tensor,
+    target_weight: Tensor,
+    core_weight: Tensor,
+    bias: Tensor | None,
+    target_block_size: int,
+) -> tuple[Tensor, Tensor]:
+    (
+        flat_val,
+        flat_projected_state,
+        flat_projected_val,
+        batch_shape,
+        nodes,
+        out_dim,
+    ) = _flatten_dense_tensors(layer_val, projected_state, projected_val)
+    target_step = nodes if target_block_size <= 0 else min(int(target_block_size), nodes)
+    projected_target = torch.matmul(flat_val, target_weight.t()).contiguous()
+    weighted_source = (
+        torch.matmul(flat_val, source_weight.t())
+        * core_weight.to(dtype=flat_val.dtype).view(1, 1, -1)
+    ).contiguous()
+    state_blocks: list[Tensor] = []
+    val_blocks: list[Tensor] = []
+    source_state = flat_projected_state.to(dtype=torch.float32)
+    source_val = flat_projected_val.to(dtype=torch.float32)
+    weighted_source_t = weighted_source.transpose(1, 2).contiguous()
+    for target_start in range(0, nodes, target_step):
+        target_end = min(target_start + target_step, nodes)
+        scores = torch.bmm(
+            projected_target[:, target_start:target_end, :],
+            weighted_source_t,
+        )
+        if bias is not None:
+            scores = scores + bias.to(dtype=scores.dtype)
+        clean_scores = torch.nan_to_num(scores).to(dtype=torch.float32)
+        edges = torch.nan_to_num(
+            torch.sign(clean_scores) * torch.softmax(clean_scores.abs(), dim=-1)
+        )
+        state_blocks.append(
+            torch.bmm(edges, source_state.unsqueeze(-1)).squeeze(-1).to(dtype=projected_state.dtype)
+        )
+        val_blocks.append(torch.bmm(edges, source_val).to(dtype=projected_val.dtype))
+    return (
+        torch.cat(state_blocks, dim=1).reshape(*batch_shape, nodes),
+        torch.cat(val_blocks, dim=1).reshape(*batch_shape, nodes, out_dim),
+    )
+
+
+class _LowRankPropagationDenseSignedAbsRecompute(Function):
+    @staticmethod
+    def forward(
+        ctx: Any,
+        layer_val: Tensor,
+        projected_state: Tensor,
+        projected_val: Tensor,
+        source_weight: Tensor,
+        target_weight: Tensor,
+        core_weight: Tensor,
+        bias: Tensor | None,
+        target_block_size: int,
+    ) -> tuple[Tensor, Tensor]:
+        ctx.has_bias = bias is not None
+        ctx.target_block_size = int(target_block_size)
+        ctx.save_for_backward(
+            layer_val,
+            projected_state,
+            projected_val,
+            source_weight,
+            target_weight,
+            core_weight,
+            _save_optional_tensor(bias, core_weight),
+        )
+        return _low_rank_dense_signed_abs_forward(
+            layer_val,
+            projected_state,
+            projected_val,
+            source_weight,
+            target_weight,
+            core_weight,
+            bias,
+            int(target_block_size),
+        )
+
+    @staticmethod
+    def backward(ctx: Any, grad_delta_state: Tensor, grad_delta_val: Tensor) -> tuple[Any, ...]:
+        (
+            layer_val,
+            projected_state,
+            projected_val,
+            source_weight,
+            target_weight,
+            core_weight,
+            bias_tensor,
+        ) = ctx.saved_tensors
+        bias = _load_optional_tensor(bias_tensor)
+        detached_inputs = [
+            layer_val.detach().requires_grad_(True),
+            projected_state.detach().requires_grad_(True),
+            projected_val.detach().requires_grad_(True),
+            source_weight.detach().requires_grad_(True),
+            target_weight.detach().requires_grad_(True),
+            core_weight.detach().requires_grad_(True),
+        ]
+        detached_bias = None if bias is None else bias.detach().requires_grad_(True)
+        with torch.enable_grad():
+            delta_state, delta_val = _low_rank_dense_signed_abs_forward(
+                detached_inputs[0],
+                detached_inputs[1],
+                detached_inputs[2],
+                detached_inputs[3],
+                detached_inputs[4],
+                detached_inputs[5],
+                detached_bias,
+                ctx.target_block_size,
+            )
+            grads = torch.autograd.grad(
+                (delta_state, delta_val),
+                (*detached_inputs, detached_bias) if detached_bias is not None else tuple(detached_inputs),
+                (grad_delta_state, grad_delta_val),
+                allow_unused=False,
+            )
+        if detached_bias is None:
+            grad_layer, grad_projected_state, grad_projected_val, grad_source_weight, grad_target_weight, grad_core_weight = grads
+            grad_bias = None
+        else:
+            (
+                grad_layer,
+                grad_projected_state,
+                grad_projected_val,
+                grad_source_weight,
+                grad_target_weight,
+                grad_core_weight,
+                grad_bias,
+            ) = grads
+        return (
+            grad_layer.to(dtype=layer_val.dtype),
+            grad_projected_state.to(dtype=projected_state.dtype),
+            grad_projected_val.to(dtype=projected_val.dtype),
+            grad_source_weight,
+            grad_target_weight,
+            grad_core_weight,
+            grad_bias if ctx.has_bias else None,
+            None,
+        )
+
+
 class _LowRankPropagationTopK(Function):
     @staticmethod
     def forward(
@@ -4084,6 +4233,28 @@ def propagation_dense_native(
             _save_optional_tensor(pairwise_fn.proj_out.bias, pairwise_fn.proj_out.weight),
             target_block_size,
             source_block_size,
+        )
+        return LayerDelta(delta_state=delta_state, delta_val=delta_val)
+    use_low_rank_dense_recompute = (
+        source_state is None
+        and torch.is_grad_enabled()
+        and _experimental_fused_training_enabled()
+        and edge_compress_name == "signed_abs_softmax"
+        and isinstance(pairwise_fn, LowRankBilinearPairwise)
+        and _cuda_float_tensor(layer_val)
+        and _cuda_float_tensor(projected_state)
+        and _cuda_float_tensor(projected_val)
+    )
+    if use_low_rank_dense_recompute:
+        delta_state, delta_val = _LowRankPropagationDenseSignedAbsRecompute.apply(
+            layer_val,
+            projected_state,
+            projected_val,
+            pairwise_fn.source_proj.weight,
+            pairwise_fn.target_proj.weight,
+            pairwise_fn.weight,
+            pairwise_fn.bias,
+            target_block_size,
         )
         return LayerDelta(delta_state=delta_state, delta_val=delta_val)
     spec = pairwise_kernel_spec(pairwise_fn)

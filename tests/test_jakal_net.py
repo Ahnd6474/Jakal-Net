@@ -7,6 +7,7 @@ from jakal_net import (
     DiagonalBilinearPairwise,
     Layer,
     LinearRoute,
+    LowRankBilinearPairwise,
     MLPRoute,
     MultiHeadPairwise,
     MultiHeadRoute,
@@ -18,7 +19,10 @@ from jakal_net import (
     SourceTargetHadamardMLPRoute,
     Transition,
 )
-from jakal_net.kernels import signed_entmax15 as _signed_entmax15_kernel
+from jakal_net.kernels import (
+    propagation_dense_kernel,
+    signed_entmax15 as _signed_entmax15_kernel,
+)
 
 
 def _pairwise_fn(target: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
@@ -182,6 +186,35 @@ class JakalNetModuleTests(unittest.TestCase):
         kernel.pairwise_fn.load_state_dict(reference.pairwise_fn.state_dict())
 
         self.assert_delta_close(reference(layer), kernel(layer))
+
+    def test_dense_low_rank_signed_abs_kernel_matches_reference(self) -> None:
+        torch.manual_seed(101)
+        layer = Layer(
+            dim=5,
+            num_nodes=9,
+            state=torch.randn(2, 9),
+            val=torch.randn(2, 9, 5),
+        )
+        reference = Propagation(
+            pairwise_fn=LowRankBilinearPairwise(dim=5, rank=3),
+            state_proj_fn=_state_proj_fn,
+            val_proj_fn=_val_proj_fn,
+            edge_compress_fn=_signed_abs_softmax_edges,
+            implementation="reference",
+        )
+        pairwise = LowRankBilinearPairwise(dim=5, rank=3)
+        pairwise.load_state_dict(reference.pairwise_fn.state_dict())
+        kernel_delta = propagation_dense_kernel(
+            pairwise_fn=pairwise,
+            edge_compress_fn=_signed_abs_softmax_edges,
+            layer_val=layer.val,
+            projected_state=_state_proj_fn(layer.state),
+            projected_val=_val_proj_fn(layer.val),
+            target_block_size=4,
+            source_block_size=3,
+        )
+
+        self.assert_delta_close(reference(layer), kernel_delta)
 
     def test_sparse_window_propagation_streaming_matches_reference(self) -> None:
         torch.manual_seed(1)

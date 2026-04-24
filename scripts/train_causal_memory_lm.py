@@ -3622,11 +3622,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-sequence-layers", action="store_true")
     parser.add_argument("--checkpoint-prediction-layers", action="store_true")
     parser.add_argument("--memory-topk", type=int, default=16)
+    parser.add_argument("--memory-train-mode", choices=("dense", "topk"), default="dense")
+    parser.add_argument("--memory-eval-mode", choices=("dense", "topk"), default="dense")
+    parser.add_argument(
+        "--eval-topk",
+        type=int,
+        default=0,
+        help="Top-k used when --memory-eval-mode=topk. Defaults to --memory-topk.",
+    )
     parser.add_argument("--scan-checkpoint-chunk-size", type=int, default=0)
     parser.add_argument("--scan-backend", choices=("auto", "python", "native"), default="auto")
     parser.add_argument("--enable-fused-training", action="store_true")
     parser.add_argument("--fused-training-checkpoint-stride", type=int, default=0)
     parser.add_argument("--enable-scan-backward-cuda", action="store_true")
+    parser.add_argument(
+        "--dense-profile",
+        action="store_true",
+        help="Print CUDA event timings for dense propagation phases when Python dense kernels run.",
+    )
     parser.add_argument(
         "--pairwise-kind",
         choices=("low_rank_bilinear", "diagonal_bilinear", "bilinear", "additive_low_rank", "scaled_cosine"),
@@ -3781,6 +3794,10 @@ def configure_native_runtime_flags(args: argparse.Namespace) -> None:
         os.environ[EXPERIMENTAL_SCAN_BACKWARD_CUDA_ENV] = "1"
     else:
         os.environ.pop(EXPERIMENTAL_SCAN_BACKWARD_CUDA_ENV, None)
+    if args.dense_profile:
+        os.environ["JAKAL_NET_DENSE_PROFILE"] = "1"
+    else:
+        os.environ.pop("JAKAL_NET_DENSE_PROFILE", None)
 
 
 def build_parameter_groups(
@@ -3915,6 +3932,8 @@ def main() -> None:
         raise ValueError("grad-accum-steps must be positive.")
     if args.batch_size <= 0:
         raise ValueError("batch-size must be positive.")
+    if args.eval_topk < 0:
+        raise ValueError("eval-topk must be non-negative.")
     if args.seq_len <= 2:
         raise ValueError("seq-len must be larger than 2.")
     if args.epochs <= 0.0:
@@ -4161,6 +4180,9 @@ def main() -> None:
         checkpoint_sequence_layers=args.checkpoint_sequence_layers,
         checkpoint_prediction_layers=args.checkpoint_prediction_layers,
         memory_topk=args.memory_topk,
+        memory_train_mode=args.memory_train_mode,
+        memory_eval_mode=args.memory_eval_mode,
+        eval_topk=None if args.eval_topk <= 0 else args.eval_topk,
         scan_checkpoint_chunk_size=None if args.scan_checkpoint_chunk_size <= 0 else args.scan_checkpoint_chunk_size,
         scan_backend=args.scan_backend,
         pairwise_kind=args.pairwise_kind,
@@ -4204,6 +4226,7 @@ def main() -> None:
         f"s_window={args.s_window} | s_microbatch_size={args.s_microbatch_size} | "
         f"scan_backend={args.scan_backend} | scan_checkpoint_chunk_size={args.scan_checkpoint_chunk_size} | "
         f"memory_slots={args.memory_slots} | memory_update_intervals={args.memory_update_intervals} | knowledge_nodes={args.knowledge_nodes} | "
+        f"memory_train_mode={args.memory_train_mode} | memory_eval_mode={args.memory_eval_mode} | eval_topk={args.eval_topk or args.memory_topk} | "
         f"unit_norm_values={args.unit_norm_values} | "
         f"optimizer={args.optimizer} | checkpoint_sequence={args.checkpoint_sequence_layers} | "
         f"checkpoint_prediction={args.checkpoint_prediction_layers}",
@@ -4212,7 +4235,7 @@ def main() -> None:
     print(
         f"native_runtime | fused_training={args.enable_fused_training} | "
         f"fused_training_checkpoint_stride={args.fused_training_checkpoint_stride} | "
-        f"scan_backward_cuda={args.enable_scan_backward_cuda}",
+        f"scan_backward_cuda={args.enable_scan_backward_cuda} | dense_profile={args.dense_profile}",
         flush=True,
     )
     print(

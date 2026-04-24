@@ -168,6 +168,32 @@ class CausalMemoryLMTests(unittest.TestCase):
         self.assertEqual(model.scan_backend, "native")
         self.assertEqual(model.scan_checkpoint_chunk_size, 32)
 
+    def test_memory_train_eval_modes_select_dense_or_topk(self) -> None:
+        model = CausalHierarchicalMemoryLM(
+            vocab_size=64,
+            dim=16,
+            max_seq_len=16,
+            s_layers=1,
+            memory_slots=(8, 4),
+            prediction_layers=1,
+            memory_topk=3,
+            memory_train_mode="dense",
+            memory_eval_mode="topk",
+            eval_topk=2,
+            pairwise_rank=8,
+            route_rank=8,
+        )
+        aligned_s = torch.randn(2, 4, 16)
+        memory_state = model.initialize_memory_state(2, device=aligned_s.device, dtype=aligned_s.dtype)
+
+        model.train()
+        train_packed = model._pack_native_scan_inputs(aligned_s, memory_state)
+        self.assertEqual(train_packed["propagation_topks"], (0, 0))
+
+        model.eval()
+        eval_packed = model._pack_native_scan_inputs(aligned_s, memory_state)
+        self.assertEqual(eval_packed["propagation_topks"], (2, 2))
+
     def test_multi_head_config_is_supported_by_native_fused_wrapper(self) -> None:
         model = CausalHierarchicalMemoryLM(
             vocab_size=64,

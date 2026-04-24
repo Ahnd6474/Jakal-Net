@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Callable
 
+import os
 import torch
 from torch import Tensor
 
@@ -23,6 +24,118 @@ from jakal_net.kernel_common import (
     supports_pairwise_kernel,
     supports_route_kernel,
 )
+from jakal_net.modules import LowRankBilinearPairwise, MultiHeadPairwise
+
+
+def _dense_profile_enabled(reference: Tensor) -> bool:
+    return (
+        reference.device.type == "cuda"
+        and os.environ.get("JAKAL_NET_DENSE_PROFILE", "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+
+
+class _DenseProfiler:
+    def __init__(self, *, enabled: bool, label: str) -> None:
+        self.enabled = enabled
+        self.label = label
+        self._events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {}
+
+    def record(self, name: str):
+        profiler = self
+
+        class _Scope:
+            def __enter__(self):
+                if not profiler.enabled:
+                    return None
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                self._pair = (start, end)
+                return None
+
+            def __exit__(self, exc_type, exc, tb):
+                if not profiler.enabled:
+                    return False
+                start, end = self._pair
+                end.record()
+                profiler._events.setdefault(name, []).append((start, end))
+                return False
+
+        return _Scope()
+
+    def report(self) -> None:
+        if not self.enabled:
+            return
+        torch.cuda.synchronize()
+        parts = []
+        for name, pairs in self._events.items():
+            total_ms = sum(start.elapsed_time(end) for start, end in pairs)
+            parts.append(f"{name}={total_ms:.3f}ms")
+        print(f"dense_profile | {self.label} | " + " | ".join(parts), flush=True)
+
+
+def _make_precomputed_low_rank_score_block(
+    pairwise_fn: object,
+    flat_val: Tensor,
+    profiler: _DenseProfiler,
+) -> Callable[[int, int, int, int], Tensor] | None:
+    if isinstance(pairwise_fn, LowRankBilinearPairwise):
+        with profiler.record("projection"):
+            projected_target = pairwise_fn.target_proj(flat_val).contiguous()
+            weighted_source = (
+                pairwise_fn.source_proj(flat_val)
+                * pairwise_fn.weight.to(dtype=flat_val.dtype).view(1, 1, -1)
+            ).contiguous()
+
+        def _score_block(target_start: int, target_end: int, source_start: int, source_end: int) -> Tensor:
+            with profiler.record("score"):
+                scores = torch.bmm(
+                    projected_target[:, target_start:target_end, :],
+                    weighted_source[:, source_start:source_end, :].transpose(1, 2),
+                )
+                if pairwise_fn.bias is not None:
+                    scores = scores + pairwise_fn.bias
+                return scores
+
+        return _score_block
+
+    if (
+        isinstance(pairwise_fn, MultiHeadPairwise)
+        and pairwise_fn.aggregate == "max"
+        and all(isinstance(head, LowRankBilinearPairwise) for head in pairwise_fn.heads)
+    ):
+        head_blocks: list[
+            tuple[Tensor, Tensor, Tensor | None]
+        ] = []
+        with profiler.record("projection"):
+            for head in pairwise_fn.heads:
+                assert isinstance(head, LowRankBilinearPairwise)
+                projected_target = head.target_proj(flat_val).contiguous()
+                weighted_source = (
+                    head.source_proj(flat_val)
+                    * head.weight.to(dtype=flat_val.dtype).view(1, 1, -1)
+                ).contiguous()
+                head_blocks.append((projected_target, weighted_source, head.bias))
+
+        def _score_block(target_start: int, target_end: int, source_start: int, source_end: int) -> Tensor:
+            running: Tensor | None = None
+            with profiler.record("score"):
+                for projected_target, weighted_source, bias in head_blocks:
+                    head_scores = torch.bmm(
+                        projected_target[:, target_start:target_end, :],
+                        weighted_source[:, source_start:source_end, :].transpose(1, 2),
+                    )
+                    if bias is not None:
+                        head_scores = head_scores + bias
+                    running = head_scores if running is None else torch.maximum(running, head_scores)
+            if running is None:
+                raise RuntimeError("MultiHeadPairwise requires at least one head.")
+            return running
+
+        return _score_block
+
+    return None
 
 
 def _native_signed_entmax15_available() -> bool:
@@ -201,6 +314,11 @@ def propagation_dense_kernel(
     ).dtype
     state_blocks: list[Tensor] = []
     val_blocks: list[Tensor] = []
+    profiler = _DenseProfiler(
+        enabled=_dense_profile_enabled(layer_val),
+        label=f"propagation_dense nodes={num_nodes}",
+    )
+    score_block = _make_precomputed_low_rank_score_block(pairwise_fn, flat_val, profiler)
 
     for target_start, target_end in iter_blocks(
         num_nodes, target_block_size, name="target_block_size"
@@ -218,36 +336,45 @@ def propagation_dense_kernel(
             tensor_dtype=projected_val.dtype,
             accumulator_dtype=accumulator_dtype,
         )
-        for source_start, source_end in iter_blocks(
-            num_nodes, source_block_size, name="source_block_size"
-        ):
+        if _edge_compress_name(edge_compress_fn) in {"signed_abs_softmax", "_signed_abs_softmax_edges"}:
+            source_blocks = ((0, num_nodes),)
+        else:
+            source_blocks = iter_blocks(num_nodes, source_block_size, name="source_block_size")
+        for source_start, source_end in source_blocks:
             source_val = flat_val[:, source_start:source_end, :]
-            scores = pairwise_scores_dense(pairwise_fn, target_val, source_val)
-            edges = _weight_edges(
-                _compress_edges(scores, edge_compress_fn),
-                flat_source_state,
-                source_start,
-                source_end,
+            scores = (
+                score_block(target_start, target_end, source_start, source_end)
+                if score_block is not None
+                else pairwise_scores_dense(pairwise_fn, target_val, source_val)
             )
+            with profiler.record("softmax"):
+                edges = _weight_edges(
+                    _compress_edges(scores, edge_compress_fn),
+                    flat_source_state,
+                    source_start,
+                    source_end,
+                )
             state_edges = edges.to(dtype=state_acc_dtype)
             val_edges = edges.to(dtype=val_acc_dtype)
 
-            if flat_source_state is not None:
-                target_state_acc += state_edges.sum(dim=-1)
-            else:
-                target_state_acc += torch.bmm(
-                    state_edges,
-                    flat_projected_state[:, source_start:source_end]
-                    .to(dtype=state_acc_dtype)
-                    .unsqueeze(-1),
-                ).squeeze(-1)
-            target_val_acc += torch.bmm(
-                val_edges,
-                flat_projected_val[:, source_start:source_end, :].to(dtype=val_acc_dtype),
-            )
+            with profiler.record("accumulate"):
+                if flat_source_state is not None:
+                    target_state_acc += state_edges.sum(dim=-1)
+                else:
+                    target_state_acc += torch.bmm(
+                        state_edges,
+                        flat_projected_state[:, source_start:source_end]
+                        .to(dtype=state_acc_dtype)
+                        .unsqueeze(-1),
+                    ).squeeze(-1)
+                target_val_acc += torch.bmm(
+                    val_edges,
+                    flat_projected_val[:, source_start:source_end, :].to(dtype=val_acc_dtype),
+                )
         state_blocks.append(target_state_acc.to(dtype=projected_state.dtype))
         val_blocks.append(target_val_acc.to(dtype=projected_val.dtype))
 
+    profiler.report()
     return LayerDelta(
         delta_state=reshape_state(torch.cat(state_blocks, dim=1), batch_shape, num_nodes),
         delta_val=reshape_val(torch.cat(val_blocks, dim=1), batch_shape, num_nodes, out_dim),
@@ -292,6 +419,11 @@ def propagation_window_kernel(
     ).dtype
     state_blocks: list[Tensor] = []
     val_blocks: list[Tensor] = []
+    profiler = _DenseProfiler(
+        enabled=_dense_profile_enabled(layer_val),
+        label=f"propagation_window nodes={num_nodes} window={window}",
+    )
+    score_block = _make_precomputed_low_rank_score_block(pairwise_fn, flat_val, profiler)
 
     for target_start, target_end in iter_blocks(
         num_nodes, target_block_size, name="target_block_size"
@@ -326,7 +458,11 @@ def propagation_window_kernel(
             source_start = source_floor + source_offset_start
             source_end = source_floor + source_offset_end
             source_val = flat_val[:, source_start:source_end, :]
-            scores = pairwise_scores_dense(pairwise_fn, target_val, source_val)
+            scores = (
+                score_block(target_start, target_end, source_start, source_end)
+                if score_block is not None
+                else pairwise_scores_dense(pairwise_fn, target_val, source_val)
+            )
             mask = causal_window_mask(
                 target_start,
                 target_end,
@@ -335,24 +471,26 @@ def propagation_window_kernel(
                 window,
                 device=layer_val.device,
             ).view(1, target_end - target_start, source_end - source_start)
-            edges = _compress_edges(scores, edge_compress_fn, mask=mask)
-            edges = _weight_edges(edges, flat_source_state, source_start, source_end)
+            with profiler.record("softmax"):
+                edges = _compress_edges(scores, edge_compress_fn, mask=mask)
+                edges = _weight_edges(edges, flat_source_state, source_start, source_end)
             state_edges = edges.to(dtype=state_acc_dtype)
             val_edges = edges.to(dtype=val_acc_dtype)
 
-            if flat_source_state is not None:
-                target_state_acc += state_edges.sum(dim=-1)
-            else:
-                target_state_acc += torch.bmm(
-                    state_edges,
-                    flat_projected_state[:, source_start:source_end]
-                    .to(dtype=state_acc_dtype)
-                    .unsqueeze(-1),
-                ).squeeze(-1)
-            target_val_acc += torch.bmm(
-                val_edges,
-                flat_projected_val[:, source_start:source_end, :].to(dtype=val_acc_dtype),
-            )
+            with profiler.record("accumulate"):
+                if flat_source_state is not None:
+                    target_state_acc += state_edges.sum(dim=-1)
+                else:
+                    target_state_acc += torch.bmm(
+                        state_edges,
+                        flat_projected_state[:, source_start:source_end]
+                        .to(dtype=state_acc_dtype)
+                        .unsqueeze(-1),
+                    ).squeeze(-1)
+                target_val_acc += torch.bmm(
+                    val_edges,
+                    flat_projected_val[:, source_start:source_end, :].to(dtype=val_acc_dtype),
+                )
         state_blocks.append(target_state_acc.to(dtype=projected_state.dtype))
         val_blocks.append(target_val_acc.to(dtype=projected_val.dtype))
 
@@ -413,6 +551,11 @@ def propagation_topk_kernel(
             source_block_size=source_block_size,
             accumulator_dtype=accumulator_dtype,
         )
+    profiler = _DenseProfiler(
+        enabled=_dense_profile_enabled(layer_val),
+        label=f"propagation_topk nodes={num_nodes} topk={k}",
+    )
+    score_block = _make_precomputed_low_rank_score_block(pairwise_fn, flat_val, profiler)
 
     for target_start, target_end in iter_blocks(
         num_nodes, target_block_size, name="target_block_size"
@@ -426,7 +569,11 @@ def propagation_topk_kernel(
             num_nodes, source_block_size, name="source_block_size"
         ):
             source_val = flat_val[:, source_start:source_end, :]
-            scores = pairwise_scores_dense(pairwise_fn, target_val, source_val)
+            scores = (
+                score_block(target_start, target_end, source_start, source_end)
+                if score_block is not None
+                else pairwise_scores_dense(pairwise_fn, target_val, source_val)
+            )
 
             if best_scores is None or best_indices is None:
                 best_scores = torch.full(
@@ -448,7 +595,8 @@ def propagation_topk_kernel(
 
             candidate_scores = torch.cat((best_scores, scores), dim=-1)
             candidate_indices = torch.cat((best_indices, source_indices), dim=-1)
-            selected = select_topk(candidate_scores, k, dim=-1)
+            with profiler.record("topk"):
+                selected = select_topk(candidate_scores, k, dim=-1)
             best_scores = selected.values
             best_indices = torch.take_along_dim(
                 candidate_indices, selected.indices, dim=-1
@@ -457,7 +605,8 @@ def propagation_topk_kernel(
         if best_scores is None or best_indices is None:
             continue
 
-        edges = _compress_edges(best_scores, edge_compress_fn)
+        with profiler.record("softmax"):
+            edges = _compress_edges(best_scores, edge_compress_fn)
         if source_state is not None:
             selected_source_state = gather_state_by_indices(
                 flatten_state(source_state),
@@ -467,21 +616,23 @@ def propagation_topk_kernel(
         selected_state = gather_state_by_indices(flat_projected_state, best_indices)
         selected_val = gather_val_by_indices(flat_projected_val, best_indices)
 
-        if source_state is not None:
-            state_block = edges.to(dtype=state_acc_dtype).sum(dim=-1)
-        else:
-            state_block = (
-                edges.to(dtype=state_acc_dtype)
-                * selected_state.to(dtype=state_acc_dtype)
-            ).sum(dim=-1)
-        state_blocks.append(state_block.to(dtype=projected_state.dtype))
-        val_blocks.append(
-            (
-                edges.to(dtype=val_acc_dtype).unsqueeze(-1)
-                * selected_val.to(dtype=val_acc_dtype)
-            ).sum(dim=-2).to(dtype=projected_val.dtype)
-        )
+        with profiler.record("accumulate"):
+            if source_state is not None:
+                state_block = edges.to(dtype=state_acc_dtype).sum(dim=-1)
+            else:
+                state_block = (
+                    edges.to(dtype=state_acc_dtype)
+                    * selected_state.to(dtype=state_acc_dtype)
+                ).sum(dim=-1)
+            state_blocks.append(state_block.to(dtype=projected_state.dtype))
+            val_blocks.append(
+                (
+                    edges.to(dtype=val_acc_dtype).unsqueeze(-1)
+                    * selected_val.to(dtype=val_acc_dtype)
+                ).sum(dim=-2).to(dtype=projected_val.dtype)
+            )
 
+    profiler.report()
     return LayerDelta(
         delta_state=reshape_state(torch.cat(state_blocks, dim=1), batch_shape, num_nodes),
         delta_val=reshape_val(torch.cat(val_blocks, dim=1), batch_shape, num_nodes, out_dim),
