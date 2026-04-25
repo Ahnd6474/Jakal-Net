@@ -112,7 +112,7 @@ class ResidualFeedForward(nn.Module):
         self,
         dim: int,
         *,
-        hidden_mult: float = 4.0,
+        hidden_mult: float = 2.0,
         dropout: float = 0.0,
     ) -> None:
         super().__init__()

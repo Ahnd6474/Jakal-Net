@@ -53,6 +53,7 @@ class CausalMemoryLMTests(unittest.TestCase):
         self.assertTrue(model.feed_forward_layers)
         self.assertTrue(model.s_module.feed_forward_layers)
         self.assertTrue(model.b_module.feed_forward_layers)
+        self.assertEqual(model.feed_forward_hidden_mult, 2.0)
         assert output.sequence_layer is not None
         assert output.query_layer is not None
         self.assertEqual(output.sequence_layer.val.shape, (2, 6, 8))

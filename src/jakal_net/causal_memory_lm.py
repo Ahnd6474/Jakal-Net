@@ -104,6 +104,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
         implementation: str = "streaming",
         unit_norm_values: bool = False,
         feed_forward_layers: bool = True,
+        feed_forward_hidden_mult: float = 2.0,
         tie_embedding_head: bool = True,
         knowledge_nodes: int = 0,
         knowledge_route_topk: int | None = None,
@@ -138,6 +139,8 @@ class CausalHierarchicalMemoryLM(nn.Module):
             raise ValueError(f"Unsupported memory_eval_mode: {memory_eval_mode!r}.")
         if eval_topk is not None and eval_topk <= 0:
             raise ValueError("eval_topk must be positive when provided.")
+        if feed_forward_hidden_mult <= 0.0:
+            raise ValueError("feed_forward_hidden_mult must be positive.")
 
         self.vocab_size = vocab_size
         self.dim = dim
@@ -150,6 +153,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
         self.checkpoint_prediction_layers = checkpoint_prediction_layers
         self.unit_norm_values = unit_norm_values
         self.feed_forward_layers = bool(feed_forward_layers)
+        self.feed_forward_hidden_mult = float(feed_forward_hidden_mult)
         if knowledge_module is None and knowledge_nodes > 0:
             knowledge_module = KModule(
                 dim=dim,
@@ -191,6 +195,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
             checkpoint_sequence_layers=checkpoint_sequence_layers,
             unit_norm_values=unit_norm_values,
             feed_forward_layers=self.feed_forward_layers,
+            feed_forward_hidden_mult=self.feed_forward_hidden_mult,
         )
         self.b_module = BModule(
             dim=dim,
@@ -215,6 +220,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
             implementation=implementation,
             unit_norm_values=unit_norm_values,
             feed_forward_layers=self.feed_forward_layers,
+            feed_forward_hidden_mult=self.feed_forward_hidden_mult,
         )
 
         self.s_prediction_proj = nn.Linear(dim, dim, bias=False)
@@ -242,7 +248,11 @@ class CausalHierarchicalMemoryLM(nn.Module):
             for _ in range(prediction_layers)
         )
         self.prediction_ffns = nn.ModuleList(
-            ResidualFeedForward(dim) if self.feed_forward_layers else nn.Identity()
+            (
+                ResidualFeedForward(dim, hidden_mult=self.feed_forward_hidden_mult)
+                if self.feed_forward_layers
+                else nn.Identity()
+            )
             for _ in range(prediction_layers)
         )
         self.output_norm = nn.LayerNorm(dim)

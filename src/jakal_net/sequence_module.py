@@ -35,6 +35,7 @@ class SModule(nn.Module):
         checkpoint_sequence_layers: bool = False,
         unit_norm_values: bool = False,
         feed_forward_layers: bool = True,
+        feed_forward_hidden_mult: float = 2.0,
     ) -> None:
         super().__init__()
         if vocab_size <= 0:
@@ -47,6 +48,8 @@ class SModule(nn.Module):
             raise ValueError("s_layers must be positive.")
         if s_microbatch_size is not None and s_microbatch_size <= 0:
             raise ValueError("s_microbatch_size must be positive when provided.")
+        if feed_forward_hidden_mult <= 0.0:
+            raise ValueError("feed_forward_hidden_mult must be positive.")
 
         self.vocab_size = vocab_size
         self.dim = dim
@@ -55,6 +58,7 @@ class SModule(nn.Module):
         self.checkpoint_sequence_layers = checkpoint_sequence_layers
         self.unit_norm_values = unit_norm_values
         self.feed_forward_layers = bool(feed_forward_layers)
+        self.feed_forward_hidden_mult = float(feed_forward_hidden_mult)
 
         self.token_embedding = nn.Embedding(vocab_size, dim)
         self.position_encoding = LearnedPositionEncoding(dim)
@@ -90,7 +94,11 @@ class SModule(nn.Module):
             for _ in range(s_layers)
         )
         self.sequence_ffns = nn.ModuleList(
-            ResidualFeedForward(dim) if self.feed_forward_layers else nn.Identity()
+            (
+                ResidualFeedForward(dim, hidden_mult=self.feed_forward_hidden_mult)
+                if self.feed_forward_layers
+                else nn.Identity()
+            )
             for _ in range(s_layers)
         )
 

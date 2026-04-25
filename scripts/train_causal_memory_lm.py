@@ -3727,6 +3727,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable memory-model FFN blocks between propagation/transition layers.",
     )
+    parser.add_argument(
+        "--feed-forward-hidden-mult",
+        type=float,
+        default=2.0,
+        help="Hidden width multiplier for memory-model FFN blocks.",
+    )
     parser.add_argument("--memory-topk", type=int, default=16)
     parser.add_argument("--memory-train-mode", choices=("dense", "topk"), default="dense")
     parser.add_argument("--memory-eval-mode", choices=("dense", "topk"), default="dense")
@@ -4407,6 +4413,7 @@ def main() -> None:
             checkpoint_sequence_layers=args.checkpoint_sequence_layers,
             checkpoint_prediction_layers=args.checkpoint_prediction_layers,
             feed_forward_layers=not args.disable_feed_forward_layers,
+            feed_forward_hidden_mult=args.feed_forward_hidden_mult,
             memory_topk=args.memory_topk,
             memory_train_mode=args.memory_train_mode,
             memory_eval_mode=args.memory_eval_mode,
@@ -4465,6 +4472,7 @@ def main() -> None:
             f"memory_slots={args.memory_slots} | memory_update_intervals={args.memory_update_intervals} | knowledge_nodes={args.knowledge_nodes} | "
             f"memory_train_mode={args.memory_train_mode} | memory_eval_mode={args.memory_eval_mode} | eval_topk={args.eval_topk or args.memory_topk} | "
             f"unit_norm_values={args.unit_norm_values} | feed_forward_layers={not args.disable_feed_forward_layers} | "
+            f"feed_forward_hidden_mult={args.feed_forward_hidden_mult:g} | "
             f"optimizer={args.optimizer} | checkpoint_sequence={args.checkpoint_sequence_layers} | "
             f"checkpoint_prediction={args.checkpoint_prediction_layers}",
             flush=True,

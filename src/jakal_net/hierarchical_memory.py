@@ -181,6 +181,7 @@ class BModule(nn.Module):
         implementation: str,
         unit_norm_values: bool = False,
         feed_forward_layers: bool = True,
+        feed_forward_hidden_mult: float = 2.0,
     ) -> None:
         super().__init__()
         if dim <= 0:
@@ -197,6 +198,8 @@ class BModule(nn.Module):
             raise ValueError("memory_update_intervals must be positive.")
         if memory_topk <= 0:
             raise ValueError("memory_topk must be positive.")
+        if feed_forward_hidden_mult <= 0.0:
+            raise ValueError("feed_forward_hidden_mult must be positive.")
 
         self.dim = dim
         self.memory_slots = tuple(int(slots) for slots in memory_slots)
@@ -205,6 +208,7 @@ class BModule(nn.Module):
         self.unit_norm_values = unit_norm_values
         self.implementation = implementation
         self.feed_forward_layers = bool(feed_forward_layers)
+        self.feed_forward_hidden_mult = float(feed_forward_hidden_mult)
 
         self.memory_levels = nn.ModuleList(
             _MemoryLevel(
@@ -257,7 +261,11 @@ class BModule(nn.Module):
         else:
             self.level_norms = nn.ModuleList(nn.LayerNorm(dim) for _ in self.memory_slots)
         self.level_ffns = nn.ModuleList(
-            ResidualFeedForward(dim) if self.feed_forward_layers else nn.Identity()
+            (
+                ResidualFeedForward(dim, hidden_mult=self.feed_forward_hidden_mult)
+                if self.feed_forward_layers
+                else nn.Identity()
+            )
             for _ in self.memory_slots
         )
 
