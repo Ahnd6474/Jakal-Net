@@ -14,7 +14,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterable, Sequence
 from uuid import uuid4
 
 import torch
@@ -3677,7 +3677,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage3-grad-accum-steps", type=int, default=0)
     parser.add_argument("--learning-rate", type=float, default=5e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--optimizer", choices=("adamw", "adamw_fused", "adamw8bit"), default="adamw_fused")
+    parser.add_argument(
+        "--optimizer",
+        choices=(
+            "adamw",
+            "adamw_fused",
+            "adamw8bit",
+            "adafactor",
+            "adagrad",
+            "lion",
+            "nadam",
+            "radam",
+            "rmsprop",
+            "sgd",
+            "sgd_nesterov",
+        ),
+        default="adamw_fused",
+    )
     parser.add_argument("--warmup-start-lr", type=float, default=1e-4)
     parser.add_argument("--warmup-steps", type=int, default=100)
     parser.add_argument("--lr-min-ratio", type=float, default=0.0)
@@ -3828,6 +3844,55 @@ def build_parameter_groups(
     return param_groups, group_configs
 
 
+class Lion(torch.optim.Optimizer):
+    def __init__(
+        self,
+        params: Iterable[torch.nn.Parameter] | Iterable[dict[str, Any]],
+        *,
+        lr: float = 1e-4,
+        betas: tuple[float, float] = (0.9, 0.99),
+        weight_decay: float = 0.0,
+    ) -> None:
+        if lr < 0.0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        beta1, beta2 = betas
+        if not 0.0 <= beta1 < 1.0:
+            raise ValueError(f"Invalid beta1: {beta1}")
+        if not 0.0 <= beta2 < 1.0:
+            raise ValueError(f"Invalid beta2: {beta2}")
+        if weight_decay < 0.0:
+            raise ValueError(f"Invalid weight_decay: {weight_decay}")
+        defaults = {"lr": lr, "betas": betas, "weight_decay": weight_decay}
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure: Any | None = None) -> Any | None:
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            lr = float(group["lr"])
+            beta1, beta2 = group["betas"]
+            weight_decay = float(group["weight_decay"])
+            for parameter in group["params"]:
+                if parameter.grad is None:
+                    continue
+                gradient = parameter.grad
+                if gradient.is_sparse:
+                    raise RuntimeError("Lion does not support sparse gradients.")
+                if weight_decay != 0.0:
+                    parameter.mul_(1.0 - lr * weight_decay)
+                state = self.state[parameter]
+                if len(state) == 0:
+                    state["exp_avg"] = torch.zeros_like(parameter)
+                exp_avg = state["exp_avg"]
+                update = exp_avg.mul(beta1).add(gradient, alpha=1.0 - beta1)
+                parameter.add_(update.sign(), alpha=-lr)
+                exp_avg.mul_(beta2).add_(gradient, alpha=1.0 - beta2)
+        return loss
+
+
 def build_optimizer(
     param_groups: Sequence[dict[str, Any]],
     *,
@@ -3857,6 +3922,43 @@ def build_optimizer(
         except ImportError as exc:  # pragma: no cover - optional dependency
             raise ImportError("bitsandbytes is required for --optimizer adamw8bit.") from exc
         return AdamW8bit(param_groups, lr=learning_rate, weight_decay=weight_decay)
+    if optimizer_name == "adafactor":
+        try:
+            adafactor_cls = torch.optim.Adafactor
+        except AttributeError as exc:  # pragma: no cover - depends on torch version
+            raise ImportError("torch.optim.Adafactor is required for --optimizer adafactor.") from exc
+        return adafactor_cls(param_groups, lr=learning_rate, weight_decay=weight_decay)
+    if optimizer_name == "adagrad":
+        return torch.optim.Adagrad(param_groups, lr=learning_rate, weight_decay=weight_decay)
+    if optimizer_name == "lion":
+        return Lion(param_groups, lr=learning_rate, weight_decay=weight_decay)
+    if optimizer_name == "nadam":
+        return torch.optim.NAdam(param_groups, lr=learning_rate, weight_decay=weight_decay)
+    if optimizer_name == "radam":
+        return torch.optim.RAdam(param_groups, lr=learning_rate, weight_decay=weight_decay)
+    if optimizer_name == "rmsprop":
+        return torch.optim.RMSprop(
+            param_groups,
+            lr=learning_rate,
+            alpha=0.99,
+            momentum=0.0,
+            weight_decay=weight_decay,
+        )
+    if optimizer_name == "sgd":
+        return torch.optim.SGD(
+            param_groups,
+            lr=learning_rate,
+            momentum=0.9,
+            weight_decay=weight_decay,
+        )
+    if optimizer_name == "sgd_nesterov":
+        return torch.optim.SGD(
+            param_groups,
+            lr=learning_rate,
+            momentum=0.9,
+            weight_decay=weight_decay,
+            nesterov=True,
+        )
     raise ValueError(f"Unsupported optimizer: {name!r}")
 
 
