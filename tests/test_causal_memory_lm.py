@@ -172,7 +172,7 @@ class CausalMemoryLMTests(unittest.TestCase):
         self.assertEqual(model.scan_backend, "native")
         self.assertEqual(model.scan_checkpoint_chunk_size, 32)
 
-    def test_feed_forward_layers_disable_native_scan_by_default(self) -> None:
+    def test_feed_forward_layers_are_supported_by_native_scan(self) -> None:
         model = CausalHierarchicalMemoryLM(
             vocab_size=64,
             dim=16,
@@ -185,7 +185,7 @@ class CausalMemoryLMTests(unittest.TestCase):
             route_rank=8,
         )
 
-        self.assertFalse(model._native_scan_supported_config())
+        self.assertTrue(model._native_scan_supported_config())
 
     def test_memory_train_eval_modes_select_dense_or_topk(self) -> None:
         model = CausalHierarchicalMemoryLM(

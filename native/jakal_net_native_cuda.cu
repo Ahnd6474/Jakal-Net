@@ -2624,6 +2624,24 @@ torch::Tensor scan_cuda_read_memory_vector(
   return read_sum;
 }
 
+ScanCudaLayerState scan_cuda_apply_ffn_to_layer(
+    const ScanCudaLayerState& layer,
+    const torch::Tensor& norm_weight,
+    const torch::Tensor& norm_bias,
+    const torch::Tensor& in_weight,
+    const torch::Tensor& in_bias,
+    const torch::Tensor& out_weight,
+    const torch::Tensor& out_bias) {
+  if (!in_weight.defined() || in_weight.numel() == 0) {
+    return layer;
+  }
+  auto normalized = scan_cuda_layer_norm_last_dim(layer.val, norm_weight, norm_bias);
+  auto hidden = scan_cuda_linear3d(normalized, in_weight, in_bias);
+  auto activated = 0.5 * hidden * (1 + torch::erf(hidden * 0.70710678118654752440));
+  auto delta = scan_cuda_linear3d(activated, out_weight, out_bias);
+  return {layer.state, layer.val + delta};
+}
+
 void scan_cuda_require_vector_size(
     const std::vector<torch::Tensor>& tensors,
     size_t expected,
@@ -2679,6 +2697,12 @@ scan_cuda_forward_impl(
     const std::vector<int64_t>& level_transition_topks,
     const std::vector<torch::Tensor>& level_norm_weights,
     const std::vector<torch::Tensor>& level_norm_biases,
+    const std::vector<torch::Tensor>& level_ffn_norm_weights,
+    const std::vector<torch::Tensor>& level_ffn_norm_biases,
+    const std::vector<torch::Tensor>& level_ffn_in_weights,
+    const std::vector<torch::Tensor>& level_ffn_in_biases,
+    const std::vector<torch::Tensor>& level_ffn_out_weights,
+    const std::vector<torch::Tensor>& level_ffn_out_biases,
     const std::vector<torch::Tensor>& skip_source_weights,
     const std::vector<torch::Tensor>& skip_target_weights,
     const std::vector<torch::Tensor>& skip_core_weights,
@@ -2718,6 +2742,12 @@ scan_cuda_forward_impl(
   scan_cuda_require_int_vector_size(level_transition_topks, num_levels > 0 ? num_levels - 1 : 0, "level_transition_topks");
   scan_cuda_require_vector_size(level_norm_weights, num_levels, "level_norm_weights");
   scan_cuda_require_vector_size(level_norm_biases, num_levels, "level_norm_biases");
+  scan_cuda_require_vector_size(level_ffn_norm_weights, num_levels, "level_ffn_norm_weights");
+  scan_cuda_require_vector_size(level_ffn_norm_biases, num_levels, "level_ffn_norm_biases");
+  scan_cuda_require_vector_size(level_ffn_in_weights, num_levels, "level_ffn_in_weights");
+  scan_cuda_require_vector_size(level_ffn_in_biases, num_levels, "level_ffn_in_biases");
+  scan_cuda_require_vector_size(level_ffn_out_weights, num_levels, "level_ffn_out_weights");
+  scan_cuda_require_vector_size(level_ffn_out_biases, num_levels, "level_ffn_out_biases");
   scan_cuda_require_vector_size(skip_source_weights, expected_skip_count, "skip_source_weights");
   scan_cuda_require_vector_size(skip_target_weights, expected_skip_count, "skip_target_weights");
   scan_cuda_require_vector_size(skip_core_weights, expected_skip_count, "skip_core_weights");
@@ -2769,6 +2799,14 @@ scan_cuda_forward_impl(
         std::get<1>(first_write_delta),
         val_norm_weights[0],
         val_norm_biases[0]);
+    level = scan_cuda_apply_ffn_to_layer(
+        level,
+        level_ffn_norm_weights[0],
+        level_ffn_norm_biases[0],
+        level_ffn_in_weights[0],
+        level_ffn_in_biases[0],
+        level_ffn_out_weights[0],
+        level_ffn_out_biases[0]);
     auto first_prop_delta = scan_cuda_low_rank_propagation_topk(
         level.state,
         level.val,
@@ -2785,6 +2823,14 @@ scan_cuda_forward_impl(
         std::get<1>(first_prop_delta),
         val_norm_weights[0],
         val_norm_biases[0]);
+    level = scan_cuda_apply_ffn_to_layer(
+        level,
+        level_ffn_norm_weights[0],
+        level_ffn_norm_biases[0],
+        level_ffn_in_weights[0],
+        level_ffn_in_biases[0],
+        level_ffn_out_weights[0],
+        level_ffn_out_biases[0]);
     next_memory.push_back(level);
 
     for (size_t level_index = 1; level_index < num_levels; ++level_index) {
@@ -2808,6 +2854,14 @@ scan_cuda_forward_impl(
           std::get<1>(parent_delta),
           val_norm_weights[level_index],
           val_norm_biases[level_index]);
+      updated_level = scan_cuda_apply_ffn_to_layer(
+          updated_level,
+          level_ffn_norm_weights[level_index],
+          level_ffn_norm_biases[level_index],
+          level_ffn_in_weights[level_index],
+          level_ffn_in_biases[level_index],
+          level_ffn_out_weights[level_index],
+          level_ffn_out_biases[level_index]);
 
       if (level_index == 1 && expected_skip_count > 0) {
         auto skip_gate = torch::sigmoid(skip_gates[0].to(token_val.scalar_type()));
@@ -2830,6 +2884,14 @@ scan_cuda_forward_impl(
             std::get<1>(skip_delta) * skip_gate,
             val_norm_weights[level_index],
             val_norm_biases[level_index]);
+        updated_level = scan_cuda_apply_ffn_to_layer(
+            updated_level,
+            level_ffn_norm_weights[level_index],
+            level_ffn_norm_biases[level_index],
+            level_ffn_in_weights[level_index],
+            level_ffn_in_biases[level_index],
+            level_ffn_out_weights[level_index],
+            level_ffn_out_biases[level_index]);
       }
 
       if (level_index >= 2) {
@@ -2854,6 +2916,14 @@ scan_cuda_forward_impl(
             std::get<1>(skip_delta) * skip_gate,
             val_norm_weights[level_index],
             val_norm_biases[level_index]);
+        updated_level = scan_cuda_apply_ffn_to_layer(
+            updated_level,
+            level_ffn_norm_weights[level_index],
+            level_ffn_norm_biases[level_index],
+            level_ffn_in_weights[level_index],
+            level_ffn_in_biases[level_index],
+            level_ffn_out_weights[level_index],
+            level_ffn_out_biases[level_index]);
       }
 
       auto propagation_delta = scan_cuda_low_rank_propagation_topk(
@@ -2872,6 +2942,14 @@ scan_cuda_forward_impl(
           std::get<1>(propagation_delta),
           val_norm_weights[level_index],
           val_norm_biases[level_index]);
+      updated_level = scan_cuda_apply_ffn_to_layer(
+          updated_level,
+          level_ffn_norm_weights[level_index],
+          level_ffn_norm_biases[level_index],
+          level_ffn_in_weights[level_index],
+          level_ffn_in_biases[level_index],
+          level_ffn_out_weights[level_index],
+          level_ffn_out_biases[level_index]);
       next_memory.push_back(updated_level);
     }
 
@@ -2943,6 +3021,12 @@ jakal_net_causal_memory_scan_fused_forward_cuda(
     const std::vector<int64_t>& level_transition_topks,
     const std::vector<torch::Tensor>& level_norm_weights,
     const std::vector<torch::Tensor>& level_norm_biases,
+    const std::vector<torch::Tensor>& level_ffn_norm_weights,
+    const std::vector<torch::Tensor>& level_ffn_norm_biases,
+    const std::vector<torch::Tensor>& level_ffn_in_weights,
+    const std::vector<torch::Tensor>& level_ffn_in_biases,
+    const std::vector<torch::Tensor>& level_ffn_out_weights,
+    const std::vector<torch::Tensor>& level_ffn_out_biases,
     const std::vector<torch::Tensor>& skip_source_weights,
     const std::vector<torch::Tensor>& skip_target_weights,
     const std::vector<torch::Tensor>& skip_core_weights,
@@ -2981,6 +3065,12 @@ jakal_net_causal_memory_scan_fused_forward_cuda(
       level_transition_topks,
       level_norm_weights,
       level_norm_biases,
+      level_ffn_norm_weights,
+      level_ffn_norm_biases,
+      level_ffn_in_weights,
+      level_ffn_in_biases,
+      level_ffn_out_weights,
+      level_ffn_out_biases,
       skip_source_weights,
       skip_target_weights,
       skip_core_weights,
@@ -3024,6 +3114,12 @@ jakal_net_causal_memory_scan_fused_trace_cuda(
     const std::vector<int64_t>& level_transition_topks,
     const std::vector<torch::Tensor>& level_norm_weights,
     const std::vector<torch::Tensor>& level_norm_biases,
+    const std::vector<torch::Tensor>& level_ffn_norm_weights,
+    const std::vector<torch::Tensor>& level_ffn_norm_biases,
+    const std::vector<torch::Tensor>& level_ffn_in_weights,
+    const std::vector<torch::Tensor>& level_ffn_in_biases,
+    const std::vector<torch::Tensor>& level_ffn_out_weights,
+    const std::vector<torch::Tensor>& level_ffn_out_biases,
     const std::vector<torch::Tensor>& skip_source_weights,
     const std::vector<torch::Tensor>& skip_target_weights,
     const std::vector<torch::Tensor>& skip_core_weights,
@@ -3062,6 +3158,12 @@ jakal_net_causal_memory_scan_fused_trace_cuda(
       level_transition_topks,
       level_norm_weights,
       level_norm_biases,
+      level_ffn_norm_weights,
+      level_ffn_norm_biases,
+      level_ffn_in_weights,
+      level_ffn_in_biases,
+      level_ffn_out_weights,
+      level_ffn_out_biases,
       skip_source_weights,
       skip_target_weights,
       skip_core_weights,
@@ -3103,6 +3205,12 @@ std::vector<torch::Tensor> jakal_net_causal_memory_scan_fused_backward_cuda(
     const std::vector<int64_t>& level_transition_topks,
     const std::vector<torch::Tensor>& level_norm_weights,
     const std::vector<torch::Tensor>& level_norm_biases,
+    const std::vector<torch::Tensor>& level_ffn_norm_weights,
+    const std::vector<torch::Tensor>& level_ffn_norm_biases,
+    const std::vector<torch::Tensor>& level_ffn_in_weights,
+    const std::vector<torch::Tensor>& level_ffn_in_biases,
+    const std::vector<torch::Tensor>& level_ffn_out_weights,
+    const std::vector<torch::Tensor>& level_ffn_out_biases,
     const std::vector<torch::Tensor>& skip_source_weights,
     const std::vector<torch::Tensor>& skip_target_weights,
     const std::vector<torch::Tensor>& skip_core_weights,
@@ -3147,6 +3255,12 @@ std::vector<torch::Tensor> jakal_net_causal_memory_scan_fused_backward_cuda(
         level_transition_topks,
         level_norm_weights,
         level_norm_biases,
+        level_ffn_norm_weights,
+        level_ffn_norm_biases,
+        level_ffn_in_weights,
+        level_ffn_in_biases,
+        level_ffn_out_weights,
+        level_ffn_out_biases,
         skip_source_weights,
         skip_target_weights,
         skip_core_weights,
@@ -3197,6 +3311,12 @@ std::vector<torch::Tensor> jakal_net_causal_memory_scan_fused_backward_cuda(
   std::vector<torch::Tensor> level_transition_biases_leaves;
   std::vector<torch::Tensor> level_norm_weights_leaves;
   std::vector<torch::Tensor> level_norm_biases_leaves;
+  std::vector<torch::Tensor> level_ffn_norm_weights_leaves;
+  std::vector<torch::Tensor> level_ffn_norm_biases_leaves;
+  std::vector<torch::Tensor> level_ffn_in_weights_leaves;
+  std::vector<torch::Tensor> level_ffn_in_biases_leaves;
+  std::vector<torch::Tensor> level_ffn_out_weights_leaves;
+  std::vector<torch::Tensor> level_ffn_out_biases_leaves;
   std::vector<torch::Tensor> skip_source_weights_leaves;
   std::vector<torch::Tensor> skip_target_weights_leaves;
   std::vector<torch::Tensor> skip_core_weights_leaves;
@@ -3220,6 +3340,12 @@ std::vector<torch::Tensor> jakal_net_causal_memory_scan_fused_backward_cuda(
   for (const auto& tensor : level_transition_biases) level_transition_biases_leaves.push_back(make_leaf(tensor));
   for (const auto& tensor : level_norm_weights) level_norm_weights_leaves.push_back(make_leaf(tensor));
   for (const auto& tensor : level_norm_biases) level_norm_biases_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : level_ffn_norm_weights) level_ffn_norm_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : level_ffn_norm_biases) level_ffn_norm_biases_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : level_ffn_in_weights) level_ffn_in_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : level_ffn_in_biases) level_ffn_in_biases_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : level_ffn_out_weights) level_ffn_out_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : level_ffn_out_biases) level_ffn_out_biases_leaves.push_back(make_leaf(tensor));
   for (const auto& tensor : skip_source_weights) skip_source_weights_leaves.push_back(make_leaf(tensor));
   for (const auto& tensor : skip_target_weights) skip_target_weights_leaves.push_back(make_leaf(tensor));
   for (const auto& tensor : skip_core_weights) skip_core_weights_leaves.push_back(make_leaf(tensor));
@@ -3273,6 +3399,14 @@ std::vector<torch::Tensor> jakal_net_causal_memory_scan_fused_backward_cuda(
         std::get<1>(first_write_delta),
         val_norm_weights_leaves[0],
         val_norm_biases_leaves[0]);
+    level = scan_cuda_apply_ffn_to_layer(
+        level,
+        level_ffn_norm_weights_leaves[0],
+        level_ffn_norm_biases_leaves[0],
+        level_ffn_in_weights_leaves[0],
+        level_ffn_in_biases_leaves[0],
+        level_ffn_out_weights_leaves[0],
+        level_ffn_out_biases_leaves[0]);
     auto first_prop_delta = scan_cuda_low_rank_propagation_topk(
         level.state,
         level.val,
@@ -3289,6 +3423,14 @@ std::vector<torch::Tensor> jakal_net_causal_memory_scan_fused_backward_cuda(
         std::get<1>(first_prop_delta),
         val_norm_weights_leaves[0],
         val_norm_biases_leaves[0]);
+    level = scan_cuda_apply_ffn_to_layer(
+        level,
+        level_ffn_norm_weights_leaves[0],
+        level_ffn_norm_biases_leaves[0],
+        level_ffn_in_weights_leaves[0],
+        level_ffn_in_biases_leaves[0],
+        level_ffn_out_weights_leaves[0],
+        level_ffn_out_biases_leaves[0]);
     next_memory.push_back(level);
 
     for (size_t level_index = 1; level_index < current_memory.size(); ++level_index) {
@@ -3312,6 +3454,14 @@ std::vector<torch::Tensor> jakal_net_causal_memory_scan_fused_backward_cuda(
           std::get<1>(parent_delta),
           val_norm_weights_leaves[level_index],
           val_norm_biases_leaves[level_index]);
+      updated_level = scan_cuda_apply_ffn_to_layer(
+          updated_level,
+          level_ffn_norm_weights_leaves[level_index],
+          level_ffn_norm_biases_leaves[level_index],
+          level_ffn_in_weights_leaves[level_index],
+          level_ffn_in_biases_leaves[level_index],
+          level_ffn_out_weights_leaves[level_index],
+          level_ffn_out_biases_leaves[level_index]);
 
       if (level_index == 1 && !skip_source_weights_leaves.empty()) {
         auto skip_gate = torch::sigmoid(skip_gates_leaves[0].to(token_val_leaf.scalar_type()));
@@ -3334,6 +3484,14 @@ std::vector<torch::Tensor> jakal_net_causal_memory_scan_fused_backward_cuda(
             std::get<1>(skip_delta) * skip_gate,
             val_norm_weights_leaves[level_index],
             val_norm_biases_leaves[level_index]);
+        updated_level = scan_cuda_apply_ffn_to_layer(
+            updated_level,
+            level_ffn_norm_weights_leaves[level_index],
+            level_ffn_norm_biases_leaves[level_index],
+            level_ffn_in_weights_leaves[level_index],
+            level_ffn_in_biases_leaves[level_index],
+            level_ffn_out_weights_leaves[level_index],
+            level_ffn_out_biases_leaves[level_index]);
       }
 
       if (level_index >= 2) {
@@ -3358,6 +3516,14 @@ std::vector<torch::Tensor> jakal_net_causal_memory_scan_fused_backward_cuda(
             std::get<1>(skip_delta) * skip_gate,
             val_norm_weights_leaves[level_index],
             val_norm_biases_leaves[level_index]);
+        updated_level = scan_cuda_apply_ffn_to_layer(
+            updated_level,
+            level_ffn_norm_weights_leaves[level_index],
+            level_ffn_norm_biases_leaves[level_index],
+            level_ffn_in_weights_leaves[level_index],
+            level_ffn_in_biases_leaves[level_index],
+            level_ffn_out_weights_leaves[level_index],
+            level_ffn_out_biases_leaves[level_index]);
       }
 
       auto propagation_delta = scan_cuda_low_rank_propagation_topk(
@@ -3376,6 +3542,14 @@ std::vector<torch::Tensor> jakal_net_causal_memory_scan_fused_backward_cuda(
           std::get<1>(propagation_delta),
           val_norm_weights_leaves[level_index],
           val_norm_biases_leaves[level_index]);
+      updated_level = scan_cuda_apply_ffn_to_layer(
+          updated_level,
+          level_ffn_norm_weights_leaves[level_index],
+          level_ffn_norm_biases_leaves[level_index],
+          level_ffn_in_weights_leaves[level_index],
+          level_ffn_in_biases_leaves[level_index],
+          level_ffn_out_weights_leaves[level_index],
+          level_ffn_out_biases_leaves[level_index]);
       next_memory.push_back(updated_level);
     }
 
@@ -3437,6 +3611,12 @@ std::vector<torch::Tensor> jakal_net_causal_memory_scan_fused_backward_cuda(
     for (const auto& tensor : level_transition_biases_leaves) all_inputs.push_back(tensor);
     for (const auto& tensor : level_norm_weights_leaves) all_inputs.push_back(tensor);
     for (const auto& tensor : level_norm_biases_leaves) all_inputs.push_back(tensor);
+    for (const auto& tensor : level_ffn_norm_weights_leaves) all_inputs.push_back(tensor);
+    for (const auto& tensor : level_ffn_norm_biases_leaves) all_inputs.push_back(tensor);
+    for (const auto& tensor : level_ffn_in_weights_leaves) all_inputs.push_back(tensor);
+    for (const auto& tensor : level_ffn_in_biases_leaves) all_inputs.push_back(tensor);
+    for (const auto& tensor : level_ffn_out_weights_leaves) all_inputs.push_back(tensor);
+    for (const auto& tensor : level_ffn_out_biases_leaves) all_inputs.push_back(tensor);
     for (const auto& tensor : skip_source_weights_leaves) all_inputs.push_back(tensor);
     for (const auto& tensor : skip_target_weights_leaves) all_inputs.push_back(tensor);
     for (const auto& tensor : skip_core_weights_leaves) all_inputs.push_back(tensor);

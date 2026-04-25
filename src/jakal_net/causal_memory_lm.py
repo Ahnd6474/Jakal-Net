@@ -468,10 +468,20 @@ class CausalHierarchicalMemoryLM(nn.Module):
         return reference.new_empty((0,))
 
     def _native_scan_supported_config(self) -> bool:
-        if getattr(self.b_module, "feed_forward_layers", False):
-            return False
         supported_route_compress = {"softmax", "signed_abs_softmax", "signed_entmax15"}
         supported_edge_compress = {"softsign", "signed_abs_softmax", "signed_entmax15"}
+
+        def _is_supported_ffn(module: nn.Module) -> bool:
+            if isinstance(module, nn.Identity):
+                return True
+            if not isinstance(module, ResidualFeedForward):
+                return False
+            return (
+                isinstance(module.input_norm, nn.LayerNorm)
+                and len(module.net) == 5
+                and isinstance(module.net[0], nn.Linear)
+                and isinstance(module.net[3], nn.Linear)
+            )
 
         def _is_supported_route(transition) -> bool:
             return (
@@ -489,6 +499,8 @@ class CausalHierarchicalMemoryLM(nn.Module):
             )
 
         if not isinstance(self.value_to_state, (nn.Linear, ValueNormStateProjection)):
+            return False
+        if not all(_is_supported_ffn(ffn) for ffn in self.b_module.level_ffns):
             return False
         if not all(_is_supported_route(level.write) for level in self.b_module.memory_levels):
             return False
@@ -621,6 +633,27 @@ class CausalHierarchicalMemoryLM(nn.Module):
             skip_gates.append(self.b_module.skip_gates[key])
             skip_topks.append(int(transition.topk))
 
+        def _level_ffn_spec(ffn: nn.Module) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+            if isinstance(ffn, nn.Identity):
+                empty = aligned_s.new_empty((0,))
+                return empty, empty, empty, empty, empty, empty
+            if not isinstance(ffn, ResidualFeedForward):
+                raise RuntimeError("Native scan supports only ResidualFeedForward or Identity level FFNs.")
+            first = ffn.net[0]
+            second = ffn.net[3]
+            if not isinstance(first, nn.Linear) or not isinstance(second, nn.Linear):
+                raise RuntimeError("Native scan requires ResidualFeedForward linear layers.")
+            return (
+                ffn.input_norm.weight,
+                ffn.input_norm.bias,
+                first.weight,
+                first.bias,
+                second.weight,
+                second.bias,
+            )
+
+        level_ffn_specs = [_level_ffn_spec(ffn) for ffn in self.b_module.level_ffns]
+
         return {
             "aligned_s": aligned_s,
             "flat_memory": self.b_module.flatten_memory_state(tuple(memory_state)),
@@ -680,6 +713,12 @@ class CausalHierarchicalMemoryLM(nn.Module):
                 self._norm_param_or_empty(norm, "bias", aligned_s)
                 for norm in self.b_module.level_norms
             ),
+            "level_ffn_norm_weights": tuple(spec[0] for spec in level_ffn_specs),
+            "level_ffn_norm_biases": tuple(spec[1] for spec in level_ffn_specs),
+            "level_ffn_in_weights": tuple(spec[2] for spec in level_ffn_specs),
+            "level_ffn_in_biases": tuple(spec[3] for spec in level_ffn_specs),
+            "level_ffn_out_weights": tuple(spec[4] for spec in level_ffn_specs),
+            "level_ffn_out_biases": tuple(spec[5] for spec in level_ffn_specs),
             "skip_source_weights": tuple(skip_source_weights),
             "skip_target_weights": tuple(skip_target_weights),
             "skip_core_weights": tuple(skip_core_weights),

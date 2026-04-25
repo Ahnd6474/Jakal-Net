@@ -1483,6 +1483,32 @@ torch::Tensor read_memory_vector(
   return read_sum;
 }
 
+NativeLayerState apply_ffn_to_layer(
+    const NativeLayerState& layer,
+    const torch::Tensor& norm_weight,
+    const torch::Tensor& norm_bias,
+    const torch::Tensor& in_weight,
+    const torch::Tensor& in_bias,
+    const torch::Tensor& out_weight,
+    const torch::Tensor& out_bias) {
+  if (!in_weight.defined() || in_weight.numel() == 0) {
+    return layer;
+  }
+  auto normalized = layer_norm_last_dim(layer.val, norm_weight, norm_bias);
+  c10::optional<torch::Tensor> packed_in_bias = c10::nullopt;
+  if (in_bias.defined() && in_bias.numel() != 0) {
+    packed_in_bias = in_bias;
+  }
+  c10::optional<torch::Tensor> packed_out_bias = c10::nullopt;
+  if (out_bias.defined() && out_bias.numel() != 0) {
+    packed_out_bias = out_bias;
+  }
+  auto hidden = linear3d(normalized, in_weight, packed_in_bias);
+  auto activated = 0.5 * hidden * (1 + torch::erf(hidden * 0.70710678118654752440));
+  auto delta = linear3d(activated, out_weight, packed_out_bias);
+  return {layer.state, layer.val + delta};
+}
+
 void require_vector_size(
     const std::vector<torch::Tensor>& tensors,
     size_t expected,
@@ -1573,6 +1599,12 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> causal_memory_scan_fused(
     const std::vector<int64_t>& level_transition_topks,
     const std::vector<torch::Tensor>& level_norm_weights,
     const std::vector<torch::Tensor>& level_norm_biases,
+    const std::vector<torch::Tensor>& level_ffn_norm_weights,
+    const std::vector<torch::Tensor>& level_ffn_norm_biases,
+    const std::vector<torch::Tensor>& level_ffn_in_weights,
+    const std::vector<torch::Tensor>& level_ffn_in_biases,
+    const std::vector<torch::Tensor>& level_ffn_out_weights,
+    const std::vector<torch::Tensor>& level_ffn_out_biases,
     const std::vector<torch::Tensor>& skip_source_weights,
     const std::vector<torch::Tensor>& skip_target_weights,
     const std::vector<torch::Tensor>& skip_core_weights,
@@ -1620,6 +1652,12 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> causal_memory_scan_fused(
         level_transition_topks,
         level_norm_weights,
         level_norm_biases,
+        level_ffn_norm_weights,
+        level_ffn_norm_biases,
+        level_ffn_in_weights,
+        level_ffn_in_biases,
+        level_ffn_out_weights,
+        level_ffn_out_biases,
         skip_source_weights,
         skip_target_weights,
         skip_core_weights,
@@ -1657,6 +1695,12 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> causal_memory_scan_fused(
   require_int_vector_size(level_transition_topks, num_levels > 0 ? num_levels - 1 : 0, "level_transition_topks");
   require_vector_size(level_norm_weights, num_levels, "level_norm_weights");
   require_vector_size(level_norm_biases, num_levels, "level_norm_biases");
+  require_vector_size(level_ffn_norm_weights, num_levels, "level_ffn_norm_weights");
+  require_vector_size(level_ffn_norm_biases, num_levels, "level_ffn_norm_biases");
+  require_vector_size(level_ffn_in_weights, num_levels, "level_ffn_in_weights");
+  require_vector_size(level_ffn_in_biases, num_levels, "level_ffn_in_biases");
+  require_vector_size(level_ffn_out_weights, num_levels, "level_ffn_out_weights");
+  require_vector_size(level_ffn_out_biases, num_levels, "level_ffn_out_biases");
   require_vector_size(skip_source_weights, expected_skip_count, "skip_source_weights");
   require_vector_size(skip_target_weights, expected_skip_count, "skip_target_weights");
   require_vector_size(skip_core_weights, expected_skip_count, "skip_core_weights");
@@ -1699,6 +1743,14 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> causal_memory_scan_fused(
         std::get<1>(first_write_delta),
         val_norm_weights[0],
         val_norm_biases[0]);
+    level = apply_ffn_to_layer(
+        level,
+        level_ffn_norm_weights[0],
+        level_ffn_norm_biases[0],
+        level_ffn_in_weights[0],
+        level_ffn_in_biases[0],
+        level_ffn_out_weights[0],
+        level_ffn_out_biases[0]);
     auto first_prop_delta = low_rank_propagation_topk_signed_abs(
         level.state,
         level.val,
@@ -1714,6 +1766,14 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> causal_memory_scan_fused(
         std::get<1>(first_prop_delta),
         val_norm_weights[0],
         val_norm_biases[0]);
+    level = apply_ffn_to_layer(
+        level,
+        level_ffn_norm_weights[0],
+        level_ffn_norm_biases[0],
+        level_ffn_in_weights[0],
+        level_ffn_in_biases[0],
+        level_ffn_out_weights[0],
+        level_ffn_out_biases[0]);
     next_memory.push_back(level);
 
     for (size_t level_index = 1; level_index < num_levels; ++level_index) {
@@ -1736,6 +1796,14 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> causal_memory_scan_fused(
           std::get<1>(parent_delta),
           val_norm_weights[level_index],
           val_norm_biases[level_index]);
+      updated_level = apply_ffn_to_layer(
+          updated_level,
+          level_ffn_norm_weights[level_index],
+          level_ffn_norm_biases[level_index],
+          level_ffn_in_weights[level_index],
+          level_ffn_in_biases[level_index],
+          level_ffn_out_weights[level_index],
+          level_ffn_out_biases[level_index]);
 
       if (level_index == 1 && expected_skip_count > 0) {
         auto skip_gate = torch::sigmoid(cast_tensor_like(skip_gates[0], token_val));
@@ -1757,6 +1825,14 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> causal_memory_scan_fused(
             std::get<1>(skip_delta) * skip_gate,
             val_norm_weights[level_index],
             val_norm_biases[level_index]);
+        updated_level = apply_ffn_to_layer(
+            updated_level,
+            level_ffn_norm_weights[level_index],
+            level_ffn_norm_biases[level_index],
+            level_ffn_in_weights[level_index],
+            level_ffn_in_biases[level_index],
+            level_ffn_out_weights[level_index],
+            level_ffn_out_biases[level_index]);
       }
 
       if (level_index >= 2) {
@@ -1780,6 +1856,14 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> causal_memory_scan_fused(
             std::get<1>(skip_delta) * skip_gate,
             val_norm_weights[level_index],
             val_norm_biases[level_index]);
+        updated_level = apply_ffn_to_layer(
+            updated_level,
+            level_ffn_norm_weights[level_index],
+            level_ffn_norm_biases[level_index],
+            level_ffn_in_weights[level_index],
+            level_ffn_in_biases[level_index],
+            level_ffn_out_weights[level_index],
+            level_ffn_out_biases[level_index]);
       }
 
       auto propagation_delta = low_rank_propagation_topk_signed_abs(
@@ -1797,6 +1881,14 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> causal_memory_scan_fused(
           std::get<1>(propagation_delta),
           val_norm_weights[level_index],
           val_norm_biases[level_index]);
+      updated_level = apply_ffn_to_layer(
+          updated_level,
+          level_ffn_norm_weights[level_index],
+          level_ffn_norm_biases[level_index],
+          level_ffn_in_weights[level_index],
+          level_ffn_in_biases[level_index],
+          level_ffn_out_weights[level_index],
+          level_ffn_out_biases[level_index]);
       next_memory.push_back(updated_level);
     }
 
@@ -1856,6 +1948,12 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>, std::vector<torch::Tensor>
     const std::vector<int64_t>& level_transition_topks,
     const std::vector<torch::Tensor>& level_norm_weights,
     const std::vector<torch::Tensor>& level_norm_biases,
+    const std::vector<torch::Tensor>& level_ffn_norm_weights,
+    const std::vector<torch::Tensor>& level_ffn_norm_biases,
+    const std::vector<torch::Tensor>& level_ffn_in_weights,
+    const std::vector<torch::Tensor>& level_ffn_in_biases,
+    const std::vector<torch::Tensor>& level_ffn_out_weights,
+    const std::vector<torch::Tensor>& level_ffn_out_biases,
     const std::vector<torch::Tensor>& skip_source_weights,
     const std::vector<torch::Tensor>& skip_target_weights,
     const std::vector<torch::Tensor>& skip_core_weights,
@@ -1903,6 +2001,12 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>, std::vector<torch::Tensor>
         level_transition_topks,
         level_norm_weights,
         level_norm_biases,
+        level_ffn_norm_weights,
+        level_ffn_norm_biases,
+        level_ffn_in_weights,
+        level_ffn_in_biases,
+        level_ffn_out_weights,
+        level_ffn_out_biases,
         skip_source_weights,
         skip_target_weights,
         skip_core_weights,
@@ -1940,6 +2044,12 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>, std::vector<torch::Tensor>
   require_int_vector_size(level_transition_topks, num_levels > 0 ? num_levels - 1 : 0, "level_transition_topks");
   require_vector_size(level_norm_weights, num_levels, "level_norm_weights");
   require_vector_size(level_norm_biases, num_levels, "level_norm_biases");
+  require_vector_size(level_ffn_norm_weights, num_levels, "level_ffn_norm_weights");
+  require_vector_size(level_ffn_norm_biases, num_levels, "level_ffn_norm_biases");
+  require_vector_size(level_ffn_in_weights, num_levels, "level_ffn_in_weights");
+  require_vector_size(level_ffn_in_biases, num_levels, "level_ffn_in_biases");
+  require_vector_size(level_ffn_out_weights, num_levels, "level_ffn_out_weights");
+  require_vector_size(level_ffn_out_biases, num_levels, "level_ffn_out_biases");
   require_vector_size(skip_source_weights, expected_skip_count, "skip_source_weights");
   require_vector_size(skip_target_weights, expected_skip_count, "skip_target_weights");
   require_vector_size(skip_core_weights, expected_skip_count, "skip_core_weights");
@@ -1990,6 +2100,14 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>, std::vector<torch::Tensor>
         std::get<1>(first_write_delta),
         val_norm_weights[0],
         val_norm_biases[0]);
+    level = apply_ffn_to_layer(
+        level,
+        level_ffn_norm_weights[0],
+        level_ffn_norm_biases[0],
+        level_ffn_in_weights[0],
+        level_ffn_in_biases[0],
+        level_ffn_out_weights[0],
+        level_ffn_out_biases[0]);
     auto level_for_propagation = layer_with_val_norm(level, val_norm_weights[0], val_norm_biases[0]);
     auto first_prop_delta = low_rank_propagation_topk_signed_abs(
         level_for_propagation.state,
@@ -2006,6 +2124,14 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>, std::vector<torch::Tensor>
         std::get<1>(first_prop_delta),
         val_norm_weights[0],
         val_norm_biases[0]);
+    level = apply_ffn_to_layer(
+        level,
+        level_ffn_norm_weights[0],
+        level_ffn_norm_biases[0],
+        level_ffn_in_weights[0],
+        level_ffn_in_biases[0],
+        level_ffn_out_weights[0],
+        level_ffn_out_biases[0]);
     next_memory.push_back(level);
 
     for (size_t level_index = 1; level_index < num_levels; ++level_index) {
@@ -2036,6 +2162,14 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>, std::vector<torch::Tensor>
           std::get<1>(parent_delta),
           val_norm_weights[level_index],
           val_norm_biases[level_index]);
+      updated_level = apply_ffn_to_layer(
+          updated_level,
+          level_ffn_norm_weights[level_index],
+          level_ffn_norm_biases[level_index],
+          level_ffn_in_weights[level_index],
+          level_ffn_in_biases[level_index],
+          level_ffn_out_weights[level_index],
+          level_ffn_out_biases[level_index]);
 
       if (level_index == 1 && expected_skip_count > 0) {
         auto skip_gate = torch::sigmoid(cast_tensor_like(skip_gates[0], token_val));
@@ -2057,6 +2191,14 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>, std::vector<torch::Tensor>
             std::get<1>(skip_delta) * skip_gate,
             val_norm_weights[level_index],
             val_norm_biases[level_index]);
+        updated_level = apply_ffn_to_layer(
+            updated_level,
+            level_ffn_norm_weights[level_index],
+            level_ffn_norm_biases[level_index],
+            level_ffn_in_weights[level_index],
+            level_ffn_in_biases[level_index],
+            level_ffn_out_weights[level_index],
+            level_ffn_out_biases[level_index]);
       }
 
       if (level_index >= 2) {
@@ -2084,6 +2226,14 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>, std::vector<torch::Tensor>
             std::get<1>(skip_delta) * skip_gate,
             val_norm_weights[level_index],
             val_norm_biases[level_index]);
+        updated_level = apply_ffn_to_layer(
+            updated_level,
+            level_ffn_norm_weights[level_index],
+            level_ffn_norm_biases[level_index],
+            level_ffn_in_weights[level_index],
+            level_ffn_in_biases[level_index],
+            level_ffn_out_weights[level_index],
+            level_ffn_out_biases[level_index]);
       }
 
       auto updated_level_for_prop = layer_with_val_norm(
@@ -2105,6 +2255,14 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>, std::vector<torch::Tensor>
           std::get<1>(propagation_delta),
           val_norm_weights[level_index],
           val_norm_biases[level_index]);
+      updated_level = apply_ffn_to_layer(
+          updated_level,
+          level_ffn_norm_weights[level_index],
+          level_ffn_norm_biases[level_index],
+          level_ffn_in_weights[level_index],
+          level_ffn_in_biases[level_index],
+          level_ffn_out_weights[level_index],
+          level_ffn_out_biases[level_index]);
       next_memory.push_back(updated_level);
     }
 
@@ -2172,6 +2330,12 @@ causal_memory_scan_fused_checkpoints(
     const std::vector<int64_t>& level_transition_topks,
     const std::vector<torch::Tensor>& level_norm_weights,
     const std::vector<torch::Tensor>& level_norm_biases,
+    const std::vector<torch::Tensor>& level_ffn_norm_weights,
+    const std::vector<torch::Tensor>& level_ffn_norm_biases,
+    const std::vector<torch::Tensor>& level_ffn_in_weights,
+    const std::vector<torch::Tensor>& level_ffn_in_biases,
+    const std::vector<torch::Tensor>& level_ffn_out_weights,
+    const std::vector<torch::Tensor>& level_ffn_out_biases,
     const std::vector<torch::Tensor>& skip_source_weights,
     const std::vector<torch::Tensor>& skip_target_weights,
     const std::vector<torch::Tensor>& skip_core_weights,
@@ -2212,6 +2376,12 @@ causal_memory_scan_fused_checkpoints(
   require_int_vector_size(level_transition_topks, num_levels > 0 ? num_levels - 1 : 0, "level_transition_topks");
   require_vector_size(level_norm_weights, num_levels, "level_norm_weights");
   require_vector_size(level_norm_biases, num_levels, "level_norm_biases");
+  require_vector_size(level_ffn_norm_weights, num_levels, "level_ffn_norm_weights");
+  require_vector_size(level_ffn_norm_biases, num_levels, "level_ffn_norm_biases");
+  require_vector_size(level_ffn_in_weights, num_levels, "level_ffn_in_weights");
+  require_vector_size(level_ffn_in_biases, num_levels, "level_ffn_in_biases");
+  require_vector_size(level_ffn_out_weights, num_levels, "level_ffn_out_weights");
+  require_vector_size(level_ffn_out_biases, num_levels, "level_ffn_out_biases");
   require_vector_size(skip_source_weights, expected_skip_count, "skip_source_weights");
   require_vector_size(skip_target_weights, expected_skip_count, "skip_target_weights");
   require_vector_size(skip_core_weights, expected_skip_count, "skip_core_weights");
@@ -2265,6 +2435,14 @@ causal_memory_scan_fused_checkpoints(
         std::get<1>(first_write_delta),
         val_norm_weights[0],
         val_norm_biases[0]);
+    level = apply_ffn_to_layer(
+        level,
+        level_ffn_norm_weights[0],
+        level_ffn_norm_biases[0],
+        level_ffn_in_weights[0],
+        level_ffn_in_biases[0],
+        level_ffn_out_weights[0],
+        level_ffn_out_biases[0]);
     auto level_for_propagation = layer_with_val_norm(level, val_norm_weights[0], val_norm_biases[0]);
     auto first_prop_delta = low_rank_propagation_topk_signed_abs(
         level_for_propagation.state,
@@ -2281,6 +2459,14 @@ causal_memory_scan_fused_checkpoints(
         std::get<1>(first_prop_delta),
         val_norm_weights[0],
         val_norm_biases[0]);
+    level = apply_ffn_to_layer(
+        level,
+        level_ffn_norm_weights[0],
+        level_ffn_norm_biases[0],
+        level_ffn_in_weights[0],
+        level_ffn_in_biases[0],
+        level_ffn_out_weights[0],
+        level_ffn_out_biases[0]);
     next_memory.push_back(level);
 
     for (size_t level_index = 1; level_index < num_levels; ++level_index) {
@@ -2311,6 +2497,14 @@ causal_memory_scan_fused_checkpoints(
           std::get<1>(parent_delta),
           val_norm_weights[level_index],
           val_norm_biases[level_index]);
+      updated_level = apply_ffn_to_layer(
+          updated_level,
+          level_ffn_norm_weights[level_index],
+          level_ffn_norm_biases[level_index],
+          level_ffn_in_weights[level_index],
+          level_ffn_in_biases[level_index],
+          level_ffn_out_weights[level_index],
+          level_ffn_out_biases[level_index]);
 
       if (level_index == 1 && expected_skip_count > 0) {
         auto skip_gate = torch::sigmoid(cast_tensor_like(skip_gates[0], token_val));
@@ -2332,6 +2526,14 @@ causal_memory_scan_fused_checkpoints(
             std::get<1>(skip_delta) * skip_gate,
             val_norm_weights[level_index],
             val_norm_biases[level_index]);
+        updated_level = apply_ffn_to_layer(
+            updated_level,
+            level_ffn_norm_weights[level_index],
+            level_ffn_norm_biases[level_index],
+            level_ffn_in_weights[level_index],
+            level_ffn_in_biases[level_index],
+            level_ffn_out_weights[level_index],
+            level_ffn_out_biases[level_index]);
       }
 
       if (level_index >= 2) {
@@ -2359,6 +2561,14 @@ causal_memory_scan_fused_checkpoints(
             std::get<1>(skip_delta) * skip_gate,
             val_norm_weights[level_index],
             val_norm_biases[level_index]);
+        updated_level = apply_ffn_to_layer(
+            updated_level,
+            level_ffn_norm_weights[level_index],
+            level_ffn_norm_biases[level_index],
+            level_ffn_in_weights[level_index],
+            level_ffn_in_biases[level_index],
+            level_ffn_out_weights[level_index],
+            level_ffn_out_biases[level_index]);
       }
 
       auto updated_level_for_prop = layer_with_val_norm(
@@ -2380,6 +2590,14 @@ causal_memory_scan_fused_checkpoints(
           std::get<1>(propagation_delta),
           val_norm_weights[level_index],
           val_norm_biases[level_index]);
+      updated_level = apply_ffn_to_layer(
+          updated_level,
+          level_ffn_norm_weights[level_index],
+          level_ffn_norm_biases[level_index],
+          level_ffn_in_weights[level_index],
+          level_ffn_in_biases[level_index],
+          level_ffn_out_weights[level_index],
+          level_ffn_out_biases[level_index]);
       next_memory.push_back(updated_level);
     }
 
@@ -2455,6 +2673,12 @@ std::vector<torch::Tensor> causal_memory_scan_fused_backward_cuda(
     const std::vector<int64_t>& level_transition_topks,
     const std::vector<torch::Tensor>& level_norm_weights,
     const std::vector<torch::Tensor>& level_norm_biases,
+    const std::vector<torch::Tensor>& level_ffn_norm_weights,
+    const std::vector<torch::Tensor>& level_ffn_norm_biases,
+    const std::vector<torch::Tensor>& level_ffn_in_weights,
+    const std::vector<torch::Tensor>& level_ffn_in_biases,
+    const std::vector<torch::Tensor>& level_ffn_out_weights,
+    const std::vector<torch::Tensor>& level_ffn_out_biases,
     const std::vector<torch::Tensor>& skip_source_weights,
     const std::vector<torch::Tensor>& skip_target_weights,
     const std::vector<torch::Tensor>& skip_core_weights,
@@ -2501,6 +2725,12 @@ std::vector<torch::Tensor> causal_memory_scan_fused_backward_cuda(
       level_transition_topks,
       level_norm_weights,
       level_norm_biases,
+      level_ffn_norm_weights,
+      level_ffn_norm_biases,
+      level_ffn_in_weights,
+      level_ffn_in_biases,
+      level_ffn_out_weights,
+      level_ffn_out_biases,
       skip_source_weights,
       skip_target_weights,
       skip_core_weights,
@@ -2547,6 +2777,12 @@ std::vector<torch::Tensor> causal_memory_scan_fused_backward_cuda(
       level_transition_topks,
       level_norm_weights,
       level_norm_biases,
+      level_ffn_norm_weights,
+      level_ffn_norm_biases,
+      level_ffn_in_weights,
+      level_ffn_in_biases,
+      level_ffn_out_weights,
+      level_ffn_out_biases,
       skip_source_weights,
       skip_target_weights,
       skip_core_weights,

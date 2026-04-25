@@ -220,6 +220,12 @@ def causal_memory_scan_fused_trace_native(
     level_transition_topks: tuple[int, ...],
     level_norm_weights: tuple[Tensor, ...],
     level_norm_biases: tuple[Tensor, ...],
+    level_ffn_norm_weights: tuple[Tensor, ...],
+    level_ffn_norm_biases: tuple[Tensor, ...],
+    level_ffn_in_weights: tuple[Tensor, ...],
+    level_ffn_in_biases: tuple[Tensor, ...],
+    level_ffn_out_weights: tuple[Tensor, ...],
+    level_ffn_out_biases: tuple[Tensor, ...],
     skip_source_weights: tuple[Tensor, ...],
     skip_target_weights: tuple[Tensor, ...],
     skip_core_weights: tuple[Tensor, ...],
@@ -260,6 +266,12 @@ def causal_memory_scan_fused_trace_native(
             list(level_transition_topks),
             list(level_norm_weights),
             list(level_norm_biases),
+            list(level_ffn_norm_weights),
+            list(level_ffn_norm_biases),
+            list(level_ffn_in_weights),
+            list(level_ffn_in_biases),
+            list(level_ffn_out_weights),
+            list(level_ffn_out_biases),
             list(skip_source_weights),
             list(skip_target_weights),
             list(skip_core_weights),
@@ -302,6 +314,12 @@ def causal_memory_scan_fused_trace_native(
             list(level_transition_topks),
             list(level_norm_weights),
             list(level_norm_biases),
+            list(level_ffn_norm_weights),
+            list(level_ffn_norm_biases),
+            list(level_ffn_in_weights),
+            list(level_ffn_in_biases),
+            list(level_ffn_out_weights),
+            list(level_ffn_out_biases),
             list(skip_source_weights),
             list(skip_target_weights),
             list(skip_core_weights),
@@ -351,6 +369,12 @@ def causal_memory_scan_fused_checkpoints_native(
     level_transition_topks: tuple[int, ...],
     level_norm_weights: tuple[Tensor, ...],
     level_norm_biases: tuple[Tensor, ...],
+    level_ffn_norm_weights: tuple[Tensor, ...],
+    level_ffn_norm_biases: tuple[Tensor, ...],
+    level_ffn_in_weights: tuple[Tensor, ...],
+    level_ffn_in_biases: tuple[Tensor, ...],
+    level_ffn_out_weights: tuple[Tensor, ...],
+    level_ffn_out_biases: tuple[Tensor, ...],
     skip_source_weights: tuple[Tensor, ...],
     skip_target_weights: tuple[Tensor, ...],
     skip_core_weights: tuple[Tensor, ...],
@@ -391,6 +415,12 @@ def causal_memory_scan_fused_checkpoints_native(
             list(level_transition_topks),
             list(level_norm_weights),
             list(level_norm_biases),
+            list(level_ffn_norm_weights),
+            list(level_ffn_norm_biases),
+            list(level_ffn_in_weights),
+            list(level_ffn_in_biases),
+            list(level_ffn_out_weights),
+            list(level_ffn_out_biases),
             list(skip_source_weights),
             list(skip_target_weights),
             list(skip_core_weights),
@@ -434,6 +464,12 @@ def causal_memory_scan_fused_checkpoints_native(
             list(level_transition_topks),
             list(level_norm_weights),
             list(level_norm_biases),
+            list(level_ffn_norm_weights),
+            list(level_ffn_norm_biases),
+            list(level_ffn_in_weights),
+            list(level_ffn_in_biases),
+            list(level_ffn_out_weights),
+            list(level_ffn_out_biases),
             list(skip_source_weights),
             list(skip_target_weights),
             list(skip_core_weights),
@@ -483,6 +519,12 @@ def causal_memory_scan_fused_native(
     level_transition_topks: tuple[int, ...],
     level_norm_weights: tuple[Tensor, ...],
     level_norm_biases: tuple[Tensor, ...],
+    level_ffn_norm_weights: tuple[Tensor, ...],
+    level_ffn_norm_biases: tuple[Tensor, ...],
+    level_ffn_in_weights: tuple[Tensor, ...],
+    level_ffn_in_biases: tuple[Tensor, ...],
+    level_ffn_out_weights: tuple[Tensor, ...],
+    level_ffn_out_biases: tuple[Tensor, ...],
     skip_source_weights: tuple[Tensor, ...],
     skip_target_weights: tuple[Tensor, ...],
     skip_core_weights: tuple[Tensor, ...],
@@ -524,6 +566,12 @@ def causal_memory_scan_fused_native(
         level_transition_topks=level_transition_topks,
         level_norm_weights=level_norm_weights,
         level_norm_biases=level_norm_biases,
+        level_ffn_norm_weights=level_ffn_norm_weights,
+        level_ffn_norm_biases=level_ffn_norm_biases,
+        level_ffn_in_weights=level_ffn_in_weights,
+        level_ffn_in_biases=level_ffn_in_biases,
+        level_ffn_out_weights=level_ffn_out_weights,
+        level_ffn_out_biases=level_ffn_out_biases,
         skip_source_weights=skip_source_weights,
         skip_target_weights=skip_target_weights,
         skip_core_weights=skip_core_weights,
@@ -665,6 +713,12 @@ def _flatten_causal_memory_scan_args(
     level_transition_topks: tuple[int, ...],
     level_norm_weights: tuple[Tensor, ...],
     level_norm_biases: tuple[Tensor, ...],
+    level_ffn_norm_weights: tuple[Tensor, ...],
+    level_ffn_norm_biases: tuple[Tensor, ...],
+    level_ffn_in_weights: tuple[Tensor, ...],
+    level_ffn_in_biases: tuple[Tensor, ...],
+    level_ffn_out_weights: tuple[Tensor, ...],
+    level_ffn_out_biases: tuple[Tensor, ...],
     skip_source_weights: tuple[Tensor, ...],
     skip_target_weights: tuple[Tensor, ...],
     skip_core_weights: tuple[Tensor, ...],
@@ -703,6 +757,12 @@ def _flatten_causal_memory_scan_args(
         *level_transition_biases,
         *level_norm_weights,
         *level_norm_biases,
+        *level_ffn_norm_weights,
+        *level_ffn_norm_biases,
+        *level_ffn_in_weights,
+        *level_ffn_in_biases,
+        *level_ffn_out_weights,
+        *level_ffn_out_biases,
         *skip_source_weights,
         *skip_target_weights,
         *skip_core_weights,
@@ -765,6 +825,12 @@ def _unpack_causal_memory_scan_tensor_args(
         ("level_transition_biases", max(num_levels - 1, 0)),
         ("level_norm_weights", num_levels),
         ("level_norm_biases", num_levels),
+        ("level_ffn_norm_weights", num_levels),
+        ("level_ffn_norm_biases", num_levels),
+        ("level_ffn_in_weights", num_levels),
+        ("level_ffn_in_biases", num_levels),
+        ("level_ffn_out_weights", num_levels),
+        ("level_ffn_out_biases", num_levels),
         ("skip_source_weights", max(num_levels - 1, 0)),
         ("skip_target_weights", max(num_levels - 1, 0)),
         ("skip_core_weights", max(num_levels - 1, 0)),
@@ -1105,6 +1171,30 @@ def _native_scan_read_memory(
     return read_sum
 
 
+def _native_scan_apply_ffn(args: dict[str, Any], level_index: int, state: Tensor, val: Tensor) -> tuple[Tensor, Tensor]:
+    in_weight = args["level_ffn_in_weights"][level_index]
+    if in_weight.numel() == 0:
+        return state, val
+    normalized = _native_scan_layer_norm(
+        val,
+        args["level_ffn_norm_weights"][level_index],
+        args["level_ffn_norm_biases"][level_index],
+    )
+    in_bias = args["level_ffn_in_biases"][level_index]
+    out_bias = args["level_ffn_out_biases"][level_index]
+    hidden = F.linear(
+        normalized,
+        in_weight.to(device=val.device, dtype=val.dtype),
+        in_bias.to(device=val.device, dtype=val.dtype) if in_bias.numel() != 0 else None,
+    )
+    delta = F.linear(
+        F.gelu(hidden),
+        args["level_ffn_out_weights"][level_index].to(device=val.device, dtype=val.dtype),
+        out_bias.to(device=val.device, dtype=val.dtype) if out_bias.numel() != 0 else None,
+    )
+    return state, val + delta
+
+
 def _causal_memory_scan_fused_reference(
     tensor_args: tuple[Tensor, ...],
     num_levels: int,
@@ -1170,6 +1260,7 @@ def _causal_memory_scan_fused_reference(
             args["val_norm_weights"][0],
             args["val_norm_biases"][0],
         )
+        level_state, level_val = _native_scan_apply_ffn(args, 0, level_state, level_val)
         level_for_prop_val = _native_scan_layer_norm(level_val, args["val_norm_weights"][0], args["val_norm_biases"][0])
         first_prop_delta = _native_scan_propagation_topk_signed_abs(
             propagation_pairwise_kind,
@@ -1189,6 +1280,7 @@ def _causal_memory_scan_fused_reference(
             args["val_norm_weights"][0],
             args["val_norm_biases"][0],
         )
+        level_state, level_val = _native_scan_apply_ffn(args, 0, level_state, level_val)
         next_memory.append((level_state, level_val))
 
         for level_index in range(1, num_levels):
@@ -1224,6 +1316,7 @@ def _causal_memory_scan_fused_reference(
                 args["val_norm_weights"][level_index],
                 args["val_norm_biases"][level_index],
             )
+            updated_state, updated_val = _native_scan_apply_ffn(args, level_index, updated_state, updated_val)
 
             if level_index == 1 and num_levels > 1:
                 skip_gate = torch.sigmoid(args["skip_gates"][0].to(dtype=token_val.dtype))
@@ -1248,6 +1341,7 @@ def _causal_memory_scan_fused_reference(
                     args["val_norm_weights"][level_index],
                     args["val_norm_biases"][level_index],
                 )
+                updated_state, updated_val = _native_scan_apply_ffn(args, level_index, updated_state, updated_val)
 
             if level_index >= 2:
                 skip_index = level_index - 1
@@ -1278,6 +1372,7 @@ def _causal_memory_scan_fused_reference(
                     args["val_norm_weights"][level_index],
                     args["val_norm_biases"][level_index],
                 )
+                updated_state, updated_val = _native_scan_apply_ffn(args, level_index, updated_state, updated_val)
 
             updated_level_for_prop_val = _native_scan_layer_norm(
                 updated_val,
@@ -1302,6 +1397,7 @@ def _causal_memory_scan_fused_reference(
                 args["val_norm_weights"][level_index],
                 args["val_norm_biases"][level_index],
             )
+            updated_state, updated_val = _native_scan_apply_ffn(args, level_index, updated_state, updated_val)
             next_memory.append((updated_state, updated_val))
 
         current_memory = next_memory
@@ -1385,6 +1481,12 @@ def _causal_memory_scan_fused_native_forward(
         list(level_transition_topks),
         list(args["level_norm_weights"]),
         list(args["level_norm_biases"]),
+        list(args["level_ffn_norm_weights"]),
+        list(args["level_ffn_norm_biases"]),
+        list(args["level_ffn_in_weights"]),
+        list(args["level_ffn_in_biases"]),
+        list(args["level_ffn_out_weights"]),
+        list(args["level_ffn_out_biases"]),
         list(args["skip_source_weights"]),
         list(args["skip_target_weights"]),
         list(args["skip_core_weights"]),
@@ -1451,6 +1553,12 @@ def _causal_memory_scan_fused_native_forward_with_checkpoints(
         level_transition_topks=level_transition_topks,
         level_norm_weights=tuple(args["level_norm_weights"]),
         level_norm_biases=tuple(args["level_norm_biases"]),
+        level_ffn_norm_weights=tuple(args["level_ffn_norm_weights"]),
+        level_ffn_norm_biases=tuple(args["level_ffn_norm_biases"]),
+        level_ffn_in_weights=tuple(args["level_ffn_in_weights"]),
+        level_ffn_in_biases=tuple(args["level_ffn_in_biases"]),
+        level_ffn_out_weights=tuple(args["level_ffn_out_weights"]),
+        level_ffn_out_biases=tuple(args["level_ffn_out_biases"]),
         skip_source_weights=tuple(args["skip_source_weights"]),
         skip_target_weights=tuple(args["skip_target_weights"]),
         skip_core_weights=tuple(args["skip_core_weights"]),
@@ -1505,6 +1613,12 @@ def _repack_causal_memory_scan_chunk_args(
         level_transition_topks=(),
         level_norm_weights=tuple(args["level_norm_weights"]),
         level_norm_biases=tuple(args["level_norm_biases"]),
+        level_ffn_norm_weights=tuple(args["level_ffn_norm_weights"]),
+        level_ffn_norm_biases=tuple(args["level_ffn_norm_biases"]),
+        level_ffn_in_weights=tuple(args["level_ffn_in_weights"]),
+        level_ffn_in_biases=tuple(args["level_ffn_in_biases"]),
+        level_ffn_out_weights=tuple(args["level_ffn_out_weights"]),
+        level_ffn_out_biases=tuple(args["level_ffn_out_biases"]),
         skip_source_weights=tuple(args["skip_source_weights"]),
         skip_target_weights=tuple(args["skip_target_weights"]),
         skip_core_weights=tuple(args["skip_core_weights"]),
@@ -1565,6 +1679,12 @@ def _causal_memory_scan_fused_backward_cuda(
         list(level_transition_topks),
         list(args["level_norm_weights"]),
         list(args["level_norm_biases"]),
+        list(args["level_ffn_norm_weights"]),
+        list(args["level_ffn_norm_biases"]),
+        list(args["level_ffn_in_weights"]),
+        list(args["level_ffn_in_biases"]),
+        list(args["level_ffn_out_weights"]),
+        list(args["level_ffn_out_biases"]),
         list(args["skip_source_weights"]),
         list(args["skip_target_weights"]),
         list(args["skip_core_weights"]),
@@ -1765,6 +1885,12 @@ class _CausalMemoryScanFusedFunction(Function):
                 level_transition_topks=level_transition_topks,
                 level_norm_weights=tuple(unpacked["level_norm_weights"]),
                 level_norm_biases=tuple(unpacked["level_norm_biases"]),
+                level_ffn_norm_weights=tuple(unpacked["level_ffn_norm_weights"]),
+                level_ffn_norm_biases=tuple(unpacked["level_ffn_norm_biases"]),
+                level_ffn_in_weights=tuple(unpacked["level_ffn_in_weights"]),
+                level_ffn_in_biases=tuple(unpacked["level_ffn_in_biases"]),
+                level_ffn_out_weights=tuple(unpacked["level_ffn_out_weights"]),
+                level_ffn_out_biases=tuple(unpacked["level_ffn_out_biases"]),
                 skip_source_weights=tuple(unpacked["skip_source_weights"]),
                 skip_target_weights=tuple(unpacked["skip_target_weights"]),
                 skip_core_weights=tuple(unpacked["skip_core_weights"]),
