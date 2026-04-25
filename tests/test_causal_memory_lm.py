@@ -50,6 +50,9 @@ class CausalMemoryLMTests(unittest.TestCase):
         self.assertEqual(output.logits.shape, (2, 5, 32))
         self.assertEqual(len(output.memory_state), 3)
         self.assertEqual(output.memory_state[0].val.shape, (2, 6, 8))
+        self.assertTrue(model.feed_forward_layers)
+        self.assertTrue(model.s_module.feed_forward_layers)
+        self.assertTrue(model.b_module.feed_forward_layers)
         assert output.sequence_layer is not None
         assert output.query_layer is not None
         self.assertEqual(output.sequence_layer.val.shape, (2, 6, 8))
@@ -168,6 +171,21 @@ class CausalMemoryLMTests(unittest.TestCase):
         self.assertEqual(model.scan_backend, "native")
         self.assertEqual(model.scan_checkpoint_chunk_size, 32)
 
+    def test_feed_forward_layers_disable_native_scan_by_default(self) -> None:
+        model = CausalHierarchicalMemoryLM(
+            vocab_size=64,
+            dim=16,
+            max_seq_len=16,
+            s_layers=1,
+            memory_slots=(8, 4),
+            prediction_layers=1,
+            memory_topk=2,
+            pairwise_rank=8,
+            route_rank=8,
+        )
+
+        self.assertFalse(model._native_scan_supported_config())
+
     def test_memory_train_eval_modes_select_dense_or_topk(self) -> None:
         model = CausalHierarchicalMemoryLM(
             vocab_size=64,
@@ -182,6 +200,7 @@ class CausalMemoryLMTests(unittest.TestCase):
             eval_topk=2,
             pairwise_rank=8,
             route_rank=8,
+            feed_forward_layers=False,
         )
         aligned_s = torch.randn(2, 4, 16)
         memory_state = model.initialize_memory_state(2, device=aligned_s.device, dtype=aligned_s.dtype)
@@ -208,6 +227,7 @@ class CausalMemoryLMTests(unittest.TestCase):
             pairwise_heads=2,
             route_heads=2,
             scan_backend="native",
+            feed_forward_layers=False,
         )
 
         self.assertTrue(model._native_scan_supported_config())
@@ -232,6 +252,7 @@ class CausalMemoryLMTests(unittest.TestCase):
             pairwise_anchor_kind="diagonal_bilinear",
             route_anchor_kind="diagonal_bilinear",
             scan_backend="native",
+            feed_forward_layers=False,
         )
 
         self.assertTrue(model._native_scan_supported_config())
@@ -260,6 +281,7 @@ class CausalMemoryLMTests(unittest.TestCase):
             pairwise_anchor_kind="constant_one",
             route_anchor_kind="constant_one",
             scan_backend="native",
+            feed_forward_layers=False,
         )
         aligned_s = torch.randn(2, 4, 16)
         memory_state = model.initialize_memory_state(2, device=aligned_s.device, dtype=aligned_s.dtype)

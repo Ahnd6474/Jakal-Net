@@ -107,6 +107,46 @@ class ScaledCosinePairwise(nn.Module):
         return torch.einsum("...id,...jd->...ij", normalized_target, normalized_source) * self.scale
 
 
+class ResidualFeedForward(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        *,
+        hidden_mult: float = 4.0,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if dim <= 0:
+            raise ValueError("dim must be positive.")
+        if hidden_mult <= 0.0:
+            raise ValueError("hidden_mult must be positive.")
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError("dropout must be in [0, 1).")
+        hidden_dim = max(dim, int(round(float(dim) * float(hidden_mult))))
+        self.input_norm = nn.LayerNorm(dim)
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(float(dropout)),
+        )
+        self._reset_parameters()
+
+    def _reset_parameters(self) -> None:
+        first = self.net[0]
+        second = self.net[3]
+        assert isinstance(first, nn.Linear)
+        assert isinstance(second, nn.Linear)
+        nn.init.xavier_uniform_(first.weight)
+        nn.init.zeros_(first.bias)
+        nn.init.xavier_uniform_(second.weight)
+        nn.init.zeros_(second.bias)
+
+    def forward(self, val: Tensor) -> Tensor:
+        return val + self.net(self.input_norm(val))
+
+
 class FixedProjectionRoute(nn.Module):
     expects_pairwise_inputs = True
 

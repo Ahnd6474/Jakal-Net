@@ -20,6 +20,7 @@ from jakal_net._architectural_common import (
 from jakal_net.core import Layer, LayerDelta
 from jakal_net.propagation import Propagation, SparsePropagation
 from jakal_net.transition import SparseTransition
+from jakal_net.modules import ResidualFeedForward
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +180,7 @@ class BModule(nn.Module):
         route_anchor_kind: str = "fixed_projection",
         implementation: str,
         unit_norm_values: bool = False,
+        feed_forward_layers: bool = True,
     ) -> None:
         super().__init__()
         if dim <= 0:
@@ -202,6 +204,7 @@ class BModule(nn.Module):
         self.num_memory_levels = len(self.memory_slots)
         self.unit_norm_values = unit_norm_values
         self.implementation = implementation
+        self.feed_forward_layers = bool(feed_forward_layers)
 
         self.memory_levels = nn.ModuleList(
             _MemoryLevel(
@@ -253,6 +256,10 @@ class BModule(nn.Module):
             self.level_norms = nn.ModuleList(nn.Identity() for _ in self.memory_slots)
         else:
             self.level_norms = nn.ModuleList(nn.LayerNorm(dim) for _ in self.memory_slots)
+        self.level_ffns = nn.ModuleList(
+            ResidualFeedForward(dim) if self.feed_forward_layers else nn.Identity()
+            for _ in self.memory_slots
+        )
 
         self.skip_transitions = nn.ModuleDict()
         self.skip_gates = nn.ParameterDict()
@@ -321,6 +328,12 @@ class BModule(nn.Module):
             )
             for slots in self.memory_slots
         )
+
+    def _apply_level_ffn(self, level_index: int, layer: Layer) -> Layer:
+        val = self.level_ffns[level_index](layer.val)
+        if self.unit_norm_values:
+            val = unit_normalize_values(val)
+        return layer.with_tensors(val=val)
 
     def initialize_state(
         self,
@@ -395,6 +408,7 @@ class BModule(nn.Module):
             val_norm=first_level_module.val_norm,
             unit_norm_values=self.unit_norm_values,
         )
+        level = self._apply_level_ffn(0, level)
         level = apply_delta(
             level,
             first_level_module.compute_propagation_delta(level),
@@ -402,6 +416,7 @@ class BModule(nn.Module):
             val_norm=first_level_module.val_norm,
             unit_norm_values=self.unit_norm_values,
         )
+        level = self._apply_level_ffn(0, level)
         next_levels.append(level)
 
         for level_index in range(1, self.num_memory_levels):
@@ -421,6 +436,7 @@ class BModule(nn.Module):
                 val_norm=level_module.val_norm,
                 unit_norm_values=self.unit_norm_values,
             )
+            level = self._apply_level_ffn(level_index, level)
             if level_index == 1 and "token_to_1" in self.skip_transitions:
                 gate = torch.sigmoid(self.skip_gates["token_to_1"])
                 skip_delta = self.skip_transitions["token_to_1"].compute_delta(
@@ -437,6 +453,7 @@ class BModule(nn.Module):
                     val_norm=level_module.val_norm,
                     unit_norm_values=self.unit_norm_values,
                 )
+                level = self._apply_level_ffn(level_index, level)
             key = f"{level_index - 2}_to_{level_index}"
             if key in self.skip_transitions:
                 gate = torch.sigmoid(self.skip_gates[key])
@@ -454,6 +471,7 @@ class BModule(nn.Module):
                     val_norm=level_module.val_norm,
                     unit_norm_values=self.unit_norm_values,
                 )
+                level = self._apply_level_ffn(level_index, level)
             level = apply_delta(
                 level,
                 level_module.compute_propagation_delta(level),
@@ -461,6 +479,7 @@ class BModule(nn.Module):
                 val_norm=level_module.val_norm,
                 unit_norm_values=self.unit_norm_values,
             )
+            level = self._apply_level_ffn(level_index, level)
             next_levels.append(level)
         return tuple(next_levels)
 
@@ -547,12 +566,15 @@ class BModule(nn.Module):
         ):
             delta = transition.compute_delta(bridge_layer, level)
             next_levels.append(
-                apply_delta(
-                    level,
-                    delta,
-                    residual=True,
-                    val_norm=level_module.val_norm,
-                    unit_norm_values=self.unit_norm_values,
+                self._apply_level_ffn(
+                    len(next_levels),
+                    apply_delta(
+                        level,
+                        delta,
+                        residual=True,
+                        val_norm=level_module.val_norm,
+                        unit_norm_values=self.unit_norm_values,
+                    ),
                 )
             )
         return tuple(next_levels)

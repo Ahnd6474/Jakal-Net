@@ -31,7 +31,7 @@ from jakal_net.native_backend import (
     native_supports,
     native_supports_device,
 )
-from jakal_net.modules import MultiHeadPairwise, MultiHeadRoute
+from jakal_net.modules import MultiHeadPairwise, MultiHeadRoute, ResidualFeedForward
 from jakal_net.propagation import SparsePropagation
 from jakal_net.sequence_module import SModule
 
@@ -103,6 +103,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
         scan_checkpoint_chunk_size: int | None = None,
         implementation: str = "streaming",
         unit_norm_values: bool = False,
+        feed_forward_layers: bool = True,
         tie_embedding_head: bool = True,
         knowledge_nodes: int = 0,
         knowledge_route_topk: int | None = None,
@@ -148,6 +149,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
         self.scan_checkpoint_chunk_size = scan_checkpoint_chunk_size
         self.checkpoint_prediction_layers = checkpoint_prediction_layers
         self.unit_norm_values = unit_norm_values
+        self.feed_forward_layers = bool(feed_forward_layers)
         if knowledge_module is None and knowledge_nodes > 0:
             knowledge_module = KModule(
                 dim=dim,
@@ -188,6 +190,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
             s_microbatch_size=s_microbatch_size,
             checkpoint_sequence_layers=checkpoint_sequence_layers,
             unit_norm_values=unit_norm_values,
+            feed_forward_layers=self.feed_forward_layers,
         )
         self.b_module = BModule(
             dim=dim,
@@ -211,6 +214,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
             route_anchor_kind=route_anchor_kind,
             implementation=implementation,
             unit_norm_values=unit_norm_values,
+            feed_forward_layers=self.feed_forward_layers,
         )
 
         self.s_prediction_proj = nn.Linear(dim, dim, bias=False)
@@ -228,13 +232,17 @@ class CausalHierarchicalMemoryLM(nn.Module):
                     anchor_kind=pairwise_anchor_kind,
                 ),
                 sparse_type="window",
-                window=max(1, prediction_window),
+                window=max(1, max_seq_len),
                 edge_compress_fn=signed_abs_softmax_edges,
                 state_weight_edges=False,
                 implementation=implementation,
                 residual=True,
                 use_direction_only=unit_norm_values,
             )
+            for _ in range(prediction_layers)
+        )
+        self.prediction_ffns = nn.ModuleList(
+            ResidualFeedForward(dim) if self.feed_forward_layers else nn.Identity()
             for _ in range(prediction_layers)
         )
         self.output_norm = nn.LayerNorm(dim)
@@ -313,7 +321,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
         )
         query_layer = scan_output.query_layer
         current_memory = scan_output.memory_state
-        for propagation, norm in zip(self.prediction_layers, self.prediction_norms):
+        for layer_index, (propagation, norm) in enumerate(zip(self.prediction_layers, self.prediction_norms)):
             if self.checkpoint_prediction_layers and torch.is_grad_enabled():
                 def _run_prediction_layer(state: Tensor, val: Tensor) -> tuple[Tensor, Tensor]:
                     current_layer = Layer(dim=self.dim, num_nodes=query_layer.num_nodes, state=state, val=val)
@@ -346,6 +354,10 @@ class CausalHierarchicalMemoryLM(nn.Module):
                     val_norm=norm,
                     unit_norm_values=self.unit_norm_values,
                 )
+            ffn_val = self.prediction_ffns[layer_index](query_layer.val)
+            if self.unit_norm_values:
+                ffn_val = unit_normalize_values(ffn_val)
+            query_layer = query_layer.with_tensors(val=ffn_val)
 
         output_state_source = self.output_norm(query_layer.val)
         output_val = output_state_source
@@ -446,6 +458,8 @@ class CausalHierarchicalMemoryLM(nn.Module):
         return reference.new_empty((0,))
 
     def _native_scan_supported_config(self) -> bool:
+        if getattr(self.b_module, "feed_forward_layers", False):
+            return False
         supported_route_compress = {"softmax", "signed_abs_softmax", "signed_entmax15"}
         supported_edge_compress = {"softsign", "signed_abs_softmax", "signed_entmax15"}
 

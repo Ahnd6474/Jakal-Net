@@ -11,7 +11,7 @@ from jakal_net._architectural_common import (
     unit_normalize_values,
 )
 from jakal_net.core import Layer
-from jakal_net.modules import LearnedPositionEncoding
+from jakal_net.modules import LearnedPositionEncoding, ResidualFeedForward
 from jakal_net.propagation import SparsePropagation
 
 
@@ -34,6 +34,7 @@ class SModule(nn.Module):
         s_microbatch_size: int | None = None,
         checkpoint_sequence_layers: bool = False,
         unit_norm_values: bool = False,
+        feed_forward_layers: bool = True,
     ) -> None:
         super().__init__()
         if vocab_size <= 0:
@@ -53,6 +54,7 @@ class SModule(nn.Module):
         self.s_microbatch_size = s_microbatch_size
         self.checkpoint_sequence_layers = checkpoint_sequence_layers
         self.unit_norm_values = unit_norm_values
+        self.feed_forward_layers = bool(feed_forward_layers)
 
         self.token_embedding = nn.Embedding(vocab_size, dim)
         self.position_encoding = LearnedPositionEncoding(dim)
@@ -87,6 +89,16 @@ class SModule(nn.Module):
             )
             for _ in range(s_layers)
         )
+        self.sequence_ffns = nn.ModuleList(
+            ResidualFeedForward(dim) if self.feed_forward_layers else nn.Identity()
+            for _ in range(s_layers)
+        )
+
+    def _apply_ffn(self, layer: Layer, ffn: nn.Module) -> Layer:
+        val = ffn(layer.val)
+        if self.unit_norm_values:
+            val = unit_normalize_values(val)
+        return layer.with_tensors(val=val)
 
     def encode(
         self,
@@ -165,7 +177,7 @@ class SModule(nn.Module):
         seq_val = torch.cat((anchor_val, token_val), dim=1)
         seq_state = torch.cat((anchor_state, state_projection(token_state_source).squeeze(-1)), dim=1)
         layer = Layer(dim=self.dim, num_nodes=seq_len + 1, state=seq_state, val=seq_val)
-        for propagation, norm in zip(self.sequence_layers, self.sequence_norms):
+        for layer_index, (propagation, norm) in enumerate(zip(self.sequence_layers, self.sequence_norms)):
             if self.checkpoint_sequence_layers and torch.is_grad_enabled():
                 def _run_sequence_layer(state: Tensor, val: Tensor) -> tuple[Tensor, Tensor]:
                     current_layer = Layer(dim=self.dim, num_nodes=seq_len + 1, state=state, val=val)
@@ -193,4 +205,5 @@ class SModule(nn.Module):
                     val_norm=norm,
                     unit_norm_values=self.unit_norm_values,
                 )
+            layer = self._apply_ffn(layer, self.sequence_ffns[layer_index])
         return layer

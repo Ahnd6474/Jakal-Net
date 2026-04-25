@@ -2569,6 +2569,7 @@ def apply_training_curriculum(model: torch.nn.Module, stage: TrainingCurriculumS
     _set_module_requires_grad(b_module.memory_levels, True)
     _set_module_requires_grad(b_module.level_transitions, True)
     _set_module_requires_grad(b_module.level_norms, True)
+    _set_module_requires_grad(b_module.level_ffns, True)
     _set_module_requires_grad(b_module.read_projections, True)
     _set_parameter_collection_requires_grad(b_module.read_gates, True)
     b_module.read_template_val.requires_grad_(True)
@@ -2581,6 +2582,7 @@ def apply_training_curriculum(model: torch.nn.Module, stage: TrainingCurriculumS
         _set_module_requires_grad(b_module.memory_levels, False)
         _set_module_requires_grad(b_module.level_transitions, False)
         _set_module_requires_grad(b_module.level_norms, False)
+        _set_module_requires_grad(b_module.level_ffns, False)
         _set_module_requires_grad(b_module.read_projections, False)
         _set_parameter_collection_requires_grad(b_module.read_gates, False)
         b_module.read_template_val.requires_grad_(False)
@@ -3720,6 +3722,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prediction-window", type=int, default=64)
     parser.add_argument("--checkpoint-sequence-layers", action="store_true")
     parser.add_argument("--checkpoint-prediction-layers", action="store_true")
+    parser.add_argument(
+        "--disable-feed-forward-layers",
+        action="store_true",
+        help="Disable memory-model FFN blocks between propagation/transition layers.",
+    )
     parser.add_argument("--memory-topk", type=int, default=16)
     parser.add_argument("--memory-train-mode", choices=("dense", "topk"), default="dense")
     parser.add_argument("--memory-eval-mode", choices=("dense", "topk"), default="dense")
@@ -4399,6 +4406,7 @@ def main() -> None:
             prediction_window=args.prediction_window,
             checkpoint_sequence_layers=args.checkpoint_sequence_layers,
             checkpoint_prediction_layers=args.checkpoint_prediction_layers,
+            feed_forward_layers=not args.disable_feed_forward_layers,
             memory_topk=args.memory_topk,
             memory_train_mode=args.memory_train_mode,
             memory_eval_mode=args.memory_eval_mode,
@@ -4456,7 +4464,7 @@ def main() -> None:
             f"scan_backend={args.scan_backend} | scan_checkpoint_chunk_size={args.scan_checkpoint_chunk_size} | "
             f"memory_slots={args.memory_slots} | memory_update_intervals={args.memory_update_intervals} | knowledge_nodes={args.knowledge_nodes} | "
             f"memory_train_mode={args.memory_train_mode} | memory_eval_mode={args.memory_eval_mode} | eval_topk={args.eval_topk or args.memory_topk} | "
-            f"unit_norm_values={args.unit_norm_values} | "
+            f"unit_norm_values={args.unit_norm_values} | feed_forward_layers={not args.disable_feed_forward_layers} | "
             f"optimizer={args.optimizer} | checkpoint_sequence={args.checkpoint_sequence_layers} | "
             f"checkpoint_prediction={args.checkpoint_prediction_layers}",
             flush=True,
