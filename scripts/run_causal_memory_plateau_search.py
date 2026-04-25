@@ -272,6 +272,16 @@ def train_command(args: argparse.Namespace, candidate: ScheduleCandidate, run_na
         str(args.seq_len),
         "--dim",
         str(args.dim),
+        "--model-kind",
+        args.model_kind,
+        "--transformer-layers",
+        str(args.transformer_layers),
+        "--transformer-heads",
+        str(args.transformer_heads),
+        "--transformer-ff-mult",
+        str(args.transformer_ff_mult),
+        "--transformer-dropout",
+        str(args.transformer_dropout),
         "--s-layers",
         str(args.s_layers),
         "--memory-slots",
@@ -595,6 +605,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pretokenize-workers", type=int, default=8)
     parser.add_argument("--seq-len", type=int, default=512)
     parser.add_argument("--dim", type=int, default=384)
+    parser.add_argument("--model-kind", choices=("causal_memory", "transformer"), default="causal_memory")
+    parser.add_argument("--transformer-layers", type=int, default=5)
+    parser.add_argument("--transformer-heads", type=int, default=6)
+    parser.add_argument("--transformer-ff-mult", type=float, default=4.0)
+    parser.add_argument("--transformer-dropout", type=float, default=0.0)
     parser.add_argument("--s-layers", type=int, default=6)
     parser.add_argument("--memory-slots", type=int, nargs="+", default=[384, 96, 24])
     parser.add_argument("--memory-update-intervals", type=int, nargs="+", default=[1, 2, 4])

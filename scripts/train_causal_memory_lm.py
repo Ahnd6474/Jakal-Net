@@ -212,6 +212,93 @@ class SharedEmbeddingRnnAuxHead(torch.nn.Module):
         return self.output(hidden)
 
 
+class TransformerBaselineLM(torch.nn.Module):
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        dim: int,
+        max_seq_len: int,
+        layers: int,
+        heads: int,
+        ff_mult: float = 4.0,
+        dropout: float = 0.0,
+        tie_embedding_head: bool = True,
+    ) -> None:
+        super().__init__()
+        if vocab_size <= 0:
+            raise ValueError("vocab_size must be positive.")
+        if dim <= 0:
+            raise ValueError("dim must be positive.")
+        if max_seq_len <= 0:
+            raise ValueError("max_seq_len must be positive.")
+        if layers <= 0:
+            raise ValueError("transformer layers must be positive.")
+        if heads <= 0 or dim % heads != 0:
+            raise ValueError("transformer heads must be positive and divide dim.")
+        if ff_mult <= 0.0:
+            raise ValueError("transformer ff multiplier must be positive.")
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError("transformer dropout must be in [0, 1).")
+        self.vocab_size = int(vocab_size)
+        self.dim = int(dim)
+        self.max_seq_len = int(max_seq_len)
+        self.layers = int(layers)
+        self.heads = int(heads)
+        self.ff_mult = float(ff_mult)
+        self.dropout = float(dropout)
+        self.token_embedding = torch.nn.Embedding(self.vocab_size, self.dim)
+        self.position_embedding = torch.nn.Embedding(self.max_seq_len, self.dim)
+        ff_dim = max(self.dim, int(round(self.dim * self.ff_mult)))
+        encoder_layer = torch.nn.TransformerEncoderLayer(
+            d_model=self.dim,
+            nhead=self.heads,
+            dim_feedforward=ff_dim,
+            dropout=self.dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = torch.nn.TransformerEncoder(encoder_layer, num_layers=self.layers)
+        self.output_norm = torch.nn.LayerNorm(self.dim)
+        self.lm_head = torch.nn.Linear(self.dim, self.vocab_size, bias=False)
+        if tie_embedding_head:
+            self.lm_head.weight = self.token_embedding.weight
+        self._reset_parameters(tie_embedding_head=tie_embedding_head)
+
+    def _reset_parameters(self, *, tie_embedding_head: bool) -> None:
+        torch.nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.02)
+        torch.nn.init.normal_(self.position_embedding.weight, mean=0.0, std=0.02)
+        if not tie_embedding_head:
+            torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.02)
+
+    def initialize_memory_state(self, batch_size: int, *, device: torch.device, dtype: torch.dtype) -> tuple[Any, ...]:
+        return ()
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        memory_state: Any | None = None,
+        knowledge_state: Any | None = None,
+        reset_mask: torch.Tensor | None = None,
+        return_memory_state: bool = False,
+        return_layers: bool = False,
+    ) -> torch.Tensor | MemoryScanOutput:
+        del memory_state, knowledge_state, reset_mask, return_layers
+        seq_len = int(input_ids.shape[1])
+        if seq_len > self.max_seq_len:
+            raise ValueError(f"input sequence length {seq_len} exceeds max_seq_len={self.max_seq_len}.")
+        positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
+        hidden = self.token_embedding(input_ids) + self.position_embedding(positions)
+        causal_mask = torch.ones(seq_len, seq_len, device=input_ids.device, dtype=torch.bool).triu(1)
+        hidden = self.encoder(hidden, mask=causal_mask, is_causal=True)
+        logits = self.lm_head(self.output_norm(hidden))
+        if not return_memory_state:
+            return logits
+        return MemoryScanOutput(logits=logits, memory_state=())
+
+
 @dataclass(frozen=True, slots=True)
 class TokenizedDocument:
     kind: str
@@ -2475,7 +2562,9 @@ def resolve_curriculum_stage(
     )
 
 
-def apply_training_curriculum(model: CausalHierarchicalMemoryLM, stage: TrainingCurriculumStage) -> None:
+def apply_training_curriculum(model: torch.nn.Module, stage: TrainingCurriculumStage) -> None:
+    if not hasattr(model, "b_module"):
+        return
     b_module = model.b_module
     _set_module_requires_grad(b_module.memory_levels, True)
     _set_module_requires_grad(b_module.level_transitions, True)
@@ -2516,6 +2605,11 @@ def override_batch_reset(batch: DocumentBatch, *, reset_all: bool) -> DocumentBa
 
 def build_run_name(args: argparse.Namespace) -> str:
     memory_slug = "-".join(str(slot) for slot in args.memory_slots)
+    if args.model_kind == "transformer":
+        return (
+            f"transformer-doc-l{args.transformer_layers}-h{args.transformer_heads}"
+            f"-ff{args.transformer_ff_mult:g}-dim{args.dim}-seq{args.seq_len}"
+        )
     return (
         f"causal-memory-doc-s{args.s_layers}-b{memory_slug}-p{args.prediction_layers}"
         f"-dim{args.dim}-seq{args.seq_len}"
@@ -3612,6 +3706,11 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--seq-len", type=int, default=2048)
     parser.add_argument("--dim", type=int, default=512)
+    parser.add_argument("--model-kind", choices=("causal_memory", "transformer"), default="causal_memory")
+    parser.add_argument("--transformer-layers", type=int, default=5)
+    parser.add_argument("--transformer-heads", type=int, default=6)
+    parser.add_argument("--transformer-ff-mult", type=float, default=4.0)
+    parser.add_argument("--transformer-dropout", type=float, default=0.0)
     parser.add_argument("--s-layers", type=int, default=2)
     parser.add_argument("--memory-slots", type=int, nargs="+", default=[256, 64, 16])
     parser.add_argument("--memory-update-intervals", type=int, nargs="+")
@@ -4038,6 +4137,14 @@ def main() -> None:
         raise ValueError("eval-topk must be non-negative.")
     if args.seq_len <= 2:
         raise ValueError("seq-len must be larger than 2.")
+    if args.transformer_layers <= 0:
+        raise ValueError("transformer-layers must be positive.")
+    if args.transformer_heads <= 0 or args.dim % args.transformer_heads != 0:
+        raise ValueError("transformer-heads must be positive and divide dim.")
+    if args.transformer_ff_mult <= 0.0:
+        raise ValueError("transformer-ff-mult must be positive.")
+    if not 0.0 <= args.transformer_dropout < 1.0:
+        raise ValueError("transformer-dropout must be in [0, 1).")
     if args.epochs <= 0.0:
         raise ValueError("epochs must be positive.")
     if not 0.0 <= args.curriculum_stage1_ratio <= 1.0:
@@ -4268,44 +4375,55 @@ def main() -> None:
         print(f"hf_embedding_dim | source={hf_dim_source} | dim={args.dim}", flush=True)
     total_steps = max(1, int(math.ceil(steps_per_epoch * args.epochs)))
 
-    model = CausalHierarchicalMemoryLM(
-        vocab_size=vocab_size,
-        dim=args.dim,
-        max_seq_len=args.seq_len,
-        s_layers=args.s_layers,
-        memory_slots=tuple(args.memory_slots),
-        memory_update_intervals=None if args.memory_update_intervals is None else tuple(args.memory_update_intervals),
-        prediction_layers=args.prediction_layers,
-        s_window=args.s_window,
-        s_microbatch_size=None if args.s_microbatch_size <= 0 else args.s_microbatch_size,
-        prediction_window=args.prediction_window,
-        checkpoint_sequence_layers=args.checkpoint_sequence_layers,
-        checkpoint_prediction_layers=args.checkpoint_prediction_layers,
-        memory_topk=args.memory_topk,
-        memory_train_mode=args.memory_train_mode,
-        memory_eval_mode=args.memory_eval_mode,
-        eval_topk=None if args.eval_topk <= 0 else args.eval_topk,
-        scan_checkpoint_chunk_size=None if args.scan_checkpoint_chunk_size <= 0 else args.scan_checkpoint_chunk_size,
-        scan_backend=args.scan_backend,
-        pairwise_kind=args.pairwise_kind,
-        route_kind=args.route_kind,
-        pairwise_rank=args.pairwise_rank,
-        route_rank=args.route_rank,
-        pairwise_heads=args.pairwise_heads,
-        pairwise_frozen_heads=args.pairwise_frozen_heads,
-        pairwise_anchor_heads=args.pairwise_anchor_heads,
-        pairwise_anchor_kind=args.pairwise_anchor_kind,
-        route_heads=args.route_heads,
-        route_frozen_heads=args.route_frozen_heads,
-        route_anchor_heads=args.route_anchor_heads,
-        route_anchor_kind=args.route_anchor_kind,
-        implementation=args.implementation,
-        unit_norm_values=args.unit_norm_values,
-        knowledge_nodes=args.knowledge_nodes,
-        knowledge_route_topk=None if args.knowledge_route_topk <= 0 else args.knowledge_route_topk,
-        knowledge_propagation_topk=None if args.knowledge_propagation_topk <= 0 else args.knowledge_propagation_topk,
-        knowledge_propagation_layers=args.knowledge_propagation_layers,
-    ).to(device)
+    if args.model_kind == "transformer":
+        model = TransformerBaselineLM(
+            vocab_size=vocab_size,
+            dim=args.dim,
+            max_seq_len=args.seq_len,
+            layers=args.transformer_layers,
+            heads=args.transformer_heads,
+            ff_mult=args.transformer_ff_mult,
+            dropout=args.transformer_dropout,
+        ).to(device)
+    else:
+        model = CausalHierarchicalMemoryLM(
+            vocab_size=vocab_size,
+            dim=args.dim,
+            max_seq_len=args.seq_len,
+            s_layers=args.s_layers,
+            memory_slots=tuple(args.memory_slots),
+            memory_update_intervals=None if args.memory_update_intervals is None else tuple(args.memory_update_intervals),
+            prediction_layers=args.prediction_layers,
+            s_window=args.s_window,
+            s_microbatch_size=None if args.s_microbatch_size <= 0 else args.s_microbatch_size,
+            prediction_window=args.prediction_window,
+            checkpoint_sequence_layers=args.checkpoint_sequence_layers,
+            checkpoint_prediction_layers=args.checkpoint_prediction_layers,
+            memory_topk=args.memory_topk,
+            memory_train_mode=args.memory_train_mode,
+            memory_eval_mode=args.memory_eval_mode,
+            eval_topk=None if args.eval_topk <= 0 else args.eval_topk,
+            scan_checkpoint_chunk_size=None if args.scan_checkpoint_chunk_size <= 0 else args.scan_checkpoint_chunk_size,
+            scan_backend=args.scan_backend,
+            pairwise_kind=args.pairwise_kind,
+            route_kind=args.route_kind,
+            pairwise_rank=args.pairwise_rank,
+            route_rank=args.route_rank,
+            pairwise_heads=args.pairwise_heads,
+            pairwise_frozen_heads=args.pairwise_frozen_heads,
+            pairwise_anchor_heads=args.pairwise_anchor_heads,
+            pairwise_anchor_kind=args.pairwise_anchor_kind,
+            route_heads=args.route_heads,
+            route_frozen_heads=args.route_frozen_heads,
+            route_anchor_heads=args.route_anchor_heads,
+            route_anchor_kind=args.route_anchor_kind,
+            implementation=args.implementation,
+            unit_norm_values=args.unit_norm_values,
+            knowledge_nodes=args.knowledge_nodes,
+            knowledge_route_topk=None if args.knowledge_route_topk <= 0 else args.knowledge_route_topk,
+            knowledge_propagation_topk=None if args.knowledge_propagation_topk <= 0 else args.knowledge_propagation_topk,
+            knowledge_propagation_layers=args.knowledge_propagation_layers,
+        ).to(device)
     if args.hf_embedding_model:
         if not isinstance(decode_vocab, HFTokenizerVocab):
             raise ValueError("--hf-embedding-model requires --tokenizer hf_auto.")
@@ -4323,17 +4441,26 @@ def main() -> None:
     rnn_aux_head = None
     parameter_count = count_parameters(model)
     rnn_aux_parameter_count = 0
-    print(
-        f"model=causal_memory_doc | params={parameter_count:,} | dim={args.dim} | seq_len={args.seq_len} | "
-        f"s_window={args.s_window} | s_microbatch_size={args.s_microbatch_size} | "
-        f"scan_backend={args.scan_backend} | scan_checkpoint_chunk_size={args.scan_checkpoint_chunk_size} | "
-        f"memory_slots={args.memory_slots} | memory_update_intervals={args.memory_update_intervals} | knowledge_nodes={args.knowledge_nodes} | "
-        f"memory_train_mode={args.memory_train_mode} | memory_eval_mode={args.memory_eval_mode} | eval_topk={args.eval_topk or args.memory_topk} | "
-        f"unit_norm_values={args.unit_norm_values} | "
-        f"optimizer={args.optimizer} | checkpoint_sequence={args.checkpoint_sequence_layers} | "
-        f"checkpoint_prediction={args.checkpoint_prediction_layers}",
-        flush=True,
-    )
+    if args.model_kind == "transformer":
+        print(
+            f"model=transformer_doc | params={parameter_count:,} | dim={args.dim} | seq_len={args.seq_len} | "
+            f"layers={args.transformer_layers} | heads={args.transformer_heads} | "
+            f"ff_mult={args.transformer_ff_mult:g} | dropout={args.transformer_dropout:g} | "
+            f"optimizer={args.optimizer}",
+            flush=True,
+        )
+    else:
+        print(
+            f"model=causal_memory_doc | params={parameter_count:,} | dim={args.dim} | seq_len={args.seq_len} | "
+            f"s_window={args.s_window} | s_microbatch_size={args.s_microbatch_size} | "
+            f"scan_backend={args.scan_backend} | scan_checkpoint_chunk_size={args.scan_checkpoint_chunk_size} | "
+            f"memory_slots={args.memory_slots} | memory_update_intervals={args.memory_update_intervals} | knowledge_nodes={args.knowledge_nodes} | "
+            f"memory_train_mode={args.memory_train_mode} | memory_eval_mode={args.memory_eval_mode} | eval_topk={args.eval_topk or args.memory_topk} | "
+            f"unit_norm_values={args.unit_norm_values} | "
+            f"optimizer={args.optimizer} | checkpoint_sequence={args.checkpoint_sequence_layers} | "
+            f"checkpoint_prediction={args.checkpoint_prediction_layers}",
+            flush=True,
+        )
     print(
         f"native_runtime | fused_training={args.enable_fused_training} | "
         f"fused_training_checkpoint_stride={args.fused_training_checkpoint_stride} | "
