@@ -193,7 +193,7 @@ def pairwise_kernel_spec(pairwise_fn: object) -> PairwiseKernelSpec:
     if isinstance(pairwise_fn, BilinearPairwise):
         return PairwiseKernelSpec(
             kind="bilinear",
-            weight=pairwise_fn.weight,
+            weight=pairwise_fn.normalized_weight(),
             bias=pairwise_fn.bias,
         )
     if isinstance(pairwise_fn, ScaledCosinePairwise):

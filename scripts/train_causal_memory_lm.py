@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import as_completed
 from contextlib import nullcontext
 import json
 import math
+import multiprocessing as mp
 import os
 import queue
 import random
@@ -66,6 +68,8 @@ except ImportError:
 from jakal_net import describe_device, resolve_device
 from jakal_net.causal_memory_lm import CausalHierarchicalMemoryLM, MemoryScanOutput, ModelRecurrentState
 from jakal_net.native_backend import (
+    EXPERIMENTAL_CAUSAL_DENSE_PROP_FORWARD_CUDA_ENV,
+    EXPERIMENTAL_DIAGONAL_DENSE_PROP_CUDA_ENV,
     EXPERIMENTAL_FUSED_TRAINING_CHECKPOINT_STRIDE_ENV,
     EXPERIMENTAL_FUSED_TRAINING_ENV,
     EXPERIMENTAL_SCAN_BACKWARD_CUDA_ENV,
@@ -411,6 +415,58 @@ class FlatPretokenizedShard:
                 else:
                     loss_mask[:active_length] = self.loss_mask_flat[token_start:token_end].to(dtype=torch.float32)
             return context, target, loss_mask, bool(self.is_continuation[chunk_index].item())
+
+    def copy_chunk_tensors_into(
+        self,
+        chunk_index: int,
+        *,
+        document_index: int,
+        is_last_chunk: bool,
+        context_out: torch.Tensor,
+        target_out: torch.Tensor,
+        loss_mask_out: torch.Tensor,
+        loss_mode: str = "default",
+    ) -> bool:
+        if self.context_flat is None or self.loss_mask_flat is None or self.is_continuation is None:
+            self.ensure_loaded()
+        if self.context_flat is None or self.loss_mask_flat is None or self.is_continuation is None:
+            raise RuntimeError(f"Shard tensors are unavailable: {self.path}")
+        token_start = int(self.chunk_token_offsets[chunk_index].item())
+        token_end = int(self.chunk_token_offsets[chunk_index + 1].item())
+        active_context = self.context_flat[token_start:token_end]
+        active_length = int(active_context.shape[0])
+        context_out.fill_(self.pad_token_id)
+        target_out.fill_(self.pad_token_id)
+        loss_mask_out.zero_()
+        if active_length > 0:
+            context_out[:active_length].copy_(active_context.to(dtype=torch.long))
+            target_out[active_length - 1] = self.eos_token_id if is_last_chunk else self.cont_token_id
+        if active_length > 1:
+            target_out[: active_length - 1].copy_(active_context[1:].to(dtype=torch.long))
+        document_kind = self.kind[document_index].lower()
+        if active_length > 0:
+            if loss_mode == "full":
+                loss_mask_out[:active_length] = 1.0
+            elif (
+                document_kind in {"dialogue", "instruction"}
+                and active_length > 2
+                and int(self.special_token_ids.get("assistant", -1)) >= 0
+                and int(self.special_token_ids.get("eot", -1)) >= 0
+            ):
+                content_ids = active_context[2:].to(dtype=torch.long)
+                content_visibility = _content_target_visibility(
+                    content_ids,
+                    loss_mode="assistant_only",
+                    special_token_ids=self.special_token_ids,
+                )
+                loss_mask_out[1 : 1 + content_visibility.shape[0]].copy_(
+                    content_visibility.to(dtype=torch.float32)
+                )
+            else:
+                loss_mask_out[:active_length].copy_(
+                    self.loss_mask_flat[token_start:token_end].to(dtype=torch.float32)
+                )
+        return bool(self.is_continuation[chunk_index].item())
 
     def ensure_loaded(self) -> None:
         if self._loaded:
@@ -1006,6 +1062,19 @@ class _PrefetchFailure:
     error: BaseException
 
 
+@dataclass(frozen=True, slots=True)
+class PrebuiltBatchBlock:
+    context: torch.Tensor
+    target: torch.Tensor
+    loss_mask: torch.Tensor
+    reset_mask: torch.Tensor
+    build_seconds: float
+
+    @property
+    def batch_count(self) -> int:
+        return int(self.context.shape[0])
+
+
 class AsyncDocumentBatchPrefetcher:
     def __init__(
         self,
@@ -1013,23 +1082,45 @@ class AsyncDocumentBatchPrefetcher:
         *,
         device: torch.device,
         prefetch_batches: int,
+        pin_memory: bool,
+        workers: int = 1,
     ) -> None:
         self.batcher = batcher
         self.device = device
         self.prefetch_batches = max(1, prefetch_batches)
+        self.workers = max(1, int(workers))
+        self._previous_pin_memory = getattr(batcher, "pin_memory", None)
+        clone = getattr(batcher, "clone_for_prefetch_worker", None)
+        if self.workers > 1 and clone is not None:
+            self._worker_batchers = [clone(index) for index in range(self.workers)]
+        else:
+            self.workers = 1
+            self._worker_batchers = [batcher]
+        for worker_batcher in self._worker_batchers:
+            if hasattr(worker_batcher, "pin_memory"):
+                worker_batcher.pin_memory = bool(pin_memory)
         self._queue: queue.Queue[DocumentBatch | _PrefetchFailure] = queue.Queue(maxsize=self.prefetch_batches)
         self._stop = threading.Event()
         self._stats_lock = threading.Lock()
         self._produced_batches = 0
         self._total_batch_build_seconds = 0.0
-        self._thread = threading.Thread(target=self._worker, name="cmem_batch_prefetch", daemon=True)
-        self._thread.start()
+        self._threads = [
+            threading.Thread(
+                target=self._worker,
+                args=(worker_batcher,),
+                name=f"cmem_batch_prefetch_{index}",
+                daemon=True,
+            )
+            for index, worker_batcher in enumerate(self._worker_batchers)
+        ]
+        for thread in self._threads:
+            thread.start()
 
-    def _worker(self) -> None:
+    def _worker(self, worker_batcher: DocumentChunkBatcher | FlatDocumentChunkBatcher) -> None:
         while not self._stop.is_set():
             try:
                 started_at = time.perf_counter()
-                batch = self.batcher.next_batch()
+                batch = worker_batcher.next_batch()
                 elapsed = time.perf_counter() - started_at
                 with self._stats_lock:
                     self._produced_batches += 1
@@ -1066,7 +1157,1020 @@ class AsyncDocumentBatchPrefetcher:
 
     def close(self) -> None:
         self._stop.set()
-        self._thread.join(timeout=1.0)
+        for thread in self._threads:
+            thread.join(timeout=1.0)
+        if self._previous_pin_memory is not None and hasattr(self.batcher, "pin_memory"):
+            self.batcher.pin_memory = bool(self._previous_pin_memory)
+
+
+class SynchronousDocumentBatchProvider:
+    def __init__(
+        self,
+        batcher: DocumentChunkBatcher | FlatDocumentChunkBatcher,
+        *,
+        device: torch.device,
+        pin_memory: bool,
+    ) -> None:
+        self.batcher = batcher
+        self.device = device
+        self._previous_pin_memory = getattr(batcher, "pin_memory", None)
+        if hasattr(batcher, "pin_memory"):
+            batcher.pin_memory = bool(pin_memory)
+        self._produced_batches = 0
+        self._total_batch_build_seconds = 0.0
+
+    def next_batch(self) -> DocumentBatch:
+        started_at = time.perf_counter()
+        batch = self.batcher.next_batch()
+        self._produced_batches += 1
+        self._total_batch_build_seconds += time.perf_counter() - started_at
+        return move_batch_to_device(batch, device=self.device, non_blocking=True)
+
+    def stats(self) -> tuple[float, int]:
+        average = (
+            self._total_batch_build_seconds / self._produced_batches
+            if self._produced_batches > 0
+            else 0.0
+        )
+        return average, 0
+
+    def close(self) -> None:
+        if self._previous_pin_memory is not None and hasattr(self.batcher, "pin_memory"):
+            self.batcher.pin_memory = bool(self._previous_pin_memory)
+
+
+class RollingProcessDocumentBatchProvider:
+    def __init__(
+        self,
+        batcher: DocumentChunkBatcher | FlatDocumentChunkBatcher,
+        *,
+        device: torch.device,
+        total_steps: int,
+        start_step: int,
+        stage1_ratio: float,
+        stage2_ratio: float,
+        stage1_span: int,
+        stage2_span: int,
+        stage3_span: int,
+        stage1_batch_size: int,
+        stage2_batch_size: int,
+        stage3_batch_size: int,
+        stage1_grad_accum_steps: int,
+        stage2_grad_accum_steps: int,
+        stage3_grad_accum_steps: int,
+        pin_memory: bool,
+        workers: int,
+        worker_threads: int,
+        block_size: int,
+        queued_blocks: int,
+    ) -> None:
+        if not hasattr(os, "fork"):
+            raise RuntimeError("rolling process prefetch requires fork-capable multiprocessing.")
+        clone = getattr(batcher, "clone_for_prefetch_worker", None)
+        if clone is None:
+            raise RuntimeError("rolling process prefetch requires clone_for_prefetch_worker().")
+        self.device = device
+        self.total_steps = int(total_steps)
+        self.start_step = int(start_step)
+        self.workers = max(1, int(workers))
+        self.block_size = max(1, int(block_size))
+        self.queued_blocks = max(1, int(queued_blocks))
+        stages = [
+            resolve_curriculum_stage(
+                step=step,
+                total_steps=total_steps,
+                stage1_ratio=stage1_ratio,
+                stage2_ratio=stage2_ratio,
+                stage1_span=stage1_span,
+                stage2_span=stage2_span,
+                stage3_span=stage3_span,
+                stage1_batch_size=stage1_batch_size,
+                stage2_batch_size=stage2_batch_size,
+                stage3_batch_size=stage3_batch_size,
+                stage1_grad_accum_steps=stage1_grad_accum_steps,
+                stage2_grad_accum_steps=stage2_grad_accum_steps,
+                stage3_grad_accum_steps=stage3_grad_accum_steps,
+            )
+            for step in range(self.start_step + 1, self.total_steps + 1)
+        ]
+        self.stage_chunks = [
+            stages[index : index + self.block_size]
+            for index in range(0, len(stages), self.block_size)
+        ]
+        if not self.stage_chunks:
+            raise ValueError("rolling process prefetch has no stages to build.")
+        self.total_batches = sum(len(chunk) for chunk in self.stage_chunks)
+        self._next_chunk_index = 0
+        self._consumed_batches = 0
+        self._current_block: PrebuiltBatchBlock | None = None
+        self._current_block_index = 0
+        self._pending_blocks: dict[int, PrebuiltBatchBlock] = {}
+        self._total_batch_build_seconds = 0.0
+        self._closed = False
+        self._ctx = mp.get_context("fork")
+        self._task_queue = self._ctx.Queue()
+        self._result_queue = self._ctx.Queue(maxsize=self.queued_blocks)
+        self._stop_event = self._ctx.Event()
+        global _PREBUILD_PROCESS_BATCHER
+        _PREBUILD_PROCESS_BATCHER = batcher
+        self._processes = [
+            self._ctx.Process(
+                target=_rolling_prefetch_worker,
+                args=(worker_index, self._task_queue, self._result_queue, self._stop_event),
+                kwargs={
+                    "pin_memory": bool(pin_memory),
+                    "worker_threads": max(1, int(worker_threads)),
+                },
+                daemon=True,
+            )
+            for worker_index in range(self.workers)
+        ]
+        for process in self._processes:
+            process.start()
+        for chunk_index, chunk in enumerate(self.stage_chunks):
+            self._task_queue.put((chunk_index, chunk))
+        for _ in self._processes:
+            self._task_queue.put(None)
+
+    def _next_ordered_block(self) -> PrebuiltBatchBlock:
+        if self._next_chunk_index >= len(self.stage_chunks):
+            raise StopIteration("rolling process prefetch is exhausted.")
+        while self._next_chunk_index not in self._pending_blocks:
+            message = self._result_queue.get()
+            kind = message[0]
+            if kind == "error":
+                _, worker_index, error = message
+                raise RuntimeError(f"Rolling prefetch worker {worker_index} failed: {error}")
+            if kind != "block":
+                raise RuntimeError(f"Unexpected rolling prefetch message: {kind}")
+            _, chunk_index, block = message
+            self._pending_blocks[int(chunk_index)] = block
+        block = self._pending_blocks.pop(self._next_chunk_index)
+        self._next_chunk_index += 1
+        self._total_batch_build_seconds += block.build_seconds
+        return block
+
+    def next_batch(self) -> DocumentBatch:
+        if self._current_block is None or self._current_block_index >= self._current_block.batch_count:
+            self._current_block = self._next_ordered_block()
+            self._current_block_index = 0
+        local_index = self._current_block_index
+        self._current_block_index += 1
+        self._consumed_batches += 1
+        batch = DocumentBatch(
+            context=self._current_block.context[local_index],
+            target=self._current_block.target[local_index],
+            loss_mask=self._current_block.loss_mask[local_index],
+            reset_mask=self._current_block.reset_mask[local_index],
+        )
+        return move_batch_to_device(batch, device=self.device, non_blocking=True)
+
+    def stats(self) -> tuple[float, int]:
+        average = self._total_batch_build_seconds / max(1, self._consumed_batches)
+        buffered = sum(block.batch_count for block in self._pending_blocks.values())
+        if self._current_block is not None:
+            buffered += max(0, self._current_block.batch_count - self._current_block_index)
+        return average, buffered
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._stop_event.set()
+        for process in self._processes:
+            process.join(timeout=1.0)
+        for process in self._processes:
+            if process.is_alive():
+                process.terminate()
+        for process in self._processes:
+            process.join(timeout=1.0)
+
+
+class RollingFileDocumentBatchProvider:
+    def __init__(
+        self,
+        batcher: DocumentChunkBatcher | FlatDocumentChunkBatcher,
+        *,
+        device: torch.device,
+        total_steps: int,
+        start_step: int,
+        stage1_ratio: float,
+        stage2_ratio: float,
+        stage1_span: int,
+        stage2_span: int,
+        stage3_span: int,
+        stage1_batch_size: int,
+        stage2_batch_size: int,
+        stage3_batch_size: int,
+        stage1_grad_accum_steps: int,
+        stage2_grad_accum_steps: int,
+        stage3_grad_accum_steps: int,
+        pin_memory: bool,
+        workers: int,
+        worker_threads: int,
+        block_size: int,
+        queued_blocks: int,
+        cache_dir: Path | None = None,
+    ) -> None:
+        if not hasattr(os, "fork"):
+            raise RuntimeError("rolling file prefetch requires fork-capable multiprocessing.")
+        clone = getattr(batcher, "clone_for_prefetch_worker", None)
+        if clone is None:
+            raise RuntimeError("rolling file prefetch requires clone_for_prefetch_worker().")
+        self.device = device
+        self.total_steps = int(total_steps)
+        self.start_step = int(start_step)
+        self.workers = max(1, int(workers))
+        self.block_size = max(1, int(block_size))
+        self.queued_blocks = max(1, int(queued_blocks))
+        stages = [
+            resolve_curriculum_stage(
+                step=step,
+                total_steps=total_steps,
+                stage1_ratio=stage1_ratio,
+                stage2_ratio=stage2_ratio,
+                stage1_span=stage1_span,
+                stage2_span=stage2_span,
+                stage3_span=stage3_span,
+                stage1_batch_size=stage1_batch_size,
+                stage2_batch_size=stage2_batch_size,
+                stage3_batch_size=stage3_batch_size,
+                stage1_grad_accum_steps=stage1_grad_accum_steps,
+                stage2_grad_accum_steps=stage2_grad_accum_steps,
+                stage3_grad_accum_steps=stage3_grad_accum_steps,
+            )
+            for step in range(self.start_step + 1, self.total_steps + 1)
+        ]
+        self.stage_chunks = [
+            stages[index : index + self.block_size]
+            for index in range(0, len(stages), self.block_size)
+        ]
+        if not self.stage_chunks:
+            raise ValueError("rolling file prefetch has no stages to build.")
+        self.total_batches = sum(len(chunk) for chunk in self.stage_chunks)
+        base_cache_dir = cache_dir
+        if base_cache_dir is None:
+            shm_root = Path("/dev/shm")
+            root = shm_root if shm_root.exists() and os.access(shm_root, os.W_OK) else Path("/tmp")
+            base_cache_dir = root / f"jakal_roll_{os.getpid()}_{uuid4().hex}"
+        self.cache_dir = base_cache_dir
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self._next_chunk_index = 0
+        self._consumed_batches = 0
+        self._current_block: PrebuiltBatchBlock | None = None
+        self._current_block_index = 0
+        self._pending_blocks: dict[int, tuple[Path, float, int]] = {}
+        self._total_batch_build_seconds = 0.0
+        self._closed = False
+        self._ctx = mp.get_context("fork")
+        self._task_queue = self._ctx.Queue()
+        self._result_queue = self._ctx.Queue(maxsize=self.queued_blocks)
+        global _PREBUILD_PROCESS_BATCHER
+        _PREBUILD_PROCESS_BATCHER = batcher
+        self._processes = [
+            self._ctx.Process(
+                target=_rolling_file_prefetch_worker,
+                args=(worker_index, self._task_queue, self._result_queue),
+                kwargs={
+                    "pin_memory": bool(pin_memory),
+                    "worker_threads": max(1, int(worker_threads)),
+                    "output_dir": str(self.cache_dir),
+                },
+                daemon=True,
+            )
+            for worker_index in range(self.workers)
+        ]
+        for process in self._processes:
+            process.start()
+        for chunk_index, chunk in enumerate(self.stage_chunks):
+            self._task_queue.put((chunk_index, chunk))
+        for _ in self._processes:
+            self._task_queue.put(None)
+
+    def _next_ordered_block(self) -> PrebuiltBatchBlock:
+        if self._next_chunk_index >= len(self.stage_chunks):
+            raise StopIteration("rolling file prefetch is exhausted.")
+        while self._next_chunk_index not in self._pending_blocks:
+            message = self._result_queue.get()
+            kind = message[0]
+            if kind == "error":
+                _, worker_index, error = message
+                raise RuntimeError(f"Rolling file prefetch worker {worker_index} failed: {error}")
+            if kind != "block_file":
+                raise RuntimeError(f"Unexpected rolling file prefetch message: {kind}")
+            _, chunk_index, block_path, build_seconds, batch_count = message
+            self._pending_blocks[int(chunk_index)] = (
+                Path(str(block_path)),
+                float(build_seconds),
+                int(batch_count),
+            )
+        block_path, build_seconds, _ = self._pending_blocks.pop(self._next_chunk_index)
+        self._next_chunk_index += 1
+        payload = torch.load(block_path, map_location="cpu")
+        try:
+            block_path.unlink()
+        except FileNotFoundError:
+            pass
+        block = PrebuiltBatchBlock(
+            context=payload["context"],
+            target=payload["target"],
+            loss_mask=payload["loss_mask"],
+            reset_mask=payload["reset_mask"],
+            build_seconds=float(payload.get("build_seconds", build_seconds)),
+        )
+        self._total_batch_build_seconds += block.build_seconds
+        return block
+
+    def next_batch(self) -> DocumentBatch:
+        if self._current_block is None or self._current_block_index >= self._current_block.batch_count:
+            self._current_block = self._next_ordered_block()
+            self._current_block_index = 0
+        local_index = self._current_block_index
+        self._current_block_index += 1
+        self._consumed_batches += 1
+        batch = DocumentBatch(
+            context=self._current_block.context[local_index],
+            target=self._current_block.target[local_index],
+            loss_mask=self._current_block.loss_mask[local_index],
+            reset_mask=self._current_block.reset_mask[local_index],
+        )
+        return move_batch_to_device(batch, device=self.device, non_blocking=True)
+
+    def stats(self) -> tuple[float, int]:
+        average = self._total_batch_build_seconds / max(1, self._consumed_batches)
+        buffered = sum(batch_count for _, _, batch_count in self._pending_blocks.values())
+        if self._current_block is not None:
+            buffered += max(0, self._current_block.batch_count - self._current_block_index)
+        return average, buffered
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for process in self._processes:
+            if process.is_alive():
+                process.terminate()
+        for process in self._processes:
+            process.join(timeout=1.0)
+        for block_path, _, _ in self._pending_blocks.values():
+            try:
+                block_path.unlink()
+            except FileNotFoundError:
+                pass
+        try:
+            for path in self.cache_dir.glob("rolling_block_*.pt"):
+                path.unlink()
+            self.cache_dir.rmdir()
+        except OSError:
+            pass
+
+
+class PrebuiltDocumentBatchProvider:
+    def __init__(
+        self,
+        batches: Sequence[DocumentBatch] | None = None,
+        *,
+        device: torch.device,
+        build_seconds: float,
+        blocks: Sequence[PrebuiltBatchBlock] | None = None,
+    ) -> None:
+        self.batches = tuple(batches or ())
+        self.blocks = tuple(blocks or ())
+        if not self.batches and not self.blocks:
+            raise ValueError("prebuilt batches must not be empty.")
+        self.device = device
+        self.build_seconds = float(build_seconds)
+        self.index = 0
+        self.total_batches = len(self.batches) + sum(block.batch_count for block in self.blocks)
+        self._block_offsets: list[tuple[int, PrebuiltBatchBlock]] = []
+        cursor = len(self.batches)
+        for block in self.blocks:
+            self._block_offsets.append((cursor, block))
+            cursor += block.batch_count
+
+    def next_batch(self) -> DocumentBatch:
+        index = self.index % self.total_batches
+        self.index += 1
+        if index < len(self.batches):
+            batch = self.batches[index]
+            return move_batch_to_device(batch, device=self.device, non_blocking=True)
+        for offset, block in self._block_offsets:
+            local_index = index - offset
+            if 0 <= local_index < block.batch_count:
+                batch = DocumentBatch(
+                    context=block.context[local_index],
+                    target=block.target[local_index],
+                    loss_mask=block.loss_mask[local_index],
+                    reset_mask=block.reset_mask[local_index],
+                )
+                return move_batch_to_device(batch, device=self.device, non_blocking=True)
+        raise IndexError(f"prebuilt batch index out of range: {index}")
+
+    def stats(self) -> tuple[float, int]:
+        return self.build_seconds / max(1, self.total_batches), max(0, self.total_batches - self.index)
+
+    def close(self) -> None:
+        return None
+
+
+_PREBUILD_PROCESS_BATCHER: DocumentChunkBatcher | FlatDocumentChunkBatcher | None = None
+
+
+def _prebuild_process_worker(
+    worker_index: int,
+    worker_stages: Sequence[TrainingCurriculumStage],
+    *,
+    pin_memory: bool,
+    worker_threads: int,
+) -> PrebuiltBatchBlock:
+    if _PREBUILD_PROCESS_BATCHER is None:
+        raise RuntimeError("prebuild process batcher was not initialized.")
+    clone = getattr(_PREBUILD_PROCESS_BATCHER, "clone_for_prefetch_worker", None)
+    if clone is None:
+        raise RuntimeError("prebuild process batcher cannot be cloned.")
+    torch.set_num_threads(max(1, int(worker_threads)))
+    worker_batcher = clone(worker_index)
+    worker_batcher.pin_memory = bool(pin_memory)
+    batch_count = len(worker_stages)
+    if batch_count <= 0:
+        raise ValueError("worker_stages must not be empty.")
+    batch_size = int(worker_stages[0].batch_size)
+    seq_len = int(getattr(worker_batcher, "seq_len", 0))
+    if seq_len <= 0:
+        probe = worker_batcher.next_batch()
+        seq_len = int(probe.context.shape[-1])
+    pad_token_id = int(getattr(worker_batcher, "pad_token_id", 0))
+    context = torch.full((batch_count, batch_size, seq_len), pad_token_id, dtype=torch.long)
+    target = torch.full((batch_count, batch_size, seq_len), pad_token_id, dtype=torch.long)
+    loss_mask = torch.zeros((batch_count, batch_size, seq_len), dtype=torch.float32)
+    reset_mask = torch.zeros((batch_count, batch_size), dtype=torch.bool)
+    worker_started_at = time.perf_counter()
+    for local_index, stage in enumerate(worker_stages):
+        worker_batcher.set_batch_size(stage.batch_size)
+        worker_batcher.set_bucket_weights(stage.bucket_weights)
+        batch = override_batch_reset(worker_batcher.next_batch(), reset_all=stage.freeze_memory)
+        context[local_index].copy_(batch.context)
+        target[local_index].copy_(batch.target)
+        loss_mask[local_index].copy_(batch.loss_mask)
+        reset_mask[local_index].copy_(batch.reset_mask)
+    return PrebuiltBatchBlock(
+        context=context.share_memory_(),
+        target=target.share_memory_(),
+        loss_mask=loss_mask.share_memory_(),
+        reset_mask=reset_mask.share_memory_(),
+        build_seconds=time.perf_counter() - worker_started_at,
+    )
+
+
+def _prebuild_process_worker_to_file(
+    worker_index: int,
+    worker_stages: Sequence[TrainingCurriculumStage],
+    *,
+    pin_memory: bool,
+    worker_threads: int,
+    output_dir: str,
+) -> tuple[int, str, float, int]:
+    if _PREBUILD_PROCESS_BATCHER is None:
+        raise RuntimeError("prebuild process batcher was not initialized.")
+    clone = getattr(_PREBUILD_PROCESS_BATCHER, "clone_for_prefetch_worker", None)
+    if clone is None:
+        raise RuntimeError("prebuild process batcher cannot be cloned.")
+    torch.set_num_threads(max(1, int(worker_threads)))
+    worker_batcher = clone(worker_index)
+    worker_batcher.pin_memory = bool(pin_memory)
+    batch_count = len(worker_stages)
+    if batch_count <= 0:
+        raise ValueError("worker_stages must not be empty.")
+    batch_size = int(worker_stages[0].batch_size)
+    seq_len = int(getattr(worker_batcher, "seq_len", 0))
+    if seq_len <= 0:
+        probe = worker_batcher.next_batch()
+        seq_len = int(probe.context.shape[-1])
+    pad_token_id = int(getattr(worker_batcher, "pad_token_id", 0))
+    context = torch.full((batch_count, batch_size, seq_len), pad_token_id, dtype=torch.long)
+    target = torch.full((batch_count, batch_size, seq_len), pad_token_id, dtype=torch.long)
+    loss_mask = torch.zeros((batch_count, batch_size, seq_len), dtype=torch.float32)
+    reset_mask = torch.zeros((batch_count, batch_size), dtype=torch.bool)
+    worker_started_at = time.perf_counter()
+    for local_index, stage in enumerate(worker_stages):
+        worker_batcher.set_batch_size(stage.batch_size)
+        worker_batcher.set_bucket_weights(stage.bucket_weights)
+        batch = override_batch_reset(worker_batcher.next_batch(), reset_all=stage.freeze_memory)
+        context[local_index].copy_(batch.context)
+        target[local_index].copy_(batch.target)
+        loss_mask[local_index].copy_(batch.loss_mask)
+        reset_mask[local_index].copy_(batch.reset_mask)
+    build_seconds = time.perf_counter() - worker_started_at
+    output_path = Path(output_dir) / f"batch_block_{worker_index:03d}.pt"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "context": context,
+            "target": target,
+            "loss_mask": loss_mask,
+            "reset_mask": reset_mask,
+            "build_seconds": build_seconds,
+            "batch_count": batch_count,
+        },
+        output_path,
+    )
+    return worker_index, str(output_path), build_seconds, batch_count
+
+
+def _rolling_prefetch_worker(
+    worker_index: int,
+    task_queue: Any,
+    result_queue: Any,
+    stop_event: Any,
+    *,
+    pin_memory: bool,
+    worker_threads: int,
+) -> None:
+    if _PREBUILD_PROCESS_BATCHER is None:
+        result_queue.put(("error", worker_index, "rolling prefetch process batcher was not initialized."))
+        return
+    clone = getattr(_PREBUILD_PROCESS_BATCHER, "clone_for_prefetch_worker", None)
+    if clone is None:
+        result_queue.put(("error", worker_index, "rolling prefetch batcher cannot be cloned."))
+        return
+    torch.set_num_threads(max(1, int(worker_threads)))
+    worker_batcher = clone(worker_index)
+    worker_batcher.pin_memory = bool(pin_memory)
+    while True:
+        task = task_queue.get()
+        if task is None:
+            while not stop_event.is_set():
+                time.sleep(0.1)
+            return
+        chunk_index, worker_stages = task
+        try:
+            batch_count = len(worker_stages)
+            if batch_count <= 0:
+                raise ValueError("worker_stages must not be empty.")
+            batch_size = int(worker_stages[0].batch_size)
+            seq_len = int(getattr(worker_batcher, "seq_len", 0))
+            if seq_len <= 0:
+                probe = worker_batcher.next_batch()
+                seq_len = int(probe.context.shape[-1])
+            pad_token_id = int(getattr(worker_batcher, "pad_token_id", 0))
+            context = torch.full((batch_count, batch_size, seq_len), pad_token_id, dtype=torch.long)
+            target = torch.full((batch_count, batch_size, seq_len), pad_token_id, dtype=torch.long)
+            loss_mask = torch.zeros((batch_count, batch_size, seq_len), dtype=torch.float32)
+            reset_mask = torch.zeros((batch_count, batch_size), dtype=torch.bool)
+            worker_started_at = time.perf_counter()
+            for local_index, stage in enumerate(worker_stages):
+                worker_batcher.set_batch_size(stage.batch_size)
+                worker_batcher.set_bucket_weights(stage.bucket_weights)
+                batch = override_batch_reset(worker_batcher.next_batch(), reset_all=stage.freeze_memory)
+                context[local_index].copy_(batch.context)
+                target[local_index].copy_(batch.target)
+                loss_mask[local_index].copy_(batch.loss_mask)
+                reset_mask[local_index].copy_(batch.reset_mask)
+            block = PrebuiltBatchBlock(
+                context=context.share_memory_(),
+                target=target.share_memory_(),
+                loss_mask=loss_mask.share_memory_(),
+                reset_mask=reset_mask.share_memory_(),
+                build_seconds=time.perf_counter() - worker_started_at,
+            )
+            result_queue.put(("block", int(chunk_index), block))
+        except BaseException as exc:  # pragma: no cover - defensive process path
+            result_queue.put(("error", worker_index, repr(exc)))
+            return
+
+
+def _rolling_file_prefetch_worker(
+    worker_index: int,
+    task_queue: Any,
+    result_queue: Any,
+    *,
+    pin_memory: bool,
+    worker_threads: int,
+    output_dir: str,
+) -> None:
+    if _PREBUILD_PROCESS_BATCHER is None:
+        result_queue.put(("error", worker_index, "rolling file prefetch process batcher was not initialized."))
+        return
+    clone = getattr(_PREBUILD_PROCESS_BATCHER, "clone_for_prefetch_worker", None)
+    if clone is None:
+        result_queue.put(("error", worker_index, "rolling file prefetch batcher cannot be cloned."))
+        return
+    torch.set_num_threads(max(1, int(worker_threads)))
+    worker_batcher = clone(worker_index)
+    worker_batcher.pin_memory = bool(pin_memory)
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    while True:
+        task = task_queue.get()
+        if task is None:
+            return
+        chunk_index, worker_stages = task
+        try:
+            batch_count = len(worker_stages)
+            if batch_count <= 0:
+                raise ValueError("worker_stages must not be empty.")
+            batch_size = int(worker_stages[0].batch_size)
+            seq_len = int(getattr(worker_batcher, "seq_len", 0))
+            if seq_len <= 0:
+                probe = worker_batcher.next_batch()
+                seq_len = int(probe.context.shape[-1])
+            pad_token_id = int(getattr(worker_batcher, "pad_token_id", 0))
+            context = torch.full((batch_count, batch_size, seq_len), pad_token_id, dtype=torch.long)
+            target = torch.full((batch_count, batch_size, seq_len), pad_token_id, dtype=torch.long)
+            loss_mask = torch.zeros((batch_count, batch_size, seq_len), dtype=torch.float32)
+            reset_mask = torch.zeros((batch_count, batch_size), dtype=torch.bool)
+            worker_started_at = time.perf_counter()
+            for local_index, stage in enumerate(worker_stages):
+                worker_batcher.set_batch_size(stage.batch_size)
+                worker_batcher.set_bucket_weights(stage.bucket_weights)
+                batch = override_batch_reset(worker_batcher.next_batch(), reset_all=stage.freeze_memory)
+                context[local_index].copy_(batch.context)
+                target[local_index].copy_(batch.target)
+                loss_mask[local_index].copy_(batch.loss_mask)
+                reset_mask[local_index].copy_(batch.reset_mask)
+            build_seconds = time.perf_counter() - worker_started_at
+            final_path = output_root / f"rolling_block_{int(chunk_index):06d}.pt"
+            temp_path = output_root / f".rolling_block_{int(chunk_index):06d}.{worker_index}.tmp"
+            torch.save(
+                {
+                    "context": context,
+                    "target": target,
+                    "loss_mask": loss_mask,
+                    "reset_mask": reset_mask,
+                    "build_seconds": build_seconds,
+                    "batch_count": batch_count,
+                },
+                temp_path,
+            )
+            os.replace(temp_path, final_path)
+            result_queue.put(("block_file", int(chunk_index), str(final_path), build_seconds, batch_count))
+        except BaseException as exc:  # pragma: no cover - defensive process path
+            result_queue.put(("error", worker_index, repr(exc)))
+            return
+
+
+def prebuild_training_batches(
+    batcher: DocumentChunkBatcher | FlatDocumentChunkBatcher,
+    *,
+    total_steps: int,
+    start_step: int,
+    stage1_ratio: float,
+    stage2_ratio: float,
+    stage1_span: int,
+    stage2_span: int,
+    stage3_span: int,
+    stage1_batch_size: int,
+    stage2_batch_size: int,
+    stage3_batch_size: int,
+    stage1_grad_accum_steps: int,
+    stage2_grad_accum_steps: int,
+    stage3_grad_accum_steps: int,
+    pin_memory: bool,
+    workers: int = 1,
+    worker_threads: int = 1,
+) -> tuple[list[DocumentBatch], float]:
+    workers = max(1, int(workers))
+    if workers > 1:
+        clone = getattr(batcher, "clone_for_prefetch_worker", None)
+        if clone is not None:
+            return prebuild_training_batches_parallel(
+                batcher,
+                total_steps=total_steps,
+                start_step=start_step,
+                stage1_ratio=stage1_ratio,
+                stage2_ratio=stage2_ratio,
+                stage1_span=stage1_span,
+                stage2_span=stage2_span,
+                stage3_span=stage3_span,
+                stage1_batch_size=stage1_batch_size,
+                stage2_batch_size=stage2_batch_size,
+                stage3_batch_size=stage3_batch_size,
+                stage1_grad_accum_steps=stage1_grad_accum_steps,
+                stage2_grad_accum_steps=stage2_grad_accum_steps,
+                stage3_grad_accum_steps=stage3_grad_accum_steps,
+                pin_memory=pin_memory,
+                workers=workers,
+                worker_threads=worker_threads,
+            )
+        print("prebuild_warning | parallel workers requested but batcher cannot be cloned; using workers=1", flush=True)
+    previous_pin_memory = getattr(batcher, "pin_memory", False)
+    if hasattr(batcher, "pin_memory"):
+        batcher.pin_memory = bool(pin_memory)
+    batches: list[DocumentBatch] = []
+    started_at = time.perf_counter()
+    last_stage_name: str | None = None
+    try:
+        for step in range(start_step + 1, total_steps + 1):
+            stage = resolve_curriculum_stage(
+                step=step,
+                total_steps=total_steps,
+                stage1_ratio=stage1_ratio,
+                stage2_ratio=stage2_ratio,
+                stage1_span=stage1_span,
+                stage2_span=stage2_span,
+                stage3_span=stage3_span,
+                stage1_batch_size=stage1_batch_size,
+                stage2_batch_size=stage2_batch_size,
+                stage3_batch_size=stage3_batch_size,
+                stage1_grad_accum_steps=stage1_grad_accum_steps,
+                stage2_grad_accum_steps=stage2_grad_accum_steps,
+                stage3_grad_accum_steps=stage3_grad_accum_steps,
+            )
+            batcher.set_batch_size(stage.batch_size)
+            batcher.set_bucket_weights(stage.bucket_weights)
+            if stage.name != last_stage_name:
+                print(
+                    f"prebuild_stage | step={step} | stage={stage.name} | span={stage.document_span} | "
+                    f"batch_size={stage.batch_size}",
+                    flush=True,
+                )
+                last_stage_name = stage.name
+            for _ in range(stage.document_span):
+                batches.append(
+                    override_batch_reset(
+                        batcher.next_batch(),
+                        reset_all=stage.freeze_memory,
+                    )
+                )
+            if step == start_step + 1 or step % 100 == 0 or step == total_steps:
+                elapsed = time.perf_counter() - started_at
+                print(
+                    f"prebuild_progress | step={step}/{total_steps} | batches={len(batches)} | "
+                    f"elapsed={elapsed:.1f}s",
+                    flush=True,
+                )
+    finally:
+        if hasattr(batcher, "pin_memory"):
+            batcher.pin_memory = previous_pin_memory
+    return batches, time.perf_counter() - started_at
+
+
+def build_prebuilt_batch_blocks_parallel(
+    batcher: DocumentChunkBatcher | FlatDocumentChunkBatcher,
+    *,
+    total_steps: int,
+    start_step: int,
+    stage1_ratio: float,
+    stage2_ratio: float,
+    stage1_span: int,
+    stage2_span: int,
+    stage3_span: int,
+    stage1_batch_size: int,
+    stage2_batch_size: int,
+    stage3_batch_size: int,
+    stage1_grad_accum_steps: int,
+    stage2_grad_accum_steps: int,
+    stage3_grad_accum_steps: int,
+    pin_memory: bool,
+    workers: int,
+    worker_threads: int,
+    cache_dir: Path,
+) -> tuple[list[PrebuiltBatchBlock], float]:
+    clone = getattr(batcher, "clone_for_prefetch_worker", None)
+    if clone is None:
+        batches, seconds = prebuild_training_batches(
+            batcher,
+            total_steps=total_steps,
+            start_step=start_step,
+            stage1_ratio=stage1_ratio,
+            stage2_ratio=stage2_ratio,
+            stage1_span=stage1_span,
+            stage2_span=stage2_span,
+            stage3_span=stage3_span,
+            stage1_batch_size=stage1_batch_size,
+            stage2_batch_size=stage2_batch_size,
+            stage3_batch_size=stage3_batch_size,
+            stage1_grad_accum_steps=stage1_grad_accum_steps,
+            stage2_grad_accum_steps=stage2_grad_accum_steps,
+            stage3_grad_accum_steps=stage3_grad_accum_steps,
+            pin_memory=pin_memory,
+            workers=1,
+            worker_threads=worker_threads,
+        )
+        block = PrebuiltBatchBlock(
+            context=torch.stack([batch.context for batch in batches], dim=0).share_memory_(),
+            target=torch.stack([batch.target for batch in batches], dim=0).share_memory_(),
+            loss_mask=torch.stack([batch.loss_mask for batch in batches], dim=0).share_memory_(),
+            reset_mask=torch.stack([batch.reset_mask for batch in batches], dim=0).share_memory_(),
+            build_seconds=seconds,
+        )
+        return [block], seconds
+    stages = [
+        resolve_curriculum_stage(
+            step=step,
+            total_steps=total_steps,
+            stage1_ratio=stage1_ratio,
+            stage2_ratio=stage2_ratio,
+            stage1_span=stage1_span,
+            stage2_span=stage2_span,
+            stage3_span=stage3_span,
+            stage1_batch_size=stage1_batch_size,
+            stage2_batch_size=stage2_batch_size,
+            stage3_batch_size=stage3_batch_size,
+            stage1_grad_accum_steps=stage1_grad_accum_steps,
+            stage2_grad_accum_steps=stage2_grad_accum_steps,
+            stage3_grad_accum_steps=stage3_grad_accum_steps,
+        )
+        for step in range(start_step + 1, total_steps + 1)
+    ]
+    if not stages:
+        raise ValueError("no stages to prebuild.")
+    if any(stage.document_span != 1 or stage.batch_size != stages[0].batch_size for stage in stages):
+        batches, seconds = prebuild_training_batches(
+            batcher,
+            total_steps=total_steps,
+            start_step=start_step,
+            stage1_ratio=stage1_ratio,
+            stage2_ratio=stage2_ratio,
+            stage1_span=stage1_span,
+            stage2_span=stage2_span,
+            stage3_span=stage3_span,
+            stage1_batch_size=stage1_batch_size,
+            stage2_batch_size=stage2_batch_size,
+            stage3_batch_size=stage3_batch_size,
+            stage1_grad_accum_steps=stage1_grad_accum_steps,
+            stage2_grad_accum_steps=stage2_grad_accum_steps,
+            stage3_grad_accum_steps=stage3_grad_accum_steps,
+            pin_memory=pin_memory,
+            workers=workers,
+            worker_threads=worker_threads,
+        )
+        block = PrebuiltBatchBlock(
+            context=torch.stack([batch.context for batch in batches], dim=0).share_memory_(),
+            target=torch.stack([batch.target for batch in batches], dim=0).share_memory_(),
+            loss_mask=torch.stack([batch.loss_mask for batch in batches], dim=0).share_memory_(),
+            reset_mask=torch.stack([batch.reset_mask for batch in batches], dim=0).share_memory_(),
+            build_seconds=seconds,
+        )
+        return [block], seconds
+    workers = max(1, int(workers))
+    worker_threads = max(1, int(worker_threads))
+    chunk_size = max(1, int(math.ceil(len(stages) / workers)))
+    worker_stage_plans = [
+        stages[start : start + chunk_size]
+        for start in range(0, len(stages), chunk_size)
+    ]
+    started_at = time.perf_counter()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    print(
+        f"prebuild_process_start | workers={workers} | worker_threads={worker_threads} | "
+        f"steps={len(stages)} | batch_size={stages[0].batch_size} | pin_memory={pin_memory} | "
+        f"cache_dir={cache_dir}",
+        flush=True,
+    )
+
+    if not hasattr(os, "fork"):
+        batches, seconds = prebuild_training_batches(
+            batcher,
+            total_steps=total_steps,
+            start_step=start_step,
+            stage1_ratio=stage1_ratio,
+            stage2_ratio=stage2_ratio,
+            stage1_span=stage1_span,
+            stage2_span=stage2_span,
+            stage3_span=stage3_span,
+            stage1_batch_size=stage1_batch_size,
+            stage2_batch_size=stage2_batch_size,
+            stage3_batch_size=stage3_batch_size,
+            stage1_grad_accum_steps=stage1_grad_accum_steps,
+            stage2_grad_accum_steps=stage2_grad_accum_steps,
+            stage3_grad_accum_steps=stage3_grad_accum_steps,
+            pin_memory=pin_memory,
+            workers=workers,
+            worker_threads=worker_threads,
+        )
+        block = PrebuiltBatchBlock(
+            context=torch.stack([batch.context for batch in batches], dim=0).share_memory_(),
+            target=torch.stack([batch.target for batch in batches], dim=0).share_memory_(),
+            loss_mask=torch.stack([batch.loss_mask for batch in batches], dim=0).share_memory_(),
+            reset_mask=torch.stack([batch.reset_mask for batch in batches], dim=0).share_memory_(),
+            build_seconds=seconds,
+        )
+        return [block], seconds
+    global _PREBUILD_PROCESS_BATCHER
+    _PREBUILD_PROCESS_BATCHER = batcher
+    ctx = mp.get_context("fork")
+    indexed_blocks: list[tuple[int, PrebuiltBatchBlock]] = []
+    with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as executor:
+        futures = [
+            executor.submit(
+                _prebuild_process_worker_to_file,
+                worker_index,
+                worker_plan,
+                pin_memory=pin_memory,
+                worker_threads=worker_threads,
+                output_dir=str(cache_dir),
+            )
+            for worker_index, worker_plan in enumerate(worker_stage_plans)
+            if worker_plan
+        ]
+        for completed, future in enumerate(as_completed(futures), start=1):
+            worker_index, block_path, worker_seconds, worker_batch_count = future.result()
+            payload = torch.load(block_path, map_location="cpu")
+            block = PrebuiltBatchBlock(
+                context=payload["context"],
+                target=payload["target"],
+                loss_mask=payload["loss_mask"],
+                reset_mask=payload["reset_mask"],
+                build_seconds=float(payload.get("build_seconds", worker_seconds)),
+            )
+            indexed_blocks.append((worker_index, block))
+            elapsed = time.perf_counter() - started_at
+            print(
+                f"prebuild_process_progress | workers_done={completed}/{len(futures)} | "
+                f"worker={worker_index} | worker_batches={worker_batch_count} | "
+                f"batches={sum(item.batch_count for _, item in indexed_blocks)} | "
+                f"elapsed={elapsed:.1f}s",
+                flush=True,
+            )
+    blocks = [block for _, block in sorted(indexed_blocks, key=lambda item: item[0])]
+    return blocks, time.perf_counter() - started_at
+
+
+def prebuild_training_batches_parallel(
+    batcher: DocumentChunkBatcher | FlatDocumentChunkBatcher,
+    *,
+    total_steps: int,
+    start_step: int,
+    stage1_ratio: float,
+    stage2_ratio: float,
+    stage1_span: int,
+    stage2_span: int,
+    stage3_span: int,
+    stage1_batch_size: int,
+    stage2_batch_size: int,
+    stage3_batch_size: int,
+    stage1_grad_accum_steps: int,
+    stage2_grad_accum_steps: int,
+    stage3_grad_accum_steps: int,
+    pin_memory: bool,
+    workers: int,
+) -> tuple[list[DocumentBatch], float]:
+    stage_plan = [
+        resolve_curriculum_stage(
+            step=step,
+            total_steps=total_steps,
+            stage1_ratio=stage1_ratio,
+            stage2_ratio=stage2_ratio,
+            stage1_span=stage1_span,
+            stage2_span=stage2_span,
+            stage3_span=stage3_span,
+            stage1_batch_size=stage1_batch_size,
+            stage2_batch_size=stage2_batch_size,
+            stage3_batch_size=stage3_batch_size,
+            stage1_grad_accum_steps=stage1_grad_accum_steps,
+            stage2_grad_accum_steps=stage2_grad_accum_steps,
+            stage3_grad_accum_steps=stage3_grad_accum_steps,
+        )
+        for step in range(start_step + 1, total_steps + 1)
+    ]
+    worker_plans = [stage_plan[index::workers] for index in range(workers)]
+    clone = getattr(batcher, "clone_for_prefetch_worker")
+    started_at = time.perf_counter()
+    print(
+        f"prebuild_parallel_start | workers={workers} | steps={len(stage_plan)} | pin_memory={pin_memory}",
+        flush=True,
+    )
+
+    def build_worker(worker_index: int, worker_plan: Sequence[TrainingCurriculumStage]) -> list[DocumentBatch]:
+        worker_batcher = clone(worker_index)
+        previous_pin_memory = getattr(worker_batcher, "pin_memory", False)
+        if hasattr(worker_batcher, "pin_memory"):
+            worker_batcher.pin_memory = bool(pin_memory)
+        worker_batches: list[DocumentBatch] = []
+        try:
+            for stage in worker_plan:
+                worker_batcher.set_batch_size(stage.batch_size)
+                worker_batcher.set_bucket_weights(stage.bucket_weights)
+                for _ in range(stage.document_span):
+                    worker_batches.append(
+                        override_batch_reset(
+                            worker_batcher.next_batch(),
+                            reset_all=stage.freeze_memory,
+                        )
+                    )
+        finally:
+            if hasattr(worker_batcher, "pin_memory"):
+                worker_batcher.pin_memory = previous_pin_memory
+        return worker_batches
+
+    batches: list[DocumentBatch] = []
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(build_worker, worker_index, worker_plan)
+            for worker_index, worker_plan in enumerate(worker_plans)
+            if worker_plan
+        ]
+        for worker_index, future in enumerate(futures, start=1):
+            worker_batches = future.result()
+            batches.extend(worker_batches)
+            elapsed = time.perf_counter() - started_at
+            print(
+                f"prebuild_parallel_progress | workers_done={worker_index}/{len(futures)} | "
+                f"batches={len(batches)} | elapsed={elapsed:.1f}s",
+                flush=True,
+            )
+    return batches, time.perf_counter() - started_at
 
 
 class FlatDocumentChunkBatcher:
@@ -1087,6 +2191,8 @@ class FlatDocumentChunkBatcher:
         self.batch_size = batch_size
         self.device = device
         self.pin_memory = device.type == "cuda"
+        self.seq_len = int(collection.shards[0].seq_len)
+        self.pad_token_id = int(collection.shards[0].pad_token_id)
         self.active_shards_per_bucket = max(1, int(active_shards_per_bucket))
         self.shard_rotation_interval = max(1, int(shard_rotation_interval))
         self._rng = random.Random(1337)
@@ -1113,6 +2219,20 @@ class FlatDocumentChunkBatcher:
         self.active_buckets = tuple(self.bucket_to_indices)
         self.active_bucket_weights = tuple(1.0 for _ in self.active_buckets)
         self.active_bucket_shards = self._sample_active_bucket_shards()
+
+    def clone_for_prefetch_worker(self, worker_index: int) -> FlatDocumentChunkBatcher:
+        clone = FlatDocumentChunkBatcher(
+            self.collection,
+            self.documents,
+            batch_size=self.batch_size,
+            device=self.device,
+            active_shards_per_bucket=self.active_shards_per_bucket,
+            shard_rotation_interval=self.shard_rotation_interval,
+        )
+        clone.pin_memory = self.pin_memory
+        clone._rng = random.Random(1337 + int(worker_index))
+        clone.set_bucket_weights(dict(zip(self.active_buckets, self.active_bucket_weights)))
+        return clone
 
     def set_batch_size(self, batch_size: int) -> None:
         if batch_size <= 0:
@@ -1213,9 +2333,9 @@ class FlatDocumentChunkBatcher:
     def next_batch(self) -> DocumentBatch:
         self._batches_served += 1
         self._refresh_active_bucket_shards()
-        contexts: list[torch.Tensor] = []
-        targets: list[torch.Tensor] = []
-        masks: list[torch.Tensor] = []
+        context = torch.full((self.batch_size, self.seq_len), self.pad_token_id, dtype=torch.long)
+        target = torch.full((self.batch_size, self.seq_len), self.pad_token_id, dtype=torch.long)
+        loss_mask = torch.zeros((self.batch_size, self.seq_len), dtype=torch.float32)
         reset_mask = torch.zeros(self.batch_size, dtype=torch.bool)
         for item_index in range(self.batch_size):
             if self.needs_reset[item_index]:
@@ -1226,14 +2346,14 @@ class FlatDocumentChunkBatcher:
             shard = self.collection.get_shard(reference.shard_index)
             chunk_start, chunk_end = shard.document_chunk_range(reference.document_index)
             chunk_index = chunk_start + self.current_chunk[item_index]
-            context, target, loss_mask, _ = shard.build_chunk_tensors(
+            shard.copy_chunk_tensors_into(
                 chunk_index,
                 document_index=reference.document_index,
                 is_last_chunk=chunk_index == chunk_end - 1,
+                context_out=context[item_index],
+                target_out=target[item_index],
+                loss_mask_out=loss_mask[item_index],
             )
-            contexts.append(context)
-            targets.append(target)
-            masks.append(loss_mask)
             next_chunk = self.current_chunk[item_index] + 1
             if chunk_start + next_chunk >= chunk_end:
                 self.needs_reset[item_index] = True
@@ -1241,9 +2361,6 @@ class FlatDocumentChunkBatcher:
             else:
                 self.needs_reset[item_index] = False
                 self.current_chunk[item_index] = next_chunk
-        context = torch.stack(contexts, dim=0)
-        target = torch.stack(targets, dim=0)
-        loss_mask = torch.stack(masks, dim=0)
         if self.pin_memory:
             context = context.pin_memory()
             target = target.pin_memory()
@@ -2356,6 +3473,15 @@ def load_flat_pretokenized_directory(
 
 def preload_flat_pretokenized_directory(collection: FlatPretokenizedDirectory) -> None:
     total_shards = len(collection.shards)
+    if collection.max_loaded_shards > 0:
+        print(
+            "flat_preload_cache_override | "
+            f"max_loaded_shards={collection.max_loaded_shards} -> 0",
+            flush=True,
+        )
+        collection.max_loaded_shards = 0
+        with collection._cache_lock:
+            collection._loaded_shard_lru.clear()
     print(f"flat_preload_start | shards={total_shards}", flush=True)
     started_at = time.perf_counter()
     for shard_index in range(total_shards):
@@ -2490,14 +3616,102 @@ def split_train_val_flat_documents_with_collection(
 
 
 def compute_masked_loss(logits: torch.Tensor, target: torch.Tensor, loss_mask: torch.Tensor) -> torch.Tensor:
-    flat_loss = F.cross_entropy(
-        logits.reshape(-1, logits.shape[-1]).float(),
-        target.reshape(-1),
-        reduction="none",
-    )
+    flat_logits = logits.reshape(-1, logits.shape[-1])
+    flat_target = target.reshape(-1)
     mask = loss_mask.reshape(-1).float()
     denom = mask.sum().clamp_min(1.0)
-    return (flat_loss * mask).sum() / denom
+    if flat_logits.numel() == 0:
+        return flat_logits.float().sum() / denom
+    chunk_size = 4096
+    total = flat_logits.new_zeros((), dtype=torch.float32)
+    for start in range(0, flat_logits.shape[0], chunk_size):
+        end = min(start + chunk_size, flat_logits.shape[0])
+        chunk_loss = F.cross_entropy(
+            flat_logits[start:end].float(),
+            flat_target[start:end],
+            reduction="none",
+        )
+        total = total + (chunk_loss * mask[start:end]).sum()
+    return total / denom
+
+
+class _ChunkedLMHeadCrossEntropy(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx: Any,
+        flat_val: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+        flat_target: torch.Tensor,
+        mask: torch.Tensor,
+        denom: torch.Tensor,
+        chunk_size: int,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(flat_val, lm_head_weight, flat_target, mask, denom)
+        ctx.chunk_size = int(chunk_size)
+        weight = lm_head_weight.to(dtype=flat_val.dtype)
+        total = flat_val.new_zeros((), dtype=torch.float32)
+        for start in range(0, flat_val.shape[0], ctx.chunk_size):
+            end = min(start + ctx.chunk_size, flat_val.shape[0])
+            logits = F.linear(flat_val[start:end], weight).float()
+            chunk_loss = F.cross_entropy(logits, flat_target[start:end], reduction="none")
+            total = total + (chunk_loss * mask[start:end]).sum()
+        return total / denom
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
+        flat_val, lm_head_weight, flat_target, mask, denom = ctx.saved_tensors
+        chunk_size = int(ctx.chunk_size)
+        weight = lm_head_weight.to(dtype=flat_val.dtype)
+        grad_val = torch.zeros_like(flat_val) if ctx.needs_input_grad[0] else None
+        grad_weight = torch.zeros_like(lm_head_weight, dtype=torch.float32) if ctx.needs_input_grad[1] else None
+        loss_scale = (grad_output.float() / denom.float()).to(dtype=torch.float32)
+        for start in range(0, flat_val.shape[0], chunk_size):
+            end = min(start + chunk_size, flat_val.shape[0])
+            val_chunk = flat_val[start:end]
+            target_chunk = flat_target[start:end]
+            logits = F.linear(val_chunk, weight).float()
+            grad_logits = torch.softmax(logits, dim=-1)
+            row_indices = torch.arange(end - start, device=flat_val.device)
+            grad_logits[row_indices, target_chunk] -= 1.0
+            grad_logits = grad_logits * (mask[start:end].float() * loss_scale).unsqueeze(-1)
+            if grad_val is not None:
+                grad_val[start:end] = torch.matmul(grad_logits.to(dtype=weight.dtype), weight).to(dtype=flat_val.dtype)
+            if grad_weight is not None:
+                grad_weight = grad_weight + torch.matmul(grad_logits.t(), val_chunk.float())
+        return (
+            grad_val,
+            grad_weight.to(dtype=lm_head_weight.dtype) if grad_weight is not None else None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+def compute_masked_lm_head_loss(
+    output_val: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    target: torch.Tensor,
+    loss_mask: torch.Tensor,
+) -> torch.Tensor:
+    flat_val = output_val.reshape(-1, output_val.shape[-1])
+    flat_target = target.reshape(-1)
+    mask = loss_mask.reshape(-1).float()
+    denom = mask.sum().clamp_min(1.0)
+    chunk_size = int(os.environ.get("JAKAL_NET_LM_HEAD_CE_CHUNK", "2048"))
+    chunk_size = max(256, min(8192, chunk_size))
+    return _ChunkedLMHeadCrossEntropy.apply(flat_val, lm_head_weight, flat_target, mask, denom, chunk_size)
+
+
+def summarize_tensor_finiteness(name: str, tensor: torch.Tensor) -> str:
+    detached = tensor.detach()
+    return (
+        f"{name}:shape={tuple(detached.shape)} dtype={detached.dtype} "
+        f"all_finite={bool(torch.isfinite(detached).all().item())} "
+        f"has_nan={bool(torch.isnan(detached).any().item())} "
+        f"has_posinf={bool(torch.isposinf(detached).any().item())} "
+        f"has_neginf={bool(torch.isneginf(detached).any().item())}"
+    )
 
 
 def _set_module_requires_grad(module: torch.nn.Module, enabled: bool) -> None:
@@ -2890,6 +4104,28 @@ def summarize_nonfinite_memory_state(memory_state: Any | None) -> list[str]:
     return diagnostics
 
 
+def summarize_nonfinite_parameters(
+    named_parameters: Sequence[tuple[str, torch.nn.Parameter]],
+    *,
+    limit: int,
+) -> list[str]:
+    diagnostics: list[tuple[int, str]] = []
+    for parameter_name, parameter in named_parameters:
+        detached = parameter.detach()
+        finite_mask = torch.isfinite(detached)
+        if bool(finite_mask.all().item()):
+            continue
+        nonfinite_count = int((~finite_mask).sum().item())
+        diagnostics.append(
+            (
+                nonfinite_count,
+                f"{parameter_name}:shape={tuple(parameter.shape)} param_nonfinite={nonfinite_count}",
+            )
+        )
+    diagnostics.sort(key=lambda item: item[0], reverse=True)
+    return [message for _, message in diagnostics[: max(1, int(limit))]]
+
+
 def summarize_nonfinite_gradients(
     named_parameters: Sequence[tuple[str, torch.nn.Parameter]],
     *,
@@ -2983,6 +4219,23 @@ def clip_grad_norm_float64(
                 gradient.mul_(clip_coef)
         return float(total_norm.item())
 
+
+
+def clip_grad_norm_fast(
+    parameters: Sequence[torch.nn.Parameter],
+    max_norm: float,
+) -> float:
+    active = [parameter for parameter in parameters if parameter.grad is not None]
+    if not active:
+        return 0.0
+    total_norm = torch.nn.utils.clip_grad_norm_(
+        active,
+        float(max_norm),
+        norm_type=2.0,
+        error_if_nonfinite=False,
+        foreach=True,
+    )
+    return float(total_norm.detach().float().item())
 
 def load_decode_vocab(*, tokenizer_label: str, tokenizer_model_path: str | None) -> object | None:
     if tokenizer_model_path is None:
@@ -3293,9 +4546,28 @@ def run_model(
                 memory_state=memory_state,
                 reset_mask=batch.reset_mask,
                 return_memory_state=True,
+                return_layers=True,
+                return_logits=False,
             )
             assert isinstance(output, MemoryScanOutput)
-            main_loss = compute_masked_loss(output.logits, batch.target, batch.loss_mask)
+            if output.query_layer is None:
+                raise RuntimeError("Model did not return query_layer for chunked LM-head loss.")
+            main_loss = compute_masked_lm_head_loss(
+                output.query_layer.val,
+                model.lm_head.weight,
+                batch.target,
+                batch.loss_mask,
+            )
+            if not bool(torch.isfinite(main_loss.detach()).item()):
+                print(
+                    "diagnose_nonfinite_loss | "
+                    f"loss={float(main_loss.detach().float().item())} | "
+                    + summarize_tensor_finiteness("output_val", output.query_layer.val)
+                    + f" | target_min={int(batch.target.min().item())} "
+                    f"target_max={int(batch.target.max().item())} "
+                    f"mask_sum={float(batch.loss_mask.float().sum().item()):.6g}",
+                    flush=True,
+                )
     return main_loss, float(main_loss.detach().item()), output.recurrent_state
 
 
@@ -3326,9 +4598,18 @@ def run_model_loss_tensor(
                 memory_state=memory_state,
                 reset_mask=batch.reset_mask,
                 return_memory_state=True,
+                return_layers=True,
+                return_logits=False,
             )
             assert isinstance(output, MemoryScanOutput)
-            main_loss = compute_masked_loss(output.logits, batch.target, batch.loss_mask)
+            if output.query_layer is None:
+                raise RuntimeError("Model did not return query_layer for chunked LM-head loss.")
+            main_loss = compute_masked_lm_head_loss(
+                output.query_layer.val,
+                model.lm_head.weight,
+                batch.target,
+                batch.loss_mask,
+            )
     return main_loss, output.recurrent_state
 
 
@@ -3633,9 +4914,10 @@ def save_checkpoint(
     cuda_rng_state: list[Tensor] | None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_model = getattr(model, "_orig_mod", model)
     torch.save(
         {
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": checkpoint_model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "rnn_aux_optimizer_state_dict": None if rnn_aux_optimizer is None else rnn_aux_optimizer.state_dict(),
             "rnn_aux_state_dict": None if rnn_aux_head is None else rnn_aux_head.state_dict(),
@@ -3700,6 +4982,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pretokenized-active-shards-per-bucket", type=int, default=2)
     parser.add_argument("--pretokenized-shard-rotation-interval", type=int, default=256)
     parser.add_argument("--prefetch-batches", type=int, default=100)
+    parser.add_argument("--prefetch-workers", type=int, default=1)
+    parser.add_argument(
+        "--prefetch-pin-memory",
+        action="store_true",
+        help="Pin CPU batches produced by the async prefetcher.",
+    )
+    parser.add_argument("--rolling-prefetch-workers", type=int, default=0)
+    parser.add_argument("--rolling-prefetch-worker-threads", type=int, default=1)
+    parser.add_argument("--rolling-prefetch-block-size", type=int, default=16)
+    parser.add_argument("--rolling-prefetch-blocks", type=int, default=4)
+    parser.add_argument("--rolling-prefetch-cache-dir")
+    parser.add_argument(
+        "--prebuild-train-batches",
+        action="store_true",
+        help="Build all training batches on CPU before entering the training loop.",
+    )
+    parser.add_argument(
+        "--prebuild-pin-memory",
+        action="store_true",
+        help="Pin prebuilt CPU batches. Faster H2D copies, but can reserve large host memory.",
+    )
+    parser.add_argument("--prebuild-workers", type=int, default=1)
+    parser.add_argument("--prebuild-worker-threads", type=int, default=1)
+    parser.add_argument("--prebuild-cache-dir")
     parser.add_argument("--save-pretokenized", action="store_true")
 
     parser.add_argument("--device", default="auto")
@@ -3728,10 +5034,53 @@ def parse_args() -> argparse.Namespace:
         help="Disable memory-model FFN blocks between propagation/transition layers.",
     )
     parser.add_argument(
+        "--disable-memory-feed-forward-layers",
+        action="store_true",
+        help="Disable only B-module recurrent memory FFN blocks while keeping sequence/prediction FFNs.",
+    )
+    parser.add_argument(
+        "--disable-memory",
+        action="store_true",
+        help="Bypass B-module scan/read entirely and train sequence/prediction path only.",
+    )
+    parser.add_argument(
+        "--disable-memory-read",
+        action="store_true",
+        help="Run B-module scan but replace its query readout with the sequence projection.",
+    )
+    parser.add_argument(
+        "--disable-memory-propagation",
+        action="store_true",
+        help="Disable recurrent same-level B memory propagation while keeping writes/transitions/readout.",
+    )
+    parser.add_argument(
         "--feed-forward-hidden-mult",
         type=float,
         default=2.0,
         help="Hidden width multiplier for memory-model FFN blocks.",
+    )
+    parser.add_argument(
+        "--feed-forward-kind",
+        choices=("value", "state_val"),
+        default="value",
+        help="FFN block type: value keeps the legacy val-only FFN; state_val uses softplus(state) * val and emits state/value residuals.",
+    )
+    parser.add_argument(
+        "--feed-forward-residual-scale",
+        type=float,
+        default=1.0,
+        help="Residual scale for state_val FFN outputs.",
+    )
+    parser.add_argument(
+        "--feed-forward-random-output-init",
+        action="store_true",
+        help="Use Xavier output init for state_val FFNs instead of zero-init identity output.",
+    )
+    parser.add_argument(
+        "--feed-forward-activation",
+        choices=("gelu", "silu", "relu"),
+        default="gelu",
+        help="Activation used inside sequence/prediction FFN blocks.",
     )
     parser.add_argument("--memory-topk", type=int, default=16)
     parser.add_argument("--memory-train-mode", choices=("dense", "topk"), default="dense")
@@ -3747,6 +5096,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable-fused-training", action="store_true")
     parser.add_argument("--fused-training-checkpoint-stride", type=int, default=0)
     parser.add_argument("--enable-scan-backward-cuda", action="store_true")
+    parser.add_argument(
+        "--enable-causal-dense-prop-cuda",
+        action="store_true",
+        help="Enable the generic causal dense propagation CUDA fastpath for supported pairwise kernels such as low_rank_bilinear.",
+    )
+    parser.add_argument("--enable-diagonal-dense-prop-cuda", action="store_true")
+    parser.add_argument("--compile-model", action="store_true")
+    parser.add_argument(
+        "--compile-mode",
+        choices=("default", "reduce-overhead", "max-autotune"),
+        default="reduce-overhead",
+    )
     parser.add_argument(
         "--dense-profile",
         action="store_true",
@@ -3768,6 +5129,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pairwise-frozen-heads", type=int, default=0)
     parser.add_argument("--pairwise-anchor-heads", type=int, default=0)
     parser.add_argument("--pairwise-anchor-kind", choices=("scaled_cosine", "diagonal_bilinear", "constant_one"), default="scaled_cosine")
+    parser.add_argument("--pairwise-head-aggregate", choices=("max", "mean", "sum", "head_mean"), default="max")
+    parser.add_argument("--disable-sequence-anchor", action="store_true")
     parser.add_argument("--route-heads", type=int, default=1)
     parser.add_argument("--route-frozen-heads", type=int, default=0)
     parser.add_argument("--route-anchor-heads", type=int, default=0)
@@ -3798,6 +5161,7 @@ def parse_args() -> argparse.Namespace:
             "adafactor",
             "adagrad",
             "lion",
+            "vi_lion",
             "nadam",
             "radam",
             "rmsprop",
@@ -3806,6 +5170,13 @@ def parse_args() -> argparse.Namespace:
         ),
         default="adamw_fused",
     )
+    parser.add_argument("--adam-beta1", type=float, default=0.9)
+    parser.add_argument("--adam-beta2", type=float, default=0.999)
+    parser.add_argument("--vi-lion-ema-beta", type=float, default=0.99)
+    parser.add_argument("--vi-lion-var-low", type=float, default=0.02)
+    parser.add_argument("--vi-lion-var-high", type=float, default=0.10)
+    parser.add_argument("--vi-lion-min-scale", type=float, default=0.10)
+    parser.add_argument("--vi-lion-max-scale", type=float, default=1.0)
     parser.add_argument("--warmup-start-lr", type=float, default=1e-4)
     parser.add_argument("--warmup-steps", type=int, default=100)
     parser.add_argument("--lr-min-ratio", type=float, default=0.0)
@@ -3814,10 +5185,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=float, default=1.0)
     parser.add_argument("--train-fraction", type=float, default=0.9)
     parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--fast-grad-clip", action="store_true")
     parser.add_argument("--diagnose-nonfinite-grad", action="store_true")
     parser.add_argument("--diagnose-nonfinite-limit", type=int, default=12)
     parser.add_argument("--stop-on-nonfinite-grad", action="store_true")
-    parser.add_argument("--eval-interval", type=int, default=200)
+    parser.add_argument("--eval-interval", type=int, default=500)
     parser.add_argument(
         "--checkpoint-interval",
         type=int,
@@ -3846,6 +5218,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", default="artifacts/training_runs")
     parser.add_argument("--run-name")
     parser.add_argument("--resume-checkpoint")
+    parser.add_argument(
+        "--init-model-checkpoint",
+        help="Initialize only model weights from a checkpoint, leaving optimizer, batcher, RNG, and step state fresh.",
+    )
     parser.add_argument("--tensorboard", action="store_true")
     parser.add_argument(
         "--cuda-graph-stage1",
@@ -3922,6 +5298,14 @@ def configure_native_runtime_flags(args: argparse.Namespace) -> None:
         os.environ[EXPERIMENTAL_SCAN_BACKWARD_CUDA_ENV] = "1"
     else:
         os.environ.pop(EXPERIMENTAL_SCAN_BACKWARD_CUDA_ENV, None)
+    if args.enable_causal_dense_prop_cuda:
+        os.environ[EXPERIMENTAL_CAUSAL_DENSE_PROP_FORWARD_CUDA_ENV] = "1"
+    else:
+        os.environ.pop(EXPERIMENTAL_CAUSAL_DENSE_PROP_FORWARD_CUDA_ENV, None)
+    if args.enable_diagonal_dense_prop_cuda:
+        os.environ[EXPERIMENTAL_DIAGONAL_DENSE_PROP_CUDA_ENV] = "1"
+    else:
+        os.environ.pop(EXPERIMENTAL_DIAGONAL_DENSE_PROP_CUDA_ENV, None)
     if args.dense_profile:
         os.environ["JAKAL_NET_DENSE_PROFILE"] = "1"
     else:
@@ -4005,6 +5389,128 @@ class Lion(torch.optim.Optimizer):
         return loss
 
 
+class VarianceInterpolatedLion(torch.optim.Optimizer):
+    def __init__(
+        self,
+        params: Iterable[torch.nn.Parameter] | Iterable[dict[str, Any]],
+        *,
+        lr: float = 1e-4,
+        betas: tuple[float, float] = (0.9, 0.99),
+        weight_decay: float = 0.0,
+        ema_beta: float = 0.99,
+        var_low: float = 0.02,
+        var_high: float = 0.10,
+        min_scale: float = 0.10,
+        max_scale: float = 1.0,
+        eps: float = 1e-8,
+    ) -> None:
+        if lr < 0.0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        beta1, beta2 = betas
+        if not 0.0 <= beta1 < 1.0:
+            raise ValueError(f"Invalid beta1: {beta1}")
+        if not 0.0 <= beta2 < 1.0:
+            raise ValueError(f"Invalid beta2: {beta2}")
+        if weight_decay < 0.0:
+            raise ValueError(f"Invalid weight_decay: {weight_decay}")
+        if not 0.0 <= ema_beta < 1.0:
+            raise ValueError(f"Invalid ema_beta: {ema_beta}")
+        if var_low < 0.0 or var_high <= var_low:
+            raise ValueError("var_high must be greater than non-negative var_low.")
+        if min_scale < 0.0 or max_scale < min_scale:
+            raise ValueError("max_scale must be greater than or equal to non-negative min_scale.")
+        if eps <= 0.0:
+            raise ValueError("eps must be positive.")
+        defaults = {
+            "lr": lr,
+            "betas": betas,
+            "weight_decay": weight_decay,
+            "ema_beta": ema_beta,
+            "var_low": var_low,
+            "var_high": var_high,
+            "min_scale": min_scale,
+            "max_scale": max_scale,
+            "eps": eps,
+        }
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure: Any | None = None) -> Any | None:
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            lr = float(group["lr"])
+            beta1, beta2 = group["betas"]
+            weight_decay = float(group["weight_decay"])
+            ema_beta = float(group["ema_beta"])
+            var_low = float(group["var_low"])
+            var_high = float(group["var_high"])
+            min_scale = float(group["min_scale"])
+            max_scale = float(group["max_scale"])
+            eps = float(group["eps"])
+
+            sumsq: Tensor | None = None
+            count = 0
+            for parameter in group["params"]:
+                if parameter.grad is None:
+                    continue
+                gradient = parameter.grad
+                if gradient.is_sparse:
+                    raise RuntimeError("VarianceInterpolatedLion does not support sparse gradients.")
+                grad_float = gradient.detach().float()
+                grad_sumsq = grad_float.square().sum()
+                sumsq = grad_sumsq if sumsq is None else sumsq + grad_sumsq
+                count += int(gradient.numel())
+            if sumsq is None or count == 0:
+                continue
+
+            grad_rms = torch.sqrt(sumsq / float(count)).detach()
+            rms_ema = group.get("vi_grad_rms_ema")
+            rms_sq_ema = group.get("vi_grad_rms_sq_ema")
+            if not isinstance(rms_ema, torch.Tensor) or not isinstance(rms_sq_ema, torch.Tensor):
+                rms_ema = grad_rms.clone()
+                rms_sq_ema = grad_rms.square()
+                rms_raw_var = torch.zeros_like(grad_rms)
+                rms_cv2 = torch.zeros_like(grad_rms)
+                ratio = torch.ones_like(grad_rms)
+            else:
+                rms_ema = rms_ema.to(device=grad_rms.device, dtype=grad_rms.dtype)
+                rms_sq_ema = rms_sq_ema.to(device=grad_rms.device, dtype=grad_rms.dtype)
+                ratio = grad_rms / rms_ema.clamp_min(eps)
+            rms_ema = rms_ema.mul(ema_beta).add(grad_rms, alpha=1.0 - ema_beta)
+            rms_sq_ema = rms_sq_ema.mul(ema_beta).add(grad_rms.square(), alpha=1.0 - ema_beta)
+            rms_raw_var = (rms_sq_ema - rms_ema.square()).clamp_min(0.0)
+            rms_cv2 = rms_raw_var / rms_ema.square().clamp_min(eps)
+            gate = ((rms_cv2 - var_low) / (var_high - var_low)).clamp(0.0, 1.0)
+            norm_scale = ratio.clamp(min_scale, max_scale)
+            scale = ((1.0 - gate) + gate * norm_scale).detach()
+            group["vi_grad_rms_ema"] = rms_ema.detach()
+            group["vi_grad_rms_sq_ema"] = rms_sq_ema.detach()
+            group["vi_grad_rms_raw_var"] = rms_raw_var.detach()
+            group["vi_grad_rms_var"] = rms_cv2.detach()
+            group["vi_last_grad_rms"] = grad_rms.detach()
+            group["vi_last_scale"] = scale.detach()
+            group["vi_last_gate"] = gate.detach()
+            group["vi_last_ratio"] = ratio.detach()
+
+            for parameter in group["params"]:
+                if parameter.grad is None:
+                    continue
+                gradient = parameter.grad
+                if weight_decay != 0.0:
+                    parameter.mul_(1.0 - lr * weight_decay)
+                state = self.state[parameter]
+                if len(state) == 0:
+                    state["exp_avg"] = torch.zeros_like(parameter)
+                exp_avg = state["exp_avg"]
+                update = exp_avg * beta1 + gradient * (1.0 - beta1)
+                parameter.add_(update.sign() * scale.to(device=parameter.device, dtype=parameter.dtype), alpha=-lr)
+                exp_avg.mul_(beta2).add_(gradient, alpha=1.0 - beta2)
+        return loss
+
+
 def build_optimizer(
     param_groups: Sequence[dict[str, Any]],
     *,
@@ -4012,10 +5518,21 @@ def build_optimizer(
     learning_rate: float,
     weight_decay: float,
     device: torch.device,
+    vi_lion_ema_beta: float = 0.99,
+    vi_lion_var_low: float = 0.02,
+    vi_lion_var_high: float = 0.10,
+    vi_lion_min_scale: float = 0.10,
+    vi_lion_max_scale: float = 1.0,
+    adam_betas: tuple[float, float] = (0.9, 0.999),
 ) -> torch.optim.Optimizer:
     optimizer_name = name.lower()
+    adam_beta1, adam_beta2 = adam_betas
+    if not 0.0 <= adam_beta1 < 1.0:
+        raise ValueError(f"Invalid adam_beta1: {adam_beta1}")
+    if not 0.0 <= adam_beta2 < 1.0:
+        raise ValueError(f"Invalid adam_beta2: {adam_beta2}")
     if optimizer_name == "adamw":
-        return torch.optim.AdamW(param_groups, lr=learning_rate, weight_decay=weight_decay)
+        return torch.optim.AdamW(param_groups, lr=learning_rate, weight_decay=weight_decay, betas=adam_betas)
     if optimizer_name == "adamw_fused":
         if device.type == "cuda":
             try:
@@ -4023,17 +5540,18 @@ def build_optimizer(
                     param_groups,
                     lr=learning_rate,
                     weight_decay=weight_decay,
+                    betas=adam_betas,
                     fused=True,
                 )
             except TypeError:
                 pass
-        return torch.optim.AdamW(param_groups, lr=learning_rate, weight_decay=weight_decay)
+        return torch.optim.AdamW(param_groups, lr=learning_rate, weight_decay=weight_decay, betas=adam_betas)
     if optimizer_name == "adamw8bit":
         try:
             from bitsandbytes.optim import AdamW8bit  # type: ignore
         except ImportError as exc:  # pragma: no cover - optional dependency
             raise ImportError("bitsandbytes is required for --optimizer adamw8bit.") from exc
-        return AdamW8bit(param_groups, lr=learning_rate, weight_decay=weight_decay)
+        return AdamW8bit(param_groups, lr=learning_rate, weight_decay=weight_decay, betas=adam_betas)
     if optimizer_name == "adafactor":
         try:
             adafactor_cls = torch.optim.Adafactor
@@ -4044,6 +5562,17 @@ def build_optimizer(
         return torch.optim.Adagrad(param_groups, lr=learning_rate, weight_decay=weight_decay)
     if optimizer_name == "lion":
         return Lion(param_groups, lr=learning_rate, weight_decay=weight_decay)
+    if optimizer_name == "vi_lion":
+        return VarianceInterpolatedLion(
+            param_groups,
+            lr=learning_rate,
+            weight_decay=weight_decay,
+            ema_beta=vi_lion_ema_beta,
+            var_low=vi_lion_var_low,
+            var_high=vi_lion_var_high,
+            min_scale=vi_lion_min_scale,
+            max_scale=vi_lion_max_scale,
+        )
     if optimizer_name == "nadam":
         return torch.optim.NAdam(param_groups, lr=learning_rate, weight_decay=weight_decay)
     if optimizer_name == "radam":
@@ -4129,6 +5658,7 @@ def build_rnn_aux_optimizer(
 
 def main() -> None:
     args = parse_args()
+    args.unit_norm_values = True
     if args.pretokenize_workers < 0:
         raise ValueError("pretokenize-workers must be non-negative.")
     if args.pretokenized_load_workers <= 0:
@@ -4141,6 +5671,8 @@ def main() -> None:
         raise ValueError("pretokenized-active-shards-per-bucket must be positive.")
     if args.pretokenized_shard_rotation_interval <= 0:
         raise ValueError("pretokenized-shard-rotation-interval must be positive.")
+    if args.prefetch_workers <= 0:
+        raise ValueError("prefetch-workers must be positive.")
     configure_native_runtime_flags(args)
     if args.grad_accum_steps <= 0:
         raise ValueError("grad-accum-steps must be positive.")
@@ -4387,6 +5919,144 @@ def main() -> None:
         )
         print(f"hf_embedding_dim | source={hf_dim_source} | dim={args.dim}", flush=True)
     total_steps = max(1, int(math.ceil(steps_per_epoch * args.epochs)))
+    run_name = args.run_name or build_run_name(args)
+    run_dir = create_run_directory(args.output_root, run_name)
+    checkpoints_dir = ensure_directory(run_dir / "checkpoints")
+
+    def create_training_batcher() -> DocumentChunkBatcher | FlatDocumentChunkBatcher:
+        if flat_collection is not None:
+            return FlatDocumentChunkBatcher(
+                flat_collection,
+                train_documents_flat,
+                batch_size=stage1_batch_size,
+                device=device,
+                active_shards_per_bucket=args.pretokenized_active_shards_per_bucket,
+                shard_rotation_interval=args.pretokenized_shard_rotation_interval,
+            )
+        return DocumentChunkBatcher(train_documents, batch_size=stage1_batch_size, device=device)
+
+    def prebuild_from_batcher(
+        source_batcher: DocumentChunkBatcher | FlatDocumentChunkBatcher,
+        *,
+        start_step_value: int,
+    ) -> tuple[list[DocumentBatch] | None, list[PrebuiltBatchBlock] | None, float]:
+        print(
+            f"startup | prebuild_train_batches_start | pin_memory={args.prebuild_pin_memory} | "
+            f"workers={args.prebuild_workers} | worker_threads={args.prebuild_worker_threads}",
+            flush=True,
+        )
+        prebuild_kwargs = dict(
+            total_steps=total_steps,
+            start_step=start_step_value,
+            stage1_ratio=args.curriculum_stage1_ratio,
+            stage2_ratio=args.curriculum_stage2_ratio,
+            stage1_span=args.curriculum_stage1_span,
+            stage2_span=args.curriculum_stage2_span,
+            stage3_span=args.curriculum_stage3_span,
+            stage1_batch_size=stage1_batch_size,
+            stage2_batch_size=stage2_batch_size,
+            stage3_batch_size=stage3_batch_size,
+            stage1_grad_accum_steps=stage1_grad_accum_steps,
+            stage2_grad_accum_steps=stage2_grad_accum_steps,
+            stage3_grad_accum_steps=stage3_grad_accum_steps,
+            pin_memory=args.prebuild_pin_memory,
+        )
+        if args.prebuild_workers > 1:
+            prebuild_cache_dir = (
+                Path(args.prebuild_cache_dir)
+                if args.prebuild_cache_dir
+                else run_dir / "prebuilt_batches"
+            )
+            blocks, seconds = build_prebuilt_batch_blocks_parallel(
+                source_batcher,
+                **prebuild_kwargs,
+                workers=args.prebuild_workers,
+                worker_threads=args.prebuild_worker_threads,
+                cache_dir=prebuild_cache_dir,
+            )
+            batches = None
+        else:
+            batches, seconds = prebuild_training_batches(
+                source_batcher,
+                **prebuild_kwargs,
+                workers=1,
+                worker_threads=args.prebuild_worker_threads,
+            )
+            blocks = None
+        prebuilt_count = (
+            len(batches)
+            if batches is not None
+            else sum(block.batch_count for block in blocks or ())
+        )
+        print(
+            f"startup | prebuild_train_batches_done | batches={prebuilt_count} | "
+            f"seconds={seconds:.1f}",
+            flush=True,
+        )
+        return batches, blocks, seconds
+
+    def create_rolling_batch_provider(
+        source_batcher: DocumentChunkBatcher | FlatDocumentChunkBatcher,
+        *,
+        start_step_value: int,
+    ) -> RollingFileDocumentBatchProvider:
+        return RollingFileDocumentBatchProvider(
+            source_batcher,
+            device=device,
+            total_steps=total_steps,
+            start_step=start_step_value,
+            stage1_ratio=args.curriculum_stage1_ratio,
+            stage2_ratio=args.curriculum_stage2_ratio,
+            stage1_span=args.curriculum_stage1_span,
+            stage2_span=args.curriculum_stage2_span,
+            stage3_span=args.curriculum_stage3_span,
+            stage1_batch_size=stage1_batch_size,
+            stage2_batch_size=stage2_batch_size,
+            stage3_batch_size=stage3_batch_size,
+            stage1_grad_accum_steps=stage1_grad_accum_steps,
+            stage2_grad_accum_steps=stage2_grad_accum_steps,
+            stage3_grad_accum_steps=stage3_grad_accum_steps,
+            pin_memory=bool(args.prefetch_pin_memory),
+            workers=max(1, int(args.rolling_prefetch_workers)),
+            worker_threads=max(1, int(args.rolling_prefetch_worker_threads)),
+            block_size=max(1, int(args.rolling_prefetch_block_size)),
+            queued_blocks=max(1, int(args.rolling_prefetch_blocks)),
+            cache_dir=None if args.rolling_prefetch_cache_dir is None else Path(args.rolling_prefetch_cache_dir),
+        )
+
+    batcher: DocumentChunkBatcher | FlatDocumentChunkBatcher | None = None
+    prefetcher: (
+        AsyncDocumentBatchPrefetcher
+        | SynchronousDocumentBatchProvider
+        | RollingProcessDocumentBatchProvider
+        | RollingFileDocumentBatchProvider
+        | PrebuiltDocumentBatchProvider
+        | None
+    ) = None
+    prebuilt_batches: list[DocumentBatch] | None = None
+    prebuilt_blocks: list[PrebuiltBatchBlock] | None = None
+    prebuild_seconds = 0.0
+    if args.prebuild_train_batches and not args.resume_checkpoint:
+        batcher = create_training_batcher()
+        print("startup | batcher_done", flush=True)
+        prebuilt_batches, prebuilt_blocks, prebuild_seconds = prebuild_from_batcher(
+            batcher,
+            start_step_value=0,
+        )
+    elif int(args.rolling_prefetch_workers) > 0 and not args.resume_checkpoint:
+        batcher = create_training_batcher()
+        print("startup | batcher_done", flush=True)
+        prefetcher = create_rolling_batch_provider(
+            batcher,
+            start_step_value=0,
+        )
+        print(
+            f"startup | rolling_prefetcher_started | workers={max(1, int(args.rolling_prefetch_workers))} | "
+            f"block_size={max(1, int(args.rolling_prefetch_block_size))} | "
+            f"queued_blocks={max(1, int(args.rolling_prefetch_blocks))} | "
+            f"cache_dir={getattr(prefetcher, 'cache_dir', None)}",
+            flush=True,
+        )
 
     if args.model_kind == "transformer":
         model = TransformerBaselineLM(
@@ -4413,7 +6083,17 @@ def main() -> None:
             checkpoint_sequence_layers=args.checkpoint_sequence_layers,
             checkpoint_prediction_layers=args.checkpoint_prediction_layers,
             feed_forward_layers=not args.disable_feed_forward_layers,
+            memory_feed_forward_layers=not (
+                args.disable_feed_forward_layers or args.disable_memory_feed_forward_layers
+            ),
+            disable_memory=args.disable_memory,
+            disable_memory_read=args.disable_memory_read,
+            disable_memory_propagation=args.disable_memory_propagation,
             feed_forward_hidden_mult=args.feed_forward_hidden_mult,
+            feed_forward_kind=args.feed_forward_kind,
+            feed_forward_residual_scale=args.feed_forward_residual_scale,
+            feed_forward_zero_init_output=not args.feed_forward_random_output_init,
+            feed_forward_activation=args.feed_forward_activation,
             memory_topk=args.memory_topk,
             memory_train_mode=args.memory_train_mode,
             memory_eval_mode=args.memory_eval_mode,
@@ -4428,6 +6108,8 @@ def main() -> None:
             pairwise_frozen_heads=args.pairwise_frozen_heads,
             pairwise_anchor_heads=args.pairwise_anchor_heads,
             pairwise_anchor_kind=args.pairwise_anchor_kind,
+            pairwise_head_aggregate=args.pairwise_head_aggregate,
+            sequence_anchor=not args.disable_sequence_anchor,
             route_heads=args.route_heads,
             route_frozen_heads=args.route_frozen_heads,
             route_anchor_heads=args.route_anchor_heads,
@@ -4472,7 +6154,14 @@ def main() -> None:
             f"memory_slots={args.memory_slots} | memory_update_intervals={args.memory_update_intervals} | knowledge_nodes={args.knowledge_nodes} | "
             f"memory_train_mode={args.memory_train_mode} | memory_eval_mode={args.memory_eval_mode} | eval_topk={args.eval_topk or args.memory_topk} | "
             f"unit_norm_values={args.unit_norm_values} | feed_forward_layers={not args.disable_feed_forward_layers} | "
+            f"memory_feed_forward_layers={not (args.disable_feed_forward_layers or args.disable_memory_feed_forward_layers)} | "
+            f"disable_memory={args.disable_memory} | disable_memory_read={args.disable_memory_read} | "
+            f"disable_memory_propagation={args.disable_memory_propagation} | "
             f"feed_forward_hidden_mult={args.feed_forward_hidden_mult:g} | "
+            f"feed_forward_kind={args.feed_forward_kind} | "
+            f"feed_forward_residual_scale={args.feed_forward_residual_scale:g} | "
+            f"feed_forward_zero_init_output={not args.feed_forward_random_output_init} | "
+            f"feed_forward_activation={args.feed_forward_activation} | "
             f"optimizer={args.optimizer} | checkpoint_sequence={args.checkpoint_sequence_layers} | "
             f"checkpoint_prediction={args.checkpoint_prediction_layers}",
             flush=True,
@@ -4480,7 +6169,11 @@ def main() -> None:
     print(
         f"native_runtime | fused_training={args.enable_fused_training} | "
         f"fused_training_checkpoint_stride={args.fused_training_checkpoint_stride} | "
-        f"scan_backward_cuda={args.enable_scan_backward_cuda} | dense_profile={args.dense_profile}",
+        f"scan_backward_cuda={args.enable_scan_backward_cuda} | "
+        f"causal_dense_prop_cuda={args.enable_causal_dense_prop_cuda} | "
+        f"diagonal_dense_prop_cuda={args.enable_diagonal_dense_prop_cuda} | "
+        f"compile_model={args.compile_model} | compile_mode={args.compile_mode} | "
+        f"dense_profile={args.dense_profile}",
         flush=True,
     )
     print(
@@ -4499,9 +6192,6 @@ def main() -> None:
         flush=True,
     )
 
-    run_name = args.run_name or build_run_name(args)
-    run_dir = create_run_directory(args.output_root, run_name)
-    checkpoints_dir = ensure_directory(run_dir / "checkpoints")
     write_json(
         run_dir / "config.json",
         {
@@ -4530,6 +6220,20 @@ def main() -> None:
             raise ImportError("tensorboard is not installed.")
         writer = SummaryWriter(log_dir=str(run_dir / "tensorboard"))
 
+    if args.init_model_checkpoint:
+        if args.resume_checkpoint:
+            raise ValueError("--init-model-checkpoint cannot be combined with --resume-checkpoint.")
+        init_checkpoint_path = Path(args.init_model_checkpoint)
+        init_checkpoint = load_checkpoint(init_checkpoint_path, device=device)
+        model.load_state_dict(init_checkpoint["model_state_dict"])
+        print(
+            f"initialized_model_checkpoint | path={init_checkpoint_path} | "
+            f"source_step={init_checkpoint.get('step')} | "
+            f"source_train_loss={init_checkpoint.get('train_loss')} | "
+            f"source_val_loss={init_checkpoint.get('val_loss')}",
+            flush=True,
+        )
+
     param_groups, param_group_configs = build_parameter_groups(
         model,
         learning_rate=args.learning_rate,
@@ -4549,21 +6253,20 @@ def main() -> None:
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         device=device,
+        vi_lion_ema_beta=args.vi_lion_ema_beta,
+        vi_lion_var_low=args.vi_lion_var_low,
+        vi_lion_var_high=args.vi_lion_var_high,
+        vi_lion_min_scale=args.vi_lion_min_scale,
+        vi_lion_max_scale=args.vi_lion_max_scale,
+        adam_betas=(args.adam_beta1, args.adam_beta2),
     )
     print("startup | main_optimizer_done", flush=True)
     scaler = torch.cuda.amp.GradScaler() if args.precision == "fp16" and device.type == "cuda" else None
-    if flat_collection is not None:
-        batcher: DocumentChunkBatcher | FlatDocumentChunkBatcher = FlatDocumentChunkBatcher(
-            flat_collection,
-            train_documents_flat,
-            batch_size=stage1_batch_size,
-            device=device,
-            active_shards_per_bucket=args.pretokenized_active_shards_per_bucket,
-            shard_rotation_interval=args.pretokenized_shard_rotation_interval,
-        )
+    if batcher is None:
+        batcher = create_training_batcher()
+        print("startup | batcher_done", flush=True)
     else:
-        batcher = DocumentChunkBatcher(train_documents, batch_size=stage1_batch_size, device=device)
-    print("startup | batcher_done", flush=True)
+        print("startup | batcher_reused_prebuilt", flush=True)
     history_rows: list[dict[str, Any]] = []
     train_memory_state: tuple[Any, ...] | None = None
     active_stage_name: str | None = None
@@ -4602,12 +6305,79 @@ def main() -> None:
             f"train_loss={checkpoint.get('train_loss')} | val_loss={checkpoint.get('val_loss')}",
             flush=True,
         )
-    prefetcher = AsyncDocumentBatchPrefetcher(
-        batcher,
-        device=device,
-        prefetch_batches=max(1, int(args.prefetch_batches)),
-    )
-    print("startup | prefetcher_done", flush=True)
+    if args.compile_model:
+        compiler = getattr(torch, "compile", None)
+        if compiler is None:
+            raise RuntimeError("--compile-model requires torch.compile support.")
+        compile_kwargs: dict[str, Any] = {"fullgraph": False}
+        if args.compile_mode != "default":
+            compile_kwargs["mode"] = args.compile_mode
+        print(
+            f"startup | compile_model_start | mode={args.compile_mode}",
+            flush=True,
+        )
+        model = compiler(model, **compile_kwargs)
+        print("startup | compile_model_done", flush=True)
+
+    def create_live_batch_provider(
+        *,
+        start_step_value: int,
+    ) -> AsyncDocumentBatchPrefetcher | SynchronousDocumentBatchProvider | RollingFileDocumentBatchProvider:
+        if int(args.rolling_prefetch_workers) > 0:
+            return create_rolling_batch_provider(
+                batcher,
+                start_step_value=start_step_value,
+            )
+        if int(args.prefetch_batches) <= 0:
+            return SynchronousDocumentBatchProvider(
+                batcher,
+                device=device,
+                pin_memory=bool(args.prefetch_pin_memory),
+            )
+        return AsyncDocumentBatchPrefetcher(
+            batcher,
+            device=device,
+            prefetch_batches=max(1, int(args.prefetch_batches)),
+            pin_memory=bool(args.prefetch_pin_memory),
+            workers=max(1, int(args.prefetch_workers)),
+        )
+
+    if args.prebuild_train_batches:
+        if prebuilt_batches is None and prebuilt_blocks is None:
+            prebuilt_batches, prebuilt_blocks, prebuild_seconds = prebuild_from_batcher(
+                batcher,
+                start_step_value=start_step,
+            )
+        prefetcher = PrebuiltDocumentBatchProvider(
+            prebuilt_batches,
+            device=device,
+            build_seconds=prebuild_seconds,
+            blocks=prebuilt_blocks,
+        )
+        prebuilt_count = (
+            len(prebuilt_batches)
+            if prebuilt_batches is not None
+            else sum(block.batch_count for block in prebuilt_blocks or ())
+        )
+        print(f"startup | prebuilt_provider_done | batches={prebuilt_count}", flush=True)
+    else:
+        if prefetcher is None:
+            prefetcher = create_live_batch_provider(start_step_value=start_step)
+        prefetch_mode = (
+            "rolling_file"
+            if int(args.rolling_prefetch_workers) > 0
+            else ("sync" if int(args.prefetch_batches) <= 0 else "async")
+        )
+        print(
+            f"startup | prefetcher_done | mode={prefetch_mode} | "
+            f"workers={max(0, int(args.rolling_prefetch_workers))} | "
+            f"prefetch_workers={max(1, int(args.prefetch_workers))} | "
+            f"block_size={max(1, int(args.rolling_prefetch_block_size))} | "
+            f"queued_blocks={max(1, int(args.rolling_prefetch_blocks))} | "
+            f"cache_dir={getattr(prefetcher, 'cache_dir', None)} | "
+            f"pin_memory={bool(args.prefetch_pin_memory)}",
+            flush=True,
+        )
     optimizer.zero_grad(set_to_none=True)
     start_time = time.time()
     grad_clip_parameters = list(model.parameters())
@@ -4626,8 +6396,9 @@ def main() -> None:
         val_loss: float | None,
     ) -> None:
         nonlocal prefetcher
-        prefetcher.close()
         batcher_state = batcher.state_dict()
+        if not args.prebuild_train_batches:
+            prefetcher.close()
         save_checkpoint(
             path,
             model=model,
@@ -4647,11 +6418,8 @@ def main() -> None:
             torch_rng_state=torch.get_rng_state(),
             cuda_rng_state=(torch.cuda.get_rng_state_all() if device.type == "cuda" else None),
         )
-        prefetcher = AsyncDocumentBatchPrefetcher(
-            batcher,
-            device=device,
-            prefetch_batches=max(1, int(args.prefetch_batches)),
-        )
+        if not args.prebuild_train_batches:
+            prefetcher = create_live_batch_provider(start_step_value=step)
 
     for step in range(start_step + 1, total_steps + 1):
         stage = resolve_curriculum_stage(
@@ -4673,12 +6441,9 @@ def main() -> None:
         batcher.set_batch_size(stage.batch_size)
         batcher.set_bucket_weights(bucket_weights)
         if stage.name != active_stage_name:
-            prefetcher.close()
-            prefetcher = AsyncDocumentBatchPrefetcher(
-                batcher,
-                device=device,
-                prefetch_batches=max(1, int(args.prefetch_batches)),
-            )
+            if not args.prebuild_train_batches and int(args.rolling_prefetch_workers) <= 0:
+                prefetcher.close()
+                prefetcher = create_live_batch_provider(start_step_value=step - 1)
             apply_training_curriculum(model, stage)
             train_memory_state = None
             active_stage_name = stage.name
@@ -4747,13 +6512,34 @@ def main() -> None:
                     memory_state=current_memory_state,
                     precision=args.precision,
                     grad_enabled=True,
-                )
+            )
             loss_is_finite = bool(torch.isfinite(loss.detach()).item())
             if not loss_is_finite:
                 print(
                     f"warning | step={step} | span_index={span_index} | non-finite loss; skipping optimizer step",
                     flush=True,
                 )
+                parameter_diagnostics = summarize_nonfinite_parameters(
+                    grad_clip_named_parameters,
+                    limit=args.diagnose_nonfinite_limit,
+                )
+                if parameter_diagnostics:
+                    print(
+                        "diagnose_nonfinite_param | "
+                        + " | ".join(parameter_diagnostics),
+                        flush=True,
+                    )
+                else:
+                    print("diagnose_nonfinite_param | all_finite", flush=True)
+                memory_diagnostics = summarize_nonfinite_memory_state(next_memory_state)
+                if memory_diagnostics:
+                    print(
+                        "diagnose_nonfinite_memory | "
+                        + " | ".join(memory_diagnostics),
+                        flush=True,
+                    )
+                else:
+                    print("diagnose_nonfinite_memory | all_finite", flush=True)
                 break
             span_losses.append(main_loss_value)
             last_span_loss_tensor = loss
@@ -4784,26 +6570,34 @@ def main() -> None:
             if scaler is not None:
                 scaler.unscale_(optimizer)
             try:
-                grad_norm = compute_grad_norm_float64(grad_clip_parameters)
-                if (
-                    args.diagnose_nonfinite_grad
-                    and math.isfinite(grad_norm)
-                    and grad_norm >= 1.0e6
-                ):
-                    gradient_extremes = summarize_gradient_extremes(
-                        grad_clip_named_parameters,
-                        limit=args.diagnose_nonfinite_limit,
+                if args.fast_grad_clip:
+                    grad_norm = clip_grad_norm_fast(
+                        grad_clip_parameters,
+                        args.grad_clip,
                     )
-                    if gradient_extremes:
-                        print(
-                            f"diagnose_large_grad_preclip | step={step} | grad_norm={grad_norm:.6g} | "
-                            + " | ".join(gradient_extremes),
-                            flush=True,
+                    if not math.isfinite(grad_norm):
+                        raise RuntimeError("non-finite grad norm before clipping")
+                else:
+                    grad_norm = compute_grad_norm_float64(grad_clip_parameters)
+                    if (
+                        args.diagnose_nonfinite_grad
+                        and math.isfinite(grad_norm)
+                        and grad_norm >= 1.0e6
+                    ):
+                        gradient_extremes = summarize_gradient_extremes(
+                            grad_clip_named_parameters,
+                            limit=args.diagnose_nonfinite_limit,
                         )
-                grad_norm = clip_grad_norm_float64(
-                    grad_clip_parameters,
-                    args.grad_clip,
-                )
+                        if gradient_extremes:
+                            print(
+                                f"diagnose_large_grad_preclip | step={step} | grad_norm={grad_norm:.6g} | "
+                                + " | ".join(gradient_extremes),
+                                flush=True,
+                            )
+                    grad_norm = clip_grad_norm_float64(
+                        grad_clip_parameters,
+                        args.grad_clip,
+                    )
             except RuntimeError as exc:
                 grad_norm = float("nan")
                 print(f"warning | step={step} | non-finite grad norm; skipping optimizer step | {exc}", flush=True)
@@ -4857,6 +6651,23 @@ def main() -> None:
         avg_rnn_batch_seconds = 0.0
         rnn_prefetch_queue_size = 0
         avg_cpu_batch_seconds, prefetch_queue_size = prefetcher.stats()
+        vi_lion_stats: dict[str, float] = {}
+        for param_group in optimizer.param_groups:
+            if "vi_last_scale" not in param_group:
+                continue
+            for stat_key, history_key in (
+                ("vi_last_grad_rms", "vi_grad_rms"),
+                ("vi_grad_rms_ema", "vi_grad_rms_ema"),
+                ("vi_grad_rms_raw_var", "vi_grad_rms_raw_var"),
+                ("vi_grad_rms_var", "vi_grad_rms_var"),
+                ("vi_last_ratio", "vi_grad_rms_ratio"),
+                ("vi_last_gate", "vi_lion_gate"),
+                ("vi_last_scale", "vi_lion_scale"),
+            ):
+                stat_value = param_group.get(stat_key)
+                if isinstance(stat_value, torch.Tensor):
+                    vi_lion_stats[history_key] = float(stat_value.detach().float().cpu().item())
+            break
         if writer is not None:
             writer.add_scalar("train/loss", train_loss, step)
             writer.add_scalar("train/lr", lr, step)
@@ -4865,16 +6676,27 @@ def main() -> None:
             writer.add_scalar("train/prefetch_queue_size", prefetch_queue_size, step)
             if not math.isnan(grad_norm):
                 writer.add_scalar("train/grad_norm", grad_norm, step)
+            for stat_name, stat_value in vi_lion_stats.items():
+                writer.add_scalar(f"train/{stat_name}", stat_value, step)
             for bucket_name, bucket_weight in bucket_weights.items():
                 writer.add_scalar(f"train_bucket_weight/{bucket_name}", bucket_weight, step)
 
         if step == 1 or step % 25 == 0:
             elapsed = time.time() - start_time
+            vi_lion_progress = ""
+            if vi_lion_stats:
+                vi_lion_progress = (
+                    f" | vi_cv2={vi_lion_stats.get('vi_grad_rms_var', float('nan')):.4g}"
+                    f" | vi_raw_var={vi_lion_stats.get('vi_grad_rms_raw_var', float('nan')):.4g}"
+                    f" | vi_gate={vi_lion_stats.get('vi_lion_gate', float('nan')):.3g}"
+                    f" | vi_scale={vi_lion_stats.get('vi_lion_scale', float('nan')):.3g}"
+                    f" | vi_ratio={vi_lion_stats.get('vi_grad_rms_ratio', float('nan')):.3g}"
+                )
             print(
                 f"progress | step={step:5d}/{total_steps} | stage={stage.name} | span={stage.document_span} | "
                 f"train_loss={train_loss:.4f} | lr={lr:.6g} | "
                 f"cpu_batch_ms={avg_cpu_batch_seconds * 1000.0:.1f} | prefetch_q={prefetch_queue_size} | "
-                f"elapsed={elapsed:.1f}s",
+                f"elapsed={elapsed:.1f}s{vi_lion_progress}",
                 flush=True,
             )
 
@@ -4980,6 +6802,7 @@ def main() -> None:
             "val_loss": val_loss,
             "val_ppl": None if val_loss is None else perplexity_from_loss(val_loss),
         }
+        row.update(vi_lion_stats)
         history_rows.append(row)
         append_jsonl(run_dir / "history.jsonl", row)
 

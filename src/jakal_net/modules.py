@@ -60,9 +60,14 @@ class BilinearPairwise(nn.Module):
         self.weight = nn.Parameter(torch.empty(dim, dim))
         nn.init.xavier_uniform_(self.weight)
         self.bias = nn.Parameter(torch.zeros(())) if bias else None
+        self._scale = float(dim**0.5)
+
+    def normalized_weight(self) -> Tensor:
+        denom = self.weight.norm(p=2).clamp_min(1e-6)
+        return self.weight * (self._scale / denom)
 
     def forward(self, target_val: Tensor, source_val: Tensor) -> Tensor:
-        scores = torch.einsum("...id,df,...jf->...ij", target_val, self.weight, source_val)
+        scores = torch.einsum("...id,df,...jf->...ij", target_val, self.normalized_weight(), source_val)
         if self.bias is not None:
             scores = scores + self.bias
         return scores
@@ -107,6 +112,16 @@ class ScaledCosinePairwise(nn.Module):
         return torch.einsum("...id,...jd->...ij", normalized_target, normalized_source) * self.scale
 
 
+def make_feed_forward_activation(name: str) -> nn.Module:
+    if name == "gelu":
+        return nn.GELU()
+    if name == "silu":
+        return nn.SiLU()
+    if name == "relu":
+        return nn.ReLU()
+    raise ValueError(f"Unsupported feed-forward activation: {name!r}.")
+
+
 class ResidualFeedForward(nn.Module):
     def __init__(
         self,
@@ -114,6 +129,7 @@ class ResidualFeedForward(nn.Module):
         *,
         hidden_mult: float = 2.0,
         dropout: float = 0.0,
+        activation: str = "gelu",
     ) -> None:
         super().__init__()
         if dim <= 0:
@@ -126,7 +142,7 @@ class ResidualFeedForward(nn.Module):
         self.input_norm = nn.LayerNorm(dim)
         self.net = nn.Sequential(
             nn.Linear(dim, hidden_dim),
-            nn.GELU(),
+            make_feed_forward_activation(activation),
             nn.Dropout(float(dropout)),
             nn.Linear(hidden_dim, dim),
             nn.Dropout(float(dropout)),
@@ -145,6 +161,60 @@ class ResidualFeedForward(nn.Module):
 
     def forward(self, val: Tensor) -> Tensor:
         return val + self.net(self.input_norm(val))
+
+
+class StateValueFeedForward(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        *,
+        hidden_mult: float = 2.0,
+        dropout: float = 0.0,
+        residual_scale: float = 1.0,
+        zero_init_output: bool = True,
+        activation: str = "gelu",
+    ) -> None:
+        super().__init__()
+        if dim <= 0:
+            raise ValueError("dim must be positive.")
+        if hidden_mult <= 0.0:
+            raise ValueError("hidden_mult must be positive.")
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError("dropout must be in [0, 1).")
+        if residual_scale < 0.0:
+            raise ValueError("residual_scale must be non-negative.")
+        hidden_dim = max(dim, int(round(float(dim) * float(hidden_mult))))
+        self.residual_scale = float(residual_scale)
+        self.input_norm = nn.LayerNorm(dim)
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            make_feed_forward_activation(activation),
+            nn.Dropout(float(dropout)),
+            nn.Linear(hidden_dim, dim + 1),
+        )
+        self.zero_init_output = bool(zero_init_output)
+        self._reset_parameters()
+
+    def _reset_parameters(self) -> None:
+        first = self.net[0]
+        second = self.net[3]
+        assert isinstance(first, nn.Linear)
+        assert isinstance(second, nn.Linear)
+        nn.init.xavier_uniform_(first.weight)
+        nn.init.zeros_(first.bias)
+        if self.zero_init_output:
+            nn.init.zeros_(second.weight)
+        else:
+            nn.init.xavier_uniform_(second.weight)
+        nn.init.zeros_(second.bias)
+
+    def forward(self, state: Tensor, val: Tensor) -> tuple[Tensor, Tensor]:
+        mixed = F.softplus(state).unsqueeze(-1) * val
+        delta = self.net(self.input_norm(mixed))
+        delta_state = delta[..., 0]
+        delta_val = delta[..., 1:]
+        scale = self.residual_scale
+        return state + scale * delta_state, val + scale * delta_val
 
 
 class FixedProjectionRoute(nn.Module):
@@ -187,7 +257,7 @@ class MultiHeadPairwise(nn.Module):
         super().__init__()
         if not heads:
             raise ValueError("heads must contain at least one pairwise module.")
-        if aggregate not in {"max", "mean", "sum"}:
+        if aggregate not in {"max", "mean", "sum", "head_mean"}:
             raise ValueError(f"Unsupported aggregate mode: {aggregate!r}.")
         self.heads = nn.ModuleList(heads)
         self.aggregate = aggregate
@@ -389,7 +459,7 @@ class MultiHeadRoute(nn.Module):
         super().__init__()
         if not heads:
             raise ValueError("heads must contain at least one route module.")
-        if aggregate not in {"max", "mean", "sum"}:
+        if aggregate not in {"max", "mean", "sum", "head_mean"}:
             raise ValueError(f"Unsupported aggregate mode: {aggregate!r}.")
         self.heads = nn.ModuleList(heads)
         self.aggregate = aggregate

@@ -374,6 +374,8 @@ def train_command(args: argparse.Namespace, candidate: ScheduleCandidate, run_na
     ]
     if args.tensorboard:
         command.append("--tensorboard")
+    if args.disable_memory_feed_forward_layers:
+        command.append("--disable-memory-feed-forward-layers")
     return command
 
 
@@ -623,6 +625,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--route-heads", type=int, default=4)
     parser.add_argument("--pairwise-anchor-heads", type=int, default=0)
     parser.add_argument("--route-anchor-heads", type=int, default=0)
+    parser.add_argument("--disable-memory-feed-forward-layers", action="store_true")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--epochs", type=float, default=1.0)
     parser.add_argument("--eval-interval", type=int, default=25)

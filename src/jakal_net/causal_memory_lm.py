@@ -15,6 +15,7 @@ from jakal_net._architectural_common import (
     init_pairwise_or_route_scales,
     make_pairwise,
     signed_abs_softmax_edges,
+    signed_softmax_state,
     unit_normalize_values,
 )
 from jakal_net.core import Layer
@@ -31,7 +32,7 @@ from jakal_net.native_backend import (
     native_supports,
     native_supports_device,
 )
-from jakal_net.modules import MultiHeadPairwise, MultiHeadRoute, ResidualFeedForward
+from jakal_net.modules import MultiHeadPairwise, MultiHeadRoute, ResidualFeedForward, StateValueFeedForward
 from jakal_net.propagation import SparsePropagation
 from jakal_net.sequence_module import SModule
 
@@ -99,12 +100,22 @@ class CausalHierarchicalMemoryLM(nn.Module):
         route_anchor_heads: int = 0,
         pairwise_anchor_kind: str = "scaled_cosine",
         route_anchor_kind: str = "fixed_projection",
+        pairwise_head_aggregate: str = "max",
+        sequence_anchor: bool = True,
         scan_backend: str = "auto",
         scan_checkpoint_chunk_size: int | None = None,
         implementation: str = "streaming",
         unit_norm_values: bool = False,
         feed_forward_layers: bool = True,
+        memory_feed_forward_layers: bool | None = None,
+        disable_memory: bool = False,
+        disable_memory_read: bool = False,
+        disable_memory_propagation: bool = False,
         feed_forward_hidden_mult: float = 2.0,
+        feed_forward_kind: str = "value",
+        feed_forward_residual_scale: float = 1.0,
+        feed_forward_zero_init_output: bool = True,
+        feed_forward_activation: str = "gelu",
         tie_embedding_head: bool = True,
         knowledge_nodes: int = 0,
         knowledge_route_topk: int | None = None,
@@ -141,6 +152,11 @@ class CausalHierarchicalMemoryLM(nn.Module):
             raise ValueError("eval_topk must be positive when provided.")
         if feed_forward_hidden_mult <= 0.0:
             raise ValueError("feed_forward_hidden_mult must be positive.")
+        if feed_forward_kind not in {"value", "state_val"}:
+            raise ValueError(f"Unsupported feed_forward_kind: {feed_forward_kind!r}.")
+        if feed_forward_residual_scale < 0.0:
+            raise ValueError("feed_forward_residual_scale must be non-negative.")
+        unit_norm_values = True
 
         self.vocab_size = vocab_size
         self.dim = dim
@@ -153,7 +169,20 @@ class CausalHierarchicalMemoryLM(nn.Module):
         self.checkpoint_prediction_layers = checkpoint_prediction_layers
         self.unit_norm_values = unit_norm_values
         self.feed_forward_layers = bool(feed_forward_layers)
+        self.memory_feed_forward_layers = (
+            self.feed_forward_layers
+            if memory_feed_forward_layers is None
+            else bool(memory_feed_forward_layers)
+        )
+        self.disable_memory = bool(disable_memory)
+        self.disable_memory_read = bool(disable_memory_read)
+        self.disable_memory_propagation = bool(disable_memory_propagation)
         self.feed_forward_hidden_mult = float(feed_forward_hidden_mult)
+        self.feed_forward_kind = feed_forward_kind
+        self.feed_forward_residual_scale = float(feed_forward_residual_scale)
+        self.feed_forward_zero_init_output = bool(feed_forward_zero_init_output)
+        self.feed_forward_activation = feed_forward_activation
+        self.sequence_anchor = bool(sequence_anchor)
         if knowledge_module is None and knowledge_nodes > 0:
             knowledge_module = KModule(
                 dim=dim,
@@ -189,6 +218,8 @@ class CausalHierarchicalMemoryLM(nn.Module):
             pairwise_frozen_heads=pairwise_frozen_heads,
             pairwise_anchor_heads=pairwise_anchor_heads,
             pairwise_anchor_kind=pairwise_anchor_kind,
+            pairwise_head_aggregate=pairwise_head_aggregate,
+            sequence_anchor=self.sequence_anchor,
             implementation=implementation,
             s_window=s_window,
             s_microbatch_size=s_microbatch_size,
@@ -196,6 +227,10 @@ class CausalHierarchicalMemoryLM(nn.Module):
             unit_norm_values=unit_norm_values,
             feed_forward_layers=self.feed_forward_layers,
             feed_forward_hidden_mult=self.feed_forward_hidden_mult,
+            feed_forward_kind=self.feed_forward_kind,
+            feed_forward_residual_scale=self.feed_forward_residual_scale,
+            feed_forward_zero_init_output=self.feed_forward_zero_init_output,
+            feed_forward_activation=self.feed_forward_activation,
         )
         self.b_module = BModule(
             dim=dim,
@@ -219,7 +254,8 @@ class CausalHierarchicalMemoryLM(nn.Module):
             route_anchor_kind=route_anchor_kind,
             implementation=implementation,
             unit_norm_values=unit_norm_values,
-            feed_forward_layers=self.feed_forward_layers,
+            feed_forward_layers=self.memory_feed_forward_layers,
+            memory_propagation_layers=not self.disable_memory_propagation,
             feed_forward_hidden_mult=self.feed_forward_hidden_mult,
         )
 
@@ -236,6 +272,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
                     frozen_heads=pairwise_frozen_heads,
                     anchor_heads=pairwise_anchor_heads,
                     anchor_kind=pairwise_anchor_kind,
+                    aggregate=pairwise_head_aggregate,
                 ),
                 sparse_type="window",
                 window=max(1, max_seq_len),
@@ -247,24 +284,67 @@ class CausalHierarchicalMemoryLM(nn.Module):
             )
             for _ in range(prediction_layers)
         )
-        self.prediction_ffns = nn.ModuleList(
-            (
-                ResidualFeedForward(dim, hidden_mult=self.feed_forward_hidden_mult)
-                if self.feed_forward_layers
-                else nn.Identity()
-            )
-            for _ in range(prediction_layers)
-        )
+        self.prediction_ffns = nn.ModuleList(self._make_prediction_ffn() for _ in range(prediction_layers))
         self.output_norm = nn.LayerNorm(dim)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
         if tie_embedding_head:
             self.lm_head.weight = self.s_module.token_embedding.weight
         self._reset_parameters(tie_embedding_head=tie_embedding_head)
 
+    def _make_prediction_ffn(self) -> nn.Module:
+        if not self.feed_forward_layers:
+            return nn.Identity()
+        if self.feed_forward_kind == "state_val":
+            return StateValueFeedForward(
+                self.dim,
+                hidden_mult=self.feed_forward_hidden_mult,
+                residual_scale=self.feed_forward_residual_scale,
+                zero_init_output=self.feed_forward_zero_init_output,
+                activation=self.feed_forward_activation,
+            )
+        return ResidualFeedForward(
+            self.dim,
+            hidden_mult=self.feed_forward_hidden_mult,
+            activation=self.feed_forward_activation,
+        )
+
+    def _memoryless_query_layer(self, aligned_s: Tensor) -> Layer:
+        query_state_source = self.prediction_input_norm(self.s_prediction_proj(aligned_s))
+        query_val = query_state_source
+        if self.unit_norm_values:
+            query_val = unit_normalize_values(query_val)
+        query_state = self.value_to_state(query_state_source).squeeze(-1)
+        return Layer(dim=self.dim, num_nodes=aligned_s.shape[1], state=query_state, val=query_val)
+
+    def _can_use_dense_apply_fastpath(self, layer: Layer, propagation: SparsePropagation) -> bool:
+        if propagation.sparse_type != "window":
+            return False
+        return int(propagation.window or 0) + 1 >= int(layer.num_nodes)
+
+    def _apply_dense_delta_fastpath(
+        self,
+        layer: Layer,
+        delta_state: Tensor,
+        delta_val: Tensor,
+        norm: nn.Module,
+    ) -> Layer:
+        updated_val = layer.val + delta_val
+        val = norm(updated_val)
+        if self.unit_norm_values:
+            val = unit_normalize_values(val)
+        touched = delta_val.detach().abs().amax(dim=-1) > 0
+        val = torch.where(touched.unsqueeze(-1), val, updated_val)
+        return layer.with_tensors(
+            state=signed_softmax_state(layer.state + delta_state),
+            val=val,
+        )
+
     def _reset_parameters(self, *, tie_embedding_head: bool) -> None:
         nn.init.normal_(self.s_module.token_embedding.weight, mean=0.0, std=PARAM_INIT_STD)
-        nn.init.normal_(self.s_module.anchor_val, mean=0.0, std=PARAM_INIT_STD)
-        nn.init.zeros_(self.s_module.anchor_state)
+        if self.s_module.anchor_val is not None:
+            nn.init.normal_(self.s_module.anchor_val, mean=0.0, std=PARAM_INIT_STD)
+        if self.s_module.anchor_state is not None:
+            nn.init.zeros_(self.s_module.anchor_state)
         init_linear(self.s_prediction_proj)
         self.b_module.reset_projection_parameters()
         if not tie_embedding_head:
@@ -302,13 +382,14 @@ class CausalHierarchicalMemoryLM(nn.Module):
         reset_mask: Tensor | None = None,
         return_memory_state: bool = False,
         return_layers: bool = False,
+        return_logits: bool = True,
     ) -> Tensor | MemoryScanOutput:
         if isinstance(memory_state, ModelRecurrentState):
             if knowledge_state is None:
                 knowledge_state = memory_state.knowledge_state
             memory_state = memory_state.memory_state
         sequence_layer = self.s_module.encode(input_ids, state_projection=self.value_to_state)
-        aligned_s = sequence_layer.val[:, 1:, :]
+        aligned_s = sequence_layer.val[:, 1:, :] if self.sequence_anchor else sequence_layer.val
         batch_size, _, _ = aligned_s.shape
         device = aligned_s.device
         dtype = aligned_s.dtype
@@ -323,12 +404,26 @@ class CausalHierarchicalMemoryLM(nn.Module):
             device=device,
             dtype=dtype,
         )
-        scan_output = self._scan_memory(
-            aligned_s,
-            current_memory,
-            knowledge_state=knowledge_state,
-            reset_mask=reset_mask,
-        )
+        if self.disable_memory:
+            scan_output = BScanOutput(
+                query_layer=self._memoryless_query_layer(aligned_s),
+                memory_state=tuple(current_memory),
+            )
+        else:
+            scan_output = self._scan_memory(
+                aligned_s,
+                current_memory,
+                knowledge_state=knowledge_state,
+                reset_mask=reset_mask,
+            )
+            if self.disable_memory_read:
+                scan_output = BScanOutput(
+                    query_layer=self._memoryless_query_layer(aligned_s),
+                    memory_state=tuple(scan_output.memory_state),
+                    bridge_layer=scan_output.bridge_layer,
+                    knowledge_state=scan_output.knowledge_state,
+                    knowledge_output=scan_output.knowledge_output,
+                )
         query_layer = scan_output.query_layer
         current_memory = scan_output.memory_state
         for layer_index, (propagation, norm) in enumerate(zip(self.prediction_layers, self.prediction_norms)):
@@ -357,17 +452,33 @@ class CausalHierarchicalMemoryLM(nn.Module):
                     val=next_val,
                 )
             else:
-                query_layer = apply_delta(
-                    query_layer,
-                    propagation.compute_delta(query_layer),
-                    residual=True,
-                    val_norm=norm,
-                    unit_norm_values=self.unit_norm_values,
-                )
-            ffn_val = self.prediction_ffns[layer_index](query_layer.val)
-            if self.unit_norm_values:
-                ffn_val = unit_normalize_values(ffn_val)
-            query_layer = query_layer.with_tensors(val=ffn_val)
+                delta = propagation.compute_delta(query_layer)
+                if self._can_use_dense_apply_fastpath(query_layer, propagation):
+                    query_layer = self._apply_dense_delta_fastpath(
+                        query_layer,
+                        delta.delta_state,
+                        delta.delta_val,
+                        norm,
+                    )
+                else:
+                    query_layer = apply_delta(
+                        query_layer,
+                        delta,
+                        residual=True,
+                        val_norm=norm,
+                        unit_norm_values=self.unit_norm_values,
+                    )
+            ffn = self.prediction_ffns[layer_index]
+            if isinstance(ffn, StateValueFeedForward):
+                ffn_state, ffn_val = ffn(query_layer.state, query_layer.val)
+                if self.unit_norm_values:
+                    ffn_val = unit_normalize_values(ffn_val)
+                query_layer = query_layer.with_tensors(state=ffn_state, val=ffn_val)
+            else:
+                ffn_val = ffn(query_layer.val)
+                if self.unit_norm_values:
+                    ffn_val = unit_normalize_values(ffn_val)
+                query_layer = query_layer.with_tensors(val=ffn_val)
 
         output_state_source = self.output_norm(query_layer.val)
         output_val = output_state_source
@@ -382,7 +493,10 @@ class CausalHierarchicalMemoryLM(nn.Module):
                 state=self.value_to_state(output_state_source).squeeze(-1),
                 val=output_val,
             )
-        logits = self.lm_head(output_val)
+        if return_logits:
+            logits = self.lm_head(output_val)
+        else:
+            logits = output_val.new_empty((0,))
         if not (return_memory_state or return_layers):
             return logits
         return MemoryScanOutput(
@@ -686,9 +800,13 @@ class CausalHierarchicalMemoryLM(nn.Module):
             "propagation_core_weights": tuple(spec[2] for spec in propagation_specs),
             "propagation_biases": tuple(spec[3] for spec in propagation_specs),
             "propagation_topks": tuple(
-                int(level.current_propagation_topk())
-                if level.current_memory_mode() == "topk"
-                else 0
+                -1
+                if self.disable_memory_propagation
+                else (
+                    int(level.current_propagation_topk())
+                    if level.current_memory_mode() == "topk"
+                    else 0
+                )
                 for level in self.b_module.memory_levels
             ),
             "propagation_compress_name": propagation_compress_name,

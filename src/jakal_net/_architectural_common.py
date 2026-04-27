@@ -114,7 +114,10 @@ def make_pairwise(
     frozen_heads: int = 0,
     anchor_heads: int = 0,
     anchor_kind: str = "scaled_cosine",
+    aggregate: str = "max",
 ) -> nn.Module:
+    if aggregate not in {"max", "mean", "sum", "head_mean"}:
+        raise ValueError(f"Unsupported pairwise head aggregate: {aggregate!r}.")
     if heads <= 0:
         raise ValueError("heads must be positive.")
     if frozen_heads < 0 or frozen_heads > heads:
@@ -137,7 +140,7 @@ def make_pairwise(
         if anchor_heads <= head_index < anchor_heads + frozen_heads:
             module = _freeze_module_parameters(module)
         head_modules.append(module)
-    return MultiHeadPairwise(head_modules)
+    return MultiHeadPairwise(head_modules, aggregate=aggregate)
 
 
 def _make_single_route(

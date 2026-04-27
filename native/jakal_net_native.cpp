@@ -93,6 +93,36 @@ bool experimental_cuda_scan_fastpath_enabled() {
   return false;
 }
 
+bool experimental_scalar_dense_cuda_enabled() {
+  if (const char* raw = std::getenv("JAKAL_NET_ENABLE_SCALAR_DENSE_CUDA")) {
+    return std::string(raw) == "1" || std::string(raw) == "true" ||
+           std::string(raw) == "TRUE" || std::string(raw) == "yes";
+  }
+  return false;
+}
+
+bool experimental_tf32_score_tile_cuda_enabled() {
+  if (const char* raw = std::getenv("JAKAL_NET_ENABLE_TF32_SCORE_TILE_CUDA")) {
+    return std::string(raw) == "1" || std::string(raw) == "true" ||
+           std::string(raw) == "TRUE" || std::string(raw) == "yes";
+  }
+  return false;
+}
+
+bool experimental_tf32_propagation_fused_cuda_enabled() {
+  if (const char* raw = std::getenv("JAKAL_NET_ENABLE_TF32_PROP_FUSED_CUDA")) {
+    return std::string(raw) == "1" || std::string(raw) == "true" ||
+           std::string(raw) == "TRUE" || std::string(raw) == "yes";
+  }
+  return false;
+}
+
+bool can_use_full_dense_logits(
+    const torch::Tensor& reference,
+    int64_t batch_flat,
+    int64_t left_nodes,
+    int64_t right_nodes);
+
 std::tuple<torch::Tensor, torch::Tensor> merge_topk_scores_indices(
     const torch::Tensor& best_scores,
     const torch::Tensor& best_indices,
@@ -183,6 +213,59 @@ low_rank_propagation_topk_forward_cuda_wrapper(
 }
 
 std::tuple<torch::Tensor, torch::Tensor>
+low_rank_propagation_dense_forward_cuda_wrapper(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    int64_t compress_kind) {
+#ifdef WITH_CUDA
+  return jakal_net_low_rank_propagation_dense_forward_cuda(
+      weighted_projected_source,
+      projected_target,
+      projected_state,
+      projected_val,
+      compress_kind);
+#else
+  throw std::runtime_error(
+      "low_rank_propagation_dense_forward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+torch::Tensor low_rank_dense_scores_tf32_cuda_wrapper(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_target) {
+#ifdef WITH_CUDA
+  return jakal_net_low_rank_dense_scores_tf32_cuda(
+      weighted_projected_source,
+      projected_target);
+#else
+  throw std::runtime_error(
+      "low_rank_dense_scores_tf32_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor>
+low_rank_propagation_dense_tf32_forward_cuda_wrapper(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    double score_bias) {
+#ifdef WITH_CUDA
+  return jakal_net_low_rank_propagation_dense_tf32_forward_cuda(
+      weighted_projected_source,
+      projected_target,
+      projected_state,
+      projected_val,
+      score_bias);
+#else
+  throw std::runtime_error(
+      "low_rank_propagation_dense_tf32_forward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor>
 low_rank_propagation_window_forward_cuda_wrapper(
     const torch::Tensor& weighted_projected_source,
     const torch::Tensor& projected_target,
@@ -205,6 +288,100 @@ low_rank_propagation_window_forward_cuda_wrapper(
 }
 
 std::tuple<torch::Tensor, torch::Tensor>
+low_rank_propagation_window_signed_abs_forward_cuda_wrapper(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    int64_t window,
+    double score_bias) {
+#ifdef WITH_CUDA
+  return jakal_net_low_rank_propagation_window_signed_abs_forward_cuda(
+      weighted_projected_source,
+      projected_target,
+      projected_state,
+      projected_val,
+      window,
+      score_bias);
+#else
+  throw std::runtime_error(
+      "low_rank_propagation_window_signed_abs_forward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor>
+low_rank_propagation_causal_dense_signed_abs_forward_cuda_wrapper(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    double score_bias) {
+#ifdef WITH_CUDA
+  return jakal_net_low_rank_propagation_causal_dense_signed_abs_forward_cuda(
+      weighted_projected_source,
+      projected_target,
+      projected_state,
+      projected_val,
+      score_bias);
+#else
+  throw std::runtime_error(
+      "low_rank_propagation_causal_dense_signed_abs_forward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+low_rank_propagation_causal_dense_signed_abs_backward_cuda_wrapper(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    const torch::Tensor& core_weight,
+    const torch::Tensor& grad_delta_state,
+    const torch::Tensor& grad_delta_val,
+    double score_bias) {
+#ifdef WITH_CUDA
+  return jakal_net_low_rank_propagation_causal_dense_signed_abs_backward_cuda(
+      weighted_projected_source,
+      projected_source,
+      projected_target,
+      projected_state,
+      projected_val,
+      core_weight,
+      grad_delta_state,
+      grad_delta_val,
+      score_bias);
+#else
+  throw std::runtime_error(
+      "low_rank_propagation_causal_dense_signed_abs_backward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+bilinear_propagation_causal_dense_signed_abs_backward_cuda_wrapper(
+    const torch::Tensor& projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    const torch::Tensor& grad_delta_state,
+    const torch::Tensor& grad_delta_val,
+    double score_bias) {
+#ifdef WITH_CUDA
+  return jakal_net_bilinear_propagation_causal_dense_signed_abs_backward_cuda(
+      projected_source,
+      projected_target,
+      projected_state,
+      projected_val,
+      grad_delta_state,
+      grad_delta_val,
+      score_bias);
+#else
+  throw std::runtime_error(
+      "bilinear_propagation_causal_dense_signed_abs_backward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor>
 low_rank_propagation_window_entmax15_forward_cuda_wrapper(
     const torch::Tensor& weighted_projected_source,
     const torch::Tensor& projected_target,
@@ -223,6 +400,103 @@ low_rank_propagation_window_entmax15_forward_cuda_wrapper(
 #else
   throw std::runtime_error(
       "low_rank_propagation_window_entmax15_forward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+
+std::tuple<torch::Tensor, torch::Tensor>
+low_rank_multihead_max_propagation_causal_dense_signed_abs_forward_cuda_wrapper(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    const torch::Tensor& biases,
+    bool has_bias) {
+#ifdef WITH_CUDA
+  return jakal_net_low_rank_multihead_max_propagation_causal_dense_signed_abs_forward_cuda(
+      weighted_projected_source,
+      projected_target,
+      projected_state,
+      projected_val,
+      biases,
+      has_bias);
+#else
+  throw std::runtime_error(
+      "low_rank_multihead_max_propagation_causal_dense_signed_abs_forward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cuda_wrapper(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    const torch::Tensor& core_weights,
+    const torch::Tensor& biases,
+    const torch::Tensor& grad_delta_state,
+    const torch::Tensor& grad_delta_val,
+    bool has_bias) {
+#ifdef WITH_CUDA
+  return jakal_net_low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cuda(
+      weighted_projected_source,
+      projected_source,
+      projected_target,
+      projected_state,
+      projected_val,
+      core_weights,
+      biases,
+      grad_delta_state,
+      grad_delta_val,
+      has_bias);
+#else
+  throw std::runtime_error(
+      "low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor>
+diagonal_propagation_causal_dense_signed_abs_forward_cuda_wrapper(
+    const torch::Tensor& layer_val,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    const torch::Tensor& normalized_weight,
+    const torch::Tensor& bias) {
+#ifdef WITH_CUDA
+  return jakal_net_diagonal_propagation_causal_dense_signed_abs_forward_cuda(
+      layer_val,
+      projected_state,
+      projected_val,
+      normalized_weight,
+      bias);
+#else
+  throw std::runtime_error(
+      "diagonal_propagation_causal_dense_signed_abs_forward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+diagonal_propagation_causal_dense_signed_abs_backward_cuda_wrapper(
+    const torch::Tensor& layer_val,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    const torch::Tensor& normalized_weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& grad_delta_state,
+    const torch::Tensor& grad_delta_val) {
+#ifdef WITH_CUDA
+  return jakal_net_diagonal_propagation_causal_dense_signed_abs_backward_cuda(
+      layer_val,
+      projected_state,
+      projected_val,
+      normalized_weight,
+      bias,
+      grad_delta_state,
+      grad_delta_val);
+#else
+  throw std::runtime_error(
+      "diagonal_propagation_causal_dense_signed_abs_backward_cuda requires a CUDA-enabled build.");
 #endif
 }
 
@@ -1259,6 +1533,81 @@ std::tuple<torch::Tensor, torch::Tensor> low_rank_propagation_topk_signed_abs(
   const auto nodes = layer_val.size(1);
   const auto k = topk <= 0 ? nodes : std::min<int64_t>(std::max<int64_t>(1, topk), nodes);
 
+#ifdef WITH_CUDA
+  if (layer_val.is_cuda() &&
+      layer_state.is_cuda() &&
+      !diagonal &&
+      topk <= 0 &&
+      compress_name == "signed_abs_softmax" &&
+      !c10::GradMode::is_enabled() &&
+      experimental_cuda_scan_fastpath_enabled() &&
+      experimental_scalar_dense_cuda_enabled() &&
+      jakal_net_low_rank_propagation_dense_forward_cuda_available()) {
+    torch::Tensor weighted_projected_source;
+    torch::Tensor projected_target;
+    if (multihead) {
+      auto projected_source = torch::einsum(
+          "bid,hrd->bhir",
+          std::vector<torch::Tensor>{layer_val, cast_source_weight}).contiguous();
+      std::vector<int64_t> core_shape(projected_source.dim(), 1);
+      core_shape[1] = cast_core_weight.size(0);
+      core_shape[3] = cast_core_weight.size(1);
+      weighted_projected_source =
+          (projected_source * cast_core_weight.view(core_shape)).contiguous();
+      projected_target = torch::einsum(
+          "bid,hrd->bhir",
+          std::vector<torch::Tensor>{layer_val, cast_target_weight}).contiguous();
+      if (cast_bias.has_value() && cast_bias.value().numel() != 0) {
+        auto bias_column = cast_bias.value()
+                               .to(weighted_projected_source.scalar_type())
+                               .reshape({1, cast_bias.value().numel(), 1, 1})
+                               .expand({weighted_projected_source.size(0),
+                                        weighted_projected_source.size(1),
+                                        weighted_projected_source.size(2),
+                                        1});
+        auto target_ones = torch::ones(
+            {projected_target.size(0), projected_target.size(1), projected_target.size(2), 1},
+            projected_target.options());
+        weighted_projected_source =
+            torch::cat({weighted_projected_source, bias_column}, -1).contiguous();
+        projected_target = torch::cat({projected_target, target_ones}, -1).contiguous();
+      }
+    } else {
+      projected_target =
+          torch::matmul(layer_val, cast_target_weight.transpose(0, 1)).contiguous();
+      auto projected_source =
+          torch::matmul(layer_val, cast_source_weight.transpose(0, 1)).contiguous();
+      weighted_projected_source =
+          (projected_source *
+           cast_core_weight.view({1, 1, -1}).to(projected_source.scalar_type())).contiguous();
+      if (cast_bias.has_value() && cast_bias.value().numel() != 0) {
+        auto bias_column = cast_bias.value()
+                               .to(weighted_projected_source.scalar_type())
+                               .reshape({1, 1, 1})
+                               .expand({weighted_projected_source.size(0),
+                                        weighted_projected_source.size(1),
+                                        1});
+        auto target_ones = torch::ones(
+            {projected_target.size(0), projected_target.size(1), 1},
+            projected_target.options());
+        weighted_projected_source =
+            torch::cat({weighted_projected_source, bias_column}, -1).contiguous();
+        projected_target = torch::cat({projected_target, target_ones}, -1).contiguous();
+      }
+    }
+    auto fused = low_rank_propagation_dense_forward_cuda_wrapper(
+        weighted_projected_source,
+        projected_target,
+        layer_state.to(torch::kFloat32).contiguous(),
+        layer_val.to(torch::kFloat32).contiguous(),
+        true);
+    return {
+        std::get<0>(fused).to(layer_state.scalar_type()),
+        std::get<1>(fused).to(layer_val.scalar_type()),
+    };
+  }
+#endif
+
   if (topk <= 0 &&
       (compress_name == "signed_abs_softmax" ||
        compress_name == "softmax" ||
@@ -1321,6 +1670,118 @@ std::tuple<torch::Tensor, torch::Tensor> low_rank_propagation_topk_signed_abs(
       }
       return scores;
     };
+    const bool single_effective_head =
+        !multihead || (precomputed_target.defined() && precomputed_target.dim() == 4 &&
+                       precomputed_target.size(1) == 1);
+    if (precompute_low_rank &&
+        single_effective_head &&
+        can_use_full_dense_logits(layer_val, layer_val.size(0), nodes, nodes)) {
+      auto full_target = multihead ? precomputed_target.select(1, 0).contiguous()
+                                   : precomputed_target;
+      auto full_weighted_source =
+          multihead ? precomputed_weighted_source.select(1, 0).contiguous()
+                    : precomputed_weighted_source;
+      if (experimental_tf32_propagation_fused_cuda_enabled() &&
+          compress_name == "signed_abs_softmax" &&
+          full_target.is_cuda() &&
+          full_weighted_source.is_cuda() &&
+          layer_state.is_cuda() &&
+          layer_val.is_cuda() &&
+          full_target.size(1) % 16 == 0 &&
+          full_weighted_source.size(1) % 16 == 0 &&
+          full_target.size(2) % 8 == 0 &&
+          jakal_net_low_rank_propagation_dense_tf32_forward_cuda_available()) {
+        double score_bias = 0.0;
+        if (cast_bias.has_value() && cast_bias.value().numel() != 0) {
+          auto full_bias = cast_bias.value().numel() == 1
+              ? cast_bias.value()
+              : cast_bias.value().select(0, 0);
+          score_bias = full_bias.item<double>();
+        }
+        auto fused = low_rank_propagation_dense_tf32_forward_cuda_wrapper(
+            full_weighted_source.to(torch::kFloat32).contiguous(),
+            full_target.to(torch::kFloat32).contiguous(),
+            layer_state.to(torch::kFloat32).contiguous(),
+            layer_val.to(torch::kFloat32).contiguous(),
+            score_bias);
+        return {
+            std::get<0>(fused).to(layer_state.scalar_type()),
+            std::get<1>(fused).to(layer_val.scalar_type()),
+        };
+      }
+      if (experimental_tf32_score_tile_cuda_enabled() &&
+          full_target.is_cuda() &&
+          full_weighted_source.is_cuda() &&
+          full_target.size(1) % 16 == 0 &&
+          full_weighted_source.size(1) % 16 == 0 &&
+          full_target.size(2) % 8 == 0 &&
+          jakal_net_low_rank_dense_scores_tf32_cuda_available()) {
+        auto scores = low_rank_dense_scores_tf32_cuda_wrapper(
+            full_weighted_source.to(torch::kFloat32).contiguous(),
+            full_target.to(torch::kFloat32).contiguous());
+        if (cast_bias.has_value() && cast_bias.value().numel() != 0) {
+          auto full_bias = cast_bias.value().numel() == 1
+              ? cast_bias.value()
+              : cast_bias.value().select(0, 0);
+          scores = scores + full_bias.to(scores.scalar_type());
+        }
+        torch::Tensor edges;
+        if (compress_name == "softsign") {
+          edges = compress_scores(compress_name, scores);
+        } else {
+          auto clean_scores = torch::nan_to_num(scores).to(torch::kFloat32);
+          auto stats = compress_name == "signed_abs_softmax" ? clean_scores.abs() : clean_scores;
+          edges = torch::softmax(stats, -1);
+          if (compress_name == "signed_abs_softmax") {
+            edges = edges * torch::sign(clean_scores);
+          }
+        }
+        const auto state_acc_dtype = dense_scan_accumulator_dtype(layer_state.scalar_type());
+        const auto val_acc_dtype = dense_scan_accumulator_dtype(layer_val.scalar_type());
+        auto delta_state = torch::bmm(
+            edges.to(state_acc_dtype),
+            layer_state.to(state_acc_dtype).unsqueeze(-1)).squeeze(-1);
+        auto delta_val = torch::bmm(
+            edges.to(val_acc_dtype),
+            layer_val.to(val_acc_dtype));
+        return {
+            delta_state.to(layer_state.scalar_type()),
+            delta_val.to(layer_val.scalar_type()),
+        };
+      }
+      auto scores = torch::bmm(
+          full_target,
+          full_weighted_source.transpose(1, 2));
+      if (cast_bias.has_value() && cast_bias.value().numel() != 0) {
+        auto full_bias = cast_bias.value().numel() == 1
+            ? cast_bias.value()
+            : cast_bias.value().select(0, 0);
+        scores = scores + full_bias.to(scores.scalar_type());
+      }
+      torch::Tensor edges;
+      if (compress_name == "softsign") {
+        edges = compress_scores(compress_name, scores);
+      } else {
+        auto clean_scores = torch::nan_to_num(scores).to(torch::kFloat32);
+        auto stats = compress_name == "signed_abs_softmax" ? clean_scores.abs() : clean_scores;
+        edges = torch::softmax(stats, -1);
+        if (compress_name == "signed_abs_softmax") {
+          edges = edges * torch::sign(clean_scores);
+        }
+      }
+      const auto state_acc_dtype = dense_scan_accumulator_dtype(layer_state.scalar_type());
+      const auto val_acc_dtype = dense_scan_accumulator_dtype(layer_val.scalar_type());
+      auto delta_state = torch::bmm(
+          edges.to(state_acc_dtype),
+          layer_state.to(state_acc_dtype).unsqueeze(-1)).squeeze(-1);
+      auto delta_val = torch::bmm(
+          edges.to(val_acc_dtype),
+          layer_val.to(val_acc_dtype));
+      return {
+          delta_state.to(layer_state.scalar_type()),
+          delta_val.to(layer_val.scalar_type()),
+      };
+    }
     const auto state_acc_dtype = dense_scan_accumulator_dtype(layer_state.scalar_type());
     const auto val_acc_dtype = dense_scan_accumulator_dtype(layer_val.scalar_type());
     auto delta_state = torch::zeros(
@@ -3164,7 +3625,18 @@ std::vector<std::string> supported_ops() {
             "query_topk_reduce_backward_cuda",
             "low_rank_pairwise_topk_forward_cuda",
             "low_rank_propagation_topk_forward_cuda",
+            "low_rank_propagation_dense_forward_cuda",
+            "low_rank_dense_scores_tf32_cuda",
+            "low_rank_propagation_dense_tf32_forward_cuda",
             "low_rank_propagation_window_forward_cuda",
+            "low_rank_propagation_window_signed_abs_forward_cuda",
+            "low_rank_propagation_causal_dense_signed_abs_forward_cuda",
+            "low_rank_propagation_causal_dense_signed_abs_backward_cuda",
+            "bilinear_propagation_causal_dense_signed_abs_backward_cuda",
+            "low_rank_multihead_max_propagation_causal_dense_signed_abs_forward_cuda",
+            "low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cuda",
+            "diagonal_propagation_causal_dense_signed_abs_forward_cuda",
+            "diagonal_propagation_causal_dense_signed_abs_backward_cuda",
             "low_rank_propagation_window_entmax15_forward_cuda",
             "softsign_backward_cuda",
             "softmax_backward_cuda",
@@ -4663,9 +5135,53 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       &low_rank_propagation_topk_forward_cuda_wrapper,
       "CUDA fused low-rank propagation top-k forward");
   m.def(
+      "low_rank_propagation_dense_forward_cuda",
+      &low_rank_propagation_dense_forward_cuda_wrapper,
+      "CUDA fused low-rank propagation dense forward");
+  m.def(
+      "low_rank_dense_scores_tf32_cuda",
+      &low_rank_dense_scores_tf32_cuda_wrapper,
+      "CUDA TF32 WMMA low-rank dense score tile forward");
+  m.def(
+      "low_rank_propagation_dense_tf32_forward_cuda",
+      &low_rank_propagation_dense_tf32_forward_cuda_wrapper,
+      "CUDA TF32 WMMA fused low-rank dense propagation forward");
+  m.def(
       "low_rank_propagation_window_forward_cuda",
       &low_rank_propagation_window_forward_cuda_wrapper,
       "CUDA fused low-rank propagation window forward");
+  m.def(
+      "low_rank_propagation_window_signed_abs_forward_cuda",
+      &low_rank_propagation_window_signed_abs_forward_cuda_wrapper,
+      "CUDA fused low-rank propagation window forward with signed_abs_softmax");
+  m.def(
+      "low_rank_propagation_causal_dense_signed_abs_forward_cuda",
+      &low_rank_propagation_causal_dense_signed_abs_forward_cuda_wrapper,
+      "CUDA fused low-rank propagation causal dense forward with signed_abs_softmax");
+  m.def(
+      "low_rank_propagation_causal_dense_signed_abs_backward_cuda",
+      &low_rank_propagation_causal_dense_signed_abs_backward_cuda_wrapper,
+      "CUDA fused low-rank propagation causal dense backward with signed_abs_softmax");
+  m.def(
+      "bilinear_propagation_causal_dense_signed_abs_backward_cuda",
+      &bilinear_propagation_causal_dense_signed_abs_backward_cuda_wrapper,
+      "CUDA fused bilinear propagation causal dense backward with signed_abs_softmax");
+  m.def(
+      "low_rank_multihead_max_propagation_causal_dense_signed_abs_forward_cuda",
+      &low_rank_multihead_max_propagation_causal_dense_signed_abs_forward_cuda_wrapper,
+      "CUDA fused multi-head max low-rank propagation causal dense forward with signed_abs_softmax");
+  m.def(
+      "low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cuda",
+      &low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cuda_wrapper,
+      "CUDA fused multi-head max low-rank propagation causal dense backward with signed_abs_softmax");
+  m.def(
+      "diagonal_propagation_causal_dense_signed_abs_forward_cuda",
+      &diagonal_propagation_causal_dense_signed_abs_forward_cuda_wrapper,
+      "CUDA fused diagonal propagation causal dense forward with signed_abs_softmax");
+  m.def(
+      "diagonal_propagation_causal_dense_signed_abs_backward_cuda",
+      &diagonal_propagation_causal_dense_signed_abs_backward_cuda_wrapper,
+      "CUDA fused diagonal propagation causal dense backward with signed_abs_softmax");
   m.def(
       "low_rank_propagation_window_entmax15_forward_cuda",
       &low_rank_propagation_window_entmax15_forward_cuda_wrapper,

@@ -59,6 +59,7 @@ class _MemoryLevel(nn.Module):
         disable_val_norm: bool = False,
     ) -> None:
         super().__init__()
+        unit_norm_values = True
         self.dim = dim
         self.num_slots = num_slots
         self.unit_norm_values = unit_norm_values
@@ -181,9 +182,11 @@ class BModule(nn.Module):
         implementation: str,
         unit_norm_values: bool = False,
         feed_forward_layers: bool = True,
+        memory_propagation_layers: bool = True,
         feed_forward_hidden_mult: float = 2.0,
     ) -> None:
         super().__init__()
+        unit_norm_values = True
         if dim <= 0:
             raise ValueError("dim must be positive.")
         if not memory_slots:
@@ -208,6 +211,7 @@ class BModule(nn.Module):
         self.unit_norm_values = unit_norm_values
         self.implementation = implementation
         self.feed_forward_layers = bool(feed_forward_layers)
+        self.memory_propagation_layers = bool(memory_propagation_layers)
         self.feed_forward_hidden_mult = float(feed_forward_hidden_mult)
 
         self.memory_levels = nn.ModuleList(
@@ -417,14 +421,15 @@ class BModule(nn.Module):
             unit_norm_values=self.unit_norm_values,
         )
         level = self._apply_level_ffn(0, level)
-        level = apply_delta(
-            level,
-            first_level_module.compute_propagation_delta(level),
-            residual=True,
-            val_norm=first_level_module.val_norm,
-            unit_norm_values=self.unit_norm_values,
-        )
-        level = self._apply_level_ffn(0, level)
+        if self.memory_propagation_layers:
+            level = apply_delta(
+                level,
+                first_level_module.compute_propagation_delta(level),
+                residual=True,
+                val_norm=first_level_module.val_norm,
+                unit_norm_values=self.unit_norm_values,
+            )
+            level = self._apply_level_ffn(0, level)
         next_levels.append(level)
 
         for level_index in range(1, self.num_memory_levels):
@@ -480,14 +485,15 @@ class BModule(nn.Module):
                     unit_norm_values=self.unit_norm_values,
                 )
                 level = self._apply_level_ffn(level_index, level)
-            level = apply_delta(
-                level,
-                level_module.compute_propagation_delta(level),
-                residual=True,
-                val_norm=level_module.val_norm,
-                unit_norm_values=self.unit_norm_values,
-            )
-            level = self._apply_level_ffn(level_index, level)
+            if self.memory_propagation_layers:
+                level = apply_delta(
+                    level,
+                    level_module.compute_propagation_delta(level),
+                    residual=True,
+                    val_norm=level_module.val_norm,
+                    unit_norm_values=self.unit_norm_values,
+                )
+                level = self._apply_level_ffn(level_index, level)
             next_levels.append(level)
         return tuple(next_levels)
 
