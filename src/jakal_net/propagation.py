@@ -58,7 +58,7 @@ def _edge_compress_name(edge_compress_fn: Callable[[Tensor], Tensor]) -> str | N
     name = getattr(edge_compress_fn, "__name__", "")
     if edge_compress_fn is F.softsign or name == "softsign":
         return "softsign"
-    if name in {"signed_abs_softmax", "_signed_abs_softmax_edges"}:
+    if name in {"signed_abs_softmax", "signed_abs_softmax_edges", "_signed_abs_softmax_edges"}:
         return "signed_abs_softmax"
     if name in {"signed_entmax15", "_signed_entmax15_edges"}:
         return "signed_entmax15"
@@ -300,7 +300,7 @@ class Propagation(nn.Module):
     def compute_delta(self, layer: Layer) -> LayerDelta:
         if self.implementation == "native" and _cuda_graph_capture_active(layer.val.device.type):
             return self._compute_delta_reference(layer)
-        if self._supports_multihead_vectorized_fast_path():
+        if self._supports_multihead_vectorized_fast_path() and self.implementation != "native":
             return self._compute_delta_reference(layer)
         if self.implementation == "native":
             edge_compress_name = _native_edge_compress_name(self.edge_compress_fn)
@@ -675,7 +675,7 @@ class SparsePropagation(Propagation):
     def compute_delta(self, layer: Layer) -> LayerDelta:
         if self.implementation == "native" and _cuda_graph_capture_active(layer.val.device.type):
             return self._compute_delta_reference(layer)
-        if self._supports_multihead_vectorized_fast_path():
+        if self._supports_multihead_vectorized_fast_path() and self.implementation != "native":
             return self._compute_delta_reference(layer)
         if self.implementation == "native":
             edge_compress_name = _native_edge_compress_name(self.edge_compress_fn)
@@ -683,7 +683,7 @@ class SparsePropagation(Propagation):
             if (
                 not self.state_weight_edges
                 and edge_compress_name is not None
-                and supports_pairwise_kernel(self.pairwise_fn)
+                and (supports_pairwise_kernel(self.pairwise_fn) or isinstance(self.pairwise_fn, MultiHeadPairwise))
                 and native_supports_device(layer.val.device.type)
             ):
                 projected_state, projected_val = self._project_inputs(layer, directional_val=directional_layer_val)

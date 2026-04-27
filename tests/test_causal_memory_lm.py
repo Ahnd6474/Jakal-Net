@@ -59,6 +59,53 @@ class CausalMemoryLMTests(unittest.TestCase):
         self.assertEqual(output.sequence_layer.val.shape, (2, 6, 8))
         self.assertEqual(output.query_layer.val.shape, (2, 5, 8))
 
+    def test_can_disable_only_memory_feed_forward_layers(self) -> None:
+        model = CausalHierarchicalMemoryLM(
+            vocab_size=32,
+            dim=8,
+            max_seq_len=12,
+            s_layers=1,
+            memory_slots=(6, 4),
+            prediction_layers=1,
+            memory_topk=2,
+            pairwise_rank=4,
+            route_rank=4,
+            memory_feed_forward_layers=False,
+        )
+
+        self.assertTrue(model.feed_forward_layers)
+        self.assertTrue(model.s_module.feed_forward_layers)
+        self.assertFalse(model.b_module.feed_forward_layers)
+        self.assertTrue(model._native_scan_supported_config())
+
+    def test_memory_ablation_flags_forward(self) -> None:
+        token_ids = torch.randint(0, 32, (2, 5))
+        for kwargs in (
+            {"disable_memory": True},
+            {"disable_memory_read": True},
+            {"disable_memory_propagation": True},
+        ):
+            model = CausalHierarchicalMemoryLM(
+                vocab_size=32,
+                dim=8,
+                max_seq_len=12,
+                s_layers=1,
+                memory_slots=(6, 4),
+                prediction_layers=1,
+                memory_topk=2,
+                pairwise_rank=4,
+                route_rank=4,
+                **kwargs,
+            )
+
+            output = model(token_ids, return_memory_state=True)
+
+            self.assertIsInstance(output, MemoryScanOutput)
+            self.assertEqual(output.logits.shape, (2, 5, 32))
+            self.assertEqual(len(output.memory_state), 2)
+            if kwargs.get("disable_memory_propagation"):
+                self.assertFalse(model.b_module.memory_propagation_layers)
+
     def test_reset_mask_preserves_fresh_path_for_selected_items(self) -> None:
         torch.manual_seed(8)
         model = CausalHierarchicalMemoryLM(

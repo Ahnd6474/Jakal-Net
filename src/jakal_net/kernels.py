@@ -247,7 +247,7 @@ def _compress_edges(
     mask: Tensor | None = None,
 ) -> Tensor:
     edge_name = _edge_compress_name(edge_compress_fn)
-    if edge_name in {"signed_abs_softmax", "_signed_abs_softmax_edges"}:
+    if edge_name in {"signed_abs_softmax", "signed_abs_softmax_edges", "_signed_abs_softmax_edges"}:
         clean_scores = torch.nan_to_num(scores)
         signs = torch.sign(clean_scores)
         magnitudes = clean_scores.abs()
@@ -336,7 +336,7 @@ def propagation_dense_kernel(
             tensor_dtype=projected_val.dtype,
             accumulator_dtype=accumulator_dtype,
         )
-        if _edge_compress_name(edge_compress_fn) in {"signed_abs_softmax", "_signed_abs_softmax_edges"}:
+        if _edge_compress_name(edge_compress_fn) in {"signed_abs_softmax", "signed_abs_softmax_edges", "_signed_abs_softmax_edges"}:
             source_blocks = ((0, num_nodes),)
         else:
             source_blocks = iter_blocks(num_nodes, source_block_size, name="source_block_size")
@@ -445,7 +445,7 @@ def propagation_window_kernel(
         )
 
         source_width = source_ceiling - source_floor
-        if _edge_compress_name(edge_compress_fn) in {"signed_abs_softmax", "_signed_abs_softmax_edges"}:
+        if _edge_compress_name(edge_compress_fn) in {"signed_abs_softmax", "signed_abs_softmax_edges", "_signed_abs_softmax_edges"}:
             source_blocks = ((0, source_width),)
         else:
             source_blocks = iter_blocks(
