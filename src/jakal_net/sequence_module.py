@@ -9,7 +9,7 @@ from jakal_net._architectural_common import (
     make_pairwise,
     signed_abs_softmax_edges,
     signed_softmax_state,
-    unit_normalize_values,
+    softsign_state,
 )
 from jakal_net.core import Layer
 from jakal_net.modules import LearnedPositionEncoding, ResidualFeedForward, StateValueFeedForward
@@ -61,8 +61,6 @@ class SModule(nn.Module):
             raise ValueError(f"Unsupported feed_forward_kind: {feed_forward_kind!r}.")
         if feed_forward_residual_scale < 0.0:
             raise ValueError("feed_forward_residual_scale must be non-negative.")
-        unit_norm_values = True
-
         self.vocab_size = vocab_size
         self.dim = dim
         self.max_seq_len = max_seq_len
@@ -93,6 +91,9 @@ class SModule(nn.Module):
         else:
             self.sequence_input_norm = nn.LayerNorm(dim)
             self.sequence_norms = nn.ModuleList(nn.LayerNorm(dim) for _ in range(s_layers))
+        sequence_window = max_seq_len if s_window is None else max(1, s_window)
+        sequence_nodes = max_seq_len + (1 if self.sequence_anchor else 0)
+        full_window_block_size = sequence_nodes if sequence_window + 1 >= sequence_nodes else None
         self.sequence_layers = nn.ModuleList(
             SparsePropagation(
                 pairwise_fn=make_pairwise(
@@ -106,11 +107,13 @@ class SModule(nn.Module):
                     aggregate=pairwise_head_aggregate,
                 ),
                 sparse_type="window",
-                window=max_seq_len if s_window is None else max(1, s_window),
+                window=sequence_window,
                 edge_compress_fn=signed_abs_softmax_edges,
-                state_weight_edges=False,
+                state_weight_edges=True,
                 implementation=implementation,
                 residual=True,
+                target_block_size=full_window_block_size,
+                source_block_size=full_window_block_size,
                 use_direction_only=unit_norm_values,
             )
             for _ in range(s_layers)
@@ -148,12 +151,12 @@ class SModule(nn.Module):
     ) -> Layer:
         updated_val = layer.val + delta_val
         val = norm(updated_val)
-        if self.unit_norm_values:
-            val = unit_normalize_values(val)
         touched = delta_val.detach().abs().amax(dim=-1) > 0
         val = torch.where(touched.unsqueeze(-1), val, updated_val)
         return layer.with_tensors(
-            state=signed_softmax_state(layer.state + delta_state),
+            state=softsign_state(layer.state + delta_state)
+            if self.unit_norm_values
+            else signed_softmax_state(layer.state + delta_state),
             val=val,
         )
 
@@ -161,11 +164,9 @@ class SModule(nn.Module):
         if isinstance(ffn, StateValueFeedForward):
             state, val = ffn(layer.state, layer.val)
             if self.unit_norm_values:
-                val = unit_normalize_values(val)
+                state = softsign_state(state)
             return layer.with_tensors(state=state, val=val)
         val = ffn(layer.val)
-        if self.unit_norm_values:
-            val = unit_normalize_values(val)
         return layer.with_tensors(val=val)
 
     def encode(
@@ -197,12 +198,13 @@ class SModule(nn.Module):
         state_projection: nn.Module,
     ) -> Layer:
         token_state_source = token_val
+        token_state = state_projection(token_state_source).squeeze(-1)
         if self.unit_norm_values:
-            token_val = unit_normalize_values(token_val)
+            token_state = softsign_state(token_state)
         return Layer(
             dim=self.dim,
             num_nodes=token_val.shape[-2],
-            state=state_projection(token_state_source).squeeze(-1),
+            state=token_state,
             val=token_val,
         )
 
@@ -229,10 +231,10 @@ class SModule(nn.Module):
         ).unsqueeze(0)
         token_val = self.sequence_input_norm(token_val)
         token_state_source = token_val
-        if self.unit_norm_values:
-            token_val = unit_normalize_values(token_val)
 
         token_state = state_projection(token_state_source).squeeze(-1)
+        if self.unit_norm_values:
+            token_state = softsign_state(token_state)
         if self.sequence_anchor:
             if self.anchor_val is None or self.anchor_state is None:
                 raise RuntimeError("sequence_anchor is enabled but anchor parameters are missing.")
@@ -240,12 +242,12 @@ class SModule(nn.Module):
                 device=token_val.device,
                 dtype=token_val.dtype,
             )
-            if self.unit_norm_values:
-                anchor_val = unit_normalize_values(anchor_val)
             anchor_state = self.anchor_state.expand(batch_size, 1).to(
                 device=token_val.device,
                 dtype=token_val.dtype,
             )
+            if self.unit_norm_values:
+                anchor_state = softsign_state(anchor_state)
             seq_val = torch.cat((anchor_val, token_val), dim=1)
             seq_state = torch.cat((anchor_state, token_state), dim=1)
         else:

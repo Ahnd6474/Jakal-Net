@@ -117,6 +117,23 @@ bool experimental_tf32_propagation_fused_cuda_enabled() {
   return false;
 }
 
+torch::Tensor normalized_low_rank_core(const torch::Tensor& core) {
+  auto denom = torch::linalg_vector_norm(core, 2, {-1}, true).clamp_min(1e-6);
+  return core / denom;
+}
+
+int64_t multihead_smoothmax_bmm_tile_size() {
+  constexpr int64_t kDefaultTileSize = 64;
+  if (const char* raw = std::getenv("JAKAL_NET_MULTIHEAD_SMOOTHMAX_BMM_TILE_SIZE")) {
+    char* end = nullptr;
+    const long parsed = std::strtol(raw, &end, 10);
+    if (end != raw && parsed > 0) {
+      return static_cast<int64_t>(parsed);
+    }
+  }
+  return kDefaultTileSize;
+}
+
 bool can_use_full_dense_logits(
     const torch::Tensor& reference,
     int64_t batch_flat,
@@ -411,7 +428,8 @@ low_rank_multihead_max_propagation_causal_dense_signed_abs_forward_cuda_wrapper(
     const torch::Tensor& projected_state,
     const torch::Tensor& projected_val,
     const torch::Tensor& biases,
-    bool has_bias) {
+    bool has_bias,
+    const std::string& aggregate) {
 #ifdef WITH_CUDA
   return jakal_net_low_rank_multihead_max_propagation_causal_dense_signed_abs_forward_cuda(
       weighted_projected_source,
@@ -419,11 +437,254 @@ low_rank_multihead_max_propagation_causal_dense_signed_abs_forward_cuda_wrapper(
       projected_state,
       projected_val,
       biases,
-      has_bias);
+      has_bias,
+      aggregate);
 #else
   throw std::runtime_error(
       "low_rank_multihead_max_propagation_causal_dense_signed_abs_forward_cuda requires a CUDA-enabled build.");
 #endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_forward_bmm_cuda_wrapper(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    const torch::Tensor& biases,
+    bool has_bias,
+    const std::string& aggregate) {
+  if (!weighted_projected_source.is_cuda() || !projected_target.is_cuda() ||
+      !projected_state.is_cuda() || !projected_val.is_cuda()) {
+    throw std::runtime_error("smoothmax bmm forward requires CUDA tensors.");
+  }
+  if (weighted_projected_source.dim() != 4 || projected_target.dim() != 4 ||
+      projected_state.dim() != 2 || projected_val.dim() != 3) {
+    throw std::runtime_error("smoothmax bmm forward received invalid ranks.");
+  }
+  if (weighted_projected_source.sizes() != projected_target.sizes()) {
+    throw std::runtime_error("smoothmax projected tensors must share [heads,batch,nodes,rank].");
+  }
+  if (has_bias && (!biases.is_cuda() || biases.dim() != 1 ||
+                   biases.size(0) != weighted_projected_source.size(0))) {
+    throw std::runtime_error("smoothmax biases must be a CUDA tensor shaped [heads].");
+  }
+
+  const auto heads = weighted_projected_source.size(0);
+  const auto batch_flat = weighted_projected_source.size(1);
+  const auto nodes = weighted_projected_source.size(2);
+  const auto rank_dim = weighted_projected_source.size(3);
+  const auto out_dim = projected_val.size(2);
+  if (projected_state.size(0) != batch_flat || projected_state.size(1) != nodes ||
+      projected_val.size(0) != batch_flat || projected_val.size(1) != nodes) {
+    throw std::runtime_error("smoothmax bmm forward input shapes are incompatible.");
+  }
+  const bool signed_smoothmax = aggregate == "signed_smoothmax";
+  if (aggregate != "smoothmax" && !signed_smoothmax) {
+    throw std::runtime_error("smoothmax bmm forward supports smoothmax and signed_smoothmax aggregates.");
+  }
+
+  const auto score_dtype = projected_target.scalar_type();
+  auto target_flat_cast =
+      projected_target.reshape({heads * batch_flat, nodes, rank_dim}).to(score_dtype);
+  const bool use_tf32_score_tile =
+      experimental_tf32_score_tile_cuda_enabled() &&
+      weighted_projected_source.is_cuda() &&
+      nodes % 16 == 0 &&
+      rank_dim % 8 == 0;
+  auto target_flat_tf32 = use_tf32_score_tile
+      ? projected_target.reshape({heads * batch_flat, nodes, rank_dim}).to(torch::kFloat32).contiguous()
+      : torch::Tensor();
+  auto mask = torch::ones(
+      {nodes, nodes},
+      torch::TensorOptions().dtype(torch::kBool).device(projected_target.device())).tril();
+  const auto bias_f32 =
+      has_bias ? biases.to(torch::kFloat32).reshape({heads, 1, 1, 1}) : torch::Tensor();
+  const auto score_neg_inf = -std::numeric_limits<float>::infinity();
+  const auto tile_size = std::max<int64_t>(1, multihead_smoothmax_bmm_tile_size());
+  const auto log_heads = std::log(static_cast<double>(heads));
+  auto row_max = torch::full(
+      {batch_flat, nodes},
+      score_neg_inf,
+      projected_state.options().dtype(torch::kFloat32));
+  auto row_denom = torch::zeros(
+      {batch_flat, nodes},
+      projected_state.options().dtype(torch::kFloat32));
+  auto state_f32 = projected_state.to(torch::kFloat32);
+  auto val_f32 = projected_val.to(torch::kFloat32);
+  auto numer_state = torch::zeros_like(projected_state, projected_state.options().dtype(torch::kFloat32));
+  auto numer_val = torch::zeros_like(projected_val, projected_val.options().dtype(torch::kFloat32));
+  for (int64_t source_start = 0; source_start < nodes; source_start += tile_size) {
+    const auto source_width = std::min<int64_t>(tile_size, nodes - source_start);
+    auto weighted_source_tile = weighted_projected_source.narrow(2, source_start, source_width);
+    auto weighted_source_tile_flat =
+        weighted_source_tile.reshape({heads * batch_flat, source_width, rank_dim});
+    auto score_tile = torch::Tensor();
+    if (use_tf32_score_tile && source_width % 16 == 0) {
+      score_tile = low_rank_dense_scores_tf32_cuda_wrapper(
+                       weighted_source_tile_flat.to(torch::kFloat32).contiguous(),
+                       target_flat_tf32)
+                       .reshape({heads, batch_flat, nodes, source_width});
+    } else {
+      score_tile = torch::bmm(target_flat_cast, weighted_source_tile_flat.transpose(1, 2))
+                       .reshape({heads, batch_flat, nodes, source_width})
+                       .to(torch::kFloat32);
+    }
+    if (has_bias) {
+      score_tile = score_tile + bias_f32;
+    }
+    auto valid_tile = mask.narrow(1, source_start, source_width).view({1, 1, nodes, source_width});
+    auto invalid_tile = valid_tile.logical_not();
+    auto combined_invalid_tile = valid_tile.view({1, nodes, source_width}).logical_not();
+    auto combined_tile = torch::Tensor();
+    if (signed_smoothmax) {
+      auto zeroed_score_tile = score_tile.masked_fill(invalid_tile, 0.0);
+      auto abs_score_tile = score_tile.abs().masked_fill(invalid_tile, score_neg_inf);
+      auto head_probs = torch::softmax(abs_score_tile, 0).masked_fill(invalid_tile, 0.0);
+      combined_tile = (zeroed_score_tile * head_probs).sum(0);
+    } else {
+      auto masked_score_tile = score_tile.masked_fill(invalid_tile, score_neg_inf);
+      combined_tile = torch::logsumexp(masked_score_tile, {0}) - log_heads;
+    }
+    auto tile_stats = combined_tile.abs().masked_fill(combined_invalid_tile, score_neg_inf);
+    auto tile_signs = torch::sign(combined_tile).masked_fill(combined_invalid_tile, 0.0);
+    auto tile_row_max = std::get<0>(tile_stats.max(-1, false));
+    auto new_row_max = torch::maximum(row_max, tile_row_max);
+    auto prev_scale = torch::exp(row_max - new_row_max);
+    auto tile_exp =
+        torch::exp(tile_stats - new_row_max.unsqueeze(-1)).masked_fill(combined_invalid_tile, 0.0);
+    row_denom = row_denom * prev_scale + tile_exp.sum(-1);
+    numer_state = numer_state * prev_scale +
+        torch::bmm(tile_signs * tile_exp, state_f32.narrow(1, source_start, source_width).unsqueeze(-1))
+            .squeeze(-1);
+    numer_val = numer_val * prev_scale.unsqueeze(-1) +
+        torch::bmm(tile_signs * tile_exp, val_f32.narrow(1, source_start, source_width));
+    row_max = new_row_max;
+  }
+  auto denom = row_denom.clamp_min(1.0e-20);
+  auto delta_state = numer_state / denom;
+  auto delta_val = numer_val / denom.unsqueeze(-1);
+
+  return {delta_state, delta_val, row_max, row_denom};
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+diagonal_multihead_smoothmax_propagation_causal_dense_signed_abs_forward_bmm_cuda_wrapper(
+    const torch::Tensor& layer_val,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    const torch::Tensor& weights,
+    const torch::Tensor& biases,
+    bool has_bias,
+    const std::string& aggregate) {
+  if (!layer_val.is_cuda() || !projected_state.is_cuda() || !projected_val.is_cuda() || !weights.is_cuda()) {
+    throw std::runtime_error("diagonal smoothmax bmm forward requires CUDA tensors.");
+  }
+  if (layer_val.dim() != 3 || projected_state.dim() != 2 || projected_val.dim() != 3 || weights.dim() != 2) {
+    throw std::runtime_error("diagonal smoothmax bmm forward received invalid ranks.");
+  }
+  if (projected_state.size(0) != layer_val.size(0) || projected_state.size(1) != layer_val.size(1) ||
+      projected_val.size(0) != layer_val.size(0) || projected_val.size(1) != layer_val.size(1) ||
+      projected_val.size(2) != layer_val.size(2)) {
+    throw std::runtime_error("diagonal smoothmax bmm forward input shapes are incompatible.");
+  }
+  if (has_bias && (!biases.is_cuda() || biases.dim() != 1 || biases.size(0) != weights.size(0))) {
+    throw std::runtime_error("diagonal smoothmax biases must be a CUDA tensor shaped [heads].");
+  }
+
+  const auto batch_flat = layer_val.size(0);
+  const auto nodes = layer_val.size(1);
+  const auto dim = layer_val.size(2);
+  const auto heads = weights.size(0);
+  if (weights.size(1) != dim) {
+    throw std::runtime_error("diagonal smoothmax weights must have shape [heads, dim].");
+  }
+  const bool signed_smoothmax = aggregate == "signed_smoothmax";
+  if (aggregate != "smoothmax" && !signed_smoothmax) {
+    throw std::runtime_error("diagonal smoothmax bmm forward supports smoothmax and signed_smoothmax aggregates.");
+  }
+
+  const auto score_dtype = layer_val.scalar_type();
+  auto query = (layer_val.unsqueeze(1) * weights.to(score_dtype).view({1, heads, 1, dim}))
+                   .reshape({batch_flat * heads, nodes, dim});
+  const bool use_tf32_score_tile =
+      experimental_tf32_score_tile_cuda_enabled() &&
+      layer_val.is_cuda() &&
+      nodes % 16 == 0 &&
+      dim % 8 == 0;
+  auto query_tf32 = use_tf32_score_tile ? query.to(torch::kFloat32).contiguous() : torch::Tensor();
+  auto mask = torch::ones(
+      {nodes, nodes},
+      torch::TensorOptions().dtype(torch::kBool).device(layer_val.device())).tril();
+  const auto bias_f32 =
+      has_bias ? biases.to(torch::kFloat32).reshape({1, heads, 1, 1}) : torch::Tensor();
+  const auto score_neg_inf = -std::numeric_limits<float>::infinity();
+  const auto tile_size = std::max<int64_t>(1, multihead_smoothmax_bmm_tile_size());
+  const auto log_heads = std::log(static_cast<double>(heads));
+  auto row_max = torch::full(
+      {batch_flat, nodes},
+      score_neg_inf,
+      projected_state.options().dtype(torch::kFloat32));
+  auto row_denom = torch::zeros(
+      {batch_flat, nodes},
+      projected_state.options().dtype(torch::kFloat32));
+  auto state_f32 = projected_state.to(torch::kFloat32);
+  auto val_f32 = projected_val.to(torch::kFloat32);
+  auto numer_state = torch::zeros_like(projected_state, projected_state.options().dtype(torch::kFloat32));
+  auto numer_val = torch::zeros_like(projected_val, projected_val.options().dtype(torch::kFloat32));
+
+  for (int64_t source_start = 0; source_start < nodes; source_start += tile_size) {
+    const auto source_width = std::min<int64_t>(tile_size, nodes - source_start);
+    auto source_tile = layer_val.narrow(1, source_start, source_width)
+                           .unsqueeze(1)
+                           .expand({batch_flat, heads, source_width, dim})
+                           .reshape({batch_flat * heads, source_width, dim});
+    auto score_tile = torch::Tensor();
+    if (use_tf32_score_tile && source_width % 16 == 0) {
+      score_tile = low_rank_dense_scores_tf32_cuda_wrapper(
+                       source_tile.to(torch::kFloat32).contiguous(),
+                       query_tf32)
+                       .reshape({batch_flat, heads, nodes, source_width});
+    } else {
+      score_tile = torch::bmm(query, source_tile.transpose(1, 2))
+                       .reshape({batch_flat, heads, nodes, source_width})
+                       .to(torch::kFloat32);
+    }
+    if (has_bias) {
+      score_tile = score_tile + bias_f32;
+    }
+    auto valid_tile = mask.narrow(1, source_start, source_width).view({1, 1, nodes, source_width});
+    auto invalid_tile = valid_tile.logical_not();
+    auto combined_invalid_tile = valid_tile.squeeze(1).logical_not();
+    auto combined_tile = torch::Tensor();
+    if (signed_smoothmax) {
+      auto zeroed_score_tile = score_tile.masked_fill(invalid_tile, 0.0);
+      auto abs_score_tile = score_tile.abs().masked_fill(invalid_tile, score_neg_inf);
+      auto head_probs = torch::softmax(abs_score_tile, 1).masked_fill(invalid_tile, 0.0);
+      combined_tile = (zeroed_score_tile * head_probs).sum(1);
+    } else {
+      auto masked_score_tile = score_tile.masked_fill(invalid_tile, score_neg_inf);
+      combined_tile = torch::logsumexp(masked_score_tile, 1) - log_heads;
+    }
+    auto tile_stats = combined_tile.abs().masked_fill(combined_invalid_tile, score_neg_inf);
+    auto tile_signs = torch::sign(combined_tile).masked_fill(combined_invalid_tile, 0.0);
+    auto tile_row_max = std::get<0>(tile_stats.max(-1, false));
+    auto new_row_max = torch::maximum(row_max, tile_row_max);
+    auto prev_scale = torch::exp(row_max - new_row_max);
+    auto tile_exp = torch::exp(tile_stats - new_row_max.unsqueeze(-1)).masked_fill(combined_invalid_tile, 0.0);
+    row_denom = row_denom * prev_scale + tile_exp.sum(-1);
+    numer_state = numer_state * prev_scale +
+        torch::bmm(tile_signs * tile_exp, state_f32.narrow(1, source_start, source_width).unsqueeze(-1))
+            .squeeze(-1);
+    numer_val = numer_val * prev_scale.unsqueeze(-1) +
+        torch::bmm(tile_signs * tile_exp, val_f32.narrow(1, source_start, source_width));
+    row_max = new_row_max;
+  }
+  auto denom = row_denom.clamp_min(1.0e-20);
+  auto delta_state = numer_state / denom;
+  auto delta_val = numer_val / denom.unsqueeze(-1);
+
+  return {delta_state, delta_val, row_max, row_denom};
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
@@ -437,7 +698,8 @@ low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cuda_wrapper
     const torch::Tensor& biases,
     const torch::Tensor& grad_delta_state,
     const torch::Tensor& grad_delta_val,
-    bool has_bias) {
+    bool has_bias,
+    const std::string& aggregate) {
 #ifdef WITH_CUDA
   return jakal_net_low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cuda(
       weighted_projected_source,
@@ -449,11 +711,346 @@ low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cuda_wrapper
       biases,
       grad_delta_state,
       grad_delta_val,
-      has_bias);
+      has_bias,
+      aggregate);
 #else
   throw std::runtime_error(
       "low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cuda requires a CUDA-enabled build.");
 #endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_backward_cuda_wrapper(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    const torch::Tensor& core_weights,
+    const torch::Tensor& biases,
+    const torch::Tensor& row_max,
+    const torch::Tensor& row_denom,
+    const torch::Tensor& grad_delta_state,
+    const torch::Tensor& grad_delta_val,
+    bool has_bias) {
+#ifdef WITH_CUDA
+  return jakal_net_low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_backward_cuda(
+      weighted_projected_source,
+      projected_source,
+      projected_target,
+      projected_state,
+      projected_val,
+      core_weights,
+      biases,
+      row_max,
+      row_denom,
+      grad_delta_state,
+      grad_delta_val,
+      has_bias);
+#else
+  throw std::runtime_error(
+      "low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_backward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_backward_bmm_cuda_wrapper(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    const torch::Tensor& core_weights,
+    const torch::Tensor& biases,
+    const torch::Tensor& row_max,
+    const torch::Tensor& row_denom,
+    const torch::Tensor& grad_delta_state,
+    const torch::Tensor& grad_delta_val,
+    bool has_bias,
+    const std::string& aggregate) {
+  if (!weighted_projected_source.is_cuda() || !projected_source.is_cuda() ||
+      !projected_target.is_cuda() || !projected_state.is_cuda() || !projected_val.is_cuda() ||
+      !core_weights.is_cuda() || !grad_delta_state.is_cuda() || !grad_delta_val.is_cuda()) {
+    throw std::runtime_error("smoothmax bmm backward requires CUDA tensors.");
+  }
+  if (weighted_projected_source.dim() != 4 || projected_source.dim() != 4 ||
+      projected_target.dim() != 4 || projected_state.dim() != 2 || projected_val.dim() != 3 ||
+      grad_delta_state.dim() != 2 || grad_delta_val.dim() != 3 || core_weights.dim() != 2) {
+    throw std::runtime_error("smoothmax bmm backward received invalid ranks.");
+  }
+  if (weighted_projected_source.sizes() != projected_source.sizes() ||
+      weighted_projected_source.sizes() != projected_target.sizes()) {
+    throw std::runtime_error("smoothmax projected tensors must share [heads,batch,nodes,rank].");
+  }
+  if (has_bias && (!biases.is_cuda() || biases.dim() != 1 ||
+                   biases.size(0) != weighted_projected_source.size(0))) {
+    throw std::runtime_error("smoothmax biases must be a CUDA tensor shaped [heads].");
+  }
+
+  const auto heads = weighted_projected_source.size(0);
+  const auto batch_flat = weighted_projected_source.size(1);
+  const auto nodes = weighted_projected_source.size(2);
+  const auto rank_dim = weighted_projected_source.size(3);
+  const auto out_dim = projected_val.size(2);
+  if (core_weights.size(0) != heads || core_weights.size(1) != rank_dim ||
+      projected_state.size(0) != batch_flat || projected_state.size(1) != nodes ||
+      projected_val.size(0) != batch_flat || projected_val.size(1) != nodes ||
+      grad_delta_state.size(0) != batch_flat || grad_delta_state.size(1) != nodes ||
+      grad_delta_val.size(0) != batch_flat || grad_delta_val.size(1) != nodes ||
+      grad_delta_val.size(2) != out_dim) {
+    throw std::runtime_error("smoothmax bmm backward input shapes are incompatible.");
+  }
+  if ((row_max.numel() != 0 || row_denom.numel() != 0) &&
+      (row_max.dim() != 2 || row_denom.dim() != 2 ||
+       row_max.size(0) != batch_flat || row_max.size(1) != nodes ||
+       row_denom.size(0) != batch_flat || row_denom.size(1) != nodes)) {
+    throw std::runtime_error("smoothmax bmm backward row stats must have shape [batch,nodes].");
+  }
+  const bool signed_smoothmax = aggregate == "signed_smoothmax";
+  if (aggregate != "smoothmax" && !signed_smoothmax) {
+    throw std::runtime_error("smoothmax bmm backward supports smoothmax and signed_smoothmax aggregates.");
+  }
+
+  const auto score_dtype = projected_target.scalar_type();
+  auto target_flat = projected_target.reshape({heads * batch_flat, nodes, rank_dim});
+  const bool use_tf32_score_tile =
+      experimental_tf32_score_tile_cuda_enabled() &&
+      weighted_projected_source.is_cuda() &&
+      nodes % 16 == 0 &&
+      rank_dim % 8 == 0;
+  auto mask = torch::ones(
+      {nodes, nodes},
+      torch::TensorOptions().dtype(torch::kBool).device(projected_target.device())).tril();
+  const auto bias_f32 = has_bias ? biases.to(torch::kFloat32).reshape({heads, 1, 1, 1}) : torch::Tensor();
+  const auto score_neg_inf = -std::numeric_limits<float>::infinity();
+  const auto tile_size = std::max<int64_t>(1, multihead_smoothmax_bmm_tile_size());
+  const auto log_heads = std::log(static_cast<double>(heads));
+  auto row_max_f32 = row_max.numel() == 0
+      ? torch::full(
+            {batch_flat, nodes},
+            score_neg_inf,
+            projected_state.options().dtype(torch::kFloat32))
+      : row_max.to(torch::kFloat32);
+  auto row_denom_f32 = row_denom.numel() == 0
+      ? torch::zeros(
+            {batch_flat, nodes},
+            projected_state.options().dtype(torch::kFloat32))
+      : row_denom.to(torch::kFloat32);
+  auto grad_projected_state = torch::zeros_like(projected_state, projected_state.options().dtype(torch::kFloat32));
+  auto grad_projected_val = torch::zeros_like(projected_val, projected_val.options().dtype(torch::kFloat32));
+  auto edge_dot = torch::zeros(
+      {batch_flat, nodes},
+      projected_state.options().dtype(torch::kFloat32));
+  auto grad_projected_target = torch::zeros(
+      {heads, batch_flat, nodes, rank_dim},
+      projected_target.options().dtype(torch::kFloat32));
+  auto grad_projected_source = torch::zeros(
+      {heads, batch_flat, nodes, rank_dim},
+      projected_source.options().dtype(torch::kFloat32));
+  auto grad_core_weights = torch::zeros_like(core_weights, core_weights.options().dtype(torch::kFloat32));
+  auto grad_biases = has_bias
+      ? torch::zeros({heads}, projected_state.options().dtype(torch::kFloat32))
+      : torch::empty({0}, projected_state.options());
+  auto projected_state_f32 = projected_state.to(torch::kFloat32);
+  auto projected_val_f32 = projected_val.to(torch::kFloat32);
+  auto grad_delta_state_f32 = grad_delta_state.to(torch::kFloat32);
+  auto grad_delta_val_f32 = grad_delta_val.to(torch::kFloat32);
+  auto grad_delta_state_expanded = grad_delta_state_f32.unsqueeze(-1);
+  auto target_flat_cast = target_flat.to(score_dtype);
+  auto target_flat_f32 = target_flat.to(torch::kFloat32);
+  auto target_flat_tf32 = use_tf32_score_tile ? target_flat.to(torch::kFloat32).contiguous() : torch::Tensor();
+  auto core_scale = core_weights.reshape({heads, 1, 1, rank_dim}).to(score_dtype);
+  auto core_scale_f32 = core_weights.reshape({heads, 1, 1, rank_dim}).to(torch::kFloat32);
+  auto projected_val_t = projected_val_f32.transpose(1, 2).contiguous();
+  std::vector<torch::Tensor> cached_grad_edges_tiles;
+  cached_grad_edges_tiles.reserve((nodes + tile_size - 1) / tile_size);
+
+  if (row_max.numel() == 0 || row_denom.numel() == 0) {
+    for (int64_t source_start = 0; source_start < nodes; source_start += tile_size) {
+      const auto source_width = std::min<int64_t>(tile_size, nodes - source_start);
+      auto weighted_source_tile = weighted_projected_source.narrow(2, source_start, source_width);
+      auto weighted_source_tile_flat =
+          weighted_source_tile.reshape({heads * batch_flat, source_width, rank_dim});
+      auto score_tile = torch::Tensor();
+      if (use_tf32_score_tile && source_width % 16 == 0) {
+        score_tile = low_rank_dense_scores_tf32_cuda_wrapper(
+                         weighted_source_tile_flat.to(torch::kFloat32).contiguous(),
+                         target_flat_tf32)
+                         .reshape({heads, batch_flat, nodes, source_width});
+      } else {
+        score_tile = torch::bmm(target_flat_cast, weighted_source_tile_flat.transpose(1, 2))
+                         .reshape({heads, batch_flat, nodes, source_width})
+                         .to(torch::kFloat32);
+      }
+      if (has_bias) {
+        score_tile = score_tile + bias_f32;
+      }
+      auto valid_tile = mask.narrow(1, source_start, source_width).view({1, 1, nodes, source_width});
+      auto invalid_tile = valid_tile.logical_not();
+      auto combined_invalid_tile = valid_tile.view({1, nodes, source_width}).logical_not();
+      auto tile_stats = torch::Tensor();
+      if (signed_smoothmax) {
+        auto zeroed_score_tile = score_tile.masked_fill(invalid_tile, 0.0);
+        auto abs_score_tile = score_tile.abs().masked_fill(invalid_tile, score_neg_inf);
+        auto head_probs = torch::softmax(abs_score_tile, 0).masked_fill(invalid_tile, 0.0);
+        auto combined_tile = (zeroed_score_tile * head_probs).sum(0);
+        tile_stats = combined_tile.abs().masked_fill(combined_invalid_tile, score_neg_inf);
+      } else {
+        auto masked_score_tile = score_tile.masked_fill(invalid_tile, score_neg_inf);
+        auto combined_tile = torch::logsumexp(masked_score_tile, {0}) - log_heads;
+        tile_stats = combined_tile.abs().masked_fill(combined_invalid_tile, score_neg_inf);
+      }
+      auto tile_row_max = std::get<0>(tile_stats.max(-1, false));
+      auto new_row_max = torch::maximum(row_max_f32, tile_row_max);
+      auto prev_scale = torch::exp(row_max_f32 - new_row_max);
+      auto tile_exp = torch::exp(tile_stats - new_row_max.unsqueeze(-1)).masked_fill(combined_invalid_tile, 0.0);
+      row_denom_f32 = row_denom_f32 * prev_scale + tile_exp.sum(-1);
+      row_max_f32 = new_row_max;
+    }
+  }
+
+  for (int64_t source_start = 0; source_start < nodes; source_start += tile_size) {
+    const auto source_width = std::min<int64_t>(tile_size, nodes - source_start);
+    auto weighted_source_tile = weighted_projected_source.narrow(2, source_start, source_width);
+    auto weighted_source_tile_flat =
+        weighted_source_tile.reshape({heads * batch_flat, source_width, rank_dim});
+    auto score_tile = torch::Tensor();
+    if (use_tf32_score_tile && source_width % 16 == 0) {
+      score_tile = low_rank_dense_scores_tf32_cuda_wrapper(
+                       weighted_source_tile_flat.to(torch::kFloat32).contiguous(),
+                       target_flat_tf32)
+                       .reshape({heads, batch_flat, nodes, source_width});
+    } else {
+      score_tile = torch::bmm(target_flat_cast, weighted_source_tile_flat.transpose(1, 2))
+                       .reshape({heads, batch_flat, nodes, source_width})
+                       .to(torch::kFloat32);
+    }
+    if (has_bias) {
+      score_tile = score_tile + bias_f32;
+    }
+    auto valid_tile = mask.narrow(1, source_start, source_width).view({1, 1, nodes, source_width});
+    auto invalid_tile = valid_tile.logical_not();
+    auto combined_invalid_tile = valid_tile.view({1, nodes, source_width}).logical_not();
+    auto probs_tile = torch::Tensor();
+    auto signs_tile = torch::Tensor();
+    if (signed_smoothmax) {
+      auto zeroed_score_tile = score_tile.masked_fill(invalid_tile, 0.0);
+      auto abs_score_tile = score_tile.abs().masked_fill(invalid_tile, score_neg_inf);
+      auto head_probs = torch::softmax(abs_score_tile, 0).masked_fill(invalid_tile, 0.0);
+      auto combined_tile = (zeroed_score_tile * head_probs).sum(0);
+      probs_tile = torch::exp(combined_tile.abs() - row_max_f32.unsqueeze(-1)) / row_denom_f32.unsqueeze(-1);
+      probs_tile = probs_tile.masked_fill(combined_invalid_tile, 0.0);
+      signs_tile = torch::sign(combined_tile).masked_fill(combined_invalid_tile, 0.0);
+    } else {
+      auto masked_score_tile = score_tile.masked_fill(invalid_tile, score_neg_inf);
+      auto combined_tile = torch::logsumexp(masked_score_tile, {0}) - log_heads;
+      probs_tile = torch::exp(combined_tile.abs() - row_max_f32.unsqueeze(-1)) / row_denom_f32.unsqueeze(-1);
+      probs_tile = probs_tile.masked_fill(combined_invalid_tile, 0.0);
+      signs_tile = torch::sign(combined_tile).masked_fill(combined_invalid_tile, 0.0);
+    }
+    auto edges_tile = signs_tile * probs_tile;
+
+    auto projected_state_tile = projected_state_f32.narrow(1, source_start, source_width);
+    auto grad_edges_tile =
+        grad_delta_state_expanded * projected_state_tile.unsqueeze(1) +
+        torch::bmm(grad_delta_val_f32, projected_val_t.narrow(2, source_start, source_width));
+    edge_dot = edge_dot + (grad_edges_tile * edges_tile).sum(-1);
+    cached_grad_edges_tiles.push_back(grad_edges_tile.to(torch::kBFloat16));
+    grad_projected_state.narrow(1, source_start, source_width).add_(
+        torch::bmm(edges_tile.transpose(1, 2), grad_delta_state_expanded).squeeze(-1));
+    grad_projected_val.narrow(1, source_start, source_width).add_(
+        torch::bmm(edges_tile.transpose(1, 2), grad_delta_val_f32));
+  }
+
+  for (int64_t source_start = 0; source_start < nodes; source_start += tile_size) {
+    const auto source_width = std::min<int64_t>(tile_size, nodes - source_start);
+    auto weighted_source_tile = weighted_projected_source.narrow(2, source_start, source_width);
+    auto weighted_source_tile_flat =
+        weighted_source_tile.reshape({heads * batch_flat, source_width, rank_dim});
+    auto source_tile = projected_source.narrow(2, source_start, source_width);
+    auto score_tile = torch::Tensor();
+    if (use_tf32_score_tile && source_width % 16 == 0) {
+      score_tile = low_rank_dense_scores_tf32_cuda_wrapper(
+                       weighted_source_tile_flat.to(torch::kFloat32).contiguous(),
+                       target_flat_tf32)
+                       .reshape({heads, batch_flat, nodes, source_width});
+    } else {
+      score_tile = torch::bmm(target_flat_cast, weighted_source_tile_flat.transpose(1, 2))
+                       .reshape({heads, batch_flat, nodes, source_width})
+                       .to(torch::kFloat32);
+    }
+    if (has_bias) {
+      score_tile = score_tile + bias_f32;
+    }
+    auto valid_tile = mask.narrow(1, source_start, source_width).view({1, 1, nodes, source_width});
+    auto invalid_tile = valid_tile.logical_not();
+    auto combined_invalid_tile = valid_tile.view({1, nodes, source_width}).logical_not();
+    auto probs_tile = torch::Tensor();
+    auto signs_tile = torch::Tensor();
+    auto zeroed_score_tile = torch::Tensor();
+    auto masked_score_tile = torch::Tensor();
+    auto abs_score_tile = torch::Tensor();
+    auto head_probs = torch::Tensor();
+    auto combined_tile = torch::Tensor();
+    if (signed_smoothmax) {
+      zeroed_score_tile = score_tile.masked_fill(invalid_tile, 0.0);
+      abs_score_tile = score_tile.abs().masked_fill(invalid_tile, score_neg_inf);
+      head_probs = torch::softmax(abs_score_tile, 0).masked_fill(invalid_tile, 0.0);
+      combined_tile = (zeroed_score_tile * head_probs).sum(0);
+      probs_tile = torch::exp(combined_tile.abs() - row_max_f32.unsqueeze(-1)) / row_denom_f32.unsqueeze(-1);
+      probs_tile = probs_tile.masked_fill(combined_invalid_tile, 0.0);
+      signs_tile = torch::sign(combined_tile).masked_fill(combined_invalid_tile, 0.0);
+    } else {
+      masked_score_tile = score_tile.masked_fill(invalid_tile, score_neg_inf);
+      auto combined_tile = torch::logsumexp(masked_score_tile, {0}) - log_heads;
+      probs_tile = torch::exp(combined_tile.abs() - row_max_f32.unsqueeze(-1)) / row_denom_f32.unsqueeze(-1);
+      probs_tile = probs_tile.masked_fill(combined_invalid_tile, 0.0);
+      signs_tile = torch::sign(combined_tile).masked_fill(combined_invalid_tile, 0.0);
+    }
+    auto edges_tile = signs_tile * probs_tile;
+    auto grad_edges_tile = cached_grad_edges_tiles[(source_start / tile_size)].to(torch::kFloat32);
+    auto grad_scores_tile =
+        signs_tile * probs_tile * (signs_tile * grad_edges_tile - edge_dot.unsqueeze(-1));
+    grad_scores_tile = grad_scores_tile.masked_fill(combined_invalid_tile, 0.0);
+    auto grad_scores_heads = signed_smoothmax
+        ? (
+              head_probs *
+              (1.0 + torch::sign(zeroed_score_tile) * (zeroed_score_tile - combined_tile.unsqueeze(0))) *
+              grad_scores_tile.unsqueeze(0)
+          )
+        : (
+              torch::softmax(masked_score_tile, 0).masked_fill(invalid_tile, 0.0) *
+              grad_scores_tile.unsqueeze(0)
+          );
+    auto grad_scores_heads_flat =
+        grad_scores_heads.reshape({heads * batch_flat, nodes, source_width}).to(torch::kFloat32);
+    auto weighted_source_tile_flat_f32 = weighted_source_tile_flat.to(torch::kFloat32);
+    grad_projected_target.add_(
+        torch::bmm(grad_scores_heads_flat, weighted_source_tile_flat_f32)
+            .reshape({heads, batch_flat, nodes, rank_dim})
+            .to(torch::kFloat32));
+    auto grad_weighted_source_tile =
+        torch::bmm(grad_scores_heads_flat.transpose(1, 2), target_flat_f32)
+            .reshape({heads, batch_flat, source_width, rank_dim});
+    grad_projected_source.narrow(2, source_start, source_width).add_(
+        (grad_weighted_source_tile * core_scale_f32).to(torch::kFloat32));
+    grad_core_weights.add_(
+        (grad_weighted_source_tile.to(torch::kFloat32) * source_tile.to(torch::kFloat32)).sum({1, 2}));
+    if (has_bias) {
+      grad_biases.add_(grad_scores_heads.sum({1, 2, 3}));
+    }
+  }
+
+  if (!has_bias) {
+    grad_biases = torch::empty({0}, projected_state.options());
+  }
+  return {
+      grad_projected_source,
+      grad_projected_target,
+      grad_projected_state,
+      grad_projected_val,
+      grad_core_weights,
+      grad_biases};
 }
 
 std::tuple<torch::Tensor, torch::Tensor>
@@ -758,15 +1355,24 @@ torch::Tensor pairwise_scores(
     const c10::optional<torch::Tensor>& in_bias,
     const c10::optional<torch::Tensor>& out_weight,
     const c10::optional<torch::Tensor>& out_bias) {
-  if (starts_with(pairwise_kind, "multihead_max_")) {
-    const auto base_kind = pairwise_kind.substr(std::string("multihead_max_").size());
+  if (starts_with(pairwise_kind, "multihead_max_") ||
+      starts_with(pairwise_kind, "multihead_smoothmax_") ||
+      starts_with(pairwise_kind, "multihead_signed_smoothmax_")) {
+    const bool smoothmax = starts_with(pairwise_kind, "multihead_smoothmax_");
+    const bool signed_smoothmax = starts_with(pairwise_kind, "multihead_signed_smoothmax_");
+    const auto prefix = smoothmax
+        ? std::string("multihead_smoothmax_")
+        : signed_smoothmax
+            ? std::string("multihead_signed_smoothmax_")
+            : std::string("multihead_max_");
+    const auto base_kind = pairwise_kind.substr(prefix.size());
     if (base_kind == "low_rank_bilinear") {
       if (!in_weight.has_value() || !out_weight.has_value()) {
-        throw std::runtime_error("multihead_max low_rank_bilinear is missing projection weights.");
+        throw std::runtime_error("multihead low_rank_bilinear is missing projection weights.");
       }
       auto cast_source = in_weight.value().to(source_val.scalar_type());
       auto cast_target = out_weight.value().to(target_val.scalar_type());
-      auto cast_core = weight.to(source_val.scalar_type());
+      auto cast_core = normalized_low_rank_core(weight.to(source_val.scalar_type()));
       auto projected_source = torch::einsum(
           "bid,hrd->bhir",
           std::vector<torch::Tensor>{source_val, cast_source});
@@ -778,16 +1384,44 @@ torch::Tensor pairwise_scores(
       core_shape[projected_source.dim() - 1] = cast_core.size(1);
       auto weighted_source = projected_source * cast_core.view(core_shape);
       auto scores = torch::einsum(
-          "bhir,bhkr->bhik",
-          std::vector<torch::Tensor>{weighted_source, projected_target});
+          "bhkr,bhir->bhki",
+          std::vector<torch::Tensor>{projected_target, weighted_source});
       if (bias.has_value()) {
         std::vector<int64_t> bias_shape(scores.dim(), 1);
         bias_shape[scores.dim() - 3] = bias.value().size(0);
         scores = scores + bias.value().to(scores.scalar_type()).view(bias_shape);
       }
+      if (smoothmax) {
+        return torch::logsumexp(scores, 1) - std::log(static_cast<double>(scores.size(1)));
+      }
+      if (signed_smoothmax) {
+        auto weights = torch::softmax(scores.abs(), 1);
+        return (scores * weights).sum(1);
+      }
+      return std::get<0>(scores.max(1));
+    }
+    if (base_kind == "diagonal_bilinear") {
+      auto cast_weight = weight.to(target_val.scalar_type());
+      auto expanded_target = target_val.unsqueeze(1);
+      auto expanded_source = source_val.unsqueeze(1);
+      auto projected_target = expanded_target * cast_weight.view({1, cast_weight.size(0), 1, cast_weight.size(1)});
+      auto scores = torch::matmul(
+          projected_target,
+          expanded_source.transpose(-1, -2));
+      if (bias.has_value()) {
+        scores = scores + bias.value().to(scores.scalar_type()).view({1, bias.value().size(0), 1, 1});
+      }
+      if (smoothmax) {
+        return torch::logsumexp(scores, 1) - std::log(static_cast<double>(scores.size(1)));
+      }
+      if (signed_smoothmax) {
+        auto weights = torch::softmax(scores.abs(), 1);
+        return (scores * weights).sum(1);
+      }
       return std::get<0>(scores.max(1));
     }
     const auto num_heads = infer_multihead_count(weight, in_weight, out_weight);
+    std::vector<torch::Tensor> head_scores_list;
     c10::optional<torch::Tensor> best_scores = c10::nullopt;
     for (int64_t head_index = 0; head_index < num_heads; ++head_index) {
       auto head_scores = pairwise_scores(
@@ -800,11 +1434,31 @@ torch::Tensor pairwise_scores(
           select_head_optional_tensor(in_bias, head_index, num_heads),
           select_head_optional_tensor(out_weight, head_index, num_heads),
           select_head_optional_tensor(out_bias, head_index, num_heads));
+      if (smoothmax || signed_smoothmax) {
+        head_scores_list.push_back(head_scores);
+        continue;
+      }
       if (best_scores.has_value()) {
         best_scores = torch::maximum(best_scores.value(), head_scores);
       } else {
         best_scores = head_scores;
       }
+    }
+    if (smoothmax) {
+      if (head_scores_list.empty()) {
+        throw std::runtime_error("multihead smoothmax pairwise kernel requires at least one head.");
+      }
+      auto stacked_scores = torch::stack(head_scores_list, -1);
+      return torch::logsumexp(stacked_scores, -1) -
+             std::log(static_cast<double>(stacked_scores.size(-1)));
+    }
+    if (signed_smoothmax) {
+      if (head_scores_list.empty()) {
+        throw std::runtime_error("multihead signed_smoothmax pairwise kernel requires at least one head.");
+      }
+      auto stacked_scores = torch::stack(head_scores_list, -1);
+      auto weights = torch::softmax(stacked_scores.abs(), -1);
+      return (stacked_scores * weights).sum(-1);
     }
     if (!best_scores.has_value()) {
       throw std::runtime_error("multihead_max pairwise kernel requires at least one head.");
@@ -837,7 +1491,7 @@ torch::Tensor pairwise_scores(
     auto projected_target = torch::matmul(target_val, out_weight.value().transpose(0, 1));
     auto projected_source = torch::matmul(source_val, in_weight.value().transpose(0, 1));
     auto weighted_source =
-        projected_source * weight.view({1, 1, -1}).to(projected_source.scalar_type());
+        projected_source * normalized_low_rank_core(weight.to(projected_source.scalar_type())).view({1, 1, -1});
     auto scores = torch::bmm(projected_target, weighted_source.transpose(1, 2));
     if (bias.has_value()) {
       scores = scores + bias.value();
@@ -1614,7 +2268,10 @@ std::tuple<torch::Tensor, torch::Tensor> low_rank_propagation_topk_signed_abs(
        compress_name == "softsign")) {
     const auto block_size = dense_scan_block_size();
     const bool precompute_low_rank = !diagonal &&
-        (pairwise_kind == "low_rank_bilinear" || pairwise_kind == "multihead_max_low_rank_bilinear");
+        (pairwise_kind == "low_rank_bilinear" ||
+         pairwise_kind == "multihead_max_low_rank_bilinear" ||
+         pairwise_kind == "multihead_smoothmax_low_rank_bilinear" ||
+         pairwise_kind == "multihead_signed_smoothmax_low_rank_bilinear");
     torch::Tensor precomputed_target;
     torch::Tensor precomputed_weighted_source;
     if (precompute_low_rank) {
@@ -1622,11 +2279,12 @@ std::tuple<torch::Tensor, torch::Tensor> low_rank_propagation_topk_signed_abs(
         auto projected_source = torch::einsum(
             "bid,hrd->bhir",
             std::vector<torch::Tensor>{layer_val, cast_source_weight}).contiguous();
+        auto normalized_core = normalized_low_rank_core(cast_core_weight);
         std::vector<int64_t> core_shape(projected_source.dim(), 1);
-        core_shape[1] = cast_core_weight.size(0);
-        core_shape[3] = cast_core_weight.size(1);
+        core_shape[1] = normalized_core.size(0);
+        core_shape[3] = normalized_core.size(1);
         precomputed_weighted_source =
-            (projected_source * cast_core_weight.view(core_shape)).contiguous();
+            (projected_source * normalized_core.view(core_shape)).contiguous();
         precomputed_target = torch::einsum(
             "bid,hrd->bhir",
             std::vector<torch::Tensor>{layer_val, cast_target_weight}).contiguous();
@@ -1637,7 +2295,7 @@ std::tuple<torch::Tensor, torch::Tensor> low_rank_propagation_topk_signed_abs(
             torch::matmul(layer_val, cast_source_weight.transpose(0, 1)).contiguous();
         precomputed_weighted_source =
             (projected_source *
-             cast_core_weight.view({1, 1, -1}).to(projected_source.scalar_type())).contiguous();
+             normalized_low_rank_core(cast_core_weight).view({1, 1, -1}).to(projected_source.scalar_type())).contiguous();
       }
     }
     auto dense_score_block = [&](int64_t target_start,
@@ -1659,7 +2317,14 @@ std::tuple<torch::Tensor, torch::Tensor> low_rank_propagation_topk_signed_abs(
         if (cast_bias.has_value() && cast_bias.value().numel() != 0) {
           scores = scores + cast_bias.value().view({1, cast_bias.value().numel(), 1, 1}).to(scores.scalar_type());
         }
-        scores = std::get<0>(scores.max(1));
+        if (pairwise_kind == "multihead_smoothmax_low_rank_bilinear") {
+          scores = torch::logsumexp(scores, 1) - std::log(static_cast<double>(scores.size(1)));
+        } else if (pairwise_kind == "multihead_signed_smoothmax_low_rank_bilinear") {
+          auto weights = torch::softmax(scores.abs(), 1);
+          scores = (scores * weights).sum(1);
+        } else {
+          scores = std::get<0>(scores.max(1));
+        }
       } else {
         scores = torch::bmm(
             precomputed_target.slice(1, target_start, target_end),
@@ -3635,6 +4300,10 @@ std::vector<std::string> supported_ops() {
             "bilinear_propagation_causal_dense_signed_abs_backward_cuda",
             "low_rank_multihead_max_propagation_causal_dense_signed_abs_forward_cuda",
             "low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cuda",
+            "low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_backward_cuda",
+            "low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_forward_bmm_cuda",
+            "low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_backward_bmm_cuda",
+            "diagonal_multihead_smoothmax_propagation_causal_dense_signed_abs_forward_bmm_cuda",
             "diagonal_propagation_causal_dense_signed_abs_forward_cuda",
             "diagonal_propagation_causal_dense_signed_abs_backward_cuda",
             "low_rank_propagation_window_entmax15_forward_cuda",
@@ -5174,6 +5843,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cuda",
       &low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cuda_wrapper,
       "CUDA fused multi-head max low-rank propagation causal dense backward with signed_abs_softmax");
+  m.def(
+      "low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_backward_cuda",
+      &low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_backward_cuda_wrapper,
+      "CUDA fused multi-head signed_smoothmax low-rank propagation causal dense backward with signed_abs_softmax");
+  m.def(
+      "low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_forward_bmm_cuda",
+      &low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_forward_bmm_cuda_wrapper,
+      "CUDA ATen BMM multi-head smoothmax propagation causal dense forward with signed_abs_softmax");
+  m.def(
+      "low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_backward_bmm_cuda",
+      &low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_backward_bmm_cuda_wrapper,
+      "CUDA ATen BMM multi-head smoothmax propagation causal dense backward with signed_abs_softmax");
+  m.def(
+      "diagonal_multihead_smoothmax_propagation_causal_dense_signed_abs_forward_bmm_cuda",
+      &diagonal_multihead_smoothmax_propagation_causal_dense_signed_abs_forward_bmm_cuda_wrapper,
+      "CUDA ATen BMM diagonal multi-head smoothmax propagation causal dense forward with signed_abs_softmax");
   m.def(
       "diagonal_propagation_causal_dense_signed_abs_forward_cuda",
       &diagonal_propagation_causal_dense_signed_abs_forward_cuda_wrapper,

@@ -16,7 +16,7 @@ from jakal_net._architectural_common import (
     make_pairwise,
     signed_abs_softmax_edges,
     signed_softmax_state,
-    unit_normalize_values,
+    softsign_state,
 )
 from jakal_net.core import Layer
 from jakal_net.hierarchical_memory import BModule, BScanOutput
@@ -156,8 +156,6 @@ class CausalHierarchicalMemoryLM(nn.Module):
             raise ValueError(f"Unsupported feed_forward_kind: {feed_forward_kind!r}.")
         if feed_forward_residual_scale < 0.0:
             raise ValueError("feed_forward_residual_scale must be non-negative.")
-        unit_norm_values = True
-
         self.vocab_size = vocab_size
         self.dim = dim
         self.max_seq_len = max_seq_len
@@ -262,6 +260,8 @@ class CausalHierarchicalMemoryLM(nn.Module):
         self.s_prediction_proj = nn.Linear(dim, dim, bias=False)
         self.prediction_input_norm = nn.LayerNorm(dim)
         self.prediction_norms = nn.ModuleList(nn.LayerNorm(dim) for _ in range(prediction_layers))
+        prediction_window_size = max(1, max_seq_len)
+        prediction_block_size = max_seq_len if prediction_window_size + 1 >= max_seq_len else None
         self.prediction_layers = nn.ModuleList(
             SparsePropagation(
                 pairwise_fn=make_pairwise(
@@ -275,11 +275,13 @@ class CausalHierarchicalMemoryLM(nn.Module):
                     aggregate=pairwise_head_aggregate,
                 ),
                 sparse_type="window",
-                window=max(1, max_seq_len),
+                window=prediction_window_size,
                 edge_compress_fn=signed_abs_softmax_edges,
-                state_weight_edges=False,
+                state_weight_edges=True,
                 implementation=implementation,
                 residual=True,
+                target_block_size=prediction_block_size,
+                source_block_size=prediction_block_size,
                 use_direction_only=unit_norm_values,
             )
             for _ in range(prediction_layers)
@@ -311,9 +313,9 @@ class CausalHierarchicalMemoryLM(nn.Module):
     def _memoryless_query_layer(self, aligned_s: Tensor) -> Layer:
         query_state_source = self.prediction_input_norm(self.s_prediction_proj(aligned_s))
         query_val = query_state_source
-        if self.unit_norm_values:
-            query_val = unit_normalize_values(query_val)
         query_state = self.value_to_state(query_state_source).squeeze(-1)
+        if self.unit_norm_values:
+            query_state = softsign_state(query_state)
         return Layer(dim=self.dim, num_nodes=aligned_s.shape[1], state=query_state, val=query_val)
 
     def _can_use_dense_apply_fastpath(self, layer: Layer, propagation: SparsePropagation) -> bool:
@@ -330,12 +332,12 @@ class CausalHierarchicalMemoryLM(nn.Module):
     ) -> Layer:
         updated_val = layer.val + delta_val
         val = norm(updated_val)
-        if self.unit_norm_values:
-            val = unit_normalize_values(val)
         touched = delta_val.detach().abs().amax(dim=-1) > 0
         val = torch.where(touched.unsqueeze(-1), val, updated_val)
         return layer.with_tensors(
-            state=signed_softmax_state(layer.state + delta_state),
+            state=softsign_state(layer.state + delta_state)
+            if self.unit_norm_values
+            else signed_softmax_state(layer.state + delta_state),
             val=val,
         )
 
@@ -472,27 +474,18 @@ class CausalHierarchicalMemoryLM(nn.Module):
             if isinstance(ffn, StateValueFeedForward):
                 ffn_state, ffn_val = ffn(query_layer.state, query_layer.val)
                 if self.unit_norm_values:
-                    ffn_val = unit_normalize_values(ffn_val)
+                    ffn_state = softsign_state(ffn_state)
                 query_layer = query_layer.with_tensors(state=ffn_state, val=ffn_val)
             else:
                 ffn_val = ffn(query_layer.val)
-                if self.unit_norm_values:
-                    ffn_val = unit_normalize_values(ffn_val)
                 query_layer = query_layer.with_tensors(val=ffn_val)
 
         output_state_source = self.output_norm(query_layer.val)
         output_val = output_state_source
+        output_state = self.value_to_state(output_state_source).squeeze(-1)
         if self.unit_norm_values:
-            output_val = unit_normalize_values(output_val)
-            query_layer = query_layer.with_tensors(
-                state=self.value_to_state(output_state_source).squeeze(-1),
-                val=output_val,
-            )
-        else:
-            query_layer = query_layer.with_tensors(
-                state=self.value_to_state(output_state_source).squeeze(-1),
-                val=output_val,
-            )
+            output_state = softsign_state(output_state)
+        query_layer = query_layer.with_tensors(state=output_state, val=output_val)
         if return_logits:
             logits = self.lm_head(output_val)
         else:
@@ -853,12 +846,10 @@ class CausalHierarchicalMemoryLM(nn.Module):
         packed = self._pack_native_scan_inputs(aligned_s, memory_state)
         query_val, flat_memory = causal_memory_scan_fused_native(**packed)
         query_state_source = query_val
-        if self.unit_norm_values:
-            query_val = unit_normalize_values(query_val)
         query_state = self.value_to_state(query_state_source).squeeze(-1)
-        next_memory = self.b_module.unflatten_memory_state(flat_memory)
         if self.unit_norm_values:
-            next_memory = self.b_module.unit_normalize_memory_values(next_memory)
+            query_state = softsign_state(query_state)
+        next_memory = self.b_module.unflatten_memory_state(flat_memory)
         return BScanOutput(
             query_layer=Layer(dim=self.dim, num_nodes=aligned_s.shape[1], state=query_state, val=query_val),
             memory_state=tuple(next_memory),

@@ -24,7 +24,10 @@ from jakal_net.kernel_common import (
     supports_pairwise_kernel,
     supports_route_kernel,
 )
-from jakal_net.modules import LowRankBilinearPairwise, MultiHeadPairwise
+from jakal_net.modules import (
+    LowRankBilinearPairwise,
+    MultiHeadPairwise,
+)
 
 
 def _dense_profile_enabled(reference: Tensor) -> bool:
@@ -83,9 +86,10 @@ def _make_precomputed_low_rank_score_block(
     if isinstance(pairwise_fn, LowRankBilinearPairwise):
         with profiler.record("projection"):
             projected_target = pairwise_fn.target_proj(flat_val).contiguous()
+            projected_source = pairwise_fn.source_proj(flat_val)
             weighted_source = (
-                pairwise_fn.source_proj(flat_val)
-                * pairwise_fn.weight.to(dtype=flat_val.dtype).view(1, 1, -1)
+                projected_source
+                * pairwise_fn.normalized_weight().to(dtype=flat_val.dtype).view(1, 1, -1)
             ).contiguous()
 
         def _score_block(target_start: int, target_end: int, source_start: int, source_end: int) -> Tensor:
@@ -112,9 +116,10 @@ def _make_precomputed_low_rank_score_block(
             for head in pairwise_fn.heads:
                 assert isinstance(head, LowRankBilinearPairwise)
                 projected_target = head.target_proj(flat_val).contiguous()
+                projected_source = head.source_proj(flat_val)
                 weighted_source = (
-                    head.source_proj(flat_val)
-                    * head.weight.to(dtype=flat_val.dtype).view(1, 1, -1)
+                    projected_source
+                    * head.normalized_weight().to(dtype=flat_val.dtype).view(1, 1, -1)
                 ).contiguous()
                 head_blocks.append((projected_target, weighted_source, head.bias))
 

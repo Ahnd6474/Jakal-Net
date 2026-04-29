@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-
 import os
 
 import torch
@@ -83,13 +82,18 @@ class LowRankBilinearPairwise(nn.Module):
         self.weight = nn.Parameter(torch.ones(rank))
         self.bias = nn.Parameter(torch.zeros(())) if bias else None
 
+    def normalized_weight(self) -> Tensor:
+        denom = self.weight.norm(p=2).clamp_min(1e-6)
+        return self.weight / denom
+
     def effective_weight(self) -> Tensor:
-        weighted_target = self.target_proj.weight.transpose(0, 1) * self.weight.view(1, -1)
+        weighted_target = self.target_proj.weight.transpose(0, 1) * self.normalized_weight().view(1, -1)
         return weighted_target @ self.source_proj.weight
 
     def forward(self, target_val: Tensor, source_val: Tensor) -> Tensor:
         projected_target = self.target_proj(target_val)
-        projected_source = self.source_proj(source_val) * self.weight
+        projected_source = self.source_proj(source_val)
+        projected_source = projected_source * self.normalized_weight()
         scores = torch.einsum("...ir,...jr->...ij", projected_target, projected_source)
         if self.bias is not None:
             scores = scores + self.bias
@@ -257,7 +261,7 @@ class MultiHeadPairwise(nn.Module):
         super().__init__()
         if not heads:
             raise ValueError("heads must contain at least one pairwise module.")
-        if aggregate not in {"max", "mean", "sum", "head_mean"}:
+        if aggregate not in {"max", "mean", "sum", "head_mean", "smoothmax", "signed_smoothmax"}:
             raise ValueError(f"Unsupported aggregate mode: {aggregate!r}.")
         self.heads = nn.ModuleList(heads)
         self.aggregate = aggregate
@@ -270,6 +274,15 @@ class MultiHeadPairwise(nn.Module):
         return torch.stack(stacked, dim=-1)
 
     def forward(self, target_val: Tensor, source_val: Tensor) -> Tensor:
+        if self.aggregate == "smoothmax":
+            stacked = self.head_scores(target_val, source_val)
+            return torch.logsumexp(stacked, dim=-1) - torch.log(
+                torch.tensor(float(self.num_heads), dtype=stacked.dtype, device=stacked.device)
+            )
+        if self.aggregate == "signed_smoothmax":
+            stacked = self.head_scores(target_val, source_val)
+            weights = torch.softmax(stacked.abs(), dim=-1)
+            return (stacked * weights).sum(dim=-1)
         if self.aggregate == "max":
             running: Tensor | None = None
             for head in self.heads:
