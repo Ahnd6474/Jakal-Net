@@ -26,6 +26,7 @@ from jakal_net.modules import (
 STATE_MASS_PER_NODE = 1.0
 PARAM_INIT_STD = 0.02
 LOW_RANK_SCALE_INIT = 0.1
+LOW_RANK_REFERENCE_RANK = 128.0
 UNIT_NORM_EPS = 1e-6
 
 
@@ -116,7 +117,7 @@ def make_pairwise(
     anchor_kind: str = "scaled_cosine",
     aggregate: str = "max",
 ) -> nn.Module:
-    if aggregate not in {"max", "mean", "sum", "head_mean"}:
+    if aggregate not in {"max", "mean", "sum", "head_mean", "smoothmax", "signed_smoothmax"}:
         raise ValueError(f"Unsupported pairwise head aggregate: {aggregate!r}.")
     if heads <= 0:
         raise ValueError("heads must be positive.")
@@ -233,13 +234,15 @@ def layer_with_val_norm(
     unit_norm_values: bool = False,
 ) -> Layer:
     val = norm(layer.val)
-    if unit_norm_values:
-        val = unit_normalize_values(val)
     return layer.with_tensors(val=val)
 
 
 def signed_softmax_state(state: Tensor) -> Tensor:
     return _COMPILED_SIGNED_SOFTMAX_STATE(state)
+
+
+def softsign_state(state: Tensor) -> Tensor:
+    return F.softsign(torch.nan_to_num(state))
 
 
 def signed_abs_softmax_edges(scores: Tensor) -> Tensor:
@@ -260,21 +263,17 @@ def apply_delta(
     unit_norm_values: bool = False,
 ) -> Layer:
     updated = layer.apply_delta(delta, merge_mode="add" if residual else "replace")
-    state = signed_softmax_state(updated.state)
-    if val_norm is None and not unit_norm_values:
+    state = softsign_state(updated.state) if unit_norm_values else signed_softmax_state(updated.state)
+    if val_norm is None:
         val = updated.val
     elif residual:
         touched = delta.delta_val.detach().abs().amax(dim=-1) > 0
         normalized_val = updated.val
         if val_norm is not None:
             normalized_val = val_norm(normalized_val)
-        if unit_norm_values:
-            normalized_val = unit_normalize_values(normalized_val)
         val = torch.where(touched.unsqueeze(-1), normalized_val, updated.val)
     else:
         val = updated.val if val_norm is None else val_norm(updated.val)
-        if unit_norm_values:
-            val = unit_normalize_values(val)
     return updated.with_tensors(state=state, val=val)
 
 
@@ -297,7 +296,9 @@ def init_pairwise_or_route_scales(module: nn.Module) -> None:
     if getattr(module, "_constant_one_anchor", False):
         return
     if isinstance(module, (LowRankBilinearPairwise, LowRankBilinearRoute)):
-        module.weight.data.fill_(LOW_RANK_SCALE_INIT)
+        rank = float(module.weight.numel())
+        rank_scale = (LOW_RANK_REFERENCE_RANK / rank) ** 0.5
+        module.weight.data.fill_(LOW_RANK_SCALE_INIT * rank_scale)
         init_linear(module.source_proj)
         init_linear(module.target_proj)
         if getattr(module, "bias", None) is not None:

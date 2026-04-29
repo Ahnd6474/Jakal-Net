@@ -100,7 +100,7 @@ def reshape_val(
 def supports_pairwise_kernel(pairwise_fn: object) -> bool:
     if isinstance(pairwise_fn, MultiHeadPairwise):
         return (
-            pairwise_fn.aggregate == "max"
+            pairwise_fn.aggregate in {"max", "smoothmax", "signed_smoothmax"}
             and len(pairwise_fn.heads) > 0
             and all(supports_pairwise_kernel(head) for head in pairwise_fn.heads)
             and len({pairwise_kernel_spec(head).kind for head in pairwise_fn.heads}) == 1
@@ -150,8 +150,8 @@ def supports_pairwise_route_kernel(route_fn: object) -> bool:
 
 def pairwise_kernel_spec(pairwise_fn: object) -> PairwiseKernelSpec:
     if isinstance(pairwise_fn, MultiHeadPairwise):
-        if pairwise_fn.aggregate != "max":
-            raise TypeError("Only max-aggregated MultiHeadPairwise is supported for native/kernel spec.")
+        if pairwise_fn.aggregate not in {"max", "smoothmax", "signed_smoothmax"}:
+            raise TypeError("Only max-, smoothmax-, or signed_smoothmax-aggregated MultiHeadPairwise is supported for native/kernel spec.")
         head_specs = [pairwise_kernel_spec(head) for head in pairwise_fn.heads]
         if not head_specs:
             raise TypeError("MultiHeadPairwise requires at least one head.")
@@ -168,7 +168,7 @@ def pairwise_kernel_spec(pairwise_fn: object) -> PairwiseKernelSpec:
             return torch.stack(values)
 
         return PairwiseKernelSpec(
-            kind=f"multihead_max_{base_kind}",
+            kind=f"multihead_{pairwise_fn.aggregate}_{base_kind}",
             weight=torch.stack([spec.weight for spec in head_specs]),
             bias=_stack_optional("bias"),
             in_weight=_stack_optional("in_weight"),
@@ -185,7 +185,7 @@ def pairwise_kernel_spec(pairwise_fn: object) -> PairwiseKernelSpec:
     if isinstance(pairwise_fn, LowRankBilinearPairwise):
         return PairwiseKernelSpec(
             kind="low_rank_bilinear",
-            weight=pairwise_fn.weight,
+            weight=pairwise_fn.normalized_weight(),
             bias=pairwise_fn.bias,
             in_weight=pairwise_fn.source_proj.weight,
             out_weight=pairwise_fn.target_proj.weight,
@@ -345,7 +345,8 @@ def pairwise_scores_dense(
 
     if isinstance(pairwise_fn, LowRankBilinearPairwise):
         projected_target = pairwise_fn.target_proj(target_val)
-        projected_source = pairwise_fn.source_proj(source_val) * pairwise_fn.weight
+        projected_source = pairwise_fn.source_proj(source_val)
+        projected_source = projected_source * pairwise_fn.normalized_weight()
         scores = torch.bmm(projected_target, projected_source.transpose(1, 2))
         if pairwise_fn.bias is not None:
             scores = scores + pairwise_fn.bias

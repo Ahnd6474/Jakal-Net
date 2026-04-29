@@ -3688,6 +3688,30 @@ class _ChunkedLMHeadCrossEntropy(torch.autograd.Function):
         )
 
 
+def resolve_lm_head_ce_chunk_size(
+    *,
+    flat_tokens: int,
+    vocab_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> int:
+    override = os.environ.get("JAKAL_NET_LM_HEAD_CE_CHUNK")
+    if override is not None:
+        chunk_size = int(override)
+        return max(256, min(32768, chunk_size))
+    if device.type != "cuda":
+        return min(flat_tokens, 2048)
+    if dtype in {torch.bfloat16, torch.float16}:
+        target_chunk = 8192
+    else:
+        target_chunk = 4096
+    if vocab_size >= 32768:
+        target_chunk = min(target_chunk, 4096)
+    elif vocab_size <= 8192:
+        target_chunk = max(target_chunk, 16384)
+    return max(256, min(flat_tokens, 32768, target_chunk))
+
+
 def compute_masked_lm_head_loss(
     output_val: torch.Tensor,
     lm_head_weight: torch.Tensor,
@@ -3698,8 +3722,12 @@ def compute_masked_lm_head_loss(
     flat_target = target.reshape(-1)
     mask = loss_mask.reshape(-1).float()
     denom = mask.sum().clamp_min(1.0)
-    chunk_size = int(os.environ.get("JAKAL_NET_LM_HEAD_CE_CHUNK", "2048"))
-    chunk_size = max(256, min(8192, chunk_size))
+    chunk_size = resolve_lm_head_ce_chunk_size(
+        flat_tokens=int(flat_val.shape[0]),
+        vocab_size=int(lm_head_weight.shape[0]),
+        dtype=flat_val.dtype,
+        device=flat_val.device,
+    )
     return _ChunkedLMHeadCrossEntropy.apply(flat_val, lm_head_weight, flat_target, mask, denom, chunk_size)
 
 
@@ -4171,6 +4199,143 @@ def summarize_gradient_extremes(
         )
     diagnostics.sort(key=lambda item: item[0], reverse=True)
     return [message for _, message in diagnostics[: max(1, int(limit))]]
+
+
+def classify_grad_diagnose_group(parameter_name: str) -> str:
+    lower = parameter_name.lower()
+    in_route = "route" in lower or "transition" in lower
+    in_propagation = "propagation" in lower
+    if "lm_head" in lower:
+        return "lm_head"
+    if "token_embedding" in lower or "embed_tokens" in lower or "input_embedding" in lower:
+        return "token_embedding"
+    if "source_proj" in lower:
+        if in_route:
+            return "route_lowrank_source"
+        if in_propagation:
+            return "propagation_lowrank_source"
+        return "lowrank_source"
+    if "target_proj" in lower:
+        if in_route:
+            return "route_lowrank_target"
+        if in_propagation:
+            return "propagation_lowrank_target"
+        return "lowrank_target"
+    if "core_weights" in lower or ("pairwise" in lower and lower.endswith(".weight")):
+        if in_route:
+            return "route_lowrank_core"
+        if in_propagation:
+            return "propagation_lowrank_core"
+        return "lowrank_core"
+    if in_propagation:
+        return "propagation"
+    if in_route:
+        return "route"
+    if "skip" in lower:
+        return "skip"
+    if "read" in lower or "reader" in lower:
+        return "memory_read"
+    if "prediction" in lower or "predict" in lower:
+        return "prediction"
+    if "memory_levels" in lower:
+        return "memory_levels"
+    return "other"
+
+
+def should_log_grad_diagnostics(
+    *,
+    step: int,
+    interval: int,
+    first_steps: int,
+) -> bool:
+    return step <= max(0, int(first_steps)) or (
+        int(interval) > 0 and step % int(interval) == 0
+    )
+
+
+def collect_grad_group_diagnostics(
+    named_parameters: Sequence[tuple[str, torch.nn.Parameter]],
+    *,
+    lr: float,
+    tiny_threshold: float = 1.0e-8,
+) -> dict[str, dict[str, float | int]]:
+    accumulators: dict[str, dict[str, Any]] = {}
+    with torch.no_grad():
+        for parameter_name, parameter in named_parameters:
+            if not parameter.requires_grad:
+                continue
+            group_name = classify_grad_diagnose_group(parameter_name)
+            accumulator = accumulators.setdefault(
+                group_name,
+                {
+                    "grad_sq": 0.0,
+                    "param_sq": 0.0,
+                    "grad_max_abs": 0.0,
+                    "tiny_grad_count": 0,
+                    "total_grad_count": 0,
+                    "parameter_count": 0,
+                },
+            )
+            parameter_detached = parameter.detach()
+            accumulator["parameter_count"] += int(parameter_detached.numel())
+            param_norm = torch.linalg.vector_norm(parameter_detached.to(dtype=torch.float64))
+            accumulator["param_sq"] += float(param_norm.square().item())
+            gradient = parameter.grad
+            if gradient is None:
+                continue
+            gradient_detached = gradient.detach()
+            grad_norm = torch.linalg.vector_norm(gradient_detached.to(dtype=torch.float64))
+            accumulator["grad_sq"] += float(grad_norm.square().item())
+            accumulator["grad_max_abs"] = max(
+                float(accumulator["grad_max_abs"]),
+                float(gradient_detached.abs().max().item()),
+            )
+            accumulator["tiny_grad_count"] += int((gradient_detached.abs() <= tiny_threshold).sum().item())
+            accumulator["total_grad_count"] += int(gradient_detached.numel())
+    diagnostics: dict[str, dict[str, float | int]] = {}
+    for group_name, accumulator in sorted(accumulators.items()):
+        grad_norm = math.sqrt(float(accumulator["grad_sq"]))
+        param_norm = math.sqrt(float(accumulator["param_sq"]))
+        total_grad_count = int(accumulator["total_grad_count"])
+        tiny_grad_count = int(accumulator["tiny_grad_count"])
+        diagnostics[group_name] = {
+            "grad_norm": grad_norm,
+            "grad_max_abs": float(accumulator["grad_max_abs"]),
+            "param_norm": param_norm,
+            "update_ratio": float(lr) * grad_norm / max(param_norm, 1.0e-12),
+            "tiny_grad_frac": (
+                float(tiny_grad_count) / float(total_grad_count)
+                if total_grad_count > 0
+                else 0.0
+            ),
+            "parameter_count": int(accumulator["parameter_count"]),
+        }
+    return diagnostics
+
+
+def should_apply_nomemory_lowrank_grad_scale(args: argparse.Namespace) -> bool:
+    return (
+        args.model_kind == "causal_memory"
+        and args.disable_memory
+        and args.pairwise_kind == "low_rank_bilinear"
+        and float(args.nomemory_lowrank_grad_scale) > 1.0
+    )
+
+
+def apply_nomemory_lowrank_grad_scale(
+    named_parameters: Sequence[tuple[str, torch.nn.Parameter]],
+    *,
+    scale: float,
+) -> None:
+    if scale <= 1.0:
+        return
+    with torch.no_grad():
+        for parameter_name, parameter in named_parameters:
+            if parameter.grad is None:
+                continue
+            group_name = classify_grad_diagnose_group(parameter_name)
+            if group_name in {"lowrank_source", "lowrank_target", "lowrank_core"}:
+                parameter.grad.mul_(float(scale))
 
 
 def compute_grad_norm_float64(parameters: Sequence[torch.nn.Parameter]) -> float:
@@ -5129,13 +5294,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pairwise-frozen-heads", type=int, default=0)
     parser.add_argument("--pairwise-anchor-heads", type=int, default=0)
     parser.add_argument("--pairwise-anchor-kind", choices=("scaled_cosine", "diagonal_bilinear", "constant_one"), default="scaled_cosine")
-    parser.add_argument("--pairwise-head-aggregate", choices=("max", "mean", "sum", "head_mean"), default="max")
+    parser.add_argument("--pairwise-head-aggregate", choices=("max", "mean", "sum", "head_mean", "smoothmax", "signed_smoothmax"), default="max")
     parser.add_argument("--disable-sequence-anchor", action="store_true")
     parser.add_argument("--route-heads", type=int, default=1)
     parser.add_argument("--route-frozen-heads", type=int, default=0)
     parser.add_argument("--route-anchor-heads", type=int, default=0)
     parser.add_argument("--route-anchor-kind", choices=("fixed_projection", "query_norm_dot", "diagonal_bilinear", "constant_one"), default="fixed_projection")
     parser.add_argument("--unit-norm-values", action="store_true")
+    parser.add_argument("--disable-forced-unit-norm-values", action="store_true")
     parser.add_argument("--implementation", choices=("reference", "streaming", "kernel", "native"), default="streaming")
     parser.add_argument("--knowledge-nodes", type=int, default=0)
     parser.add_argument("--knowledge-route-topk", type=int, default=0)
@@ -5186,6 +5352,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-fraction", type=float, default=0.9)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--fast-grad-clip", action="store_true")
+    parser.add_argument("--nomemory-lowrank-grad-scale", type=float, default=1.0)
+    parser.add_argument("--grad-diagnose-groups", action="store_true")
+    parser.add_argument("--grad-diagnose-interval", type=int, default=25)
+    parser.add_argument("--grad-diagnose-first-steps", type=int, default=10)
     parser.add_argument("--diagnose-nonfinite-grad", action="store_true")
     parser.add_argument("--diagnose-nonfinite-limit", type=int, default=12)
     parser.add_argument("--stop-on-nonfinite-grad", action="store_true")
@@ -5658,7 +5828,13 @@ def build_rnn_aux_optimizer(
 
 def main() -> None:
     args = parse_args()
-    args.unit_norm_values = True
+    forced_unit_norm_policy = "none"
+    if not args.disable_forced_unit_norm_values:
+        if args.model_kind == "causal_memory" and args.pairwise_kind == "diagonal_bilinear":
+            args.unit_norm_values = True
+            forced_unit_norm_policy = "diagonal_default_on"
+        else:
+            forced_unit_norm_policy = "respect_cli"
     if args.pretokenize_workers < 0:
         raise ValueError("pretokenize-workers must be non-negative.")
     if args.pretokenized_load_workers <= 0:
@@ -5682,14 +5858,9 @@ def main() -> None:
         raise ValueError("eval-topk must be non-negative.")
     if args.seq_len <= 2:
         raise ValueError("seq-len must be larger than 2.")
-    if args.transformer_layers <= 0:
-        raise ValueError("transformer-layers must be positive.")
-    if args.transformer_heads <= 0 or args.dim % args.transformer_heads != 0:
-        raise ValueError("transformer-heads must be positive and divide dim.")
-    if args.transformer_ff_mult <= 0.0:
-        raise ValueError("transformer-ff-mult must be positive.")
-    if not 0.0 <= args.transformer_dropout < 1.0:
-        raise ValueError("transformer-dropout must be in [0, 1).")
+    # Transformer-only shape validation is intentionally disabled here.
+    # This training entrypoint is used heavily for causal-memory runs, and
+    # transformer defaults should not be able to block non-transformer jobs.
     if args.epochs <= 0.0:
         raise ValueError("epochs must be positive.")
     if not 0.0 <= args.curriculum_stage1_ratio <= 1.0:
@@ -5919,6 +6090,19 @@ def main() -> None:
         )
         print(f"hf_embedding_dim | source={hf_dim_source} | dim={args.dim}", flush=True)
     total_steps = max(1, int(math.ceil(steps_per_epoch * args.epochs)))
+    lowrank_lion_default_schedule_applied = False
+    if (
+        args.model_kind == "causal_memory"
+        and args.optimizer.lower() == "lion"
+        and args.pairwise_kind == "low_rank_bilinear"
+        and args.lr_decay_start_step == -1
+        and args.lr_decay_steps == 0
+        and abs(float(args.lr_min_ratio)) <= 1.0e-12
+    ):
+        args.lr_decay_start_step = max(int(args.warmup_steps), int(0.6 * total_steps))
+        args.lr_decay_steps = max(1, total_steps - int(args.lr_decay_start_step))
+        args.lr_min_ratio = 0.25
+        lowrank_lion_default_schedule_applied = True
     run_name = args.run_name or build_run_name(args)
     run_dir = create_run_directory(args.output_root, run_name)
     checkpoints_dir = ensure_directory(run_dir / "checkpoints")
@@ -6177,6 +6361,21 @@ def main() -> None:
         flush=True,
     )
     print(
+        f"training_policy | forced_unit_norm_policy={forced_unit_norm_policy} | "
+        f"unit_norm_values={args.unit_norm_values} | "
+        f"lowrank_lion_default_schedule_applied={lowrank_lion_default_schedule_applied} | "
+        f"nomemory_lowrank_grad_scale={args.nomemory_lowrank_grad_scale} | "
+        f"lr_decay_start_step={args.lr_decay_start_step} | "
+        f"lr_decay_steps={args.lr_decay_steps} | lr_min_ratio={args.lr_min_ratio}",
+        flush=True,
+    )
+    if args.model_kind == "causal_memory" and args.disable_memory:
+        print(
+            "warning | disable_memory=True | memory, route, propagation, and skip paths are bypassed; "
+            "near-zero grads in those subsystems are expected and do not indicate a training bug",
+            flush=True,
+        )
+    print(
         f"curriculum_batches | stage1=batch{stage1_batch_size}/ga{stage1_grad_accum_steps} | "
         f"stage2=batch{stage2_batch_size}/ga{stage2_grad_accum_steps} | "
         f"stage3=batch{stage3_batch_size}/ga{stage3_grad_accum_steps}",
@@ -6196,6 +6395,10 @@ def main() -> None:
         run_dir / "config.json",
         {
             "args": vars(args),
+            "training_policy": {
+                "forced_unit_norm_policy": forced_unit_norm_policy,
+                "lowrank_lion_default_schedule_applied": lowrank_lion_default_schedule_applied,
+            },
             "tokenizer_label": tokenizer_label,
             "tokenizer_model_path": tokenizer_model_path,
             "parameter_count": parameter_count,
@@ -6566,9 +6769,25 @@ def main() -> None:
             train_memory_state = None
 
         should_step_optimizer = step % stage.grad_accum_steps == 0 or step == total_steps
+        grad_group_diagnostics: dict[str, dict[str, float | int]] = {}
         if loss_is_finite and should_step_optimizer:
             if scaler is not None:
                 scaler.unscale_(optimizer)
+            if should_apply_nomemory_lowrank_grad_scale(args):
+                apply_nomemory_lowrank_grad_scale(
+                    grad_clip_named_parameters,
+                    scale=float(args.nomemory_lowrank_grad_scale),
+                )
+            should_capture_grad_groups = args.grad_diagnose_groups and should_log_grad_diagnostics(
+                step=step,
+                interval=args.grad_diagnose_interval,
+                first_steps=args.grad_diagnose_first_steps,
+            )
+            if should_capture_grad_groups:
+                grad_group_diagnostics = collect_grad_group_diagnostics(
+                    grad_clip_named_parameters,
+                    lr=lr,
+                )
             try:
                 if args.fast_grad_clip:
                     grad_norm = clip_grad_norm_fast(
@@ -6676,12 +6895,20 @@ def main() -> None:
             writer.add_scalar("train/prefetch_queue_size", prefetch_queue_size, step)
             if not math.isnan(grad_norm):
                 writer.add_scalar("train/grad_norm", grad_norm, step)
+            for group_name, group_stats in grad_group_diagnostics.items():
+                for stat_name, stat_value in group_stats.items():
+                    writer.add_scalar(
+                        f"train_grad_group/{group_name}/{stat_name}",
+                        float(stat_value),
+                        step,
+                    )
             for stat_name, stat_value in vi_lion_stats.items():
                 writer.add_scalar(f"train/{stat_name}", stat_value, step)
             for bucket_name, bucket_weight in bucket_weights.items():
                 writer.add_scalar(f"train_bucket_weight/{bucket_name}", bucket_weight, step)
 
-        if step == 1 or step % 25 == 0:
+        should_print_progress = step == 1 or step % 25 == 0
+        if should_print_progress:
             elapsed = time.time() - start_time
             vi_lion_progress = ""
             if vi_lion_stats:
@@ -6699,6 +6926,20 @@ def main() -> None:
                 f"elapsed={elapsed:.1f}s{vi_lion_progress}",
                 flush=True,
             )
+        if grad_group_diagnostics:
+            group_messages = []
+            for group_name, group_stats in sorted(
+                grad_group_diagnostics.items(),
+                key=lambda item: float(item[1]["grad_norm"]),
+                reverse=True,
+            ):
+                group_messages.append(
+                    f"{group_name}:grad={float(group_stats['grad_norm']):.3g}"
+                    f":param={float(group_stats['param_norm']):.3g}"
+                    f":upd={float(group_stats['update_ratio']):.3g}"
+                    f":tiny={float(group_stats['tiny_grad_frac']):.3g}"
+                )
+            print("grad_diagnose | " + " | ".join(group_messages), flush=True)
 
         val_loss = None
         should_eval = (
@@ -6802,6 +7043,8 @@ def main() -> None:
             "val_loss": val_loss,
             "val_ppl": None if val_loss is None else perplexity_from_loss(val_loss),
         }
+        if grad_group_diagnostics:
+            row["grad_group_diagnostics"] = grad_group_diagnostics
         row.update(vi_lion_stats)
         history_rows.append(row)
         append_jsonl(run_dir / "history.jsonl", row)

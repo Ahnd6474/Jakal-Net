@@ -130,7 +130,8 @@ jakal_net_low_rank_multihead_max_propagation_causal_dense_signed_abs_forward_cud
     const torch::Tensor& projected_state,
     const torch::Tensor& projected_val,
     const torch::Tensor& biases,
-    bool has_bias);
+    bool has_bias,
+    const std::string& aggregate);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 jakal_net_low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cuda(
@@ -141,6 +142,22 @@ jakal_net_low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cu
     const torch::Tensor& projected_val,
     const torch::Tensor& core_weights,
     const torch::Tensor& biases,
+    const torch::Tensor& grad_delta_state,
+    const torch::Tensor& grad_delta_val,
+    bool has_bias,
+    const std::string& aggregate);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+jakal_net_low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_backward_cuda(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    const torch::Tensor& core_weights,
+    const torch::Tensor& biases,
+    const torch::Tensor& row_max,
+    const torch::Tensor& row_denom,
     const torch::Tensor& grad_delta_state,
     const torch::Tensor& grad_delta_val,
     bool has_bias);

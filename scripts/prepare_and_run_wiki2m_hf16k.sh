@@ -92,8 +92,9 @@ run_transformer() {
     --device cuda --precision bf16 \
     --model-kind transformer --transformer-layers 5 --transformer-heads 6 --transformer-ff-mult 3.7005 --transformer-dropout 0.0 \
     --batch-size $B_TRANS --grad-accum-steps 1 --stage1-batch-size $B_TRANS --stage2-batch-size $B_TRANS --stage3-batch-size $B_TRANS \
-    --learning-rate 0.0002 --warmup-start-lr 0.00003 --warmup-steps 40 --lr-decay-start-step 50 --lr-decay-steps 180 --lr-min-ratio 0.25 \
+    --learning-rate 0.0002 --warmup-start-lr 0.00002 --warmup-steps 200 --lr-min-ratio 0.1 \
     --optimizer adamw_fused --epochs 1.0 --grad-clip 1.0 --diagnose-nonfinite-grad --diagnose-nonfinite-limit 6 \
+    --prebuild-train-batches --prebuild-workers 1 --prebuild-worker-threads 1 \
     --eval-start-step 500 --eval-interval 500 --checkpoint-interval 200 --eval-sample-interval 1000 --eval-documents 8 \
     --curriculum-stage1-ratio 0.0075 --curriculum-stage2-ratio 0.0125 --curriculum-stage1-span 1 --curriculum-stage2-span 1 --curriculum-stage3-span 1 \
     --run-name wiki2m_hf16k_transformer_b${B_TRANS}_adamw_eval500_v1 --tensorboard \
@@ -109,8 +110,9 @@ run_nomemory() {
     --scan-backend auto --enable-fused-training --enable-scan-backward-cuda \
     --pairwise-kind low_rank_bilinear --route-kind low_rank_bilinear --pairwise-rank 128 --route-rank 96 --pairwise-heads 4 --route-heads 4 --implementation native \
     --batch-size $B_NOMEM --grad-accum-steps 1 --stage1-batch-size $B_NOMEM --stage2-batch-size $B_NOMEM --stage3-batch-size $B_NOMEM \
-    --learning-rate 0.0002 --warmup-start-lr 0.00003 --warmup-steps 40 --lr-decay-start-step 50 --lr-decay-steps 180 --lr-min-ratio 0.25 \
+    --learning-rate 0.0002 --warmup-start-lr 0.00002 --warmup-steps 200 --lr-min-ratio 0.1 \
     --optimizer lion --epochs 1.0 --grad-clip 1.0 --diagnose-nonfinite-grad --diagnose-nonfinite-limit 6 \
+    --prebuild-train-batches --prebuild-workers 1 --prebuild-worker-threads 1 \
     --eval-start-step 500 --eval-interval 500 --checkpoint-interval 200 --eval-sample-interval 1000 --eval-documents 8 \
     --curriculum-stage1-ratio 0.0075 --curriculum-stage2-ratio 0.0125 --curriculum-stage1-span 1 --curriculum-stage2-span 1 --curriculum-stage3-span 1 \
     --disable-feed-forward-layers --disable-memory \
@@ -127,8 +129,9 @@ run_noread() {
     --scan-backend auto --enable-fused-training --enable-scan-backward-cuda \
     --pairwise-kind low_rank_bilinear --route-kind low_rank_bilinear --pairwise-rank 128 --route-rank 96 --pairwise-heads 4 --route-heads 4 --implementation native \
     --batch-size $B_NOREAD --grad-accum-steps 1 --stage1-batch-size $B_NOREAD --stage2-batch-size $B_NOREAD --stage3-batch-size $B_NOREAD \
-    --learning-rate 0.0002 --warmup-start-lr 0.00003 --warmup-steps 40 --lr-decay-start-step 50 --lr-decay-steps 180 --lr-min-ratio 0.25 \
+    --learning-rate 0.0002 --warmup-start-lr 0.00002 --warmup-steps 200 --lr-min-ratio 0.1 \
     --optimizer lion --epochs 1.0 --grad-clip 1.0 --diagnose-nonfinite-grad --diagnose-nonfinite-limit 6 \
+    --prebuild-train-batches --prebuild-workers 1 --prebuild-worker-threads 1 \
     --eval-start-step 500 --eval-interval 500 --checkpoint-interval 200 --eval-sample-interval 1000 --eval-documents 8 \
     --curriculum-stage1-ratio 0.0075 --curriculum-stage2-ratio 0.0125 --curriculum-stage1-span 1 --curriculum-stage2-span 1 --curriculum-stage3-span 1 \
     --disable-feed-forward-layers --disable-memory-read \
