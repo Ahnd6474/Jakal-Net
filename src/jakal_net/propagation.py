@@ -42,13 +42,20 @@ from jakal_net.native_backend import (
     propagation_window_native,
 )
 from jakal_net.modules import MultiHeadPairwise
+def _cuda_graph_capture_active(device_type: str) -> bool:
+    if device_type != "cuda":
+        return False
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except Exception:
+        return False
 
 
 def _edge_compress_name(edge_compress_fn: Callable[[Tensor], Tensor]) -> str | None:
     name = getattr(edge_compress_fn, "__name__", "")
     if edge_compress_fn is F.softsign or name == "softsign":
         return "softsign"
-    if name in {"signed_abs_softmax", "_signed_abs_softmax_edges"}:
+    if name in {"signed_abs_softmax", "signed_abs_softmax_edges", "_signed_abs_softmax_edges"}:
         return "signed_abs_softmax"
     if name in {"signed_entmax15", "_signed_entmax15_edges"}:
         return "signed_entmax15"
@@ -81,7 +88,7 @@ def _compress_edges(
 
 def _native_edge_compress_name(edge_compress_fn: Callable[[Tensor], Tensor]) -> str | None:
     name = _edge_compress_name(edge_compress_fn)
-    if name in {"softsign", "signed_entmax15"}:
+    if name in {"softsign", "signed_abs_softmax", "signed_entmax15"}:
         return name
     return None
 
@@ -102,6 +109,7 @@ class Propagation(nn.Module):
         target_block_size: int | None = 128,
         source_block_size: int | None = 128,
         accumulator_dtype: torch.dtype | None = None,
+        use_direction_only: bool = False,
     ) -> None:
         super().__init__()
         validate_implementation(implementation)
@@ -117,9 +125,14 @@ class Propagation(nn.Module):
         self.target_block_size = target_block_size
         self.source_block_size = source_block_size
         self.accumulator_dtype = accumulator_dtype
+        self.use_direction_only = use_direction_only
+
+    def _directional_val(self, val: Tensor) -> Tensor:
+        return val
 
     def compute_scores(self, layer: Layer) -> Tensor:
-        scores = self.pairwise_fn(layer.val, layer.val)
+        directional_val = self._directional_val(layer.val)
+        scores = self.pairwise_fn(directional_val, directional_val)
         validate_pairwise_scores(scores, layer)
         return scores
 
@@ -134,9 +147,14 @@ class Propagation(nn.Module):
             return edges
         return edges * source_state.unsqueeze(-2)
 
-    def _project_inputs(self, layer: Layer) -> tuple[Tensor, Tensor]:
+    def _project_inputs(
+        self,
+        layer: Layer,
+        *,
+        directional_val: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
         projected_state = self.state_proj_fn(layer.state)
-        projected_val = self.val_proj_fn(layer.val)
+        projected_val = self.val_proj_fn(self._directional_val(layer.val) if directional_val is None else directional_val)
         validate_projected_state(projected_state, layer)
         validate_projected_val(projected_val, layer)
         return projected_state, projected_val
@@ -159,16 +177,23 @@ class Propagation(nn.Module):
         return delta_state, delta_val
 
     def _compute_delta_reference(self, layer: Layer) -> LayerDelta:
-        edges = self.compute_edges(layer)
+        directional_val = self._directional_val(layer.val)
+        scores = self.pairwise_fn(directional_val, directional_val)
+        validate_pairwise_scores(scores, layer)
+        edges = self.edge_compress_fn(scores)
         edges = self._weight_edges(edges, layer.state)
-        projected_state, projected_val = self._project_inputs(layer)
+        projected_state, projected_val = self._project_inputs(layer, directional_val=directional_val)
 
-        delta_state = torch.einsum("...ij,...j->...i", edges, projected_state)
+        if self.state_weight_edges:
+            delta_state = edges.sum(dim=-1)
+        else:
+            delta_state = torch.einsum("...ij,...j->...i", edges, projected_state)
         delta_val = torch.einsum("...ij,...jd->...id", edges, projected_val)
         return LayerDelta(delta_state=delta_state, delta_val=delta_val)
 
     def _compute_delta_streaming(self, layer: Layer) -> LayerDelta:
-        projected_state, projected_val = self._project_inputs(layer)
+        directional_val = self._directional_val(layer.val)
+        projected_state, projected_val = self._project_inputs(layer, directional_val=directional_val)
         delta_state, delta_val = self._allocate_delta_buffers(
             layer, projected_state, projected_val
         )
@@ -178,11 +203,11 @@ class Propagation(nn.Module):
         for target_start, target_end in iter_blocks(
             layer.num_nodes, self.target_block_size, name="target_block_size"
         ):
-            target_val = layer.val[..., target_start:target_end, :]
+            target_val = directional_val[..., target_start:target_end, :]
             for source_start, source_end in iter_blocks(
                 layer.num_nodes, self.source_block_size, name="source_block_size"
             ):
-                source_val = layer.val[..., source_start:source_end, :]
+                source_val = directional_val[..., source_start:source_end, :]
                 scores = self.pairwise_fn(target_val, source_val)
                 validate_pairwise_block_scores(
                     scores=scores,
@@ -197,11 +222,14 @@ class Propagation(nn.Module):
                 state_edges = edges.to(dtype=state_acc_dtype)
                 val_edges = edges.to(dtype=val_acc_dtype)
 
-                delta_state[..., target_start:target_end] += torch.einsum(
-                    "...ij,...j->...i",
-                    state_edges,
-                    projected_state[..., source_start:source_end].to(state_acc_dtype),
-                )
+                if self.state_weight_edges:
+                    delta_state[..., target_start:target_end] += state_edges.sum(dim=-1)
+                else:
+                    delta_state[..., target_start:target_end] += torch.einsum(
+                        "...ij,...j->...i",
+                        state_edges,
+                        projected_state[..., source_start:source_end].to(state_acc_dtype),
+                    )
                 delta_val[..., target_start:target_end, :] += torch.einsum(
                     "...ij,...jd->...id",
                     val_edges,
@@ -215,20 +243,21 @@ class Propagation(nn.Module):
 
     def _compute_delta_kernel_preferred(self, layer: Layer) -> LayerDelta:
         edge_compress_name = _native_edge_compress_name(self.edge_compress_fn)
+        directional_layer_val = self._directional_val(layer.val)
         if (
-            not self.state_weight_edges
-            and edge_compress_name is not None
+            edge_compress_name is not None
             and supports_pairwise_kernel(self.pairwise_fn)
             and native_supports("propagation_dense")
             and native_supports_device(layer.val.device.type)
         ):
-            projected_state, projected_val = self._project_inputs(layer)
+            projected_state, projected_val = self._project_inputs(layer, directional_val=directional_layer_val)
             return propagation_dense_native(
                 pairwise_fn=self.pairwise_fn,
                 edge_compress_name=edge_compress_name,
-                layer_val=layer.val,
+                layer_val=directional_layer_val,
                 projected_state=projected_state,
                 projected_val=projected_val,
+                source_state=layer.state if self.state_weight_edges else None,
                 target_block_size=self.target_block_size or layer.num_nodes,
                 source_block_size=self.source_block_size or layer.num_nodes,
             )
@@ -236,11 +265,11 @@ class Propagation(nn.Module):
             layer.val.device.type == "privateuseone"
             and supports_pairwise_kernel(self.pairwise_fn)
         ):
-            projected_state, projected_val = self._project_inputs(layer)
+            projected_state, projected_val = self._project_inputs(layer, directional_val=directional_layer_val)
             return propagation_dense_kernel(
                 pairwise_fn=self.pairwise_fn,
                 edge_compress_fn=self.edge_compress_fn,
-                layer_val=layer.val,
+                layer_val=directional_layer_val,
                 projected_state=projected_state,
                 projected_val=projected_val,
                 source_state=layer.state if self.state_weight_edges else None,
@@ -249,7 +278,7 @@ class Propagation(nn.Module):
                 accumulator_dtype=self.accumulator_dtype,
             )
         if supports_pairwise_kernel(self.pairwise_fn):
-            projected_state, projected_val = self._project_inputs(layer)
+            projected_state, projected_val = self._project_inputs(layer, directional_val=directional_layer_val)
             return propagation_dense_kernel(
                 pairwise_fn=self.pairwise_fn,
                 edge_compress_fn=self.edge_compress_fn,
@@ -261,27 +290,30 @@ class Propagation(nn.Module):
                 source_block_size=self.source_block_size,
                 accumulator_dtype=self.accumulator_dtype,
             )
-        return self._compute_delta_streaming(layer)
+        return Propagation._compute_delta_streaming(self, layer)
 
     def compute_delta(self, layer: Layer) -> LayerDelta:
+        if self.implementation == "native" and _cuda_graph_capture_active(layer.val.device.type):
+            return self._compute_delta_reference(layer)
         if self._supports_multihead_vectorized_fast_path():
             return self._compute_delta_reference(layer)
         if self.implementation == "native":
             edge_compress_name = _native_edge_compress_name(self.edge_compress_fn)
+            directional_layer_val = self._directional_val(layer.val)
             if (
-                not self.state_weight_edges
-                and edge_compress_name is not None
+                edge_compress_name is not None
                 and supports_pairwise_kernel(self.pairwise_fn)
                 and native_supports("propagation_dense")
                 and native_supports_device(layer.val.device.type)
             ):
-                projected_state, projected_val = self._project_inputs(layer)
+                projected_state, projected_val = self._project_inputs(layer, directional_val=directional_layer_val)
                 return propagation_dense_native(
                     pairwise_fn=self.pairwise_fn,
                     edge_compress_name=edge_compress_name,
-                    layer_val=layer.val,
+                    layer_val=directional_layer_val,
                     projected_state=projected_state,
                     projected_val=projected_val,
+                    source_state=layer.state if self.state_weight_edges else None,
                     target_block_size=self.target_block_size or layer.num_nodes,
                     source_block_size=self.source_block_size or layer.num_nodes,
                 )
@@ -323,6 +355,7 @@ class SparsePropagation(Propagation):
         target_block_size: int | None = 128,
         source_block_size: int | None = 128,
         accumulator_dtype: torch.dtype | None = None,
+        use_direction_only: bool = False,
     ) -> None:
         super().__init__(
             pairwise_fn=pairwise_fn,
@@ -337,6 +370,7 @@ class SparsePropagation(Propagation):
             target_block_size=target_block_size,
             source_block_size=source_block_size,
             accumulator_dtype=accumulator_dtype,
+            use_direction_only=use_direction_only,
         )
         if sparse_type not in {"window", "topk"}:
             raise ValueError(f"Unsupported sparse_type: {sparse_type!r}.")
@@ -349,8 +383,10 @@ class SparsePropagation(Propagation):
         self.window = window
 
     def _compute_delta_reference(self, layer: Layer) -> LayerDelta:
-        projected_state, projected_val = self._project_inputs(layer)
-        scores = self.compute_scores(layer)
+        directional_val = self._directional_val(layer.val)
+        projected_state, projected_val = self._project_inputs(layer, directional_val=directional_val)
+        scores = self.pairwise_fn(directional_val, directional_val)
+        validate_pairwise_scores(scores, layer)
 
         if self.sparse_type == "window":
             mask_2d = causal_window_mask(
@@ -368,14 +404,18 @@ class SparsePropagation(Propagation):
 
         masked_edges = _compress_edges(scores, self.edge_compress_fn, mask=mask)
         masked_edges = self._weight_edges(masked_edges, layer.state)
-        delta_state = torch.einsum("...ij,...j->...i", masked_edges, projected_state)
+        if self.state_weight_edges:
+            delta_state = masked_edges.sum(dim=-1)
+        else:
+            delta_state = torch.einsum("...ij,...j->...i", masked_edges, projected_state)
         delta_val = torch.einsum("...ij,...jd->...id", masked_edges, projected_val)
         return LayerDelta(delta_state=delta_state, delta_val=delta_val)
 
     def _compute_window_delta_streaming(self, layer: Layer) -> LayerDelta:
         if _edge_compress_name(self.edge_compress_fn) == "signed_abs_softmax":
             return self._compute_delta_reference(layer)
-        projected_state, projected_val = self._project_inputs(layer)
+        directional_val = self._directional_val(layer.val)
+        projected_state, projected_val = self._project_inputs(layer, directional_val=directional_val)
         delta_state, delta_val = self._allocate_delta_buffers(
             layer, projected_state, projected_val
         )
@@ -386,7 +426,7 @@ class SparsePropagation(Propagation):
         for target_start, target_end in iter_blocks(
             layer.num_nodes, self.target_block_size, name="target_block_size"
         ):
-            target_val = layer.val[..., target_start:target_end, :]
+            target_val = directional_val[..., target_start:target_end, :]
             source_floor = max(0, target_start - window)
             source_ceiling = target_end
 
@@ -397,7 +437,7 @@ class SparsePropagation(Propagation):
             ):
                 global_source_start = source_floor + source_start
                 global_source_end = source_floor + source_end
-                source_val = layer.val[..., global_source_start:global_source_end, :]
+                source_val = directional_val[..., global_source_start:global_source_end, :]
                 scores = self.pairwise_fn(target_val, source_val)
                 validate_pairwise_block_scores(
                     scores=scores,
@@ -420,13 +460,17 @@ class SparsePropagation(Propagation):
                     layer.state[..., global_source_start:global_source_end],
                 )
 
-                delta_state[..., target_start:target_end] += torch.einsum(
-                    "...ij,...j->...i",
-                    edges.to(dtype=state_acc_dtype),
-                    projected_state[..., global_source_start:global_source_end].to(
-                        state_acc_dtype
-                    ),
-                )
+                state_edges = edges.to(dtype=state_acc_dtype)
+                if self.state_weight_edges:
+                    delta_state[..., target_start:target_end] += state_edges.sum(dim=-1)
+                else:
+                    delta_state[..., target_start:target_end] += torch.einsum(
+                        "...ij,...j->...i",
+                        state_edges,
+                        projected_state[..., global_source_start:global_source_end].to(
+                            state_acc_dtype
+                        ),
+                    )
                 delta_val[..., target_start:target_end, :] += torch.einsum(
                     "...ij,...jd->...id",
                     edges.to(dtype=val_acc_dtype),
@@ -441,7 +485,8 @@ class SparsePropagation(Propagation):
         )
 
     def _compute_topk_delta_streaming(self, layer: Layer) -> LayerDelta:
-        projected_state, projected_val = self._project_inputs(layer)
+        directional_val = self._directional_val(layer.val)
+        projected_state, projected_val = self._project_inputs(layer, directional_val=directional_val)
         delta_state, delta_val = self._allocate_delta_buffers(
             layer, projected_state, projected_val
         )
@@ -455,7 +500,7 @@ class SparsePropagation(Propagation):
         for target_start, target_end in iter_blocks(
             layer.num_nodes, self.target_block_size, name="target_block_size"
         ):
-            target_val = layer.val[..., target_start:target_end, :]
+            target_val = directional_val[..., target_start:target_end, :]
             target_nodes = target_end - target_start
             best_scores: Tensor | None = None
             best_indices: Tensor | None = None
@@ -463,7 +508,7 @@ class SparsePropagation(Propagation):
             for source_start, source_end in iter_blocks(
                 layer.num_nodes, self.source_block_size, name="source_block_size"
             ):
-                source_val = layer.val[..., source_start:source_end, :]
+                source_val = directional_val[..., source_start:source_end, :]
                 scores = self.pairwise_fn(target_val, source_val)
                 validate_pairwise_block_scores(
                     scores=scores,
@@ -510,10 +555,13 @@ class SparsePropagation(Propagation):
             selected_state = gather_state_by_indices(projected_state, best_indices)
             selected_val = gather_val_by_indices(projected_val, best_indices)
 
-            delta_state[..., target_start:target_end] = (
-                compressed_edges.to(dtype=state_acc_dtype)
-                * selected_state.to(dtype=state_acc_dtype)
-            ).sum(dim=-1)
+            state_edges = compressed_edges.to(dtype=state_acc_dtype)
+            if self.state_weight_edges:
+                delta_state[..., target_start:target_end] = state_edges.sum(dim=-1)
+            else:
+                delta_state[..., target_start:target_end] = (
+                    state_edges * selected_state.to(dtype=state_acc_dtype)
+                ).sum(dim=-1)
             delta_val[..., target_start:target_end, :] = (
                 compressed_edges.to(dtype=val_acc_dtype).unsqueeze(-1)
                 * selected_val.to(dtype=val_acc_dtype)
@@ -531,18 +579,19 @@ class SparsePropagation(Propagation):
 
     def _compute_delta_kernel_preferred(self, layer: Layer) -> LayerDelta:
         edge_compress_name = _native_edge_compress_name(self.edge_compress_fn)
+        directional_layer_val = self._directional_val(layer.val)
         if (
             not self.state_weight_edges
             and edge_compress_name is not None
             and supports_pairwise_kernel(self.pairwise_fn)
             and native_supports_device(layer.val.device.type)
         ):
-            projected_state, projected_val = self._project_inputs(layer)
+            projected_state, projected_val = self._project_inputs(layer, directional_val=directional_layer_val)
             if self.sparse_type == "window" and native_supports("propagation_window"):
                 return propagation_window_native(
                     pairwise_fn=self.pairwise_fn,
                     edge_compress_name=edge_compress_name,
-                    layer_val=layer.val,
+                    layer_val=directional_layer_val,
                     projected_state=projected_state,
                     projected_val=projected_val,
                     window=self.window or 0,
@@ -553,7 +602,7 @@ class SparsePropagation(Propagation):
                 return propagation_topk_native(
                     pairwise_fn=self.pairwise_fn,
                     edge_compress_name=edge_compress_name,
-                    layer_val=layer.val,
+                    layer_val=directional_layer_val,
                     projected_state=projected_state,
                     projected_val=projected_val,
                     topk=self.topk or layer.num_nodes,
@@ -563,12 +612,12 @@ class SparsePropagation(Propagation):
         if layer.val.device.type == "privateuseone" and supports_pairwise_kernel(
             self.pairwise_fn
         ):
-            projected_state, projected_val = self._project_inputs(layer)
+            projected_state, projected_val = self._project_inputs(layer, directional_val=directional_layer_val)
             if self.sparse_type == "window":
                 return propagation_window_kernel(
                     pairwise_fn=self.pairwise_fn,
                     edge_compress_fn=self.edge_compress_fn,
-                    layer_val=layer.val,
+                    layer_val=directional_layer_val,
                     projected_state=projected_state,
                     projected_val=projected_val,
                     source_state=layer.state if self.state_weight_edges else None,
@@ -580,7 +629,7 @@ class SparsePropagation(Propagation):
             return propagation_topk_kernel(
                 pairwise_fn=self.pairwise_fn,
                 edge_compress_fn=self.edge_compress_fn,
-                layer_val=layer.val,
+                layer_val=directional_layer_val,
                 projected_state=projected_state,
                 projected_val=projected_val,
                 source_state=layer.state if self.state_weight_edges else None,
@@ -590,12 +639,12 @@ class SparsePropagation(Propagation):
                 accumulator_dtype=self.accumulator_dtype,
             )
         if supports_pairwise_kernel(self.pairwise_fn):
-            projected_state, projected_val = self._project_inputs(layer)
+            projected_state, projected_val = self._project_inputs(layer, directional_val=directional_layer_val)
             if self.sparse_type == "window":
                 return propagation_window_kernel(
                     pairwise_fn=self.pairwise_fn,
                     edge_compress_fn=self.edge_compress_fn,
-                    layer_val=layer.val,
+                    layer_val=directional_layer_val,
                     projected_state=projected_state,
                     projected_val=projected_val,
                     source_state=layer.state if self.state_weight_edges else None,
@@ -607,7 +656,7 @@ class SparsePropagation(Propagation):
             return propagation_topk_kernel(
                 pairwise_fn=self.pairwise_fn,
                 edge_compress_fn=self.edge_compress_fn,
-                layer_val=layer.val,
+                layer_val=directional_layer_val,
                 projected_state=projected_state,
                 projected_val=projected_val,
                 source_state=layer.state if self.state_weight_edges else None,
@@ -619,22 +668,25 @@ class SparsePropagation(Propagation):
         return self._compute_delta_streaming(layer)
 
     def compute_delta(self, layer: Layer) -> LayerDelta:
+        if self.implementation == "native" and _cuda_graph_capture_active(layer.val.device.type):
+            return self._compute_delta_reference(layer)
         if self._supports_multihead_vectorized_fast_path():
             return self._compute_delta_reference(layer)
         if self.implementation == "native":
             edge_compress_name = _native_edge_compress_name(self.edge_compress_fn)
+            directional_layer_val = self._directional_val(layer.val)
             if (
                 not self.state_weight_edges
                 and edge_compress_name is not None
                 and supports_pairwise_kernel(self.pairwise_fn)
                 and native_supports_device(layer.val.device.type)
             ):
-                projected_state, projected_val = self._project_inputs(layer)
+                projected_state, projected_val = self._project_inputs(layer, directional_val=directional_layer_val)
                 if self.sparse_type == "window" and native_supports("propagation_window"):
                     return propagation_window_native(
                         pairwise_fn=self.pairwise_fn,
                         edge_compress_name=edge_compress_name,
-                        layer_val=layer.val,
+                        layer_val=directional_layer_val,
                         projected_state=projected_state,
                         projected_val=projected_val,
                         window=self.window or 0,
@@ -645,7 +697,7 @@ class SparsePropagation(Propagation):
                     return propagation_topk_native(
                         pairwise_fn=self.pairwise_fn,
                         edge_compress_name=edge_compress_name,
-                        layer_val=layer.val,
+                        layer_val=directional_layer_val,
                         projected_state=projected_state,
                         projected_val=projected_val,
                         topk=self.topk or layer.num_nodes,

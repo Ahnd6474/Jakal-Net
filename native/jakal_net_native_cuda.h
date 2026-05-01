@@ -11,6 +11,15 @@ bool jakal_net_query_topk_reduce_cuda_available();
 bool jakal_net_low_rank_pairwise_topk_forward_cuda_available();
 bool jakal_net_low_rank_propagation_topk_forward_cuda_available();
 bool jakal_net_low_rank_propagation_window_forward_cuda_available();
+bool jakal_net_low_rank_propagation_window_signed_abs_forward_cuda_available();
+bool jakal_net_low_rank_propagation_causal_dense_signed_abs_forward_cuda_available();
+bool jakal_net_low_rank_propagation_causal_dense_signed_abs_backward_cuda_available();
+bool jakal_net_bilinear_propagation_causal_dense_signed_abs_backward_cuda_available();
+bool jakal_net_low_rank_multihead_max_propagation_causal_dense_signed_abs_cuda_available();
+bool jakal_net_diagonal_propagation_causal_dense_signed_abs_cuda_available();
+bool jakal_net_low_rank_propagation_dense_forward_cuda_available();
+bool jakal_net_low_rank_dense_scores_tf32_cuda_available();
+bool jakal_net_low_rank_propagation_dense_tf32_forward_cuda_available();
 
 std::tuple<torch::Tensor, torch::Tensor> jakal_net_query_topk_reduce_cuda(
     const torch::Tensor& edges,
@@ -47,6 +56,26 @@ jakal_net_low_rank_propagation_topk_forward_cuda(
     int64_t compress_kind);
 
 std::tuple<torch::Tensor, torch::Tensor>
+jakal_net_low_rank_propagation_dense_forward_cuda(
+    const torch::Tensor& weighted_projected_source,
+    torch::Tensor projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    int64_t compress_kind);
+
+torch::Tensor jakal_net_low_rank_dense_scores_tf32_cuda(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_target);
+
+std::tuple<torch::Tensor, torch::Tensor>
+jakal_net_low_rank_propagation_dense_tf32_forward_cuda(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    double score_bias);
+
+std::tuple<torch::Tensor, torch::Tensor>
 jakal_net_low_rank_propagation_window_forward_cuda(
     const torch::Tensor& weighted_projected_source,
     torch::Tensor projected_target,
@@ -54,6 +83,102 @@ jakal_net_low_rank_propagation_window_forward_cuda(
     const torch::Tensor& projected_val,
     int64_t window,
     double score_bias);
+
+std::tuple<torch::Tensor, torch::Tensor>
+jakal_net_low_rank_propagation_window_signed_abs_forward_cuda(
+    const torch::Tensor& weighted_projected_source,
+    torch::Tensor projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    int64_t window,
+    double score_bias);
+
+std::tuple<torch::Tensor, torch::Tensor>
+jakal_net_low_rank_propagation_causal_dense_signed_abs_forward_cuda(
+    const torch::Tensor& weighted_projected_source,
+    torch::Tensor projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    double score_bias);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+jakal_net_low_rank_propagation_causal_dense_signed_abs_backward_cuda(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    const torch::Tensor& core_weight,
+    const torch::Tensor& grad_delta_state,
+    const torch::Tensor& grad_delta_val,
+    double score_bias);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+jakal_net_bilinear_propagation_causal_dense_signed_abs_backward_cuda(
+    const torch::Tensor& projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    const torch::Tensor& grad_delta_state,
+    const torch::Tensor& grad_delta_val,
+    double score_bias);
+
+std::tuple<torch::Tensor, torch::Tensor>
+jakal_net_low_rank_multihead_max_propagation_causal_dense_signed_abs_forward_cuda(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    const torch::Tensor& biases,
+    bool has_bias,
+    const std::string& aggregate);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+jakal_net_low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cuda(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    const torch::Tensor& core_weights,
+    const torch::Tensor& biases,
+    const torch::Tensor& grad_delta_state,
+    const torch::Tensor& grad_delta_val,
+    bool has_bias,
+    const std::string& aggregate);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+jakal_net_low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_backward_cuda(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    const torch::Tensor& core_weights,
+    const torch::Tensor& biases,
+    const torch::Tensor& row_max,
+    const torch::Tensor& row_denom,
+    const torch::Tensor& grad_delta_state,
+    const torch::Tensor& grad_delta_val,
+    bool has_bias);
+
+std::tuple<torch::Tensor, torch::Tensor>
+jakal_net_diagonal_propagation_causal_dense_signed_abs_forward_cuda(
+    const torch::Tensor& layer_val,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    const torch::Tensor& normalized_weight,
+    const torch::Tensor& bias);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+jakal_net_diagonal_propagation_causal_dense_signed_abs_backward_cuda(
+    const torch::Tensor& layer_val,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    const torch::Tensor& normalized_weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& grad_delta_state,
+    const torch::Tensor& grad_delta_val);
 
 std::tuple<torch::Tensor, torch::Tensor>
 jakal_net_low_rank_propagation_window_entmax15_forward_cuda(
@@ -71,6 +196,17 @@ torch::Tensor jakal_net_softsign_backward_cuda(
 torch::Tensor jakal_net_softmax_backward_cuda(
     const torch::Tensor& routes,
     const torch::Tensor& grad_routes);
+
+std::tuple<torch::Tensor, torch::Tensor>
+jakal_net_apply_delta_to_layer_cuda(
+    const torch::Tensor& layer_state,
+    const torch::Tensor& layer_val,
+    const torch::Tensor& delta_state,
+    const torch::Tensor& delta_val,
+    const torch::Tensor& val_norm_weight,
+    const torch::Tensor& val_norm_bias,
+    const std::string& state_activation_name,
+    bool use_fused_forward);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 jakal_net_diagonal_pairwise_topk_backward_cuda(
@@ -127,6 +263,12 @@ jakal_net_causal_memory_scan_fused_forward_cuda(
     const std::vector<int64_t>& level_transition_topks,
     const std::vector<torch::Tensor>& level_norm_weights,
     const std::vector<torch::Tensor>& level_norm_biases,
+    const std::vector<torch::Tensor>& level_ffn_norm_weights,
+    const std::vector<torch::Tensor>& level_ffn_norm_biases,
+    const std::vector<torch::Tensor>& level_ffn_in_weights,
+    const std::vector<torch::Tensor>& level_ffn_in_biases,
+    const std::vector<torch::Tensor>& level_ffn_out_weights,
+    const std::vector<torch::Tensor>& level_ffn_out_biases,
     const std::vector<torch::Tensor>& skip_source_weights,
     const std::vector<torch::Tensor>& skip_target_weights,
     const std::vector<torch::Tensor>& skip_core_weights,
@@ -167,6 +309,12 @@ jakal_net_causal_memory_scan_fused_trace_cuda(
     const std::vector<int64_t>& level_transition_topks,
     const std::vector<torch::Tensor>& level_norm_weights,
     const std::vector<torch::Tensor>& level_norm_biases,
+    const std::vector<torch::Tensor>& level_ffn_norm_weights,
+    const std::vector<torch::Tensor>& level_ffn_norm_biases,
+    const std::vector<torch::Tensor>& level_ffn_in_weights,
+    const std::vector<torch::Tensor>& level_ffn_in_biases,
+    const std::vector<torch::Tensor>& level_ffn_out_weights,
+    const std::vector<torch::Tensor>& level_ffn_out_biases,
     const std::vector<torch::Tensor>& skip_source_weights,
     const std::vector<torch::Tensor>& skip_target_weights,
     const std::vector<torch::Tensor>& skip_core_weights,
@@ -206,6 +354,12 @@ std::vector<torch::Tensor> jakal_net_causal_memory_scan_fused_backward_cuda(
     const std::vector<int64_t>& level_transition_topks,
     const std::vector<torch::Tensor>& level_norm_weights,
     const std::vector<torch::Tensor>& level_norm_biases,
+    const std::vector<torch::Tensor>& level_ffn_norm_weights,
+    const std::vector<torch::Tensor>& level_ffn_norm_biases,
+    const std::vector<torch::Tensor>& level_ffn_in_weights,
+    const std::vector<torch::Tensor>& level_ffn_in_biases,
+    const std::vector<torch::Tensor>& level_ffn_out_weights,
+    const std::vector<torch::Tensor>& level_ffn_out_biases,
     const std::vector<torch::Tensor>& skip_source_weights,
     const std::vector<torch::Tensor>& skip_target_weights,
     const std::vector<torch::Tensor>& skip_core_weights,

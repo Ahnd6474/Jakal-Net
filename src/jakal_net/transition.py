@@ -38,6 +38,13 @@ from jakal_net.native_backend import (
     transition_topk_native,
 )
 from jakal_net.modules import MultiHeadRoute
+def _cuda_graph_capture_active(device_type: str) -> bool:
+    if device_type != "cuda":
+        return False
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except Exception:
+        return False
 
 
 def signed_abs_softmax(
@@ -126,6 +133,7 @@ class Transition(nn.Module):
         src_block_size: int | None = 128,
         dst_block_size: int | None = 128,
         accumulator_dtype: torch.dtype | None = None,
+        use_direction_only: bool = False,
     ) -> None:
         super().__init__()
         validate_merge_mode(merge_mode)
@@ -143,11 +151,19 @@ class Transition(nn.Module):
         self.src_block_size = src_block_size
         self.dst_block_size = dst_block_size
         self.accumulator_dtype = accumulator_dtype
+        self.use_direction_only = use_direction_only
         self.track_stats = False
         self.last_stats: dict[str, float] | None = None
+        self._route_expects_pairwise_inputs = _route_uses_pairwise_inputs(route_fn)
+        self._multihead_vectorized_fast_path = isinstance(self.route_fn, MultiHeadRoute)
+
+    def _directional_val(self, val: Tensor) -> Tensor:
+        return val
 
     def _route_logits(self, src_val: Tensor, dst_val: Tensor) -> Tensor:
-        if _route_uses_pairwise_inputs(self.route_fn):
+        src_val = self._directional_val(src_val)
+        dst_val = self._directional_val(dst_val)
+        if self._route_expects_pairwise_inputs:
             return self.route_fn(src_val, dst_val)
         return self.route_fn(src_val)
 
@@ -157,7 +173,7 @@ class Transition(nn.Module):
         return logits
 
     def _supports_multihead_vectorized_fast_path(self) -> bool:
-        return isinstance(self.route_fn, MultiHeadRoute)
+        return self._multihead_vectorized_fast_path
 
     def compute_routes(self, src_layer: Layer, dst_layer: Layer) -> Tensor:
         logits = self.compute_route_logits(src_layer, dst_layer)
@@ -173,9 +189,14 @@ class Transition(nn.Module):
         return torch.softmax(logits, dim=-1)
 
     def _project_inputs(
-        self, src_layer: Layer, dst_layer: Layer
+        self,
+        src_layer: Layer,
+        dst_layer: Layer,
+        *,
+        directional_src_val: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        projected_val = self.val_proj_fn(src_layer.val)
+        source_val = self._directional_val(src_layer.val) if directional_src_val is None else directional_src_val
+        projected_val = self.val_proj_fn(source_val)
         projected_state = self.state_proj_fn(src_layer.state)
         sender_strength = self.state_activation_fn(src_layer.state)
 
@@ -210,9 +231,16 @@ class Transition(nn.Module):
         return delta_state, delta_val
 
     def _compute_delta_reference(self, src_layer: Layer, dst_layer: Layer) -> LayerDelta:
-        routes = self.compute_routes(src_layer, dst_layer)
+        directional_src_val = self._directional_val(src_layer.val)
+        directional_dst_val = self._directional_val(dst_layer.val)
+        if self._route_expects_pairwise_inputs:
+            logits = self.route_fn(directional_src_val, directional_dst_val)
+        else:
+            logits = self.route_fn(directional_src_val)
+        validate_route_logits(logits, src_layer, dst_layer)
+        routes = self._compress_routes(logits)
         projected_val, projected_state, sender_strength = self._project_inputs(
-            src_layer, dst_layer
+            src_layer, dst_layer, directional_src_val=directional_src_val
         )
         weighted_routes = routes * sender_strength.unsqueeze(-1)
 
@@ -221,8 +249,10 @@ class Transition(nn.Module):
         return LayerDelta(delta_state=delta_state, delta_val=delta_val)
 
     def _compute_delta_streaming(self, src_layer: Layer, dst_layer: Layer) -> LayerDelta:
+        directional_src_val = self._directional_val(src_layer.val)
+        directional_dst_val = self._directional_val(dst_layer.val)
         projected_val, projected_state, sender_strength = self._project_inputs(
-            src_layer, dst_layer
+            src_layer, dst_layer, directional_src_val=directional_src_val
         )
         delta_state, delta_val = self._allocate_delta_buffers(
             dst_layer, projected_val, projected_state
@@ -233,8 +263,11 @@ class Transition(nn.Module):
         for src_start, src_end in iter_blocks(
             src_layer.num_nodes, self.src_block_size, name="src_block_size"
         ):
-            src_val = src_layer.val[..., src_start:src_end, :]
-            logits = self._route_logits(src_val, dst_layer.val)
+            src_val = directional_src_val[..., src_start:src_end, :]
+            if self._route_expects_pairwise_inputs:
+                logits = self.route_fn(src_val, directional_dst_val)
+            else:
+                logits = self.route_fn(src_val)
             validate_route_block_logits(
                 logits=logits,
                 batch_shape=src_layer.batch_shape,
@@ -263,18 +296,19 @@ class Transition(nn.Module):
     def _compute_delta_kernel_preferred(
         self, src_layer: Layer, dst_layer: Layer
     ) -> LayerDelta:
+        directional_src_val = self._directional_val(src_layer.val)
         if src_layer.val.device.type == "privateuseone":
             return self._compute_delta_reference(src_layer, dst_layer)
-        if not _route_uses_pairwise_inputs(self.route_fn) and supports_route_kernel(
+        if not self._route_expects_pairwise_inputs and supports_route_kernel(
             self.route_fn
         ):
             projected_val, projected_state, sender_strength = self._project_inputs(
-                src_layer, dst_layer
+                src_layer, dst_layer, directional_src_val=directional_src_val
             )
             return transition_dense_kernel(
                 route_fn=self.route_fn,
                 sender_strength=sender_strength,
-                src_val=src_layer.val,
+                src_val=directional_src_val,
                 projected_state=projected_state,
                 projected_val=projected_val,
                 dst_nodes=dst_layer.num_nodes,
@@ -290,24 +324,28 @@ class Transition(nn.Module):
             logits = self.compute_route_logits(src_layer, dst_layer)
             routes = self._compress_routes(logits)
             self.last_stats = _summarize_routes(routes)
-        if self._supports_multihead_vectorized_fast_path():
+        if self.implementation == "native" and _cuda_graph_capture_active(src_layer.val.device.type):
+            return self._compute_delta_reference(src_layer, dst_layer)
+        if self._supports_multihead_vectorized_fast_path() and self.implementation != "native":
             return self._compute_delta_reference(src_layer, dst_layer)
         if self.implementation == "native":
+            directional_src_val = self._directional_val(src_layer.val)
+            directional_dst_val = self._directional_val(dst_layer.val)
             if (
-                self.route_compress_name in {"softmax", "signed_entmax15"}
+                self.route_compress_name in {"softmax", "signed_abs_softmax", "signed_entmax15"}
                 and
                 supports_pairwise_route_kernel(self.route_fn)
                 and native_supports("transition_pairwise_dense")
                 and native_supports_device(src_layer.val.device.type)
             ):
                 projected_val, projected_state, sender_strength = self._project_inputs(
-                    src_layer, dst_layer
+                    src_layer, dst_layer, directional_src_val=directional_src_val
                 )
                 return transition_pairwise_dense_native(
                     route_fn=self.route_fn,
                     sender_strength=sender_strength,
-                    src_val=src_layer.val,
-                    dst_val=dst_layer.val,
+                    src_val=directional_src_val,
+                    dst_val=directional_dst_val,
                     projected_state=projected_state,
                     projected_val=projected_val,
                     src_block_size=self.src_block_size or src_layer.num_nodes,
@@ -315,9 +353,9 @@ class Transition(nn.Module):
                     route_compress_name=self.route_compress_name,
                 )
             if (
-                self.route_compress_name in {"softmax", "signed_entmax15"}
+                self.route_compress_name in {"softmax", "signed_abs_softmax", "signed_entmax15"}
                 and
-                not _route_uses_pairwise_inputs(self.route_fn)
+                not self._route_expects_pairwise_inputs
                 and supports_route_kernel(self.route_fn)
                 and native_supports("transition_dense")
                 and native_supports_device(src_layer.val.device.type)
@@ -328,7 +366,7 @@ class Transition(nn.Module):
                 return transition_dense_native(
                     route_fn=self.route_fn,
                     sender_strength=sender_strength,
-                    src_val=src_layer.val,
+                    src_val=directional_src_val,
                     projected_state=projected_state,
                     projected_val=projected_val,
                     dst_nodes=dst_layer.num_nodes,
@@ -365,6 +403,7 @@ class SparseTransition(Transition):
         src_block_size: int | None = 128,
         dst_block_size: int | None = 128,
         accumulator_dtype: torch.dtype | None = None,
+        use_direction_only: bool = False,
     ) -> None:
         super().__init__(
             route_fn=route_fn,
@@ -378,22 +417,29 @@ class SparseTransition(Transition):
             src_block_size=src_block_size,
             dst_block_size=dst_block_size,
             accumulator_dtype=accumulator_dtype,
+            use_direction_only=use_direction_only,
         )
         if topk <= 0:
             raise ValueError("topk must be positive.")
         self.topk = topk
 
     def _compute_delta_reference(self, src_layer: Layer, dst_layer: Layer) -> LayerDelta:
-        logits = self.compute_route_logits(src_layer, dst_layer)
+        directional_src_val = self._directional_val(src_layer.val)
+        directional_dst_val = self._directional_val(dst_layer.val)
+        if self._route_expects_pairwise_inputs:
+            logits = self.route_fn(directional_src_val, directional_dst_val)
+        else:
+            logits = self.route_fn(directional_src_val)
+        validate_route_logits(logits, src_layer, dst_layer)
         k = min(self.topk, dst_layer.num_nodes)
         if k == dst_layer.num_nodes:
-            routes = self.compute_routes(src_layer, dst_layer)
+            routes = self._compress_routes(logits)
         else:
             mask = build_topk_mask(logits, k, dim=-1)
             routes = self._compress_routes(logits, mask=mask)
 
         projected_val, projected_state, sender_strength = self._project_inputs(
-            src_layer, dst_layer
+            src_layer, dst_layer, directional_src_val=directional_src_val
         )
         weighted_routes = routes * sender_strength.unsqueeze(-1)
         delta_state = torch.einsum("...jk,...j->...k", weighted_routes, projected_state)
@@ -403,7 +449,13 @@ class SparseTransition(Transition):
     def _compute_delta_directml_fallback(
         self, src_layer: Layer, dst_layer: Layer
     ) -> LayerDelta:
-        logits = self.compute_route_logits(src_layer, dst_layer)
+        directional_src_val = self._directional_val(src_layer.val)
+        directional_dst_val = self._directional_val(dst_layer.val)
+        if self._route_expects_pairwise_inputs:
+            logits = self.route_fn(directional_src_val, directional_dst_val)
+        else:
+            logits = self.route_fn(directional_src_val)
+        validate_route_logits(logits, src_layer, dst_layer)
         k = min(self.topk, dst_layer.num_nodes)
         if k == dst_layer.num_nodes:
             routes = self._compress_routes(logits)
@@ -417,7 +469,7 @@ class SparseTransition(Transition):
             routes = self._compress_routes(logits, mask=mask)
 
         projected_val, projected_state, sender_strength = self._project_inputs(
-            src_layer, dst_layer
+            src_layer, dst_layer, directional_src_val=directional_src_val
         )
         weighted_routes = routes * sender_strength.unsqueeze(-1)
         delta_state = torch.einsum("...jk,...j->...k", weighted_routes, projected_state)
@@ -425,8 +477,10 @@ class SparseTransition(Transition):
         return LayerDelta(delta_state=delta_state, delta_val=delta_val)
 
     def _compute_delta_streaming(self, src_layer: Layer, dst_layer: Layer) -> LayerDelta:
+        directional_src_val = self._directional_val(src_layer.val)
+        directional_dst_val = self._directional_val(dst_layer.val)
         projected_val, projected_state, sender_strength = self._project_inputs(
-            src_layer, dst_layer
+            src_layer, dst_layer, directional_src_val=directional_src_val
         )
         delta_state, delta_val = self._allocate_delta_buffers(
             dst_layer, projected_val, projected_state
@@ -438,19 +492,19 @@ class SparseTransition(Transition):
         if k == dst_layer.num_nodes:
             return super()._compute_delta_streaming(src_layer, dst_layer)
 
-        pairwise_route = _route_uses_pairwise_inputs(self.route_fn)
+        pairwise_route = self._route_expects_pairwise_inputs
         for src_start, src_end in iter_blocks(
             src_layer.num_nodes, self.src_block_size, name="src_block_size"
         ):
-            src_val = src_layer.val[..., src_start:src_end, :]
+            src_val = directional_src_val[..., src_start:src_end, :]
             if pairwise_route:
                 topk_values: Tensor | None = None
                 topk_indices: Tensor | None = None
                 for dst_start, dst_end in iter_blocks(
                     dst_layer.num_nodes, self.dst_block_size, name="dst_block_size"
                 ):
-                    dst_val = dst_layer.val[..., dst_start:dst_end, :]
-                    logits = self._route_logits(src_val, dst_val)
+                    dst_val = directional_dst_val[..., dst_start:dst_end, :]
+                    logits = self.route_fn(src_val, dst_val)
                     validate_route_block_logits(
                         logits=logits,
                         batch_shape=src_layer.batch_shape,
@@ -485,7 +539,7 @@ class SparseTransition(Transition):
                 if topk_values is None or topk_indices is None:
                     continue
             else:
-                logits = self._route_logits(src_val, dst_layer.val)
+                logits = self.route_fn(src_val)
                 validate_route_block_logits(
                     logits=logits,
                     batch_shape=src_layer.batch_shape,
@@ -533,6 +587,8 @@ class SparseTransition(Transition):
     def _compute_delta_kernel_preferred(
         self, src_layer: Layer, dst_layer: Layer
     ) -> LayerDelta:
+        directional_src_val = self._directional_val(src_layer.val)
+        directional_dst_val = self._directional_val(dst_layer.val)
         if src_layer.val.device.type == "privateuseone":
             return self._compute_delta_directml_fallback(src_layer, dst_layer)
         if (
@@ -541,14 +597,14 @@ class SparseTransition(Transition):
             and native_supports_device(src_layer.val.device.type)
         ):
             projected_val, projected_state, sender_strength = self._project_inputs(
-                src_layer, dst_layer
+                src_layer, dst_layer, directional_src_val=directional_src_val
             )
             try:
                 return transition_pairwise_topk_native(
                     route_fn=self.route_fn,
                     sender_strength=sender_strength,
-                    src_val=src_layer.val,
-                    dst_val=dst_layer.val,
+                    src_val=directional_src_val,
+                    dst_val=directional_dst_val,
                     projected_state=projected_state,
                     projected_val=projected_val,
                     topk=self.topk,
@@ -560,16 +616,16 @@ class SparseTransition(Transition):
                 if self.route_compress_name != "softmax":
                     return self._compute_delta_streaming(src_layer, dst_layer)
                 raise
-        if not _route_uses_pairwise_inputs(self.route_fn) and supports_route_kernel(
+        if not self._route_expects_pairwise_inputs and supports_route_kernel(
             self.route_fn
         ):
             projected_val, projected_state, sender_strength = self._project_inputs(
-                src_layer, dst_layer
+                src_layer, dst_layer, directional_src_val=directional_src_val
             )
             return transition_topk_kernel(
                 route_fn=self.route_fn,
                 sender_strength=sender_strength,
-                src_val=src_layer.val,
+                src_val=directional_src_val,
                 projected_state=projected_state,
                 projected_val=projected_val,
                 dst_nodes=dst_layer.num_nodes,
@@ -596,23 +652,27 @@ class SparseTransition(Transition):
                 dense_routes.scatter_(-1, topk_indices, routes)
                 routes = dense_routes
             self.last_stats = _summarize_routes(routes, topk_indices=topk_indices)
+        if self.implementation == "native" and _cuda_graph_capture_active(src_layer.val.device.type):
+            return self._compute_delta_reference(src_layer, dst_layer)
         if self._supports_multihead_vectorized_fast_path():
             return self._compute_delta_reference(src_layer, dst_layer)
         if self.implementation == "native":
+            directional_src_val = self._directional_val(src_layer.val)
+            directional_dst_val = self._directional_val(dst_layer.val)
             if (
                 supports_pairwise_route_kernel(self.route_fn)
                 and native_supports("transition_pairwise_topk")
                 and native_supports_device(src_layer.val.device.type)
             ):
                 projected_val, projected_state, sender_strength = self._project_inputs(
-                    src_layer, dst_layer
+                    src_layer, dst_layer, directional_src_val=directional_src_val
                 )
                 try:
                     return transition_pairwise_topk_native(
                         route_fn=self.route_fn,
                         sender_strength=sender_strength,
-                        src_val=src_layer.val,
-                        dst_val=dst_layer.val,
+                        src_val=directional_src_val,
+                        dst_val=directional_dst_val,
                         projected_state=projected_state,
                         projected_val=projected_val,
                         topk=self.topk,
@@ -627,18 +687,18 @@ class SparseTransition(Transition):
             if (
                 self.route_compress_name == "softmax"
                 and
-                not _route_uses_pairwise_inputs(self.route_fn)
+                not self._route_expects_pairwise_inputs
                 and supports_route_kernel(self.route_fn)
                 and native_supports("transition_topk")
                 and native_supports_device(src_layer.val.device.type)
             ):
                 projected_val, projected_state, sender_strength = self._project_inputs(
-                    src_layer, dst_layer
+                    src_layer, dst_layer, directional_src_val=directional_src_val
                 )
                 return transition_topk_native(
                     route_fn=self.route_fn,
                     sender_strength=sender_strength,
-                    src_val=src_layer.val,
+                    src_val=directional_src_val,
                     projected_state=projected_state,
                     projected_val=projected_val,
                     dst_nodes=dst_layer.num_nodes,

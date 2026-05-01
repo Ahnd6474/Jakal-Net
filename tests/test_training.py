@@ -2,6 +2,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import sys
+from unittest.mock import patch
 
 import torch
 
@@ -32,24 +33,113 @@ from train_causal_memory_lm import (  # noqa: E402
     BOS_TOKEN,
     CODE_TOKEN,
     CONT_TOKEN,
+    DocumentChunk,
+    FlatDocumentChunkBatcher,
+    FlatIndexPrebuiltBatchBlock,
     DIALOGUE_TOKEN,
     EOT_TOKEN,
     INSTRUCTION_TOKEN,
     MATH_TOKEN,
+    PrebuiltDocumentBatchProvider,
     RESPONSE_TOKEN,
     TEXT_TOKEN,
+    TokenizedDocument,
     TrainingCurriculumStage,
     _content_target_visibility,
     _normalize_dialogue_body,
+    build_prebuilt_batch_blocks_parallel,
     build_special_token_id_map,
+    load_flat_pretokenized_directory,
     make_document_chunks,
     apply_training_curriculum,
+    preload_flat_pretokenized_directory,
     resolve_curriculum_stage,
+    save_pretokenized_bundle,
+    split_train_val_flat_documents_with_collection,
 )
 from build_segmented_dialogue_corpus import dialogue_has_mixed_segments, segment_message_content_exact  # noqa: E402
 from jakal_net.causal_memory_lm import CausalHierarchicalMemoryLM  # noqa: E402
 
 class TrainingTests(unittest.TestCase):
+    def _write_flat_test_shards(self, root: Path) -> Path:
+        corpus_info = {
+            "special_tokens": {"pad": 0, "eos": 4, "cont": 3},
+            "tokenized_summary": {"documents": 4, "chunks": 4, "tokens": 16},
+        }
+        shard1 = (
+            TokenizedDocument(
+                kind="text",
+                source="wiki:test:1",
+                token_count=4,
+                chunks=(
+                    DocumentChunk(
+                        context=torch.tensor([1, 2, 10, 0], dtype=torch.long),
+                        target=torch.tensor([2, 10, 4, 0], dtype=torch.long),
+                        loss_mask=torch.tensor([1.0, 1.0, 1.0, 0.0], dtype=torch.float32),
+                        is_continuation=False,
+                    ),
+                ),
+            ),
+            TokenizedDocument(
+                kind="text",
+                source="wiki:test:2",
+                token_count=4,
+                chunks=(
+                    DocumentChunk(
+                        context=torch.tensor([1, 5, 11, 0], dtype=torch.long),
+                        target=torch.tensor([5, 11, 4, 0], dtype=torch.long),
+                        loss_mask=torch.tensor([1.0, 1.0, 1.0, 0.0], dtype=torch.float32),
+                        is_continuation=False,
+                    ),
+                ),
+            ),
+        )
+        shard2 = (
+            TokenizedDocument(
+                kind="text",
+                source="wiki:test:3",
+                token_count=4,
+                chunks=(
+                    DocumentChunk(
+                        context=torch.tensor([1, 6, 12, 0], dtype=torch.long),
+                        target=torch.tensor([6, 12, 4, 0], dtype=torch.long),
+                        loss_mask=torch.tensor([1.0, 1.0, 1.0, 0.0], dtype=torch.float32),
+                        is_continuation=False,
+                    ),
+                ),
+            ),
+            TokenizedDocument(
+                kind="text",
+                source="wiki:test:4",
+                token_count=4,
+                chunks=(
+                    DocumentChunk(
+                        context=torch.tensor([1, 7, 13, 0], dtype=torch.long),
+                        target=torch.tensor([7, 13, 4, 0], dtype=torch.long),
+                        loss_mask=torch.tensor([1.0, 1.0, 1.0, 0.0], dtype=torch.float32),
+                        is_continuation=False,
+                    ),
+                ),
+            ),
+        )
+        save_pretokenized_bundle(
+            root / "shard_0000.pt",
+            documents=shard1,
+            vocab_size=128,
+            tokenizer_label="test",
+            tokenizer_model_path=None,
+            corpus_info=corpus_info,
+        )
+        save_pretokenized_bundle(
+            root / "shard_0001.pt",
+            documents=shard2,
+            vocab_size=128,
+            tokenizer_label="test",
+            tokenizer_model_path=None,
+            corpus_info=corpus_info,
+        )
+        return root
+
     def test_segment_message_content_exact_marks_code_and_math(self) -> None:
         content = "Explain this:\n```python\nprint(1)\n```\nThen solve $$x^2 + 1 = 0$$ please."
 
@@ -258,7 +348,6 @@ class TrainingTests(unittest.TestCase):
             final_refine_layers=1,
         )
         prompt = torch.randint(0, 32, (8,), dtype=torch.long)
-
         generated = generate_next_tokens_with_sampling(
             model,
             prompt,
@@ -273,6 +362,240 @@ class TrainingTests(unittest.TestCase):
         )
 
         self.assertEqual(generated.shape, (12,))
+
+    def test_preload_flat_pretokenized_directory_overrides_loaded_shard_limit(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            shard_dir = self._write_flat_test_shards(Path(tmpdir))
+            collection = load_flat_pretokenized_directory(
+                shard_dir,
+                load_workers=1,
+                max_loaded_shards=1,
+                integrity_mode="meta",
+                integrity_workers=1,
+            )
+
+            self.assertEqual(collection.max_loaded_shards, 1)
+
+            preload_flat_pretokenized_directory(collection)
+
+            self.assertEqual(collection.max_loaded_shards, 0)
+            self.assertEqual(len(collection._loaded_shard_lru), 0)
+            self.assertTrue(all(shard._loaded for shard in collection.shards))
+
+    def test_flat_process_prebuild_blocks_complete_with_spawned_fresh_workers(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            shard_dir = self._write_flat_test_shards(root / "shards")
+            collection = load_flat_pretokenized_directory(
+                shard_dir,
+                load_workers=1,
+                max_loaded_shards=1,
+                integrity_mode="meta",
+                integrity_workers=1,
+            )
+            train_documents_flat, _ = split_train_val_flat_documents_with_collection(
+                collection,
+                collection.document_refs,
+                train_fraction=0.75,
+            )
+            batcher = FlatDocumentChunkBatcher(
+                collection,
+                tuple(ref for ref in train_documents_flat if collection.get_shard(ref.shard_index).source[ref.document_index].startswith("wiki:")),
+                batch_size=1,
+                device=torch.device("cpu"),
+                active_shards_per_bucket=1,
+                shard_rotation_interval=4,
+            )
+
+            blocks, seconds = build_prebuilt_batch_blocks_parallel(
+                batcher,
+                total_steps=16,
+                start_step=0,
+                stage1_ratio=1.0,
+                stage2_ratio=1.0,
+                stage1_span=1,
+                stage2_span=1,
+                stage3_span=1,
+                stage1_batch_size=1,
+                stage2_batch_size=1,
+                stage3_batch_size=1,
+                stage1_grad_accum_steps=1,
+                stage2_grad_accum_steps=1,
+                stage3_grad_accum_steps=1,
+                pin_memory=False,
+                workers=2,
+                worker_threads=1,
+                cache_dir=root / "unused_cache",
+                flat_train_fraction=0.75,
+            )
+
+            self.assertGreaterEqual(seconds, 0.0)
+            self.assertGreaterEqual(sum(block.batch_count for block in blocks), 16)
+            self.assertGreater(len(blocks), 2)
+            self.assertIsInstance(blocks[0], FlatIndexPrebuiltBatchBlock)
+            block = blocks[0]
+            assert isinstance(block, FlatIndexPrebuiltBatchBlock)
+            self.assertEqual(block.shard_index.shape[1:], (1,))
+            self.assertFalse(any((root / "unused_cache").glob("batch_block_*.pt")))
+
+    def test_flat_index_prebuilt_provider_reconstructs_batch(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            shard_dir = self._write_flat_test_shards(Path(tmpdir))
+            collection = load_flat_pretokenized_directory(
+                shard_dir,
+                load_workers=1,
+                max_loaded_shards=0,
+                integrity_mode="meta",
+                integrity_workers=1,
+            )
+            block = FlatIndexPrebuiltBatchBlock(
+                shard_index=torch.tensor([[0, 0]], dtype=torch.int32),
+                document_index=torch.tensor([[0, 1]], dtype=torch.int32),
+                chunk_index=torch.tensor([[0, 1]], dtype=torch.int32),
+                reset_mask=torch.tensor([[True, False]], dtype=torch.bool),
+                build_seconds=0.0,
+            )
+            provider = PrebuiltDocumentBatchProvider(
+                device=torch.device("cpu"),
+                build_seconds=0.0,
+                blocks=[block],
+                flat_collection=collection,
+            )
+            batch = provider.next_batch()
+
+            torch.testing.assert_close(
+                batch.context,
+                torch.tensor([[1, 2, 10, 0], [1, 5, 11, 0]], dtype=torch.long),
+            )
+            torch.testing.assert_close(
+                batch.target,
+                torch.tensor([[2, 10, 4, 0], [5, 11, 4, 0]], dtype=torch.long),
+            )
+            torch.testing.assert_close(
+                batch.loss_mask,
+                torch.tensor([[1.0, 1.0, 1.0, 0.0], [1.0, 1.0, 1.0, 0.0]], dtype=torch.float32),
+            )
+            torch.testing.assert_close(
+                batch.reset_mask,
+                torch.tensor([True, False], dtype=torch.bool),
+            )
+
+    def test_flat_index_prebuilt_provider_caches_materialized_block(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            shard_dir = self._write_flat_test_shards(Path(tmpdir))
+            collection = load_flat_pretokenized_directory(
+                shard_dir,
+                load_workers=1,
+                max_loaded_shards=0,
+                integrity_mode="meta",
+                integrity_workers=1,
+            )
+            block = FlatIndexPrebuiltBatchBlock(
+                shard_index=torch.tensor([[0, 0], [0, 0]], dtype=torch.int32),
+                document_index=torch.tensor([[0, 1], [0, 1]], dtype=torch.int32),
+                chunk_index=torch.tensor([[0, 1], [1, 0]], dtype=torch.int32),
+                reset_mask=torch.tensor([[True, False], [False, True]], dtype=torch.bool),
+                build_seconds=0.0,
+            )
+            provider = PrebuiltDocumentBatchProvider(
+                device=torch.device("cpu"),
+                build_seconds=0.0,
+                blocks=[block],
+                flat_collection=collection,
+            )
+            original_get_shard = type(collection).get_shard
+            call_count = 0
+
+            def counted_get_shard(instance, shard_index: int):
+                nonlocal call_count
+                call_count += 1
+                return original_get_shard(instance, shard_index)
+
+            with patch.object(type(collection), "get_shard", autospec=True, side_effect=counted_get_shard):
+                first = provider.next_batch()
+                first_count = call_count
+                second = provider.next_batch()
+                second_count = call_count
+
+            self.assertGreater(first_count, 0)
+            self.assertEqual(first_count, second_count)
+            self.assertEqual(first.context.shape, (2, 4))
+            self.assertEqual(second.context.shape, (2, 4))
+
+    def test_flat_batcher_reuses_loaded_shard_within_batch(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            shard_dir = self._write_flat_test_shards(Path(tmpdir))
+            collection = load_flat_pretokenized_directory(
+                shard_dir,
+                load_workers=1,
+                max_loaded_shards=0,
+                integrity_mode="meta",
+                integrity_workers=1,
+            )
+            batcher = FlatDocumentChunkBatcher(
+                collection,
+                collection.document_refs[:2],
+                batch_size=2,
+                device=torch.device("cpu"),
+                active_shards_per_bucket=1,
+                shard_rotation_interval=4,
+            )
+            batcher.current_doc = [0, 1]
+            batcher.current_chunk = [0, 0]
+            batcher.needs_reset = [False, False]
+
+            original_get_shard = type(collection).get_shard
+            call_count = 0
+
+            def counted_get_shard(instance, shard_index: int):
+                nonlocal call_count
+                call_count += 1
+                return original_get_shard(instance, shard_index)
+
+            with patch.object(type(collection), "get_shard", autospec=True, side_effect=counted_get_shard):
+                batch = batcher.next_batch()
+
+            self.assertEqual(batch.context.shape, (2, 4))
+            self.assertEqual(call_count, 1)
+
+    def test_flat_index_batcher_uses_metadata_only(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            shard_dir = self._write_flat_test_shards(Path(tmpdir))
+            collection = load_flat_pretokenized_directory(
+                shard_dir,
+                load_workers=1,
+                max_loaded_shards=0,
+                integrity_mode="meta",
+                integrity_workers=1,
+            )
+            batcher = FlatDocumentChunkBatcher(
+                collection,
+                collection.document_refs[:2],
+                batch_size=2,
+                device=torch.device("cpu"),
+                active_shards_per_bucket=1,
+                shard_rotation_interval=4,
+            )
+            batcher.current_doc = [0, 1]
+            batcher.current_chunk = [0, 0]
+            batcher.needs_reset = [False, False]
+            shard_index = torch.zeros((2,), dtype=torch.int32)
+            document_index = torch.zeros((2,), dtype=torch.int32)
+            chunk_index = torch.zeros((2,), dtype=torch.int32)
+            reset_mask = torch.zeros((2,), dtype=torch.bool)
+
+            with patch.object(type(collection), "get_shard", autospec=True, side_effect=AssertionError("unexpected shard load")):
+                batcher.next_index_batch_into(
+                    shard_index_out=shard_index,
+                    document_index_out=document_index,
+                    chunk_index_out=chunk_index,
+                    reset_mask_out=reset_mask,
+                )
+
+            torch.testing.assert_close(shard_index, torch.tensor([0, 0], dtype=torch.int32))
+            torch.testing.assert_close(document_index, torch.tensor([0, 1], dtype=torch.int32))
+            torch.testing.assert_close(chunk_index, torch.tensor([0, 1], dtype=torch.int32))
+            torch.testing.assert_close(reset_mask, torch.tensor([False, False], dtype=torch.bool))
 
     def test_query_block_sampling_prepends_start_token(self) -> None:
         tokens = torch.arange(40, dtype=torch.long)

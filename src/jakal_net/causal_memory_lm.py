@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Any, Sequence
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.autograd import Function
+from torch.autograd.function import once_differentiable
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from jakal_net._architectural_common import (
@@ -13,10 +17,10 @@ from jakal_net._architectural_common import (
     clone_layer,
     init_linear,
     init_pairwise_or_route_scales,
-    layer_with_val_norm,
     make_pairwise,
     signed_abs_softmax_edges,
-    unit_normalize_values,
+    signed_softmax_state,
+    softsign_state,
 )
 from jakal_net.core import Layer
 from jakal_net.hierarchical_memory import BModule, BScanOutput
@@ -28,11 +32,22 @@ from jakal_net.kernel_common import (
 )
 from jakal_net.latent_graph import KModule
 from jakal_net.native_backend import (
+    _LowRankPropagationWindow,
+    _experimental_fused_training_enabled,
     causal_memory_scan_fused_native,
+    dense_apply_native,
+    dense_apply_native_available,
     native_supports,
-    native_supports_device,
+    nomemory_causal_stack_ffn_fused_native,
+    nomemory_causal_stack_ffn_fused_native_available,
+    nomemory_causal_stack_ffn_fused_trace_native,
+    nomemory_causal_stack_fused_native,
+    nomemory_causal_stack_fused_native_available,
+    nomemory_causal_stack_fused_trace_native,
+    _nomemory_causal_stack_ffn_fused_backward_cuda,
+    _nomemory_causal_stack_fused_backward_cuda,
 )
-from jakal_net.modules import MultiHeadPairwise, MultiHeadRoute
+from jakal_net.modules import LowRankBilinearPairwise, MultiHeadPairwise, MultiHeadRoute, ResidualFeedForward
 from jakal_net.propagation import SparsePropagation
 from jakal_net.sequence_module import SModule
 
@@ -59,6 +74,488 @@ class MemoryScanOutput:
         )
 
 
+class ValueNormStateProjection(nn.Module):
+    def __init__(self, *, eps: float = 1e-8) -> None:
+        super().__init__()
+        self.eps = float(eps)
+
+    def forward(self, val: Tensor) -> Tensor:
+        return torch.linalg.vector_norm(val, ord=2, dim=-1, keepdim=True).clamp_min(self.eps)
+
+
+_EXPERIMENTAL_NOMEMORY_EXACT_STACK_FASTPATH_ENV = (
+    "JAKAL_NET_ENABLE_EXPERIMENTAL_NOMEMORY_EXACT_STACK_FASTPATH"
+)
+_EXPERIMENTAL_NOMEMORY_EXACT_STACK_FFN_FASTPATH_ENV = (
+    "JAKAL_NET_ENABLE_EXPERIMENTAL_NOMEMORY_EXACT_STACK_FFN_FASTPATH"
+)
+
+
+def _nomemory_optional_tensor(tensor: Tensor) -> Tensor | None:
+    if tensor.numel() == 0:
+        return None
+    return tensor
+
+
+def _nomemory_make_leaf(tensor: Tensor) -> Tensor:
+    leaf = tensor.detach()
+    leaf.requires_grad_(tensor.requires_grad)
+    return leaf
+
+
+def _nomemory_accumulate_grad(
+    grads: list[Tensor | None],
+    index: int,
+    grad: Tensor | None,
+) -> None:
+    if grad is None:
+        return
+    if grads[index] is None:
+        grads[index] = grad
+    else:
+        grads[index] = grads[index] + grad
+
+
+def _nomemory_value_to_state(val: Tensor) -> Tensor:
+    return torch.linalg.vector_norm(val, ord=2, dim=-1, keepdim=False).clamp_min(1e-8)
+
+
+def _nomemory_exact_apply_layer(
+    state: Tensor,
+    val: Tensor,
+    *,
+    source_weight: Tensor,
+    target_weight: Tensor,
+    core_weight: Tensor,
+    bias_tensor: Tensor,
+    norm_weight: Tensor,
+    norm_bias: Tensor,
+    compress_kind: int,
+    window: int,
+    target_block_size: int,
+    source_block_size: int,
+    state_activation_name: str,
+) -> tuple[Tensor, Tensor]:
+    delta_state, delta_val = _LowRankPropagationWindow.apply(
+        val,
+        state,
+        val,
+        source_weight,
+        target_weight,
+        core_weight,
+        _nomemory_optional_tensor(bias_tensor),
+        compress_kind,
+        window,
+        target_block_size,
+        source_block_size,
+    )
+    return dense_apply_native(
+        layer_state=state,
+        layer_val=val,
+        delta_state=delta_state,
+        delta_val=delta_val,
+        val_norm_weight=norm_weight,
+        val_norm_bias=norm_bias,
+        state_activation_name=state_activation_name,
+    )
+
+
+def _nomemory_exact_run_layers(
+    state: Tensor,
+    val: Tensor,
+    *,
+    layer_tensors: tuple[Tensor, ...],
+    layer_specs: tuple[tuple[int, int, int, int], ...],
+    state_activation_name: str,
+    checkpoint_layers: bool = False,
+) -> tuple[Tensor, Tensor]:
+    offset = 0
+    for compress_kind, window, target_block_size, source_block_size in layer_specs:
+        source_weight = layer_tensors[offset]
+        target_weight = layer_tensors[offset + 1]
+        core_weight = layer_tensors[offset + 2]
+        bias_tensor = layer_tensors[offset + 3]
+        norm_weight = layer_tensors[offset + 4]
+        norm_bias = layer_tensors[offset + 5]
+        offset += 6
+        if checkpoint_layers and torch.is_grad_enabled():
+            def _run_single_layer(layer_state: Tensor, layer_val: Tensor) -> tuple[Tensor, Tensor]:
+                return _nomemory_exact_apply_layer(
+                    layer_state,
+                    layer_val,
+                    source_weight=source_weight,
+                    target_weight=target_weight,
+                    core_weight=core_weight,
+                    bias_tensor=bias_tensor,
+                    norm_weight=norm_weight,
+                    norm_bias=norm_bias,
+                    compress_kind=compress_kind,
+                    window=window,
+                    target_block_size=target_block_size,
+                    source_block_size=source_block_size,
+                    state_activation_name=state_activation_name,
+                )
+
+            state, val = torch_checkpoint(
+                _run_single_layer,
+                state,
+                val,
+                use_reentrant=True,
+                preserve_rng_state=False,
+            )
+        else:
+            state, val = _nomemory_exact_apply_layer(
+                state,
+                val,
+                source_weight=source_weight,
+                target_weight=target_weight,
+                core_weight=core_weight,
+                bias_tensor=bias_tensor,
+                norm_weight=norm_weight,
+                norm_bias=norm_bias,
+                compress_kind=compress_kind,
+                window=window,
+                target_block_size=target_block_size,
+                source_block_size=source_block_size,
+                state_activation_name=state_activation_name,
+            )
+    return state, val
+
+
+def _nomemory_exact_prediction_forward(
+    aligned_s: Tensor,
+    *,
+    s_prediction_weight: Tensor,
+    prediction_input_norm_weight: Tensor,
+    prediction_input_norm_bias: Tensor,
+    prediction_tensors: tuple[Tensor, ...],
+    prediction_specs: tuple[tuple[int, int, int, int], ...],
+    state_activation_name: str,
+    checkpoint_layers: bool = False,
+) -> Tensor:
+    query_val = torch.layer_norm(
+        F.linear(aligned_s, s_prediction_weight, None),
+        (aligned_s.shape[-1],),
+        prediction_input_norm_weight.to(device=aligned_s.device, dtype=aligned_s.dtype),
+        _nomemory_optional_tensor(prediction_input_norm_bias.to(device=aligned_s.device, dtype=aligned_s.dtype))
+        if prediction_input_norm_bias.defined() and prediction_input_norm_bias.numel() > 0
+        else None,
+        1e-5,
+    )
+    query_state = _nomemory_value_to_state(query_val)
+    if state_activation_name == "softsign":
+        query_state = softsign_state(query_state)
+    query_state, query_val = _nomemory_exact_run_layers(
+        query_state,
+        query_val,
+        layer_tensors=prediction_tensors,
+        layer_specs=prediction_specs,
+        state_activation_name=state_activation_name,
+        checkpoint_layers=checkpoint_layers,
+    )
+    return query_val
+
+
+class _NomemoryExactStackFunction(Function):
+    @staticmethod
+    def forward(ctx: Any, *args: Any) -> Tensor:
+        num_sequence_layers = int(args[-5])
+        num_prediction_layers = int(args[-4])
+        sequence_specs = tuple(args[-3])
+        prediction_specs = tuple(args[-2])
+        state_activation_name = str(args[-1])
+        tensor_args = tuple(arg for arg in args[:-5])
+
+        sequence_tensor_count = num_sequence_layers * 6
+        prediction_tensor_count = num_prediction_layers * 6
+        (
+            token_val,
+            anchor_state,
+            anchor_val,
+            s_prediction_weight,
+            prediction_input_norm_weight,
+            prediction_input_norm_bias,
+            *remaining,
+        ) = tensor_args
+        sequence_tensors = tuple(remaining[:sequence_tensor_count])
+        prediction_tensors = tuple(remaining[sequence_tensor_count: sequence_tensor_count + prediction_tensor_count])
+        if not nomemory_causal_stack_fused_native_available(token_val.device.type):
+            raise RuntimeError("nomemory_causal_stack_fused native path is unavailable for this device.")
+        query_val, trace_tensors = nomemory_causal_stack_fused_trace_native(
+            token_val=token_val,
+            anchor_state=anchor_state,
+            anchor_val=anchor_val,
+            s_prediction_weight=s_prediction_weight,
+            prediction_input_norm_weight=prediction_input_norm_weight,
+            prediction_input_norm_bias=_nomemory_optional_tensor(prediction_input_norm_bias),
+            sequence_tensors=sequence_tensors,
+            prediction_tensors=prediction_tensors,
+            sequence_specs=sequence_specs,
+            prediction_specs=prediction_specs,
+            state_activation_name=state_activation_name,
+        )
+
+        ctx.num_sequence_layers = num_sequence_layers
+        ctx.num_prediction_layers = num_prediction_layers
+        ctx.sequence_specs = sequence_specs
+        ctx.prediction_specs = prediction_specs
+        ctx.sequence_tensor_count = sequence_tensor_count
+        ctx.prediction_tensor_count = prediction_tensor_count
+        ctx.tensor_arg_count = len(tensor_args)
+        ctx.state_activation_name = state_activation_name
+        ctx.trace_tensor_count = len(trace_tensors)
+        ctx.save_for_backward(*tensor_args, *trace_tensors)
+        return query_val
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx: Any, grad_query_val: Tensor) -> tuple[Any, ...]:
+        saved = tuple(ctx.saved_tensors)
+        tensor_args = saved[: ctx.tensor_arg_count]
+        trace_tensors = saved[ctx.tensor_arg_count : ctx.tensor_arg_count + ctx.trace_tensor_count]
+
+        sequence_tensor_count = ctx.sequence_tensor_count
+        prediction_tensor_count = ctx.prediction_tensor_count
+        (
+            token_val,
+            anchor_state,
+            anchor_val,
+            s_prediction_weight,
+            prediction_input_norm_weight,
+            prediction_input_norm_bias,
+            *remaining,
+        ) = tensor_args
+        sequence_tensors = tuple(remaining[:sequence_tensor_count])
+        prediction_tensors = tuple(remaining[sequence_tensor_count: sequence_tensor_count + prediction_tensor_count])
+        if grad_query_val is None:
+            grad_query_val = torch.zeros_like(
+                nomemory_causal_stack_fused_native(
+                    token_val=token_val,
+                    anchor_state=anchor_state,
+                    anchor_val=anchor_val,
+                    s_prediction_weight=s_prediction_weight,
+                    prediction_input_norm_weight=prediction_input_norm_weight,
+                    prediction_input_norm_bias=_nomemory_optional_tensor(prediction_input_norm_bias),
+                    sequence_tensors=sequence_tensors,
+                    prediction_tensors=prediction_tensors,
+                    sequence_specs=ctx.sequence_specs,
+                    prediction_specs=ctx.prediction_specs,
+                    state_activation_name=ctx.state_activation_name,
+                )
+            )
+        grads = _nomemory_causal_stack_fused_backward_cuda(
+            token_val=token_val,
+            anchor_state=anchor_state,
+            anchor_val=anchor_val,
+            s_prediction_weight=s_prediction_weight,
+            prediction_input_norm_weight=prediction_input_norm_weight,
+            prediction_input_norm_bias=_nomemory_optional_tensor(prediction_input_norm_bias),
+            sequence_tensors=sequence_tensors,
+            prediction_tensors=prediction_tensors,
+            sequence_specs=ctx.sequence_specs,
+            prediction_specs=ctx.prediction_specs,
+            state_activation_name=ctx.state_activation_name,
+            trace_tensors=tuple(trace_tensors),
+            grad_query_val=grad_query_val,
+        )
+        return (*grads, None, None, None, None, None)
+
+
+def _nomemory_exact_stack_fused(
+    token_val: Tensor,
+    *,
+    anchor_state: Tensor,
+    anchor_val: Tensor,
+    s_prediction_weight: Tensor,
+    prediction_input_norm_weight: Tensor,
+    prediction_input_norm_bias: Tensor,
+    sequence_tensors: tuple[Tensor, ...],
+    prediction_tensors: tuple[Tensor, ...],
+    sequence_specs: tuple[tuple[int, int, int, int], ...],
+    prediction_specs: tuple[tuple[int, int, int, int], ...],
+    state_activation_name: str,
+) -> Tensor:
+    return _NomemoryExactStackFunction.apply(
+        token_val,
+        anchor_state,
+        anchor_val,
+        s_prediction_weight,
+        prediction_input_norm_weight,
+        prediction_input_norm_bias,
+        *sequence_tensors,
+        *prediction_tensors,
+        len(sequence_specs),
+        len(prediction_specs),
+        sequence_specs,
+        prediction_specs,
+        state_activation_name,
+    )
+
+
+class _NomemoryExactStackFfnFunction(Function):
+    @staticmethod
+    def forward(ctx: Any, *args: Any) -> Tensor:
+        num_sequence_layers = int(args[-5])
+        num_prediction_layers = int(args[-4])
+        sequence_specs = tuple(args[-3])
+        prediction_specs = tuple(args[-2])
+        state_activation_name = str(args[-1])
+        tensor_args = tuple(arg for arg in args[:-5])
+
+        sequence_tensor_count = num_sequence_layers * 6
+        prediction_tensor_count = num_prediction_layers * 6
+        sequence_ffn_tensor_count = num_sequence_layers * 6
+        prediction_ffn_tensor_count = num_prediction_layers * 6
+        (
+            token_val,
+            anchor_state,
+            anchor_val,
+            s_prediction_weight,
+            prediction_input_norm_weight,
+            prediction_input_norm_bias,
+            *remaining,
+        ) = tensor_args
+        sequence_tensors = tuple(remaining[:sequence_tensor_count])
+        remaining = remaining[sequence_tensor_count:]
+        prediction_tensors = tuple(remaining[:prediction_tensor_count])
+        remaining = remaining[prediction_tensor_count:]
+        sequence_ffn_tensors = tuple(remaining[:sequence_ffn_tensor_count])
+        prediction_ffn_tensors = tuple(
+            remaining[sequence_ffn_tensor_count: sequence_ffn_tensor_count + prediction_ffn_tensor_count]
+        )
+        if not nomemory_causal_stack_ffn_fused_native_available(token_val.device.type):
+            raise RuntimeError("nomemory_causal_stack_ffn_fused native path is unavailable for this device.")
+        query_val, trace_tensors = nomemory_causal_stack_ffn_fused_trace_native(
+            token_val=token_val,
+            anchor_state=anchor_state,
+            anchor_val=anchor_val,
+            s_prediction_weight=s_prediction_weight,
+            prediction_input_norm_weight=prediction_input_norm_weight,
+            prediction_input_norm_bias=_nomemory_optional_tensor(prediction_input_norm_bias),
+            sequence_tensors=sequence_tensors,
+            prediction_tensors=prediction_tensors,
+            sequence_ffn_tensors=sequence_ffn_tensors,
+            prediction_ffn_tensors=prediction_ffn_tensors,
+            sequence_specs=sequence_specs,
+            prediction_specs=prediction_specs,
+            state_activation_name=state_activation_name,
+        )
+
+        ctx.num_sequence_layers = num_sequence_layers
+        ctx.num_prediction_layers = num_prediction_layers
+        ctx.sequence_specs = sequence_specs
+        ctx.prediction_specs = prediction_specs
+        ctx.sequence_tensor_count = sequence_tensor_count
+        ctx.prediction_tensor_count = prediction_tensor_count
+        ctx.sequence_ffn_tensor_count = sequence_ffn_tensor_count
+        ctx.prediction_ffn_tensor_count = prediction_ffn_tensor_count
+        ctx.tensor_arg_count = len(tensor_args)
+        ctx.state_activation_name = state_activation_name
+        ctx.trace_tensor_count = len(trace_tensors)
+        ctx.save_for_backward(*tensor_args, *trace_tensors)
+        return query_val
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx: Any, grad_query_val: Tensor) -> tuple[Any, ...]:
+        saved = tuple(ctx.saved_tensors)
+        tensor_args = saved[: ctx.tensor_arg_count]
+        trace_tensors = saved[ctx.tensor_arg_count : ctx.tensor_arg_count + ctx.trace_tensor_count]
+
+        sequence_tensor_count = ctx.sequence_tensor_count
+        prediction_tensor_count = ctx.prediction_tensor_count
+        sequence_ffn_tensor_count = ctx.sequence_ffn_tensor_count
+        prediction_ffn_tensor_count = ctx.prediction_ffn_tensor_count
+        (
+            token_val,
+            anchor_state,
+            anchor_val,
+            s_prediction_weight,
+            prediction_input_norm_weight,
+            prediction_input_norm_bias,
+            *remaining,
+        ) = tensor_args
+        sequence_tensors = tuple(remaining[:sequence_tensor_count])
+        remaining = remaining[sequence_tensor_count:]
+        prediction_tensors = tuple(remaining[:prediction_tensor_count])
+        remaining = remaining[prediction_tensor_count:]
+        sequence_ffn_tensors = tuple(remaining[:sequence_ffn_tensor_count])
+        prediction_ffn_tensors = tuple(
+            remaining[sequence_ffn_tensor_count: sequence_ffn_tensor_count + prediction_ffn_tensor_count]
+        )
+        if grad_query_val is None:
+            grad_query_val = torch.zeros_like(
+                nomemory_causal_stack_ffn_fused_native(
+                    token_val=token_val,
+                    anchor_state=anchor_state,
+                    anchor_val=anchor_val,
+                    s_prediction_weight=s_prediction_weight,
+                    prediction_input_norm_weight=prediction_input_norm_weight,
+                    prediction_input_norm_bias=_nomemory_optional_tensor(prediction_input_norm_bias),
+                    sequence_tensors=sequence_tensors,
+                    prediction_tensors=prediction_tensors,
+                    sequence_ffn_tensors=sequence_ffn_tensors,
+                    prediction_ffn_tensors=prediction_ffn_tensors,
+                    sequence_specs=ctx.sequence_specs,
+                    prediction_specs=ctx.prediction_specs,
+                    state_activation_name=ctx.state_activation_name,
+                )
+            )
+        grads = _nomemory_causal_stack_ffn_fused_backward_cuda(
+            token_val=token_val,
+            anchor_state=anchor_state,
+            anchor_val=anchor_val,
+            s_prediction_weight=s_prediction_weight,
+            prediction_input_norm_weight=prediction_input_norm_weight,
+            prediction_input_norm_bias=_nomemory_optional_tensor(prediction_input_norm_bias),
+            sequence_tensors=sequence_tensors,
+            prediction_tensors=prediction_tensors,
+            sequence_ffn_tensors=sequence_ffn_tensors,
+            prediction_ffn_tensors=prediction_ffn_tensors,
+            sequence_specs=ctx.sequence_specs,
+            prediction_specs=ctx.prediction_specs,
+            state_activation_name=ctx.state_activation_name,
+            trace_tensors=tuple(trace_tensors),
+            grad_query_val=grad_query_val,
+        )
+        return (*grads, None, None, None, None, None)
+
+
+def _nomemory_exact_stack_ffn_fused(
+    token_val: Tensor,
+    *,
+    anchor_state: Tensor,
+    anchor_val: Tensor,
+    s_prediction_weight: Tensor,
+    prediction_input_norm_weight: Tensor,
+    prediction_input_norm_bias: Tensor,
+    sequence_tensors: tuple[Tensor, ...],
+    prediction_tensors: tuple[Tensor, ...],
+    sequence_ffn_tensors: tuple[Tensor, ...],
+    prediction_ffn_tensors: tuple[Tensor, ...],
+    sequence_specs: tuple[tuple[int, int, int, int], ...],
+    prediction_specs: tuple[tuple[int, int, int, int], ...],
+    state_activation_name: str,
+) -> Tensor:
+    return _NomemoryExactStackFfnFunction.apply(
+        token_val,
+        anchor_state,
+        anchor_val,
+        s_prediction_weight,
+        prediction_input_norm_weight,
+        prediction_input_norm_bias,
+        *sequence_tensors,
+        *prediction_tensors,
+        *sequence_ffn_tensors,
+        *prediction_ffn_tensors,
+        len(sequence_specs),
+        len(prediction_specs),
+        sequence_specs,
+        prediction_specs,
+        state_activation_name,
+    )
+
+
 class CausalHierarchicalMemoryLM(nn.Module):
     def __init__(
         self,
@@ -68,6 +565,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
         max_seq_len: int = 2048,
         s_layers: int = 2,
         memory_slots: Sequence[int] = (256, 64, 16),
+        memory_update_intervals: Sequence[int] | None = None,
         prediction_layers: int = 2,
         s_window: int | None = None,
         s_microbatch_size: int | None = None,
@@ -75,6 +573,9 @@ class CausalHierarchicalMemoryLM(nn.Module):
         checkpoint_sequence_layers: bool = False,
         checkpoint_prediction_layers: bool = False,
         memory_topk: int = 16,
+        memory_train_mode: str = "dense",
+        memory_eval_mode: str = "dense",
+        eval_topk: int | None = None,
         pairwise_kind: str = "low_rank_bilinear",
         route_kind: str = "low_rank_bilinear",
         pairwise_rank: int = 64,
@@ -83,10 +584,20 @@ class CausalHierarchicalMemoryLM(nn.Module):
         route_heads: int = 1,
         pairwise_frozen_heads: int = 0,
         route_frozen_heads: int = 0,
+        pairwise_anchor_heads: int = 0,
+        route_anchor_heads: int = 0,
+        pairwise_anchor_kind: str = "scaled_cosine",
+        route_anchor_kind: str = "fixed_projection",
         scan_backend: str = "auto",
         scan_checkpoint_chunk_size: int | None = None,
         implementation: str = "streaming",
-        unit_norm_values: bool = False,
+        direction_only_values: bool = False,
+        feed_forward_layers: bool = True,
+        memory_feed_forward_layers: bool | None = None,
+        disable_memory: bool = False,
+        disable_memory_read: bool = False,
+        disable_memory_propagation: bool = False,
+        feed_forward_hidden_mult: float = 2.0,
         tie_embedding_head: bool = True,
         knowledge_nodes: int = 0,
         knowledge_route_topk: int | None = None,
@@ -115,6 +626,14 @@ class CausalHierarchicalMemoryLM(nn.Module):
             raise ValueError("knowledge_nodes must be non-negative.")
         if knowledge_propagation_layers <= 0:
             raise ValueError("knowledge_propagation_layers must be positive.")
+        if memory_train_mode not in {"dense", "topk"}:
+            raise ValueError(f"Unsupported memory_train_mode: {memory_train_mode!r}.")
+        if memory_eval_mode not in {"dense", "topk"}:
+            raise ValueError(f"Unsupported memory_eval_mode: {memory_eval_mode!r}.")
+        if eval_topk is not None and eval_topk <= 0:
+            raise ValueError("eval_topk must be positive when provided.")
+        if feed_forward_hidden_mult <= 0.0:
+            raise ValueError("feed_forward_hidden_mult must be positive.")
 
         self.vocab_size = vocab_size
         self.dim = dim
@@ -125,7 +644,17 @@ class CausalHierarchicalMemoryLM(nn.Module):
         self.scan_backend = scan_backend
         self.scan_checkpoint_chunk_size = scan_checkpoint_chunk_size
         self.checkpoint_prediction_layers = checkpoint_prediction_layers
-        self.unit_norm_values = unit_norm_values
+        self.direction_only_values = direction_only_values
+        self.feed_forward_layers = bool(feed_forward_layers)
+        self.memory_feed_forward_layers = (
+            self.feed_forward_layers
+            if memory_feed_forward_layers is None
+            else bool(memory_feed_forward_layers)
+        )
+        self.disable_memory = bool(disable_memory)
+        self.disable_memory_read = bool(disable_memory_read)
+        self.disable_memory_propagation = bool(disable_memory_propagation)
+        self.feed_forward_hidden_mult = float(feed_forward_hidden_mult)
         if knowledge_module is None and knowledge_nodes > 0:
             knowledge_module = KModule(
                 dim=dim,
@@ -138,6 +667,10 @@ class CausalHierarchicalMemoryLM(nn.Module):
                 pairwise_heads=pairwise_heads,
                 route_frozen_heads=route_frozen_heads,
                 pairwise_frozen_heads=pairwise_frozen_heads,
+                route_anchor_heads=route_anchor_heads,
+                pairwise_anchor_heads=pairwise_anchor_heads,
+                route_anchor_kind=route_anchor_kind,
+                pairwise_anchor_kind=pairwise_anchor_kind,
                 route_topk=knowledge_route_topk or memory_topk,
                 propagation_topk=knowledge_propagation_topk or memory_topk,
                 propagation_layers=knowledge_propagation_layers,
@@ -145,7 +678,7 @@ class CausalHierarchicalMemoryLM(nn.Module):
             )
         self.knowledge_module = knowledge_module
 
-        self.value_to_state = nn.Linear(dim, 1)
+        self.value_to_state = ValueNormStateProjection()
         self.s_module = SModule(
             vocab_size=vocab_size,
             dim=dim,
@@ -155,16 +688,24 @@ class CausalHierarchicalMemoryLM(nn.Module):
             pairwise_rank=pairwise_rank,
             pairwise_heads=pairwise_heads,
             pairwise_frozen_heads=pairwise_frozen_heads,
+            pairwise_anchor_heads=pairwise_anchor_heads,
+            pairwise_anchor_kind=pairwise_anchor_kind,
             implementation=implementation,
             s_window=s_window,
             s_microbatch_size=s_microbatch_size,
             checkpoint_sequence_layers=checkpoint_sequence_layers,
-            unit_norm_values=unit_norm_values,
+            direction_only_values=direction_only_values,
+            feed_forward_layers=self.feed_forward_layers,
+            feed_forward_hidden_mult=self.feed_forward_hidden_mult,
         )
         self.b_module = BModule(
             dim=dim,
             memory_slots=self.memory_slots,
+            memory_update_intervals=memory_update_intervals,
             memory_topk=memory_topk,
+            memory_train_mode=memory_train_mode,
+            memory_eval_mode=memory_eval_mode,
+            eval_topk=eval_topk,
             pairwise_kind=pairwise_kind,
             route_kind=route_kind,
             pairwise_rank=pairwise_rank,
@@ -173,8 +714,15 @@ class CausalHierarchicalMemoryLM(nn.Module):
             route_heads=route_heads,
             pairwise_frozen_heads=pairwise_frozen_heads,
             route_frozen_heads=route_frozen_heads,
+            pairwise_anchor_heads=pairwise_anchor_heads,
+            route_anchor_heads=route_anchor_heads,
+            pairwise_anchor_kind=pairwise_anchor_kind,
+            route_anchor_kind=route_anchor_kind,
             implementation=implementation,
-            unit_norm_values=unit_norm_values,
+            direction_only_values=direction_only_values,
+            feed_forward_layers=self.memory_feed_forward_layers,
+            memory_propagation_layers=not self.disable_memory_propagation,
+            feed_forward_hidden_mult=self.feed_forward_hidden_mult,
         )
 
         self.s_prediction_proj = nn.Linear(dim, dim, bias=False)
@@ -188,33 +736,461 @@ class CausalHierarchicalMemoryLM(nn.Module):
                     rank=pairwise_rank,
                     heads=pairwise_heads,
                     frozen_heads=pairwise_frozen_heads,
+                    anchor_heads=pairwise_anchor_heads,
+                    anchor_kind=pairwise_anchor_kind,
                 ),
                 sparse_type="window",
-                window=max(1, prediction_window),
+                window=max(1, max_seq_len),
                 edge_compress_fn=signed_abs_softmax_edges,
-                state_weight_edges=True,
+                state_weight_edges=False,
                 implementation=implementation,
                 residual=True,
+                use_direction_only=direction_only_values,
+            )
+            for _ in range(prediction_layers)
+        )
+        self.prediction_ffns = nn.ModuleList(
+            (
+                ResidualFeedForward(dim, hidden_mult=self.feed_forward_hidden_mult)
+                if self.feed_forward_layers
+                else nn.Identity()
             )
             for _ in range(prediction_layers)
         )
         self.output_norm = nn.LayerNorm(dim)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
+        self._nomemory_exact_stack_fastpath_calls = 0
+        self._nomemory_exact_stack_ffn_fastpath_calls = 0
+        self._prediction_dense_apply_native_calls = 0
+        self._prediction_dense_apply_python_calls = 0
         if tie_embedding_head:
             self.lm_head.weight = self.s_module.token_embedding.weight
         self._reset_parameters(tie_embedding_head=tie_embedding_head)
+
+    def _memoryless_query_layer(self, aligned_s: Tensor) -> Layer:
+        query_state_source = self.prediction_input_norm(self.s_prediction_proj(aligned_s))
+        query_val = query_state_source
+        query_state = self.value_to_state(query_state_source).squeeze(-1)
+        if self.direction_only_values:
+            query_state = softsign_state(query_state)
+        return Layer(dim=self.dim, num_nodes=aligned_s.shape[1], state=query_state, val=query_val)
+
+    def _can_use_dense_apply_fastpath(self, layer: Layer, propagation: SparsePropagation) -> bool:
+        if propagation.sparse_type != "window":
+            return False
+        return int(propagation.window or 0) + 1 >= int(layer.num_nodes)
+
+    def reset_dense_apply_stats(self) -> None:
+        self.s_module.reset_dense_apply_stats()
+        self._nomemory_exact_stack_fastpath_calls = 0
+        self._nomemory_exact_stack_ffn_fastpath_calls = 0
+        self._prediction_dense_apply_native_calls = 0
+        self._prediction_dense_apply_python_calls = 0
+
+    def dense_apply_stats(self) -> dict[str, int]:
+        sequence_stats = self.s_module.dense_apply_stats()
+        return {
+            "nomemory_exact_stack_fastpath_calls": int(self._nomemory_exact_stack_fastpath_calls),
+            "nomemory_exact_stack_ffn_fastpath_calls": int(self._nomemory_exact_stack_ffn_fastpath_calls),
+            "sequence_native_calls": int(sequence_stats["native_calls"]),
+            "sequence_python_calls": int(sequence_stats["python_calls"]),
+            "prediction_native_calls": int(self._prediction_dense_apply_native_calls),
+            "prediction_python_calls": int(self._prediction_dense_apply_python_calls),
+        }
+
+    @staticmethod
+    def _nomemory_exact_supported_ffn(module: nn.Module) -> bool:
+        return (
+            isinstance(module, ResidualFeedForward)
+            and isinstance(module.input_norm, nn.LayerNorm)
+            and len(module.net) == 5
+            and isinstance(module.net[0], nn.Linear)
+            and isinstance(module.net[3], nn.Linear)
+        )
+
+    def _nomemory_exact_ffn_tensors(self, module: nn.Module, reference: Tensor) -> tuple[Tensor, ...]:
+        if not self._nomemory_exact_supported_ffn(module):
+            raise TypeError("nomemory exact FFN fastpath requires ResidualFeedForward modules.")
+        first = module.net[0]
+        second = module.net[3]
+        assert isinstance(first, nn.Linear)
+        assert isinstance(second, nn.Linear)
+        return (
+            self._norm_param_or_empty(module.input_norm, "weight", reference),
+            self._norm_param_or_empty(module.input_norm, "bias", reference),
+            self._tensor_or_empty(first.weight, reference),
+            self._tensor_or_empty(first.bias, reference),
+            self._tensor_or_empty(second.weight, reference),
+            self._tensor_or_empty(second.bias, reference),
+        )
+
+    def _apply_dense_delta_fastpath(
+        self,
+        layer: Layer,
+        delta_state: Tensor,
+        delta_val: Tensor,
+        norm: nn.Module,
+        propagation: SparsePropagation,
+    ) -> Layer:
+        state_activation_name = "softsign" if self.direction_only_values else "signed_softmax"
+        if propagation.implementation == "native" and dense_apply_native_available(layer.val.device.type):
+            next_state, next_val = dense_apply_native(
+                layer_state=layer.state,
+                layer_val=layer.val,
+                delta_state=delta_state,
+                delta_val=delta_val,
+                val_norm_weight=self._norm_param_or_empty(norm, "weight", layer.val),
+                val_norm_bias=self._norm_param_or_empty(norm, "bias", layer.val),
+                state_activation_name=state_activation_name,
+            )
+            self._prediction_dense_apply_native_calls += 1
+            return layer.with_tensors(state=next_state, val=next_val)
+        self._prediction_dense_apply_python_calls += 1
+        updated_val = layer.val + delta_val
+        return layer.with_tensors(
+            state=softsign_state(layer.state + delta_state)
+            if self.direction_only_values
+            else signed_softmax_state(layer.state + delta_state),
+            val=norm(updated_val),
+        )
+
+    def _nomemory_exact_edge_compress_kind(self, propagation: SparsePropagation) -> int | None:
+        edge_compress_name = self._native_edge_compress_name(propagation.edge_compress_fn)
+        if edge_compress_name == "softsign":
+            return 0
+        if edge_compress_name == "signed_abs_softmax":
+            return 1
+        return None
+
+    def _supports_nomemory_exact_stack_fastpath(
+        self,
+        input_ids: Tensor,
+        *,
+        return_layers: bool,
+    ) -> bool:
+        if return_layers:
+            return False
+        if not self.disable_memory or self.feed_forward_layers:
+            return False
+        if self.checkpoint_prediction_layers or self.s_module.checkpoint_sequence_layers:
+            return False
+        if os.environ.get(_EXPERIMENTAL_NOMEMORY_EXACT_STACK_FASTPATH_ENV, "").strip().lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return False
+        if input_ids.device.type != "cuda":
+            return False
+        if not dense_apply_native_available(input_ids.device.type):
+            return False
+        if not nomemory_causal_stack_fused_native_available(input_ids.device.type):
+            return False
+        if not _experimental_fused_training_enabled():
+            return False
+        if not native_supports("nomemory_causal_stack_fused_trace"):
+            return False
+        if not native_supports("nomemory_causal_stack_fused_backward_cuda"):
+            return False
+
+        sequence_nodes = int(input_ids.shape[1]) + 1
+        prediction_nodes = int(input_ids.shape[1])
+        for propagation in (*self.s_module.sequence_layers, *self.prediction_layers):
+            if propagation.implementation != "native":
+                return False
+            if propagation.sparse_type != "window":
+                return False
+            if propagation.state_weight_edges:
+                return False
+            if not supports_pairwise_kernel(propagation.pairwise_fn):
+                return False
+            pairwise_kind = pairwise_kernel_spec(propagation.pairwise_fn).kind
+            if pairwise_kind not in {"low_rank_bilinear", "multihead_max_low_rank_bilinear"}:
+                return False
+            compress_kind = self._nomemory_exact_edge_compress_kind(propagation)
+            if compress_kind is None:
+                return False
+            if compress_kind == 1 and not native_supports("low_rank_propagation_causal_dense_signed_abs_forward_cuda"):
+                return False
+            if compress_kind == 0 and not native_supports("low_rank_propagation_window_forward_cuda"):
+                return False
+        return all(
+            int(propagation.window or 0) + 1 >= sequence_nodes
+            for propagation in self.s_module.sequence_layers
+        ) and all(
+            int(propagation.window or 0) + 1 >= prediction_nodes
+            for propagation in self.prediction_layers
+        )
+
+    def _supports_nomemory_exact_stack_ffn_fastpath(
+        self,
+        input_ids: Tensor,
+        *,
+        return_layers: bool,
+    ) -> bool:
+        if return_layers:
+            return False
+        if not self.disable_memory or not self.feed_forward_layers:
+            return False
+        if self.checkpoint_prediction_layers or self.s_module.checkpoint_sequence_layers:
+            return False
+        if os.environ.get(_EXPERIMENTAL_NOMEMORY_EXACT_STACK_FASTPATH_ENV, "").strip().lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return False
+        if os.environ.get(_EXPERIMENTAL_NOMEMORY_EXACT_STACK_FFN_FASTPATH_ENV, "").strip().lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return False
+        if input_ids.device.type != "cuda":
+            return False
+        if not dense_apply_native_available(input_ids.device.type):
+            return False
+        if not nomemory_causal_stack_ffn_fused_native_available(input_ids.device.type):
+            return False
+        if not _experimental_fused_training_enabled():
+            return False
+        if not native_supports("nomemory_causal_stack_ffn_fused_trace"):
+            return False
+        if not native_supports("nomemory_causal_stack_ffn_fused_backward_cuda"):
+            return False
+        if not all(self._nomemory_exact_supported_ffn(ffn) for ffn in self.s_module.sequence_ffns):
+            return False
+        if not all(self._nomemory_exact_supported_ffn(ffn) for ffn in self.prediction_ffns):
+            return False
+
+        sequence_nodes = int(input_ids.shape[1]) + 1
+        prediction_nodes = int(input_ids.shape[1])
+        for propagation in (*self.s_module.sequence_layers, *self.prediction_layers):
+            if propagation.implementation != "native":
+                return False
+            if propagation.sparse_type != "window":
+                return False
+            if propagation.state_weight_edges:
+                return False
+            if not supports_pairwise_kernel(propagation.pairwise_fn):
+                return False
+            pairwise_kind = pairwise_kernel_spec(propagation.pairwise_fn).kind
+            if pairwise_kind not in {"low_rank_bilinear", "multihead_max_low_rank_bilinear"}:
+                return False
+            compress_kind = self._nomemory_exact_edge_compress_kind(propagation)
+            if compress_kind is None:
+                return False
+            if compress_kind == 1 and not native_supports("low_rank_propagation_causal_dense_signed_abs_forward_cuda"):
+                return False
+            if compress_kind == 0 and not native_supports("low_rank_propagation_window_forward_cuda"):
+                return False
+        return all(
+            int(propagation.window or 0) + 1 >= sequence_nodes
+            for propagation in self.s_module.sequence_layers
+        ) and all(
+            int(propagation.window or 0) + 1 >= prediction_nodes
+            for propagation in self.prediction_layers
+        )
+
+    def _run_nomemory_exact_stack_fastpath(
+        self,
+        input_ids: Tensor,
+    ) -> Tensor:
+        s_module = self.s_module
+        token_val = s_module.token_embedding(input_ids)
+        token_val = token_val + s_module.position_encoding(
+            input_ids.shape[1],
+            device=token_val.device,
+            dtype=token_val.dtype,
+        ).unsqueeze(0)
+        token_val = s_module.sequence_input_norm(token_val)
+
+        sequence_specs = tuple(
+            (
+                int(self._nomemory_exact_edge_compress_kind(propagation) or 0),
+                int(propagation.window or 0),
+                int(propagation.target_block_size or (input_ids.shape[1] + 1)),
+                int(propagation.source_block_size or (input_ids.shape[1] + 1)),
+            )
+            for propagation in self.s_module.sequence_layers
+        )
+        prediction_specs = tuple(
+            (
+                int(self._nomemory_exact_edge_compress_kind(propagation) or 0),
+                int(propagation.window or 0),
+                int(propagation.target_block_size or input_ids.shape[1]),
+                int(propagation.source_block_size or input_ids.shape[1]),
+            )
+            for propagation in self.prediction_layers
+        )
+        sequence_tensors = tuple(
+            tensor
+            for propagation, norm in zip(self.s_module.sequence_layers, self.s_module.sequence_norms)
+            for spec in (pairwise_kernel_spec(propagation.pairwise_fn),)
+            for tensor in (
+                self._tensor_or_empty(spec.in_weight, token_val),
+                self._tensor_or_empty(spec.out_weight, token_val),
+                spec.weight.to(device=token_val.device, dtype=token_val.dtype),
+                self._tensor_or_empty(spec.bias, token_val),
+                self.s_module._norm_param_or_empty(norm, "weight", token_val),
+                self.s_module._norm_param_or_empty(norm, "bias", token_val),
+            )
+        )
+        prediction_tensors = tuple(
+            tensor
+            for propagation, norm in zip(self.prediction_layers, self.prediction_norms)
+            for spec in (pairwise_kernel_spec(propagation.pairwise_fn),)
+            for tensor in (
+                self._tensor_or_empty(spec.in_weight, token_val),
+                self._tensor_or_empty(spec.out_weight, token_val),
+                spec.weight.to(device=token_val.device, dtype=token_val.dtype),
+                self._tensor_or_empty(spec.bias, token_val),
+                self._norm_param_or_empty(norm, "weight", token_val),
+                self._norm_param_or_empty(norm, "bias", token_val),
+            )
+        )
+        query_val = _nomemory_exact_stack_fused(
+            token_val,
+            anchor_state=s_module.anchor_state.expand(input_ids.shape[0], 1).to(
+                device=token_val.device,
+                dtype=token_val.dtype,
+            ),
+            anchor_val=s_module.anchor_val.expand(input_ids.shape[0], 1, -1).to(
+                device=token_val.device,
+                dtype=token_val.dtype,
+            ),
+            s_prediction_weight=self.s_prediction_proj.weight.to(device=token_val.device, dtype=token_val.dtype),
+            prediction_input_norm_weight=self._norm_param_or_empty(self.prediction_input_norm, "weight", token_val),
+            prediction_input_norm_bias=self._norm_param_or_empty(self.prediction_input_norm, "bias", token_val),
+            sequence_tensors=sequence_tensors,
+            prediction_tensors=prediction_tensors,
+            sequence_specs=sequence_specs,
+            prediction_specs=prediction_specs,
+            state_activation_name="softsign" if self.direction_only_values else "signed_softmax",
+        )
+        self.s_module._dense_apply_native_calls += len(self.s_module.sequence_layers)
+        self._prediction_dense_apply_native_calls += len(self.prediction_layers)
+        self._nomemory_exact_stack_fastpath_calls += 1
+        return query_val
+
+    def _run_nomemory_exact_stack_ffn_fastpath(
+        self,
+        input_ids: Tensor,
+    ) -> Tensor:
+        s_module = self.s_module
+        token_val = s_module.token_embedding(input_ids)
+        token_val = token_val + s_module.position_encoding(
+            input_ids.shape[1],
+            device=token_val.device,
+            dtype=token_val.dtype,
+        ).unsqueeze(0)
+        token_val = s_module.sequence_input_norm(token_val)
+
+        sequence_specs = tuple(
+            (
+                int(self._nomemory_exact_edge_compress_kind(propagation) or 0),
+                int(propagation.window or 0),
+                int(propagation.target_block_size or (input_ids.shape[1] + 1)),
+                int(propagation.source_block_size or (input_ids.shape[1] + 1)),
+            )
+            for propagation in self.s_module.sequence_layers
+        )
+        prediction_specs = tuple(
+            (
+                int(self._nomemory_exact_edge_compress_kind(propagation) or 0),
+                int(propagation.window or 0),
+                int(propagation.target_block_size or input_ids.shape[1]),
+                int(propagation.source_block_size or input_ids.shape[1]),
+            )
+            for propagation in self.prediction_layers
+        )
+        sequence_tensors = tuple(
+            tensor
+            for propagation, norm in zip(self.s_module.sequence_layers, self.s_module.sequence_norms)
+            for spec in (pairwise_kernel_spec(propagation.pairwise_fn),)
+            for tensor in (
+                self._tensor_or_empty(spec.in_weight, token_val),
+                self._tensor_or_empty(spec.out_weight, token_val),
+                spec.weight.to(device=token_val.device, dtype=token_val.dtype),
+                self._tensor_or_empty(spec.bias, token_val),
+                self.s_module._norm_param_or_empty(norm, "weight", token_val),
+                self.s_module._norm_param_or_empty(norm, "bias", token_val),
+            )
+        )
+        prediction_tensors = tuple(
+            tensor
+            for propagation, norm in zip(self.prediction_layers, self.prediction_norms)
+            for spec in (pairwise_kernel_spec(propagation.pairwise_fn),)
+            for tensor in (
+                self._tensor_or_empty(spec.in_weight, token_val),
+                self._tensor_or_empty(spec.out_weight, token_val),
+                spec.weight.to(device=token_val.device, dtype=token_val.dtype),
+                self._tensor_or_empty(spec.bias, token_val),
+                self._norm_param_or_empty(norm, "weight", token_val),
+                self._norm_param_or_empty(norm, "bias", token_val),
+            )
+        )
+        sequence_ffn_tensors = tuple(
+            tensor
+            for ffn in self.s_module.sequence_ffns
+            for tensor in self._nomemory_exact_ffn_tensors(ffn, token_val)
+        )
+        prediction_ffn_tensors = tuple(
+            tensor
+            for ffn in self.prediction_ffns
+            for tensor in self._nomemory_exact_ffn_tensors(ffn, token_val)
+        )
+        query_val = _nomemory_exact_stack_ffn_fused(
+            token_val,
+            anchor_state=s_module.anchor_state.expand(input_ids.shape[0], 1).to(
+                device=token_val.device,
+                dtype=token_val.dtype,
+            ),
+            anchor_val=s_module.anchor_val.expand(input_ids.shape[0], 1, -1).to(
+                device=token_val.device,
+                dtype=token_val.dtype,
+            ),
+            s_prediction_weight=self.s_prediction_proj.weight.to(device=token_val.device, dtype=token_val.dtype),
+            prediction_input_norm_weight=self._norm_param_or_empty(self.prediction_input_norm, "weight", token_val),
+            prediction_input_norm_bias=self._norm_param_or_empty(self.prediction_input_norm, "bias", token_val),
+            sequence_tensors=sequence_tensors,
+            prediction_tensors=prediction_tensors,
+            sequence_ffn_tensors=sequence_ffn_tensors,
+            prediction_ffn_tensors=prediction_ffn_tensors,
+            sequence_specs=sequence_specs,
+            prediction_specs=prediction_specs,
+            state_activation_name="softsign" if self.direction_only_values else "signed_softmax",
+        )
+        self.s_module._dense_apply_native_calls += len(self.s_module.sequence_layers)
+        self._prediction_dense_apply_native_calls += len(self.prediction_layers)
+        self._nomemory_exact_stack_ffn_fastpath_calls += 1
+        return query_val
 
     def _reset_parameters(self, *, tie_embedding_head: bool) -> None:
         nn.init.normal_(self.s_module.token_embedding.weight, mean=0.0, std=PARAM_INIT_STD)
         nn.init.normal_(self.s_module.anchor_val, mean=0.0, std=PARAM_INIT_STD)
         nn.init.zeros_(self.s_module.anchor_state)
-        init_linear(self.value_to_state)
         init_linear(self.s_prediction_proj)
         self.b_module.reset_projection_parameters()
         if not tie_embedding_head:
             nn.init.normal_(self.lm_head.weight, mean=0.0, std=PARAM_INIT_STD)
         for module in self.modules():
             init_pairwise_or_route_scales(module)
+
+    @property
+    def memory_levels(self) -> nn.ModuleList:
+        return self.b_module.memory_levels
+
+    @property
+    def read_projections(self) -> nn.ModuleList:
+        return self.b_module.read_projections
+
+    @property
+    def skip_gates(self) -> nn.ParameterDict:
+        return self.b_module.skip_gates
 
     def initialize_memory_state(
         self,
@@ -239,11 +1215,41 @@ class CausalHierarchicalMemoryLM(nn.Module):
             if knowledge_state is None:
                 knowledge_state = memory_state.knowledge_state
             memory_state = memory_state.memory_state
-        sequence_layer = self.s_module.encode(input_ids, state_projection=self.value_to_state)
-        aligned_s = sequence_layer.val[:, 1:, :]
-        batch_size, _, _ = aligned_s.shape
-        device = aligned_s.device
-        dtype = aligned_s.dtype
+        use_nomemory_exact_stack_fastpath = self._supports_nomemory_exact_stack_fastpath(
+            input_ids,
+            return_layers=return_layers,
+        )
+        use_nomemory_exact_stack_ffn_fastpath = self._supports_nomemory_exact_stack_ffn_fastpath(
+            input_ids,
+            return_layers=return_layers,
+        )
+        used_nomemory_exact_fastpath = (
+            use_nomemory_exact_stack_fastpath or use_nomemory_exact_stack_ffn_fastpath
+        )
+        if use_nomemory_exact_stack_fastpath:
+            query_val = self._run_nomemory_exact_stack_fastpath(input_ids)
+            batch_size, _, _ = query_val.shape
+            device = query_val.device
+            dtype = query_val.dtype
+            query_state = self.value_to_state(query_val).squeeze(-1)
+            if self.direction_only_values:
+                query_state = softsign_state(query_state)
+            sequence_layer = None
+        elif use_nomemory_exact_stack_ffn_fastpath:
+            query_val = self._run_nomemory_exact_stack_ffn_fastpath(input_ids)
+            batch_size, _, _ = query_val.shape
+            device = query_val.device
+            dtype = query_val.dtype
+            query_state = self.value_to_state(query_val).squeeze(-1)
+            if self.direction_only_values:
+                query_state = softsign_state(query_state)
+            sequence_layer = None
+        else:
+            sequence_layer = self.s_module.encode(input_ids, state_projection=self.value_to_state)
+            aligned_s = sequence_layer.val[:, 1:, :]
+            batch_size, _, _ = aligned_s.shape
+            device = aligned_s.device
+            dtype = aligned_s.dtype
 
         if memory_state is None:
             memory_state = self.initialize_memory_state(batch_size, device=device, dtype=dtype)
@@ -255,67 +1261,89 @@ class CausalHierarchicalMemoryLM(nn.Module):
             device=device,
             dtype=dtype,
         )
-        scan_output = self._scan_memory(
-            aligned_s,
-            current_memory,
-            knowledge_state=knowledge_state,
-            reset_mask=reset_mask,
-        )
+        if self.disable_memory and used_nomemory_exact_fastpath:
+            scan_output = BScanOutput(
+                query_layer=Layer(dim=self.dim, num_nodes=query_val.shape[1], state=query_state, val=query_val),
+                memory_state=tuple(current_memory),
+            )
+        elif self.disable_memory:
+            scan_output = BScanOutput(
+                query_layer=self._memoryless_query_layer(aligned_s),
+                memory_state=tuple(current_memory),
+            )
+        else:
+            scan_output = self._scan_memory(
+                aligned_s,
+                current_memory,
+                knowledge_state=knowledge_state,
+                reset_mask=reset_mask,
+            )
+            if self.disable_memory_read:
+                scan_output = BScanOutput(
+                    query_layer=self._memoryless_query_layer(aligned_s),
+                    memory_state=tuple(scan_output.memory_state),
+                    bridge_layer=scan_output.bridge_layer,
+                    knowledge_state=scan_output.knowledge_state,
+                    knowledge_output=scan_output.knowledge_output,
+                )
         query_layer = scan_output.query_layer
         current_memory = scan_output.memory_state
-        for propagation, norm in zip(self.prediction_layers, self.prediction_norms):
-            if self.checkpoint_prediction_layers and torch.is_grad_enabled():
-                def _run_prediction_layer(state: Tensor, val: Tensor) -> tuple[Tensor, Tensor]:
-                    current_layer = Layer(dim=self.dim, num_nodes=query_layer.num_nodes, state=state, val=val)
-                    next_layer = apply_delta(
-                        current_layer,
-                        propagation.compute_delta(
-                            layer_with_val_norm(
-                                current_layer,
-                                norm,
-                                unit_norm_values=self.unit_norm_values,
-                            )
-                        ),
-                        residual=True,
-                        val_norm=norm,
-                        unit_norm_values=self.unit_norm_values,
-                    )
-                    return next_layer.state, next_layer.val
-
-                next_state, next_val = torch_checkpoint(
-                    _run_prediction_layer,
-                    query_layer.state,
-                    query_layer.val,
-                    use_reentrant=False,
-                )
-                query_layer = Layer(
-                    dim=self.dim,
-                    num_nodes=query_layer.num_nodes,
-                    state=next_state,
-                    val=next_val,
-                )
-            else:
-                query_layer = apply_delta(
-                    query_layer,
-                    propagation.compute_delta(
-                        layer_with_val_norm(
-                            query_layer,
-                            norm,
-                            unit_norm_values=self.unit_norm_values,
+        if not used_nomemory_exact_fastpath:
+            for layer_index, (propagation, norm) in enumerate(zip(self.prediction_layers, self.prediction_norms)):
+                if self.checkpoint_prediction_layers and torch.is_grad_enabled():
+                    def _run_prediction_layer(state: Tensor, val: Tensor) -> tuple[Tensor, Tensor]:
+                        current_layer = Layer(dim=self.dim, num_nodes=query_layer.num_nodes, state=state, val=val)
+                        next_layer = apply_delta(
+                            current_layer,
+                            propagation.compute_delta(current_layer),
+                            residual=True,
+                            val_norm=norm,
+                            direction_only_values=self.direction_only_values,
                         )
-                    ),
-                    residual=True,
-                    val_norm=norm,
-                    unit_norm_values=self.unit_norm_values,
-                )
+                        return next_layer.state, next_layer.val
 
-        output_val = self.output_norm(query_layer.val)
-        if self.unit_norm_values:
-            output_val = unit_normalize_values(output_val)
-            query_layer = query_layer.with_tensors(
-                state=self.value_to_state(output_val).squeeze(-1),
-                val=output_val,
-            )
+                    next_state, next_val = torch_checkpoint(
+                        _run_prediction_layer,
+                        query_layer.state,
+                        query_layer.val,
+                        use_reentrant=False,
+                    )
+                    query_layer = Layer(
+                        dim=self.dim,
+                        num_nodes=query_layer.num_nodes,
+                        state=next_state,
+                        val=next_val,
+                    )
+                else:
+                    delta = propagation.compute_delta(query_layer)
+                    if self._can_use_dense_apply_fastpath(query_layer, propagation):
+                        query_layer = self._apply_dense_delta_fastpath(
+                            query_layer,
+                            delta.delta_state,
+                            delta.delta_val,
+                            norm,
+                            propagation,
+                        )
+                    else:
+                        query_layer = apply_delta(
+                            query_layer,
+                            delta,
+                            residual=True,
+                            val_norm=norm,
+                            direction_only_values=self.direction_only_values,
+                        )
+                ffn_val = self.prediction_ffns[layer_index](query_layer.val)
+                query_layer = query_layer.with_tensors(val=ffn_val)
+
+        output_state_source = self.output_norm(query_layer.val)
+        output_val = output_state_source
+        output_state = self.value_to_state(output_state_source).squeeze(-1)
+        if self.direction_only_values:
+            output_state = softsign_state(output_state)
+        query_layer = query_layer.with_tensors(
+            state=output_state,
+            val=output_val,
+        )
         logits = self.lm_head(output_val)
         if not (return_memory_state or return_layers):
             return logits
@@ -332,6 +1360,8 @@ class CausalHierarchicalMemoryLM(nn.Module):
         name = getattr(edge_compress_fn, "__name__", "")
         if name in {"signed_abs_softmax", "signed_abs_softmax_edges", "_signed_abs_softmax_edges"}:
             return "signed_abs_softmax"
+        if name in {"softsign"}:
+            return "softsign"
         if name in {"signed_entmax15", "_signed_entmax15_edges"}:
             return "signed_entmax15"
         return None
@@ -394,9 +1424,28 @@ class CausalHierarchicalMemoryLM(nn.Module):
             return reference.new_empty((0,))
         return tensor.to(device=reference.device, dtype=reference.dtype)
 
+    @staticmethod
+    def _norm_param_or_empty(module: nn.Module, name: str, reference: Tensor) -> Tensor:
+        tensor = getattr(module, name, None)
+        if isinstance(tensor, Tensor):
+            return tensor.to(device=reference.device, dtype=reference.dtype)
+        return reference.new_empty((0,))
+
     def _native_scan_supported_config(self) -> bool:
         supported_route_compress = {"softmax", "signed_abs_softmax", "signed_entmax15"}
         supported_edge_compress = {"softsign", "signed_abs_softmax", "signed_entmax15"}
+
+        def _is_supported_ffn(module: nn.Module) -> bool:
+            if isinstance(module, nn.Identity):
+                return True
+            if not isinstance(module, ResidualFeedForward):
+                return False
+            return (
+                isinstance(module.input_norm, nn.LayerNorm)
+                and len(module.net) == 5
+                and isinstance(module.net[0], nn.Linear)
+                and isinstance(module.net[3], nn.Linear)
+            )
 
         def _is_supported_route(transition) -> bool:
             return (
@@ -405,14 +1454,17 @@ class CausalHierarchicalMemoryLM(nn.Module):
             )
 
         def _is_supported_propagation(propagation) -> bool:
+            sparse_type = getattr(propagation, "sparse_type", "dense")
             return (
                 self._pairwise_kernel_kind(propagation.pairwise_fn) is not None
-                and propagation.sparse_type in {"topk", "dense"}
-                and propagation.state_weight_edges
+                and sparse_type in {"topk", "dense"}
+                and not propagation.state_weight_edges
                 and self._native_edge_compress_name(propagation.edge_compress_fn) in supported_edge_compress
             )
 
-        if not isinstance(self.value_to_state, nn.Linear):
+        if not isinstance(self.value_to_state, (nn.Linear, ValueNormStateProjection)):
+            return False
+        if not all(_is_supported_ffn(ffn) for ffn in self.b_module.level_ffns):
             return False
         if not all(_is_supported_route(level.write) for level in self.b_module.memory_levels):
             return False
@@ -545,11 +1597,40 @@ class CausalHierarchicalMemoryLM(nn.Module):
             skip_gates.append(self.b_module.skip_gates[key])
             skip_topks.append(int(transition.topk))
 
+        def _level_ffn_spec(ffn: nn.Module) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+            if isinstance(ffn, nn.Identity):
+                empty = aligned_s.new_empty((0,))
+                return empty, empty, empty, empty, empty, empty
+            if not isinstance(ffn, ResidualFeedForward):
+                raise RuntimeError("Native scan supports only ResidualFeedForward or Identity level FFNs.")
+            first = ffn.net[0]
+            second = ffn.net[3]
+            if not isinstance(first, nn.Linear) or not isinstance(second, nn.Linear):
+                raise RuntimeError("Native scan requires ResidualFeedForward linear layers.")
+            return (
+                ffn.input_norm.weight,
+                ffn.input_norm.bias,
+                first.weight,
+                first.bias,
+                second.weight,
+                second.bias,
+            )
+
+        level_ffn_specs = [_level_ffn_spec(ffn) for ffn in self.b_module.level_ffns]
+
         return {
             "aligned_s": aligned_s,
             "flat_memory": self.b_module.flatten_memory_state(tuple(memory_state)),
-            "value_to_state_weight": self.value_to_state.weight,
-            "value_to_state_bias": self.value_to_state.bias,
+            "value_to_state_weight": (
+                self.value_to_state.weight
+                if isinstance(self.value_to_state, nn.Linear)
+                else aligned_s.new_empty((0,))
+            ),
+            "value_to_state_bias": (
+                self.value_to_state.bias
+                if isinstance(self.value_to_state, nn.Linear)
+                else None
+            ),
             "s_prediction_weight": self.s_prediction_proj.weight,
             "prediction_input_norm_weight": self.prediction_input_norm.weight,
             "prediction_input_norm_bias": self.prediction_input_norm.bias,
@@ -568,17 +1649,44 @@ class CausalHierarchicalMemoryLM(nn.Module):
             "propagation_target_weights": tuple(spec[1] for spec in propagation_specs),
             "propagation_core_weights": tuple(spec[2] for spec in propagation_specs),
             "propagation_biases": tuple(spec[3] for spec in propagation_specs),
-            "propagation_topks": tuple(int(level.propagation.topk or level.num_slots) for level in self.b_module.memory_levels),
+            "propagation_topks": tuple(
+                -1
+                if self.disable_memory_propagation
+                else (
+                    int(level.current_propagation_topk())
+                    if level.current_memory_mode() == "topk"
+                    else 0
+                )
+                for level in self.b_module.memory_levels
+            ),
             "propagation_compress_name": propagation_compress_name,
-            "val_norm_weights": tuple(level.val_norm.weight for level in self.b_module.memory_levels),
-            "val_norm_biases": tuple(level.val_norm.bias for level in self.b_module.memory_levels),
+            "val_norm_weights": tuple(
+                self._norm_param_or_empty(level.val_norm, "weight", aligned_s)
+                for level in self.b_module.memory_levels
+            ),
+            "val_norm_biases": tuple(
+                self._norm_param_or_empty(level.val_norm, "bias", aligned_s)
+                for level in self.b_module.memory_levels
+            ),
             "level_transition_source_weights": tuple(spec[0] for spec in level_transition_specs),
             "level_transition_target_weights": tuple(spec[1] for spec in level_transition_specs),
             "level_transition_core_weights": tuple(spec[2] for spec in level_transition_specs),
             "level_transition_biases": tuple(spec[3] for spec in level_transition_specs),
             "level_transition_topks": tuple(int(transition.topk) for transition in self.b_module.level_transitions),
-            "level_norm_weights": tuple(norm.weight for norm in self.b_module.level_norms),
-            "level_norm_biases": tuple(norm.bias for norm in self.b_module.level_norms),
+            "level_norm_weights": tuple(
+                self._norm_param_or_empty(norm, "weight", aligned_s)
+                for norm in self.b_module.level_norms
+            ),
+            "level_norm_biases": tuple(
+                self._norm_param_or_empty(norm, "bias", aligned_s)
+                for norm in self.b_module.level_norms
+            ),
+            "level_ffn_norm_weights": tuple(spec[0] for spec in level_ffn_specs),
+            "level_ffn_norm_biases": tuple(spec[1] for spec in level_ffn_specs),
+            "level_ffn_in_weights": tuple(spec[2] for spec in level_ffn_specs),
+            "level_ffn_in_biases": tuple(spec[3] for spec in level_ffn_specs),
+            "level_ffn_out_weights": tuple(spec[4] for spec in level_ffn_specs),
+            "level_ffn_out_biases": tuple(spec[5] for spec in level_ffn_specs),
             "skip_source_weights": tuple(skip_source_weights),
             "skip_target_weights": tuple(skip_target_weights),
             "skip_core_weights": tuple(skip_core_weights),
@@ -594,15 +1702,14 @@ class CausalHierarchicalMemoryLM(nn.Module):
     ) -> BScanOutput:
         packed = self._pack_native_scan_inputs(aligned_s, memory_state)
         query_val, flat_memory = causal_memory_scan_fused_native(**packed)
-        if self.unit_norm_values:
-            query_val = unit_normalize_values(self.prediction_input_norm(query_val))
-        query_state = self.value_to_state(query_val).squeeze(-1)
-        constrained_memory = self.b_module.constrain_memory_state(
-            self.b_module.unflatten_memory_state(flat_memory)
-        )
+        query_state_source = query_val
+        query_state = self.value_to_state(query_state_source).squeeze(-1)
+        if self.direction_only_values:
+            query_state = softsign_state(query_state)
+        next_memory = self.b_module.unflatten_memory_state(flat_memory)
         return BScanOutput(
             query_layer=Layer(dim=self.dim, num_nodes=aligned_s.shape[1], state=query_state, val=query_val),
-            memory_state=constrained_memory,
+            memory_state=tuple(next_memory),
             bridge_layer=None,
             knowledge_state=None,
             knowledge_output=None,
@@ -616,8 +1723,15 @@ class CausalHierarchicalMemoryLM(nn.Module):
         knowledge_state: Layer | None,
         reset_mask: Tensor | None,
     ) -> Any:
+        stream_capturing = False
+        if aligned_s.device.type == "cuda":
+            try:
+                stream_capturing = bool(torch.cuda.is_current_stream_capturing())
+            except Exception:
+                stream_capturing = False
         use_native_scan = (
             self.knowledge_module is None
+            and not stream_capturing
             and self.scan_backend != "python"
             and self._native_scan_supported_config()
             and native_supports("causal_memory_scan_fused")
