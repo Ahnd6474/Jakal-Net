@@ -38,9 +38,6 @@ from jakal_net.native_backend import (
     transition_topk_native,
 )
 from jakal_net.modules import MultiHeadRoute
-from jakal_net._architectural_common import unit_normalize_values
-
-
 def _cuda_graph_capture_active(device_type: str) -> bool:
     if device_type != "cuda":
         return False
@@ -161,9 +158,7 @@ class Transition(nn.Module):
         self._multihead_vectorized_fast_path = isinstance(self.route_fn, MultiHeadRoute)
 
     def _directional_val(self, val: Tensor) -> Tensor:
-        if not self.use_direction_only:
-            return val
-        return unit_normalize_values(val)
+        return val
 
     def _route_logits(self, src_val: Tensor, dst_val: Tensor) -> Tensor:
         src_val = self._directional_val(src_val)

@@ -26,7 +26,6 @@ from jakal_net.modules import (
 STATE_MASS_PER_NODE = 1.0
 PARAM_INIT_STD = 0.02
 LOW_RANK_SCALE_INIT = 0.1
-LOW_RANK_REFERENCE_RANK = 128.0
 UNIT_NORM_EPS = 1e-6
 
 
@@ -42,7 +41,7 @@ def _maybe_compile(fn):
         return fn
 
 
-def _unit_normalize_values_impl(val: Tensor, *, eps: float = UNIT_NORM_EPS) -> Tensor:
+def _normalize_value_directions_impl(val: Tensor, *, eps: float = UNIT_NORM_EPS) -> Tensor:
     return F.normalize(torch.nan_to_num(val), p=2.0, dim=-1, eps=eps)
 
 
@@ -54,8 +53,13 @@ def _signed_softmax_state_impl(state: Tensor) -> Tensor:
     return torch.sign(clean_state) * magnitude * state_mass
 
 
-_COMPILED_UNIT_NORMALIZE_VALUES = _maybe_compile(_unit_normalize_values_impl)
+def _softsign_state_impl(state: Tensor) -> Tensor:
+    return F.softsign(torch.nan_to_num(state))
+
+
+_COMPILED_UNIT_NORMALIZE_VALUES = _maybe_compile(_normalize_value_directions_impl)
 _COMPILED_SIGNED_SOFTMAX_STATE = _maybe_compile(_signed_softmax_state_impl)
+_COMPILED_SOFTSIGN_STATE = _maybe_compile(_softsign_state_impl)
 
 
 def _make_single_pairwise(
@@ -115,10 +119,7 @@ def make_pairwise(
     frozen_heads: int = 0,
     anchor_heads: int = 0,
     anchor_kind: str = "scaled_cosine",
-    aggregate: str = "max",
 ) -> nn.Module:
-    if aggregate not in {"max", "mean", "sum", "head_mean", "smoothmax", "signed_smoothmax"}:
-        raise ValueError(f"Unsupported pairwise head aggregate: {aggregate!r}.")
     if heads <= 0:
         raise ValueError("heads must be positive.")
     if frozen_heads < 0 or frozen_heads > heads:
@@ -141,7 +142,7 @@ def make_pairwise(
         if anchor_heads <= head_index < anchor_heads + frozen_heads:
             module = _freeze_module_parameters(module)
         head_modules.append(module)
-    return MultiHeadPairwise(head_modules, aggregate=aggregate)
+    return MultiHeadPairwise(head_modules)
 
 
 def _make_single_route(
@@ -223,7 +224,7 @@ def make_route(
     return MultiHeadRoute(head_modules)
 
 
-def unit_normalize_values(val: Tensor, *, eps: float = UNIT_NORM_EPS) -> Tensor:
+def normalize_value_directions(val: Tensor, *, eps: float = UNIT_NORM_EPS) -> Tensor:
     return _COMPILED_UNIT_NORMALIZE_VALUES(val, eps=eps)
 
 
@@ -231,7 +232,7 @@ def layer_with_val_norm(
     layer: Layer,
     norm: nn.LayerNorm,
     *,
-    unit_norm_values: bool = False,
+    direction_only_values: bool = False,
 ) -> Layer:
     val = norm(layer.val)
     return layer.with_tensors(val=val)
@@ -242,7 +243,7 @@ def signed_softmax_state(state: Tensor) -> Tensor:
 
 
 def softsign_state(state: Tensor) -> Tensor:
-    return F.softsign(torch.nan_to_num(state))
+    return _COMPILED_SOFTSIGN_STATE(state)
 
 
 def signed_abs_softmax_edges(scores: Tensor) -> Tensor:
@@ -260,10 +261,10 @@ def apply_delta(
     *,
     residual: bool = True,
     val_norm: nn.LayerNorm | None = None,
-    unit_norm_values: bool = False,
+    direction_only_values: bool = False,
 ) -> Layer:
     updated = layer.apply_delta(delta, merge_mode="add" if residual else "replace")
-    state = softsign_state(updated.state) if unit_norm_values else signed_softmax_state(updated.state)
+    state = softsign_state(updated.state) if direction_only_values else signed_softmax_state(updated.state)
     if val_norm is None:
         val = updated.val
     elif residual:
@@ -296,9 +297,7 @@ def init_pairwise_or_route_scales(module: nn.Module) -> None:
     if getattr(module, "_constant_one_anchor", False):
         return
     if isinstance(module, (LowRankBilinearPairwise, LowRankBilinearRoute)):
-        rank = float(module.weight.numel())
-        rank_scale = (LOW_RANK_REFERENCE_RANK / rank) ** 0.5
-        module.weight.data.fill_(LOW_RANK_SCALE_INIT * rank_scale)
+        module.weight.data.fill_(LOW_RANK_SCALE_INIT)
         init_linear(module.source_proj)
         init_linear(module.target_proj)
         if getattr(module, "bias", None) is not None:

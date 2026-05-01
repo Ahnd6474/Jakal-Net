@@ -601,6 +601,23 @@ __global__ void scan_signed_softmax_state_kernel(
 }
 
 template <typename scalar_t>
+__global__ void scan_softsign_state_kernel(
+    const scalar_t* __restrict__ state,
+    const scalar_t* __restrict__ delta_state,
+    scalar_t* __restrict__ output,
+    int64_t total) {
+  const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= total) {
+    return;
+  }
+  float value = static_cast<float>(state[index]) + static_cast<float>(delta_state[index]);
+  if (!isfinite(value)) {
+    value = 0.0f;
+  }
+  output[index] = static_cast<scalar_t>(value / (1.0f + fabsf(value)));
+}
+
+template <typename scalar_t>
 __global__ void scan_val_add_layer_norm_kernel(
     const scalar_t* __restrict__ val,
     const scalar_t* __restrict__ delta_val,
@@ -4882,6 +4899,68 @@ torch::Tensor jakal_net_softmax_backward_cuda(
   return grad_scores;
 }
 
+std::tuple<torch::Tensor, torch::Tensor> jakal_net_apply_delta_to_layer_cuda(
+    const torch::Tensor& layer_state,
+    const torch::Tensor& layer_val,
+    const torch::Tensor& delta_state,
+    const torch::Tensor& delta_val,
+    const torch::Tensor& val_norm_weight,
+    const torch::Tensor& val_norm_bias,
+    const std::string& state_activation_name,
+    bool use_fused_forward) {
+  require_cuda_contiguous(layer_state, "layer_state");
+  require_cuda_contiguous(layer_val, "layer_val");
+  require_cuda_contiguous(delta_state, "delta_state");
+  require_cuda_contiguous(delta_val, "delta_val");
+  if (layer_state.sizes() != delta_state.sizes()) {
+    throw std::runtime_error("layer_state and delta_state must share shape.");
+  }
+  if (layer_val.sizes() != delta_val.sizes()) {
+    throw std::runtime_error("layer_val and delta_val must share shape.");
+  }
+  (void)use_fused_forward;
+
+  auto updated_state_input = layer_state + delta_state;
+  torch::Tensor updated_state;
+  if (state_activation_name == "signed_softmax") {
+    auto clean_state = torch::nan_to_num(updated_state_input);
+    clean_state = torch::layer_norm(
+        clean_state,
+        {clean_state.size(-1)},
+        c10::nullopt,
+        c10::nullopt,
+        1e-5,
+        false);
+    auto magnitude = torch::softmax(clean_state.abs(), -1);
+    const auto state_mass = static_cast<double>(updated_state_input.size(-1));
+    updated_state = torch::sign(clean_state) * magnitude * state_mass;
+  } else if (state_activation_name == "softsign") {
+    auto clean_state = torch::nan_to_num(updated_state_input);
+    updated_state = clean_state / (1.0 + clean_state.abs());
+  } else {
+    throw std::runtime_error("Unsupported state_activation_name: " + state_activation_name);
+  }
+
+  auto updated_val_input = layer_val + delta_val;
+  torch::Tensor updated_val;
+  if (!val_norm_weight.defined() || val_norm_weight.numel() == 0) {
+    updated_val = updated_val_input;
+  } else {
+    c10::optional<torch::Tensor> optional_bias = c10::nullopt;
+    if (val_norm_bias.defined() && val_norm_bias.numel() > 0) {
+      optional_bias = val_norm_bias.to(updated_val_input.scalar_type());
+    }
+    updated_val = torch::layer_norm(
+        updated_val_input,
+        {updated_val_input.size(-1)},
+        val_norm_weight.to(updated_val_input.scalar_type()),
+        optional_bias,
+        1e-5,
+        false);
+  }
+  return {updated_state, updated_val};
+}
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 jakal_net_diagonal_pairwise_topk_backward_cuda(
     const torch::Tensor& query_val,
@@ -5027,6 +5106,15 @@ struct ScanCudaLayerState {
   torch::Tensor state;
   torch::Tensor val;
 };
+
+ScanCudaLayerState scan_cuda_apply_delta_to_layer(
+    const ScanCudaLayerState& layer,
+    const torch::Tensor& delta_state,
+    const torch::Tensor& delta_val,
+    const torch::Tensor& val_norm_weight,
+    const torch::Tensor& val_norm_bias,
+    bool use_fused_forward,
+    const std::string& state_activation_name);
 
 inline c10::optional<torch::Tensor> scan_cuda_optional_tensor(const torch::Tensor& tensor) {
   if (!tensor.defined() || tensor.numel() == 0) {
@@ -5204,7 +5292,8 @@ ScanCudaLayerState scan_cuda_apply_delta_to_layer(
     const torch::Tensor& delta_val,
     const torch::Tensor& val_norm_weight,
     const torch::Tensor& val_norm_bias,
-    bool use_fused_forward) {
+    bool use_fused_forward,
+    const std::string& state_activation_name = "signed_softmax") {
   if (use_fused_forward &&
       layer.state.is_cuda() &&
       delta_state.is_cuda() &&
@@ -5221,27 +5310,46 @@ ScanCudaLayerState scan_cuda_apply_delta_to_layer(
       (!val_norm_weight.defined() || val_norm_weight.numel() == 0 ||
        val_norm_weight.scalar_type() == layer.val.scalar_type()) &&
       (!val_norm_bias.defined() || val_norm_bias.numel() == 0 ||
-       val_norm_bias.scalar_type() == layer.val.scalar_type())) {
+       val_norm_bias.scalar_type() == layer.val.scalar_type()) &&
+      (state_activation_name == "signed_softmax" || state_activation_name == "softsign")) {
     auto updated_state = torch::empty_like(layer.state);
     auto updated_val = torch::empty_like(layer.val);
     constexpr int threads = 256;
     const auto stream = at::cuda::getCurrentCUDAStream();
-    const auto state_shmem = 2 * threads * sizeof(float);
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        torch::kHalf,
-        torch::kBFloat16,
-        layer.state.scalar_type(),
-        "scan_signed_softmax_state_kernel",
-        [&] {
-          scan_signed_softmax_state_kernel<scalar_t>
-              <<<layer.state.size(0), threads, state_shmem, stream>>>(
-                  layer.state.data_ptr<scalar_t>(),
-                  delta_state.data_ptr<scalar_t>(),
-                  updated_state.data_ptr<scalar_t>(),
-                  layer.state.size(0),
-                  layer.state.size(1));
-          C10_CUDA_KERNEL_LAUNCH_CHECK();
-        });
+    if (state_activation_name == "signed_softmax") {
+      const auto state_shmem = 2 * threads * sizeof(float);
+      AT_DISPATCH_FLOATING_TYPES_AND2(
+          torch::kHalf,
+          torch::kBFloat16,
+          layer.state.scalar_type(),
+          "scan_signed_softmax_state_kernel",
+          [&] {
+            scan_signed_softmax_state_kernel<scalar_t>
+                <<<layer.state.size(0), threads, state_shmem, stream>>>(
+                    layer.state.data_ptr<scalar_t>(),
+                    delta_state.data_ptr<scalar_t>(),
+                    updated_state.data_ptr<scalar_t>(),
+                    layer.state.size(0),
+                    layer.state.size(1));
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+          });
+    } else {
+      const auto state_total = layer.state.numel();
+      AT_DISPATCH_FLOATING_TYPES_AND2(
+          torch::kHalf,
+          torch::kBFloat16,
+          layer.state.scalar_type(),
+          "scan_softsign_state_kernel",
+          [&] {
+            scan_softsign_state_kernel<scalar_t>
+                <<<(state_total + threads - 1) / threads, threads, 0, stream>>>(
+                    layer.state.data_ptr<scalar_t>(),
+                    delta_state.data_ptr<scalar_t>(),
+                    updated_state.data_ptr<scalar_t>(),
+                    state_total);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+          });
+    }
 
     const auto val_rows = layer.val.size(0) * layer.val.size(1);
     const auto val_dim = layer.val.size(2);
@@ -5269,7 +5377,15 @@ ScanCudaLayerState scan_cuda_apply_delta_to_layer(
         });
     return {updated_state, updated_val};
   }
-  auto updated_state = scan_cuda_signed_softmax_state(layer.state + delta_state);
+  torch::Tensor updated_state;
+  if (state_activation_name == "signed_softmax") {
+    updated_state = scan_cuda_signed_softmax_state(layer.state + delta_state);
+  } else if (state_activation_name == "softsign") {
+    auto clean_state = torch::nan_to_num(layer.state + delta_state);
+    updated_state = clean_state / (1.0 + clean_state.abs());
+  } else {
+    throw std::runtime_error("Unsupported state_activation_name: " + state_activation_name);
+  }
   auto updated_val = scan_cuda_layer_norm_last_dim(layer.val + delta_val, val_norm_weight, val_norm_bias);
   return {updated_state, updated_val};
 }

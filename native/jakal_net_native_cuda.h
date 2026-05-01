@@ -197,6 +197,17 @@ torch::Tensor jakal_net_softmax_backward_cuda(
     const torch::Tensor& routes,
     const torch::Tensor& grad_routes);
 
+std::tuple<torch::Tensor, torch::Tensor>
+jakal_net_apply_delta_to_layer_cuda(
+    const torch::Tensor& layer_state,
+    const torch::Tensor& layer_val,
+    const torch::Tensor& delta_state,
+    const torch::Tensor& delta_val,
+    const torch::Tensor& val_norm_weight,
+    const torch::Tensor& val_norm_bias,
+    const std::string& state_activation_name,
+    bool use_fused_forward);
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 jakal_net_diagonal_pairwise_topk_backward_cuda(
     const torch::Tensor& query_val,
