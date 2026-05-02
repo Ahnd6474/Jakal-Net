@@ -20,7 +20,7 @@ from jakal_net._architectural_common import (
 from jakal_net.core import Layer, LayerDelta
 from jakal_net.propagation import Propagation, SparsePropagation
 from jakal_net.transition import SparseTransition
-from jakal_net.modules import ResidualFeedForward
+from jakal_net.modules import make_residual_postmix
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,8 +179,10 @@ class BModule(nn.Module):
         implementation: str,
         direction_only_values: bool = False,
         feed_forward_layers: bool = True,
+        feed_forward_kind: str = "ffn",
         memory_propagation_layers: bool = True,
         feed_forward_hidden_mult: float = 2.0,
+        feed_forward_dropout: float = 0.0,
     ) -> None:
         super().__init__()
         if dim <= 0:
@@ -199,6 +201,10 @@ class BModule(nn.Module):
             raise ValueError("memory_topk must be positive.")
         if feed_forward_hidden_mult <= 0.0:
             raise ValueError("feed_forward_hidden_mult must be positive.")
+        if feed_forward_kind not in {"ffn", "linear"}:
+            raise ValueError("feed_forward_kind must be 'ffn' or 'linear'.")
+        if not 0.0 <= feed_forward_dropout < 1.0:
+            raise ValueError("feed_forward_dropout must be in [0, 1).")
 
         self.dim = dim
         self.memory_slots = tuple(int(slots) for slots in memory_slots)
@@ -207,8 +213,10 @@ class BModule(nn.Module):
         self.direction_only_values = direction_only_values
         self.implementation = implementation
         self.feed_forward_layers = bool(feed_forward_layers)
+        self.feed_forward_kind = str(feed_forward_kind)
         self.memory_propagation_layers = bool(memory_propagation_layers)
         self.feed_forward_hidden_mult = float(feed_forward_hidden_mult)
+        self.feed_forward_dropout = float(feed_forward_dropout)
 
         self.memory_levels = nn.ModuleList(
             _MemoryLevel(
@@ -262,7 +270,12 @@ class BModule(nn.Module):
             self.level_norms = nn.ModuleList(nn.LayerNorm(dim) for _ in self.memory_slots)
         self.level_ffns = nn.ModuleList(
             (
-                ResidualFeedForward(dim, hidden_mult=self.feed_forward_hidden_mult)
+                make_residual_postmix(
+                    self.feed_forward_kind,
+                    dim,
+                    hidden_mult=self.feed_forward_hidden_mult,
+                    dropout=self.feed_forward_dropout,
+                )
                 if self.feed_forward_layers
                 else nn.Identity()
             )

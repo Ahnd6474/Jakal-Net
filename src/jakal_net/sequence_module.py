@@ -12,7 +12,7 @@ from jakal_net._architectural_common import (
     softsign_state,
 )
 from jakal_net.core import Layer
-from jakal_net.modules import LearnedPositionEncoding, ResidualFeedForward
+from jakal_net.modules import LearnedPositionEncoding, make_residual_postmix
 from jakal_net.native_backend import dense_apply_native, dense_apply_native_available
 from jakal_net.propagation import SparsePropagation
 
@@ -37,7 +37,9 @@ class SModule(nn.Module):
         checkpoint_sequence_layers: bool = False,
         direction_only_values: bool = False,
         feed_forward_layers: bool = True,
+        feed_forward_kind: str = "ffn",
         feed_forward_hidden_mult: float = 2.0,
+        feed_forward_dropout: float = 0.0,
     ) -> None:
         super().__init__()
         if vocab_size <= 0:
@@ -52,6 +54,10 @@ class SModule(nn.Module):
             raise ValueError("s_microbatch_size must be positive when provided.")
         if feed_forward_hidden_mult <= 0.0:
             raise ValueError("feed_forward_hidden_mult must be positive.")
+        if feed_forward_kind not in {"ffn", "linear"}:
+            raise ValueError("feed_forward_kind must be 'ffn' or 'linear'.")
+        if not 0.0 <= feed_forward_dropout < 1.0:
+            raise ValueError("feed_forward_dropout must be in [0, 1).")
 
         self.vocab_size = vocab_size
         self.dim = dim
@@ -60,7 +66,9 @@ class SModule(nn.Module):
         self.checkpoint_sequence_layers = checkpoint_sequence_layers
         self.direction_only_values = direction_only_values
         self.feed_forward_layers = bool(feed_forward_layers)
+        self.feed_forward_kind = str(feed_forward_kind)
         self.feed_forward_hidden_mult = float(feed_forward_hidden_mult)
+        self.feed_forward_dropout = float(feed_forward_dropout)
 
         self.token_embedding = nn.Embedding(vocab_size, dim)
         self.position_encoding = LearnedPositionEncoding(dim)
@@ -97,7 +105,12 @@ class SModule(nn.Module):
         )
         self.sequence_ffns = nn.ModuleList(
             (
-                ResidualFeedForward(dim, hidden_mult=self.feed_forward_hidden_mult)
+                make_residual_postmix(
+                    self.feed_forward_kind,
+                    dim,
+                    hidden_mult=self.feed_forward_hidden_mult,
+                    dropout=self.feed_forward_dropout,
+                )
                 if self.feed_forward_layers
                 else nn.Identity()
             )

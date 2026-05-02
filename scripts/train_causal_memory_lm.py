@@ -68,6 +68,7 @@ except ImportError:
 
 from jakal_net import describe_device, resolve_device
 from jakal_net.causal_memory_lm import CausalHierarchicalMemoryLM, MemoryScanOutput, ModelRecurrentState
+from jakal_net.modules import LowRankBilinearPairwise, LowRankBilinearRoute, ResidualLinear
 from jakal_net.native_backend import (
     EXPERIMENTAL_DIAGONAL_DENSE_PROP_CUDA_ENV,
     EXPERIMENTAL_FUSED_TRAINING_CHECKPOINT_STRIDE_ENV,
@@ -4168,6 +4169,34 @@ def perplexity_from_loss(loss_value: float) -> float:
     return float(math.exp(clamped))
 
 
+def _freeze_linear_identity(linear: torch.nn.Linear) -> bool:
+    rows, cols = linear.weight.shape
+    if rows != cols:
+        return False
+    with torch.no_grad():
+        linear.weight.zero_()
+        linear.weight.diagonal().fill_(1.0)
+    linear.weight.requires_grad_(False)
+    return True
+
+
+def freeze_square_low_rank_projections_identity(model: torch.nn.Module) -> dict[str, int]:
+    module_count = 0
+    matrix_count = 0
+    for module in model.modules():
+        if not isinstance(module, (LowRankBilinearPairwise, LowRankBilinearRoute)):
+            continue
+        source_frozen = _freeze_linear_identity(module.source_proj)
+        target_frozen = _freeze_linear_identity(module.target_proj)
+        if source_frozen:
+            matrix_count += 1
+        if target_frozen:
+            matrix_count += 1
+        if source_frozen or target_frozen:
+            module_count += 1
+    return {"modules": module_count, "matrices": matrix_count}
+
+
 def compute_learning_rate(
     *,
     step: int,
@@ -5276,6 +5305,24 @@ def parse_args() -> argparse.Namespace:
         default=2.0,
         help="Hidden width multiplier for memory-model FFN blocks.",
     )
+    parser.add_argument(
+        "--feed-forward-kind",
+        choices=("ffn", "linear"),
+        default="ffn",
+        help="Post-propagation residual block type for sequence/prediction and enabled memory FFN blocks.",
+    )
+    parser.add_argument(
+        "--output-postmix-kind",
+        choices=("none", "ffn", "linear"),
+        default="none",
+        help="Residual block applied once after the final propagation stack and before output norm/head.",
+    )
+    parser.add_argument(
+        "--feed-forward-dropout",
+        type=float,
+        default=0.0,
+        help="Dropout applied inside memory-model FFN blocks.",
+    )
     parser.add_argument("--memory-topk", type=int, default=16)
     parser.add_argument("--memory-train-mode", choices=("dense", "topk"), default="dense")
     parser.add_argument("--memory-eval-mode", choices=("dense", "topk"), default="dense")
@@ -5350,6 +5397,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage2-grad-accum-steps", type=int, default=0)
     parser.add_argument("--stage3-grad-accum-steps", type=int, default=0)
     parser.add_argument("--learning-rate", type=float, default=5e-4)
+    parser.add_argument(
+        "--linear-lr-mult",
+        type=float,
+        default=1.0,
+        help="Learning-rate multiplier applied only to ResidualLinear blocks.",
+    )
+    parser.add_argument("--linear-learning-rate", type=float)
+    parser.add_argument("--linear-warmup-start-lr", type=float)
+    parser.add_argument("--linear-warmup-steps", type=int)
+    parser.add_argument("--linear-lr-min-ratio", type=float)
+    parser.add_argument("--linear-lr-delay-steps", type=int, default=0)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument(
         "--optimizer",
@@ -5374,6 +5432,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr-decay-start-step", type=int, default=-1)
     parser.add_argument("--lr-decay-steps", type=int, default=0)
     parser.add_argument("--disable-lr-decay", action="store_true")
+    parser.add_argument("--freeze-square-low-rank-proj-identity", action="store_true")
     parser.add_argument("--epochs", type=float, default=1.0)
     parser.add_argument("--train-fraction", type=float, default=0.9)
     parser.add_argument("--grad-clip", type=float, default=1.0)
@@ -5500,24 +5559,97 @@ def build_parameter_groups(
     *,
     learning_rate: float,
     weight_decay: float,
+    linear_lr_mult: float = 1.0,
 ) -> tuple[list[dict[str, Any]], tuple[OptimizerParameterGroupConfig, ...]]:
-    parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
-    parameter_count = sum(int(parameter.numel()) for parameter in parameters)
+    lr_scale_linear = float(linear_lr_mult)
+    if lr_scale_linear <= 0.0:
+        raise ValueError("linear_lr_mult must be positive.")
+    named_parameters = [(name, parameter) for name, parameter in model.named_parameters() if parameter.requires_grad]
+    if lr_scale_linear == 1.0:
+        parameters = [parameter for _, parameter in named_parameters]
+        parameter_count = sum(int(parameter.numel()) for parameter in parameters)
+        param_groups = [
+            {
+                "params": parameters,
+                "lr": learning_rate,
+                "weight_decay": weight_decay,
+                "group_name": "model",
+                "lr_scale": 1.0,
+            }
+        ]
+        group_configs = (
+            OptimizerParameterGroupConfig(
+                name="model",
+                lr_scale=1.0,
+                weight_decay=weight_decay,
+                parameter_count=parameter_count,
+            ),
+        )
+        return param_groups, group_configs
+
+    linear_parameter_ids = {
+        id(parameter)
+        for module in model.modules()
+        if isinstance(module, ResidualLinear)
+        for parameter in module.parameters()
+        if parameter.requires_grad
+    }
+    base_parameters: list[torch.nn.Parameter] = []
+    linear_parameters: list[torch.nn.Parameter] = []
+    for _, parameter in named_parameters:
+        if id(parameter) in linear_parameter_ids:
+            linear_parameters.append(parameter)
+        else:
+            base_parameters.append(parameter)
+    if not linear_parameters or not base_parameters:
+        parameters = [parameter for _, parameter in named_parameters]
+        parameter_count = sum(int(parameter.numel()) for parameter in parameters)
+        param_groups = [
+            {
+                "params": parameters,
+                "lr": learning_rate,
+                "weight_decay": weight_decay,
+                "group_name": "model",
+                "lr_scale": 1.0,
+            }
+        ]
+        group_configs = (
+            OptimizerParameterGroupConfig(
+                name="model",
+                lr_scale=1.0,
+                weight_decay=weight_decay,
+                parameter_count=parameter_count,
+            ),
+        )
+        return param_groups, group_configs
     param_groups = [
         {
-            "params": parameters,
+            "params": base_parameters,
             "lr": learning_rate,
             "weight_decay": weight_decay,
             "group_name": "model",
             "lr_scale": 1.0,
-        }
+        },
+        {
+            "params": linear_parameters,
+            "lr": learning_rate * lr_scale_linear,
+            "weight_decay": weight_decay,
+            "group_name": "linear",
+            "lr_scale": lr_scale_linear,
+        },
     ]
     group_configs = (
         OptimizerParameterGroupConfig(
             name="model",
             lr_scale=1.0,
             weight_decay=weight_decay,
-            parameter_count=parameter_count,
+            parameter_count=sum(int(parameter.numel()) for parameter in base_parameters),
+        ),
+        OptimizerParameterGroupConfig(
+            name="linear",
+            lr_scale=lr_scale_linear,
+            weight_decay=weight_decay,
+            parameter_count=sum(int(parameter.numel()) for parameter in linear_parameters),
         ),
     )
     return param_groups, group_configs
@@ -5727,6 +5859,8 @@ def main() -> None:
         raise ValueError("transformer-ff-mult must be positive.")
     if not 0.0 <= args.transformer_dropout < 1.0:
         raise ValueError("transformer-dropout must be in [0, 1).")
+    if not 0.0 <= args.feed_forward_dropout < 1.0:
+        raise ValueError("feed-forward-dropout must be in [0, 1).")
     if args.epochs <= 0.0:
         raise ValueError("epochs must be positive.")
     if not 0.0 <= args.curriculum_stage1_ratio <= 1.0:
@@ -5743,8 +5877,18 @@ def main() -> None:
         raise ValueError("--hf-embedding-model currently requires --tokenizer hf_auto.")
     if args.warmup_start_lr < 0.0 or args.learning_rate < 0.0:
         raise ValueError("learning rates must be non-negative.")
+    if args.linear_learning_rate is not None and args.linear_learning_rate < 0.0:
+        raise ValueError("linear-learning-rate must be non-negative.")
+    if args.linear_warmup_start_lr is not None and args.linear_warmup_start_lr < 0.0:
+        raise ValueError("linear-warmup-start-lr must be non-negative.")
     if args.warmup_steps < 0:
         raise ValueError("warmup-steps must be non-negative.")
+    if args.linear_warmup_steps is not None and args.linear_warmup_steps < 0:
+        raise ValueError("linear-warmup-steps must be non-negative.")
+    if args.linear_lr_min_ratio is not None and not 0.0 <= args.linear_lr_min_ratio <= 1.0:
+        raise ValueError("linear-lr-min-ratio must be between 0 and 1.")
+    if args.linear_lr_delay_steps < 0:
+        raise ValueError("linear-lr-delay-steps must be non-negative.")
     if any(
         value < 0
         for value in (
@@ -6134,7 +6278,10 @@ def main() -> None:
             disable_memory=args.disable_memory,
             disable_memory_read=args.disable_memory_read,
             disable_memory_propagation=args.disable_memory_propagation,
+            feed_forward_kind=args.feed_forward_kind,
             feed_forward_hidden_mult=args.feed_forward_hidden_mult,
+            feed_forward_dropout=args.feed_forward_dropout,
+            output_postmix_kind=args.output_postmix_kind,
             memory_topk=args.memory_topk,
             memory_train_mode=args.memory_train_mode,
             memory_eval_mode=args.memory_eval_mode,
@@ -6160,6 +6307,13 @@ def main() -> None:
             knowledge_propagation_topk=None if args.knowledge_propagation_topk <= 0 else args.knowledge_propagation_topk,
             knowledge_propagation_layers=args.knowledge_propagation_layers,
         ).to(device)
+        if args.freeze_square_low_rank_proj_identity:
+            freeze_stats = freeze_square_low_rank_projections_identity(model)
+            print(
+                f"freeze_square_low_rank_proj_identity | modules={freeze_stats['modules']} | "
+                f"matrices={freeze_stats['matrices']}",
+                flush=True,
+            )
     if args.hf_embedding_model:
         if not isinstance(decode_vocab, HFTokenizerVocab):
             raise ValueError("--hf-embedding-model requires --tokenizer hf_auto.")
@@ -6196,7 +6350,10 @@ def main() -> None:
             f"memory_feed_forward_layers={not (args.disable_feed_forward_layers or args.disable_memory_feed_forward_layers)} | "
             f"disable_memory={args.disable_memory} | disable_memory_read={args.disable_memory_read} | "
             f"disable_memory_propagation={args.disable_memory_propagation} | "
+            f"feed_forward_kind={args.feed_forward_kind} | "
+            f"output_postmix_kind={args.output_postmix_kind} | "
             f"feed_forward_hidden_mult={args.feed_forward_hidden_mult:g} | "
+            f"feed_forward_dropout={args.feed_forward_dropout:g} | "
             f"optimizer={args.optimizer} | checkpoint_sequence={args.checkpoint_sequence_layers} | "
             f"checkpoint_prediction={args.checkpoint_prediction_layers}",
             flush=True,
@@ -6258,6 +6415,7 @@ def main() -> None:
         model,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
+        linear_lr_mult=args.linear_lr_mult,
     )
     print(
         "optimizer_groups | "
@@ -6500,8 +6658,43 @@ def main() -> None:
             decay_steps=args.lr_decay_steps,
             disable_decay=args.disable_lr_decay,
         )
+        linear_delay_steps = int(args.linear_lr_delay_steps)
+        if step <= linear_delay_steps:
+            linear_lr = 0.0
+        else:
+            linear_lr = compute_learning_rate(
+                step=step - linear_delay_steps,
+                total_steps=max(1, total_steps - linear_delay_steps),
+                base_lr=(
+                    float(args.linear_learning_rate)
+                    if args.linear_learning_rate is not None
+                    else args.learning_rate * float(args.linear_lr_mult)
+                ),
+                warmup_start_lr=(
+                    float(args.linear_warmup_start_lr)
+                    if args.linear_warmup_start_lr is not None
+                    else args.warmup_start_lr
+                ),
+                warmup_steps=(
+                    int(args.linear_warmup_steps)
+                    if args.linear_warmup_steps is not None
+                    else args.warmup_steps
+                ),
+                min_ratio=(
+                    float(args.linear_lr_min_ratio)
+                    if args.linear_lr_min_ratio is not None
+                    else args.lr_min_ratio
+                ),
+                decay_start_step=(
+                    args.lr_decay_start_step - linear_delay_steps
+                    if args.lr_decay_start_step >= 0
+                    else args.lr_decay_start_step
+                ),
+                decay_steps=args.lr_decay_steps,
+                disable_decay=args.disable_lr_decay,
+            )
         for param_group in optimizer.param_groups:
-            param_group["lr"] = lr
+            param_group["lr"] = linear_lr if param_group.get("group_name") == "linear" else lr
 
         current_memory_state = None if stage.freeze_memory else train_memory_state
         span_losses: list[float] = []

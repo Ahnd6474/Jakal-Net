@@ -167,6 +167,43 @@ class ResidualFeedForward(nn.Module):
         return val + self.net(self.input_norm(val))
 
 
+class ResidualLinear(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        if dim <= 0:
+            raise ValueError("dim must be positive.")
+        self.input_norm = nn.LayerNorm(dim)
+        self.linear = nn.Linear(dim, dim)
+        self._reset_parameters()
+
+    def _reset_parameters(self) -> None:
+        nn.init.eye_(self.linear.weight)
+        nn.init.zeros_(self.linear.bias)
+
+    def forward(self, val: Tensor) -> Tensor:
+        return self.linear(self.input_norm(val))
+
+
+def make_residual_postmix(
+    kind: str,
+    dim: int,
+    *,
+    hidden_mult: float = 2.0,
+    dropout: float = 0.0,
+    activation: str = "gelu",
+) -> nn.Module:
+    if kind == "ffn":
+        return ResidualFeedForward(
+            dim,
+            hidden_mult=hidden_mult,
+            dropout=dropout,
+            activation=activation,
+        )
+    if kind == "linear":
+        return ResidualLinear(dim)
+    raise ValueError(f"Unsupported feed-forward kind: {kind!r}.")
+
+
 class StateValueFeedForward(nn.Module):
     def __init__(
         self,

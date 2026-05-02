@@ -198,6 +198,14 @@ def nomemory_causal_stack_ffn_fused_native_available(device_type: str) -> bool:
     )
 
 
+def nomemory_causal_stack_linear_fused_native_available(device_type: str) -> bool:
+    return (
+        native_supports("nomemory_causal_stack_linear_fused")
+        and native_supports("nomemory_causal_stack_linear_fused_backward_cuda")
+        and native_supports_device(device_type)
+    )
+
+
 def _native_scan_uses_legacy_low_rank_extension(
     route_kind_name: str,
     propagation_pairwise_kind: str,
@@ -2396,6 +2404,35 @@ def _split_nomemory_stack_ffn_layer_tensors(
     )
 
 
+def _split_nomemory_stack_linear_layer_tensors(
+    layer_tensors: tuple[Tensor, ...],
+    num_layers: int,
+) -> tuple[
+    tuple[Tensor, ...],
+    tuple[Tensor, ...],
+    tuple[Tensor, ...],
+    tuple[Tensor, ...],
+]:
+    expected = num_layers * 4
+    if len(layer_tensors) != expected:
+        raise ValueError(f"Expected {expected} linear layer tensors, got {len(layer_tensors)}.")
+    norm_weights: list[Tensor] = []
+    norm_biases: list[Tensor] = []
+    linear_weights: list[Tensor] = []
+    linear_biases: list[Tensor] = []
+    for offset in range(0, expected, 4):
+        norm_weights.append(layer_tensors[offset])
+        norm_biases.append(layer_tensors[offset + 1])
+        linear_weights.append(layer_tensors[offset + 2])
+        linear_biases.append(layer_tensors[offset + 3])
+    return (
+        tuple(norm_weights),
+        tuple(norm_biases),
+        tuple(linear_weights),
+        tuple(linear_biases),
+    )
+
+
 def _split_nomemory_stack_specs(
     specs: tuple[tuple[int, int, int, int], ...],
 ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
@@ -3027,6 +3064,339 @@ def _nomemory_causal_stack_ffn_fused_backward_cuda(
     for layer_index in range(num_prediction_layers):
         for group_index in range(6):
             flat_grads.append(grouped_prediction_ffn_grads[group_index][layer_index])
+    return tuple(flat_grads)
+
+
+def nomemory_causal_stack_linear_fused_native(
+    *,
+    token_val: Tensor,
+    anchor_state: Tensor,
+    anchor_val: Tensor,
+    s_prediction_weight: Tensor,
+    prediction_input_norm_weight: Tensor,
+    prediction_input_norm_bias: Tensor | None,
+    sequence_tensors: tuple[Tensor, ...],
+    prediction_tensors: tuple[Tensor, ...],
+    sequence_linear_tensors: tuple[Tensor, ...],
+    prediction_linear_tensors: tuple[Tensor, ...],
+    sequence_specs: tuple[tuple[int, int, int, int], ...],
+    prediction_specs: tuple[tuple[int, int, int, int], ...],
+    state_activation_name: str,
+) -> Tensor:
+    num_sequence_layers = len(sequence_specs)
+    num_prediction_layers = len(prediction_specs)
+    (
+        sequence_source_weights,
+        sequence_target_weights,
+        sequence_core_weights,
+        sequence_biases,
+        sequence_norm_weights,
+        sequence_norm_biases,
+    ) = _split_nomemory_stack_layer_tensors(sequence_tensors, num_sequence_layers)
+    (
+        prediction_source_weights,
+        prediction_target_weights,
+        prediction_core_weights,
+        prediction_biases,
+        prediction_norm_weights,
+        prediction_norm_biases,
+    ) = _split_nomemory_stack_layer_tensors(prediction_tensors, num_prediction_layers)
+    (
+        sequence_linear_norm_weights,
+        sequence_linear_norm_biases,
+        sequence_linear_weights,
+        sequence_linear_biases,
+    ) = _split_nomemory_stack_linear_layer_tensors(sequence_linear_tensors, num_sequence_layers)
+    (
+        prediction_linear_norm_weights,
+        prediction_linear_norm_biases,
+        prediction_linear_weights,
+        prediction_linear_biases,
+    ) = _split_nomemory_stack_linear_layer_tensors(prediction_linear_tensors, num_prediction_layers)
+    (
+        sequence_compress_kinds,
+        sequence_windows,
+        sequence_target_block_sizes,
+        sequence_source_block_sizes,
+    ) = _split_nomemory_stack_specs(sequence_specs)
+    (
+        prediction_compress_kinds,
+        prediction_windows,
+        prediction_target_block_sizes,
+        prediction_source_block_sizes,
+    ) = _split_nomemory_stack_specs(prediction_specs)
+    result = _native_module().nomemory_causal_stack_linear_fused(
+        token_val,
+        anchor_state,
+        anchor_val,
+        s_prediction_weight,
+        prediction_input_norm_weight,
+        _save_optional_tensor(prediction_input_norm_bias, token_val),
+        list(sequence_source_weights),
+        list(sequence_target_weights),
+        list(sequence_core_weights),
+        list(sequence_biases),
+        list(sequence_norm_weights),
+        list(sequence_norm_biases),
+        list(sequence_linear_norm_weights),
+        list(sequence_linear_norm_biases),
+        list(sequence_linear_weights),
+        list(sequence_linear_biases),
+        list(sequence_compress_kinds),
+        list(sequence_windows),
+        list(sequence_target_block_sizes),
+        list(sequence_source_block_sizes),
+        list(prediction_source_weights),
+        list(prediction_target_weights),
+        list(prediction_core_weights),
+        list(prediction_biases),
+        list(prediction_norm_weights),
+        list(prediction_norm_biases),
+        list(prediction_linear_norm_weights),
+        list(prediction_linear_norm_biases),
+        list(prediction_linear_weights),
+        list(prediction_linear_biases),
+        list(prediction_compress_kinds),
+        list(prediction_windows),
+        list(prediction_target_block_sizes),
+        list(prediction_source_block_sizes),
+        state_activation_name,
+    )
+    if not isinstance(result, Tensor):
+        raise TypeError("nomemory_causal_stack_linear_fused must return a Tensor.")
+    return result
+
+
+def nomemory_causal_stack_linear_fused_trace_native(
+    *,
+    token_val: Tensor,
+    anchor_state: Tensor,
+    anchor_val: Tensor,
+    s_prediction_weight: Tensor,
+    prediction_input_norm_weight: Tensor,
+    prediction_input_norm_bias: Tensor | None,
+    sequence_tensors: tuple[Tensor, ...],
+    prediction_tensors: tuple[Tensor, ...],
+    sequence_linear_tensors: tuple[Tensor, ...],
+    prediction_linear_tensors: tuple[Tensor, ...],
+    sequence_specs: tuple[tuple[int, int, int, int], ...],
+    prediction_specs: tuple[tuple[int, int, int, int], ...],
+    state_activation_name: str,
+) -> tuple[Tensor, tuple[Tensor, ...]]:
+    num_sequence_layers = len(sequence_specs)
+    num_prediction_layers = len(prediction_specs)
+    (
+        sequence_source_weights,
+        sequence_target_weights,
+        sequence_core_weights,
+        sequence_biases,
+        sequence_norm_weights,
+        sequence_norm_biases,
+    ) = _split_nomemory_stack_layer_tensors(sequence_tensors, num_sequence_layers)
+    (
+        prediction_source_weights,
+        prediction_target_weights,
+        prediction_core_weights,
+        prediction_biases,
+        prediction_norm_weights,
+        prediction_norm_biases,
+    ) = _split_nomemory_stack_layer_tensors(prediction_tensors, num_prediction_layers)
+    (
+        sequence_linear_norm_weights,
+        sequence_linear_norm_biases,
+        sequence_linear_weights,
+        sequence_linear_biases,
+    ) = _split_nomemory_stack_linear_layer_tensors(sequence_linear_tensors, num_sequence_layers)
+    (
+        prediction_linear_norm_weights,
+        prediction_linear_norm_biases,
+        prediction_linear_weights,
+        prediction_linear_biases,
+    ) = _split_nomemory_stack_linear_layer_tensors(prediction_linear_tensors, num_prediction_layers)
+    (
+        sequence_compress_kinds,
+        sequence_windows,
+        sequence_target_block_sizes,
+        sequence_source_block_sizes,
+    ) = _split_nomemory_stack_specs(sequence_specs)
+    (
+        prediction_compress_kinds,
+        prediction_windows,
+        prediction_target_block_sizes,
+        prediction_source_block_sizes,
+    ) = _split_nomemory_stack_specs(prediction_specs)
+    result = _native_module().nomemory_causal_stack_linear_fused_trace(
+        token_val,
+        anchor_state,
+        anchor_val,
+        s_prediction_weight,
+        prediction_input_norm_weight,
+        _save_optional_tensor(prediction_input_norm_bias, token_val),
+        list(sequence_source_weights),
+        list(sequence_target_weights),
+        list(sequence_core_weights),
+        list(sequence_biases),
+        list(sequence_norm_weights),
+        list(sequence_norm_biases),
+        list(sequence_linear_norm_weights),
+        list(sequence_linear_norm_biases),
+        list(sequence_linear_weights),
+        list(sequence_linear_biases),
+        list(sequence_compress_kinds),
+        list(sequence_windows),
+        list(sequence_target_block_sizes),
+        list(sequence_source_block_sizes),
+        list(prediction_source_weights),
+        list(prediction_target_weights),
+        list(prediction_core_weights),
+        list(prediction_biases),
+        list(prediction_norm_weights),
+        list(prediction_norm_biases),
+        list(prediction_linear_norm_weights),
+        list(prediction_linear_norm_biases),
+        list(prediction_linear_weights),
+        list(prediction_linear_biases),
+        list(prediction_compress_kinds),
+        list(prediction_windows),
+        list(prediction_target_block_sizes),
+        list(prediction_source_block_sizes),
+        state_activation_name,
+    )
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise TypeError("nomemory_causal_stack_linear_fused_trace must return (query_val, trace_tensors).")
+    query_val, trace_tensors = result
+    if not isinstance(query_val, Tensor):
+        raise TypeError("nomemory_causal_stack_linear_fused_trace query_val must be a Tensor.")
+    if not isinstance(trace_tensors, (list, tuple)):
+        raise TypeError("nomemory_causal_stack_linear_fused_trace trace_tensors must be a sequence.")
+    return query_val, tuple(trace_tensors)
+
+
+def _nomemory_causal_stack_linear_fused_backward_cuda(
+    *,
+    token_val: Tensor,
+    anchor_state: Tensor,
+    anchor_val: Tensor,
+    s_prediction_weight: Tensor,
+    prediction_input_norm_weight: Tensor,
+    prediction_input_norm_bias: Tensor | None,
+    sequence_tensors: tuple[Tensor, ...],
+    prediction_tensors: tuple[Tensor, ...],
+    sequence_linear_tensors: tuple[Tensor, ...],
+    prediction_linear_tensors: tuple[Tensor, ...],
+    sequence_specs: tuple[tuple[int, int, int, int], ...],
+    prediction_specs: tuple[tuple[int, int, int, int], ...],
+    state_activation_name: str,
+    trace_tensors: tuple[Tensor, ...],
+    grad_query_val: Tensor,
+) -> tuple[Tensor | None, ...]:
+    num_sequence_layers = len(sequence_specs)
+    num_prediction_layers = len(prediction_specs)
+    (
+        sequence_source_weights,
+        sequence_target_weights,
+        sequence_core_weights,
+        sequence_biases,
+        sequence_norm_weights,
+        sequence_norm_biases,
+    ) = _split_nomemory_stack_layer_tensors(sequence_tensors, num_sequence_layers)
+    (
+        prediction_source_weights,
+        prediction_target_weights,
+        prediction_core_weights,
+        prediction_biases,
+        prediction_norm_weights,
+        prediction_norm_biases,
+    ) = _split_nomemory_stack_layer_tensors(prediction_tensors, num_prediction_layers)
+    (
+        sequence_linear_norm_weights,
+        sequence_linear_norm_biases,
+        sequence_linear_weights,
+        sequence_linear_biases,
+    ) = _split_nomemory_stack_linear_layer_tensors(sequence_linear_tensors, num_sequence_layers)
+    (
+        prediction_linear_norm_weights,
+        prediction_linear_norm_biases,
+        prediction_linear_weights,
+        prediction_linear_biases,
+    ) = _split_nomemory_stack_linear_layer_tensors(prediction_linear_tensors, num_prediction_layers)
+    (
+        sequence_compress_kinds,
+        sequence_windows,
+        sequence_target_block_sizes,
+        sequence_source_block_sizes,
+    ) = _split_nomemory_stack_specs(sequence_specs)
+    (
+        prediction_compress_kinds,
+        prediction_windows,
+        prediction_target_block_sizes,
+        prediction_source_block_sizes,
+    ) = _split_nomemory_stack_specs(prediction_specs)
+    result = _native_module().nomemory_causal_stack_linear_fused_backward_cuda(
+        token_val,
+        anchor_state,
+        anchor_val,
+        s_prediction_weight,
+        prediction_input_norm_weight,
+        _save_optional_tensor(prediction_input_norm_bias, token_val),
+        list(sequence_source_weights),
+        list(sequence_target_weights),
+        list(sequence_core_weights),
+        list(sequence_biases),
+        list(sequence_norm_weights),
+        list(sequence_norm_biases),
+        list(sequence_linear_norm_weights),
+        list(sequence_linear_norm_biases),
+        list(sequence_linear_weights),
+        list(sequence_linear_biases),
+        list(sequence_compress_kinds),
+        list(sequence_windows),
+        list(sequence_target_block_sizes),
+        list(sequence_source_block_sizes),
+        list(prediction_source_weights),
+        list(prediction_target_weights),
+        list(prediction_core_weights),
+        list(prediction_biases),
+        list(prediction_norm_weights),
+        list(prediction_norm_biases),
+        list(prediction_linear_norm_weights),
+        list(prediction_linear_norm_biases),
+        list(prediction_linear_weights),
+        list(prediction_linear_biases),
+        list(prediction_compress_kinds),
+        list(prediction_windows),
+        list(prediction_target_block_sizes),
+        list(prediction_source_block_sizes),
+        state_activation_name,
+        list(trace_tensors),
+        grad_query_val,
+    )
+    expected = 6 + len(sequence_tensors) + len(prediction_tensors) + len(sequence_linear_tensors) + len(prediction_linear_tensors)
+    if not isinstance(result, (list, tuple)) or len(result) != expected:
+        raise TypeError("nomemory_causal_stack_linear_fused_backward_cuda must return one grad per saved tensor.")
+    result = tuple(None if grad is None else grad for grad in result)
+    base_grads = list(result[:6])
+    offset = 6
+    grouped_sequence_grads = [result[offset + (index * num_sequence_layers): offset + ((index + 1) * num_sequence_layers)] for index in range(6)]
+    offset += num_sequence_layers * 6
+    grouped_prediction_grads = [result[offset + (index * num_prediction_layers): offset + ((index + 1) * num_prediction_layers)] for index in range(6)]
+    offset += num_prediction_layers * 6
+    grouped_sequence_linear_grads = [result[offset + (index * num_sequence_layers): offset + ((index + 1) * num_sequence_layers)] for index in range(4)]
+    offset += num_sequence_layers * 4
+    grouped_prediction_linear_grads = [result[offset + (index * num_prediction_layers): offset + ((index + 1) * num_prediction_layers)] for index in range(4)]
+    flat_grads: list[Tensor | None] = base_grads
+    for layer_index in range(num_sequence_layers):
+        for group_index in range(6):
+            flat_grads.append(grouped_sequence_grads[group_index][layer_index])
+    for layer_index in range(num_prediction_layers):
+        for group_index in range(6):
+            flat_grads.append(grouped_prediction_grads[group_index][layer_index])
+    for layer_index in range(num_sequence_layers):
+        for group_index in range(4):
+            flat_grads.append(grouped_sequence_linear_grads[group_index][layer_index])
+    for layer_index in range(num_prediction_layers):
+        for group_index in range(4):
+            flat_grads.append(grouped_prediction_linear_grads[group_index][layer_index])
     return tuple(flat_grads)
 
 
