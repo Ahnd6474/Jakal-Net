@@ -1,0 +1,21 @@
+1432:model=causal_memory_doc | params=24,552,662 | dim=384 | seq_len=512 | s_window=512 | s_microbatch_size=0 | scan_backend=auto | scan_checkpoint_chunk_size=0 | memory_slots=[384, 96, 24] | memory_update_intervals=[1, 2, 4] | knowledge_nodes=0 | memory_train_mode=dense | memory_eval_mode=dense | eval_topk=16 | direction_only_values=True | feed_forward_layers=False | memory_feed_forward_layers=False | disable_memory=True | disable_memory_read=False | disable_memory_propagation=False | feed_forward_hidden_mult=2 | optimizer=adamw_fused | checkpoint_sequence=False | checkpoint_prediction=False
+1433:native_runtime | fused_training=True | fused_training_checkpoint_stride=0 | scan_backward_cuda=False | diagonal_dense_prop_cuda=False | compile_model=False | compile_mode=reduce-overhead | dense_profile=False
+1434:curriculum_batches | stage1=batch384/ga1 | stage2=batch384/ga1 | stage3=batch384/ga1
+1445:progress | step=    1/9153 | stage=stage1 | span=1 | train_loss=9.7767 | lr=0.0001 | cpu_batch_ms=6.2 | prefetch_q=9152 | elapsed=2.6s
+1446:progress | step=   25/9153 | stage=stage1 | span=1 | train_loss=8.4434 | lr=0.000119238 | cpu_batch_ms=6.2 | prefetch_q=9128 | elapsed=27.6s
+1447:progress | step=   50/9153 | stage=stage1 | span=1 | train_loss=7.7509 | lr=0.000139279 | cpu_batch_ms=6.2 | prefetch_q=9103 | elapsed=54.0s
+1448:progress | step=   75/9153 | stage=stage1 | span=1 | train_loss=7.5897 | lr=0.000159319 | cpu_batch_ms=6.2 | prefetch_q=9078 | elapsed=82.0s
+1449:progress | step=  100/9153 | stage=stage1 | span=1 | train_loss=7.5619 | lr=0.000179359 | cpu_batch_ms=6.2 | prefetch_q=9053 | elapsed=108.9s
+1450:progress | step=  125/9153 | stage=stage1 | span=1 | train_loss=7.5310 | lr=0.000199399 | cpu_batch_ms=6.2 | prefetch_q=9028 | elapsed=136.0s
+1451:progress | step=  150/9153 | stage=stage1 | span=1 | train_loss=7.4801 | lr=0.000219439 | cpu_batch_ms=6.2 | prefetch_q=9003 | elapsed=164.0s
+1452:progress | step=  175/9153 | stage=stage1 | span=1 | train_loss=7.2444 | lr=0.000239479 | cpu_batch_ms=6.2 | prefetch_q=8978 | elapsed=191.2s
+1453:progress | step=  200/9153 | stage=stage1 | span=1 | train_loss=6.8942 | lr=0.000259519 | cpu_batch_ms=6.2 | prefetch_q=8953 | elapsed=218.4s
+1465:progress | step=  500/9153 | stage=stage1 | span=1 | train_loss=5.4767 | lr=0.0005 | cpu_batch_ms=6.2 | prefetch_q=8653 | elapsed=549.8s
+1466:eval | step=500 | train_loss=5.4767 | val_loss=5.6941 | val_ppl=297.12
+1487:progress | step= 1000/9153 | stage=stage2 | span=1 | train_loss=5.0490 | lr=0.0005 | cpu_batch_ms=6.2 | prefetch_q=8153 | elapsed=1102.8s
+1488:eval | step=1000 | train_loss=5.0490 | val_loss=5.2514 | val_ppl=190.83
+1508:progress | step= 1500/9153 | stage=stage2 | span=1 | train_loss=4.7975 | lr=0.0005 | cpu_batch_ms=6.2 | prefetch_q=7653 | elapsed=1658.8s
+1509:eval | step=1500 | train_loss=4.7975 | val_loss=5.0433 | val_ppl=154.97
+1615:eval | step=4000 | train_loss=4.3926 | val_loss=4.7356 | val_ppl=113.93
+1657:eval | step=5000 | train_loss=4.3394 | val_loss=4.7027 | val_ppl=110.25
+1720:eval | step=6500 | train_loss=4.2103 | val_loss=4.6513 | val_ppl=104.72
