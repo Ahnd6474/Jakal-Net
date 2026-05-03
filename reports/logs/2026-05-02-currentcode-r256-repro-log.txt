@@ -1,0 +1,10 @@
+1445:progress | step=    1/9153 | stage=stage1 | span=1 | train_loss=9.7767 | lr=0.0001 | cpu_batch_ms=6.1 | prefetch_q=9152 | elapsed=2.5s
+1446:progress | step=   25/9153 | stage=stage1 | span=1 | train_loss=8.4434 | lr=0.000119238 | cpu_batch_ms=6.1 | prefetch_q=9128 | elapsed=27.3s
+1447:progress | step=   50/9153 | stage=stage1 | span=1 | train_loss=7.7509 | lr=0.000139279 | cpu_batch_ms=6.1 | prefetch_q=9103 | elapsed=53.3s
+1448:progress | step=   75/9153 | stage=stage1 | span=1 | train_loss=7.5897 | lr=0.000159319 | cpu_batch_ms=6.1 | prefetch_q=9078 | elapsed=80.5s
+1449:progress | step=  100/9153 | stage=stage1 | span=1 | train_loss=7.5619 | lr=0.000179359 | cpu_batch_ms=6.1 | prefetch_q=9053 | elapsed=106.9s
+1450:progress | step=  125/9153 | stage=stage1 | span=1 | train_loss=7.5310 | lr=0.000199399 | cpu_batch_ms=6.1 | prefetch_q=9028 | elapsed=133.7s
+1451:progress | step=  150/9153 | stage=stage1 | span=1 | train_loss=7.4801 | lr=0.000219439 | cpu_batch_ms=6.1 | prefetch_q=9003 | elapsed=161.6s
+1452:progress | step=  175/9153 | stage=stage1 | span=1 | train_loss=7.2444 | lr=0.000239479 | cpu_batch_ms=6.1 | prefetch_q=8978 | elapsed=188.7s
+1453:progress | step=  200/9153 | stage=stage1 | span=1 | train_loss=6.8942 | lr=0.000259519 | cpu_batch_ms=6.1 | prefetch_q=8953 | elapsed=215.8s
+1455:progress | step=  250/9153 | stage=stage1 | span=1 | train_loss=6.4810 | lr=0.000299599 | cpu_batch_ms=6.1 | prefetch_q=8903 | elapsed=271.3s

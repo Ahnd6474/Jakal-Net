@@ -1,0 +1,4 @@
+using device: cuda
+loaded_pretokenized_dir | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | documents=2,000,000 | tokenizer=hf_auto
+startup | prebuild_train_batches_start | pin_memory=True | workers=8 | worker_threads=2
+progress | step=    1/27459 | stage=stage1 | span=1 | train_loss=9.7767 | lr=0.0001 | cpu_batch_ms=5.1 | prefetch_q=27458 | elapsed=4.8s
