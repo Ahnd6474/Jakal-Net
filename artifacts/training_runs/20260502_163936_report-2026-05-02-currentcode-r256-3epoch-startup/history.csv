@@ -1,0 +1,2 @@
+kind,step,total_steps,stage,span,train_loss,lr,cpu_batch_ms,prefetch_q,elapsed_s
+progress,1,27459,stage1,1,9.7767,0.0001,5.1,27458,4.8

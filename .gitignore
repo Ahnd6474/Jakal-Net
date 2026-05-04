@@ -29,7 +29,15 @@ native/build/
 artifacts/logs/
 artifacts/notebook_runs/
 artifacts/tensorboard/
-artifacts/training_runs/
+artifacts/training_runs/*
+!artifacts/training_runs/**/
+!artifacts/training_runs/**/config.json
+!artifacts/training_runs/**/history.csv
+!artifacts/training_runs/**/history.jsonl
+!artifacts/training_runs/**/tensorboard/
+!artifacts/training_runs/**/tensorboard/events.out.tfevents*
+artifacts/training_runs/**/checkpoints/
+artifacts/training_runs/**/prebuilt_batches/
 artifacts/tokenizers/
 artifacts/diagnostics/
 artifacts/cleanup_manifests/

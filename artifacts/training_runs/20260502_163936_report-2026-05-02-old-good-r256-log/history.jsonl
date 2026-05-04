@@ -1,0 +1,18 @@
+{"kind": "progress", "step": 1, "total_steps": 9153, "stage": "stage1", "span": 1, "train_loss": 9.7767, "lr": 0.0001, "cpu_batch_ms": 6.2, "prefetch_q": 9152, "elapsed_s": 2.6}
+{"kind": "progress", "step": 25, "total_steps": 9153, "stage": "stage1", "span": 1, "train_loss": 8.4434, "lr": 0.000119238, "cpu_batch_ms": 6.2, "prefetch_q": 9128, "elapsed_s": 27.6}
+{"kind": "progress", "step": 50, "total_steps": 9153, "stage": "stage1", "span": 1, "train_loss": 7.7509, "lr": 0.000139279, "cpu_batch_ms": 6.2, "prefetch_q": 9103, "elapsed_s": 54.0}
+{"kind": "progress", "step": 75, "total_steps": 9153, "stage": "stage1", "span": 1, "train_loss": 7.5897, "lr": 0.000159319, "cpu_batch_ms": 6.2, "prefetch_q": 9078, "elapsed_s": 82.0}
+{"kind": "progress", "step": 100, "total_steps": 9153, "stage": "stage1", "span": 1, "train_loss": 7.5619, "lr": 0.000179359, "cpu_batch_ms": 6.2, "prefetch_q": 9053, "elapsed_s": 108.9}
+{"kind": "progress", "step": 125, "total_steps": 9153, "stage": "stage1", "span": 1, "train_loss": 7.531, "lr": 0.000199399, "cpu_batch_ms": 6.2, "prefetch_q": 9028, "elapsed_s": 136.0}
+{"kind": "progress", "step": 150, "total_steps": 9153, "stage": "stage1", "span": 1, "train_loss": 7.4801, "lr": 0.000219439, "cpu_batch_ms": 6.2, "prefetch_q": 9003, "elapsed_s": 164.0}
+{"kind": "progress", "step": 175, "total_steps": 9153, "stage": "stage1", "span": 1, "train_loss": 7.2444, "lr": 0.000239479, "cpu_batch_ms": 6.2, "prefetch_q": 8978, "elapsed_s": 191.2}
+{"kind": "progress", "step": 200, "total_steps": 9153, "stage": "stage1", "span": 1, "train_loss": 6.8942, "lr": 0.000259519, "cpu_batch_ms": 6.2, "prefetch_q": 8953, "elapsed_s": 218.4}
+{"kind": "progress", "step": 500, "total_steps": 9153, "stage": "stage1", "span": 1, "train_loss": 5.4767, "lr": 0.0005, "cpu_batch_ms": 6.2, "prefetch_q": 8653, "elapsed_s": 549.8}
+{"kind": "eval", "step": 500, "train_loss": 5.4767, "val_loss": 5.6941, "val_ppl": 297.12}
+{"kind": "progress", "step": 1000, "total_steps": 9153, "stage": "stage2", "span": 1, "train_loss": 5.049, "lr": 0.0005, "cpu_batch_ms": 6.2, "prefetch_q": 8153, "elapsed_s": 1102.8}
+{"kind": "eval", "step": 1000, "train_loss": 5.049, "val_loss": 5.2514, "val_ppl": 190.83}
+{"kind": "progress", "step": 1500, "total_steps": 9153, "stage": "stage2", "span": 1, "train_loss": 4.7975, "lr": 0.0005, "cpu_batch_ms": 6.2, "prefetch_q": 7653, "elapsed_s": 1658.8}
+{"kind": "eval", "step": 1500, "train_loss": 4.7975, "val_loss": 5.0433, "val_ppl": 154.97}
+{"kind": "eval", "step": 4000, "train_loss": 4.3926, "val_loss": 4.7356, "val_ppl": 113.93}
+{"kind": "eval", "step": 5000, "train_loss": 4.3394, "val_loss": 4.7027, "val_ppl": 110.25}
+{"kind": "eval", "step": 6500, "train_loss": 4.2103, "val_loss": 4.6513, "val_ppl": 104.72}
