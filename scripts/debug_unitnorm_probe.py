@@ -19,7 +19,7 @@ if str(REPO_ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from jakal_net._architectural_common import apply_delta  # noqa: E402
-from jakal_net.causal_memory_lm import CausalHierarchicalMemoryLM  # noqa: E402
+from jakal_net.causal_memory_lm import CausalMemoryLM  # noqa: E402
 from jakal_net.core import LayerDelta  # noqa: E402
 from train_causal_memory_lm import (  # noqa: E402
     FlatDocumentChunkBatcher,
@@ -118,7 +118,7 @@ def _build_model_kwargs(cfg: dict[str, Any], vocab_size: int) -> dict[str, Any]:
     }
 
 
-def _configure_unit_norm(model: CausalHierarchicalMemoryLM, enabled: bool) -> CausalHierarchicalMemoryLM:
+def _configure_unit_norm(model: CausalMemoryLM, enabled: bool) -> CausalMemoryLM:
     model.unit_norm_values = bool(enabled)
     model.s_module.unit_norm_values = bool(enabled)
     for propagation in model.prediction_layers:
@@ -141,7 +141,7 @@ def _sum_head_grad_norms(pairwise_fn: Any) -> tuple[float, float, float]:
 
 
 def _run_case(
-    base_model: CausalHierarchicalMemoryLM,
+    base_model: CausalMemoryLM,
     batch: Any,
     *,
     unit_norm: bool,
@@ -286,7 +286,7 @@ def main() -> None:
     batch = move_batch_to_device(batcher.next_batch(), device=device, non_blocking=False)
 
     model_kwargs = _build_model_kwargs(cfg, collection.vocab_size)
-    base_model = CausalHierarchicalMemoryLM(**model_kwargs).to(device=device, dtype=torch.bfloat16)
+    base_model = CausalMemoryLM(**model_kwargs).to(device=device, dtype=torch.bfloat16)
     base_model.train()
 
     results = {

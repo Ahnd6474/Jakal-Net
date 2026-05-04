@@ -20,7 +20,9 @@ from typing import Any, Iterable, Sequence
 from uuid import uuid4
 
 import torch
+import torch.distributed as dist
 from torch.nn import functional as F
+from torch.nn.parallel import DistributedDataParallel
 
 from lm_experiment_utils import (
     _expand_sources,
@@ -66,7 +68,7 @@ except ImportError:
     AutoTokenizer = None
 
 from jakal_net import describe_device, resolve_device
-from jakal_net.causal_memory_lm import CausalHierarchicalMemoryLM, MemoryScanOutput, ModelRecurrentState
+from jakal_net.causal_memory_lm import CausalMemoryLM, MemoryScanOutput, ModelRecurrentState
 from jakal_net.native_backend import (
     EXPERIMENTAL_CAUSAL_DENSE_PROP_FORWARD_CUDA_ENV,
     EXPERIMENTAL_DIAGONAL_DENSE_PROP_CUDA_ENV,
@@ -559,6 +561,42 @@ def _coerce_text(value: object) -> str | None:
     return None
 
 
+def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    base_model = model
+    while True:
+        if isinstance(base_model, DistributedDataParallel):
+            base_model = base_model.module
+            continue
+        original_model = getattr(base_model, "_orig_mod", None)
+        if isinstance(original_model, torch.nn.Module):
+            base_model = original_model
+            continue
+        return base_model
+
+
+def shard_sequence_for_rank(items: Sequence[Any], *, rank: int, world_size: int) -> list[Any]:
+    if world_size <= 1:
+        return list(items)
+    return [items[index] for index in range(rank, len(items), world_size)]
+
+
+def resolve_local_batch_size(global_batch_size: int, *, world_size: int, label: str) -> int:
+    if global_batch_size <= 0:
+        raise ValueError(f"{label} must be positive.")
+    if world_size <= 1:
+        return int(global_batch_size)
+    if global_batch_size % world_size != 0:
+        raise ValueError(
+            f"{label}={global_batch_size} must be divisible by distributed world_size={world_size}."
+        )
+    local_batch_size = int(global_batch_size) // int(world_size)
+    if local_batch_size <= 0:
+        raise ValueError(
+            f"{label}={global_batch_size} is too small for distributed world_size={world_size}."
+        )
+    return local_batch_size
+
+
 def _segment_token(kind: str) -> str:
     if kind not in MODE_TOKEN_BY_KIND:
         raise ValueError(f"Unsupported segment kind: {kind!r}")
@@ -930,12 +968,15 @@ class DocumentChunkBatcher:
         *,
         batch_size: int,
         device: torch.device,
+        seed: int = 1337,
     ) -> None:
         if not documents:
             raise ValueError("documents must not be empty.")
         self.documents = tuple(documents)
         self.batch_size = batch_size
         self.device = device
+        self.seed = int(seed)
+        self._rng = random.Random(self.seed)
         self.pin_memory = device.type == "cuda"
         self.current_doc = [-1] * batch_size
         self.current_chunk = [0] * batch_size
@@ -964,9 +1005,9 @@ class DocumentChunkBatcher:
 
     def _sample_document_index(self) -> int:
         if not self.active_buckets:
-            return random.randrange(len(self.documents))
-        bucket = random.choices(self.active_buckets, weights=self.active_bucket_weights, k=1)[0]
-        return random.choice(self.bucket_to_indices[bucket])
+            return self._rng.randrange(len(self.documents))
+        bucket = self._rng.choices(self.active_buckets, weights=self.active_bucket_weights, k=1)[0]
+        return self._rng.choice(self.bucket_to_indices[bucket])
 
     def set_bucket_weights(self, weights: dict[str, float]) -> None:
         active = [
@@ -1073,6 +1114,35 @@ class PrebuiltBatchBlock:
     @property
     def batch_count(self) -> int:
         return int(self.context.shape[0])
+
+
+@dataclass(frozen=True, slots=True)
+class FlatBatchPlan:
+    shard_indices: tuple[int, ...]
+    document_indices: tuple[int, ...]
+    chunk_indices: tuple[int, ...]
+    is_last_chunk: tuple[bool, ...]
+    reset_mask: tuple[bool, ...]
+
+    @property
+    def batch_size(self) -> int:
+        return len(self.shard_indices)
+
+
+@dataclass(frozen=True, slots=True)
+class PrebuiltFlatBatchPlan:
+    plan: FlatBatchPlan
+    reset_all: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PrebuiltFlatBatchPlanBlock:
+    plans: tuple[PrebuiltFlatBatchPlan, ...]
+    build_seconds: float
+
+    @property
+    def batch_count(self) -> int:
+        return len(self.plans)
 
 
 class AsyncDocumentBatchPrefetcher:
@@ -1532,7 +1602,8 @@ class PrebuiltDocumentBatchProvider:
         *,
         device: torch.device,
         build_seconds: float,
-        blocks: Sequence[PrebuiltBatchBlock] | None = None,
+        blocks: Sequence[PrebuiltBatchBlock | PrebuiltFlatBatchPlanBlock] | None = None,
+        batcher: FlatDocumentChunkBatcher | None = None,
     ) -> None:
         self.batches = tuple(batches or ())
         self.blocks = tuple(blocks or ())
@@ -1541,8 +1612,9 @@ class PrebuiltDocumentBatchProvider:
         self.device = device
         self.build_seconds = float(build_seconds)
         self.index = 0
+        self.batcher = batcher
         self.total_batches = len(self.batches) + sum(block.batch_count for block in self.blocks)
-        self._block_offsets: list[tuple[int, PrebuiltBatchBlock]] = []
+        self._block_offsets: list[tuple[int, PrebuiltBatchBlock | PrebuiltFlatBatchPlanBlock]] = []
         cursor = len(self.batches)
         for block in self.blocks:
             self._block_offsets.append((cursor, block))
@@ -1557,12 +1629,22 @@ class PrebuiltDocumentBatchProvider:
         for offset, block in self._block_offsets:
             local_index = index - offset
             if 0 <= local_index < block.batch_count:
-                batch = DocumentBatch(
-                    context=block.context[local_index],
-                    target=block.target[local_index],
-                    loss_mask=block.loss_mask[local_index],
-                    reset_mask=block.reset_mask[local_index],
-                )
+                if isinstance(block, PrebuiltBatchBlock):
+                    batch = DocumentBatch(
+                        context=block.context[local_index],
+                        target=block.target[local_index],
+                        loss_mask=block.loss_mask[local_index],
+                        reset_mask=block.reset_mask[local_index],
+                    )
+                else:
+                    if self.batcher is None:
+                        raise RuntimeError("Flat batch plan prebuild requires a flat batcher for materialization.")
+                    plan_entry = block.plans[local_index]
+                    batch = self.batcher.materialize_batch_plan(
+                        plan_entry.plan,
+                        pin_memory=bool(getattr(self.batcher, "pin_memory", False)),
+                    )
+                    batch = override_batch_reset(batch, reset_all=plan_entry.reset_all)
                 return move_batch_to_device(batch, device=self.device, non_blocking=True)
         raise IndexError(f"prebuilt batch index out of range: {index}")
 
@@ -1905,6 +1987,69 @@ def prebuild_training_batches(
     return batches, time.perf_counter() - started_at
 
 
+def prebuild_flat_batch_plan_blocks(
+    batcher: FlatDocumentChunkBatcher,
+    *,
+    total_steps: int,
+    start_step: int,
+    stage1_ratio: float,
+    stage2_ratio: float,
+    stage1_span: int,
+    stage2_span: int,
+    stage3_span: int,
+    stage1_batch_size: int,
+    stage2_batch_size: int,
+    stage3_batch_size: int,
+    stage1_grad_accum_steps: int,
+    stage2_grad_accum_steps: int,
+    stage3_grad_accum_steps: int,
+) -> tuple[list[PrebuiltFlatBatchPlanBlock], float]:
+    started_at = time.perf_counter()
+    last_stage_name: str | None = None
+    plans: list[PrebuiltFlatBatchPlan] = []
+    for step in range(start_step + 1, total_steps + 1):
+        stage = resolve_curriculum_stage(
+            step=step,
+            total_steps=total_steps,
+            stage1_ratio=stage1_ratio,
+            stage2_ratio=stage2_ratio,
+            stage1_span=stage1_span,
+            stage2_span=stage2_span,
+            stage3_span=stage3_span,
+            stage1_batch_size=stage1_batch_size,
+            stage2_batch_size=stage2_batch_size,
+            stage3_batch_size=stage3_batch_size,
+            stage1_grad_accum_steps=stage1_grad_accum_steps,
+            stage2_grad_accum_steps=stage2_grad_accum_steps,
+            stage3_grad_accum_steps=stage3_grad_accum_steps,
+        )
+        batcher.set_batch_size(stage.batch_size)
+        batcher.set_bucket_weights(stage.bucket_weights)
+        if stage.name != last_stage_name:
+            print(
+                f"prebuild_index_stage | step={step} | stage={stage.name} | span={stage.document_span} | "
+                f"batch_size={stage.batch_size}",
+                flush=True,
+            )
+            last_stage_name = stage.name
+        for _ in range(stage.document_span):
+            plans.append(
+                PrebuiltFlatBatchPlan(
+                    plan=batcher.next_batch_plan(),
+                    reset_all=bool(stage.freeze_memory),
+                )
+            )
+        if step == start_step + 1 or step % 100 == 0 or step == total_steps:
+            elapsed = time.perf_counter() - started_at
+            print(
+                f"prebuild_index_progress | step={step}/{total_steps} | batches={len(plans)} | "
+                f"elapsed={elapsed:.1f}s",
+                flush=True,
+            )
+    block = PrebuiltFlatBatchPlanBlock(plans=tuple(plans), build_seconds=time.perf_counter() - started_at)
+    return [block], float(block.build_seconds)
+
+
 def build_prebuilt_batch_blocks_parallel(
     batcher: DocumentChunkBatcher | FlatDocumentChunkBatcher,
     *,
@@ -2183,6 +2328,7 @@ class FlatDocumentChunkBatcher:
         device: torch.device,
         active_shards_per_bucket: int = 2,
         shard_rotation_interval: int = 256,
+        seed: int = 1337,
     ) -> None:
         if not documents:
             raise ValueError("documents must not be empty.")
@@ -2191,11 +2337,12 @@ class FlatDocumentChunkBatcher:
         self.batch_size = batch_size
         self.device = device
         self.pin_memory = device.type == "cuda"
+        self.seed = int(seed)
         self.seq_len = int(collection.shards[0].seq_len)
         self.pad_token_id = int(collection.shards[0].pad_token_id)
         self.active_shards_per_bucket = max(1, int(active_shards_per_bucket))
         self.shard_rotation_interval = max(1, int(shard_rotation_interval))
-        self._rng = random.Random(1337)
+        self._rng = random.Random(self.seed)
         self._batches_served = 0
         self.current_doc = [-1] * batch_size
         self.current_chunk = [0] * batch_size
@@ -2228,9 +2375,9 @@ class FlatDocumentChunkBatcher:
             device=self.device,
             active_shards_per_bucket=self.active_shards_per_bucket,
             shard_rotation_interval=self.shard_rotation_interval,
+            seed=self.seed + int(worker_index),
         )
         clone.pin_memory = self.pin_memory
-        clone._rng = random.Random(1337 + int(worker_index))
         clone.set_bucket_weights(dict(zip(self.active_buckets, self.active_bucket_weights)))
         return clone
 
@@ -2262,8 +2409,8 @@ class FlatDocumentChunkBatcher:
 
     def _sample_document_index(self) -> int:
         if not self.active_buckets:
-            return random.randrange(len(self.documents))
-        bucket = random.choices(self.active_buckets, weights=self.active_bucket_weights, k=1)[0]
+            return self._rng.randrange(len(self.documents))
+        bucket = self._rng.choices(self.active_buckets, weights=self.active_bucket_weights, k=1)[0]
         active_shards = self.active_bucket_shards.get(bucket) or tuple(self.bucket_to_shard_indices[bucket])
         shard_index = self._rng.choice(active_shards)
         return self._rng.choice(self.bucket_to_shard_indices[bucket][shard_index])
@@ -2330,30 +2477,30 @@ class FlatDocumentChunkBatcher:
             self._rng.setstate(rng_state)
         self._batches_served = int(state.get("batches_served", self._batches_served))
 
-    def next_batch(self) -> DocumentBatch:
+    def next_batch_plan(self) -> FlatBatchPlan:
         self._batches_served += 1
         self._refresh_active_bucket_shards()
-        context = torch.full((self.batch_size, self.seq_len), self.pad_token_id, dtype=torch.long)
-        target = torch.full((self.batch_size, self.seq_len), self.pad_token_id, dtype=torch.long)
-        loss_mask = torch.zeros((self.batch_size, self.seq_len), dtype=torch.float32)
-        reset_mask = torch.zeros(self.batch_size, dtype=torch.bool)
+        shard_indices: list[int] = []
+        document_indices: list[int] = []
+        chunk_indices: list[int] = []
+        is_last_chunk: list[bool] = []
+        reset_mask: list[bool] = []
         for item_index in range(self.batch_size):
             if self.needs_reset[item_index]:
                 self.current_doc[item_index] = self._sample_document_index()
                 self.current_chunk[item_index] = 0
-                reset_mask[item_index] = True
+                reset_mask.append(True)
+            else:
+                reset_mask.append(False)
             reference = self.documents[self.current_doc[item_index]]
             shard = self.collection.get_shard(reference.shard_index)
             chunk_start, chunk_end = shard.document_chunk_range(reference.document_index)
             chunk_index = chunk_start + self.current_chunk[item_index]
-            shard.copy_chunk_tensors_into(
-                chunk_index,
-                document_index=reference.document_index,
-                is_last_chunk=chunk_index == chunk_end - 1,
-                context_out=context[item_index],
-                target_out=target[item_index],
-                loss_mask_out=loss_mask[item_index],
-            )
+            last_chunk = chunk_index == chunk_end - 1
+            shard_indices.append(int(reference.shard_index))
+            document_indices.append(int(reference.document_index))
+            chunk_indices.append(int(chunk_index))
+            is_last_chunk.append(bool(last_chunk))
             next_chunk = self.current_chunk[item_index] + 1
             if chunk_start + next_chunk >= chunk_end:
                 self.needs_reset[item_index] = True
@@ -2361,7 +2508,37 @@ class FlatDocumentChunkBatcher:
             else:
                 self.needs_reset[item_index] = False
                 self.current_chunk[item_index] = next_chunk
-        if self.pin_memory:
+        return FlatBatchPlan(
+            shard_indices=tuple(shard_indices),
+            document_indices=tuple(document_indices),
+            chunk_indices=tuple(chunk_indices),
+            is_last_chunk=tuple(is_last_chunk),
+            reset_mask=tuple(reset_mask),
+        )
+
+    def materialize_batch_plan(
+        self,
+        plan: FlatBatchPlan,
+        *,
+        pin_memory: bool | None = None,
+    ) -> DocumentBatch:
+        batch_size = int(plan.batch_size)
+        context = torch.full((batch_size, self.seq_len), self.pad_token_id, dtype=torch.long)
+        target = torch.full((batch_size, self.seq_len), self.pad_token_id, dtype=torch.long)
+        loss_mask = torch.zeros((batch_size, self.seq_len), dtype=torch.float32)
+        reset_mask = torch.tensor(plan.reset_mask, dtype=torch.bool)
+        for item_index in range(batch_size):
+            shard = self.collection.get_shard(plan.shard_indices[item_index])
+            shard.copy_chunk_tensors_into(
+                plan.chunk_indices[item_index],
+                document_index=plan.document_indices[item_index],
+                is_last_chunk=plan.is_last_chunk[item_index],
+                context_out=context[item_index],
+                target_out=target[item_index],
+                loss_mask_out=loss_mask[item_index],
+            )
+        use_pin_memory = self.pin_memory if pin_memory is None else bool(pin_memory)
+        if use_pin_memory:
             context = context.pin_memory()
             target = target.pin_memory()
             loss_mask = loss_mask.pin_memory()
@@ -2372,6 +2549,9 @@ class FlatDocumentChunkBatcher:
             loss_mask=loss_mask,
             reset_mask=reset_mask,
         )
+
+    def next_batch(self) -> DocumentBatch:
+        return self.materialize_batch_plan(self.next_batch_plan(), pin_memory=self.pin_memory)
 
 
 class FlatSequentialDocumentBatcher:
@@ -3540,10 +3720,11 @@ def split_train_val_documents(
     documents: Sequence[TokenizedDocument],
     *,
     train_fraction: float,
+    seed: int = 1337,
 ) -> tuple[list[TokenizedDocument], list[TokenizedDocument]]:
     if len(documents) < 2:
         return list(documents), list(documents)
-    rng = random.Random(1337)
+    rng = random.Random(int(seed))
     bucket_to_documents: dict[str, list[TokenizedDocument]] = {}
     for document in documents:
         bucket_to_documents.setdefault(document_sampling_bucket(document), []).append(document)
@@ -3585,10 +3766,11 @@ def split_train_val_flat_documents_with_collection(
     documents: Sequence[FlatDocumentRef],
     *,
     train_fraction: float,
+    seed: int = 1337,
 ) -> tuple[list[FlatDocumentRef], list[FlatDocumentRef]]:
     if len(documents) < 2:
         return list(documents), list(documents)
-    rng = random.Random(1337)
+    rng = random.Random(int(seed))
     bucket_to_documents: dict[str, list[FlatDocumentRef]] = {}
     for reference in documents:
         bucket_to_documents.setdefault(flat_document_ref_bucket(collection, reference), []).append(reference)
@@ -3805,9 +3987,10 @@ def resolve_curriculum_stage(
 
 
 def apply_training_curriculum(model: torch.nn.Module, stage: TrainingCurriculumStage) -> None:
-    if not hasattr(model, "b_module"):
+    base_model = unwrap_model(model)
+    if not hasattr(base_model, "b_module"):
         return
-    b_module = model.b_module
+    b_module = base_model.b_module
     _set_module_requires_grad(b_module.memory_levels, True)
     _set_module_requires_grad(b_module.level_transitions, True)
     _set_module_requires_grad(b_module.level_norms, True)
@@ -3849,13 +4032,14 @@ def override_batch_reset(batch: DocumentBatch, *, reset_all: bool) -> DocumentBa
 
 def build_run_name(args: argparse.Namespace) -> str:
     memory_slug = "-".join(str(slot) for slot in args.memory_slots)
+    propagation_layers = resolve_total_propagation_layers(args)
     if args.model_kind == "transformer":
         return (
             f"transformer-doc-l{args.transformer_layers}-h{args.transformer_heads}"
             f"-ff{args.transformer_ff_mult:g}-dim{args.dim}-seq{args.seq_len}"
         )
     return (
-        f"causal-memory-doc-s{args.s_layers}-b{memory_slug}-p{args.prediction_layers}"
+        f"causal-memory-doc-pl{propagation_layers}-b{memory_slug}"
         f"-dim{args.dim}-seq{args.seq_len}"
     )
 
@@ -3863,6 +4047,13 @@ def build_run_name(args: argparse.Namespace) -> str:
 def estimate_steps_per_epoch(*, documents: Sequence[TokenizedDocument], batch_size: int) -> int:
     total_chunks = sum(len(document.chunks) for document in documents)
     return max(1, math.ceil(total_chunks / max(1, batch_size)))
+
+
+def resolve_total_propagation_layers(args: argparse.Namespace) -> int:
+    explicit = int(getattr(args, "propagation_layers", 0))
+    if explicit > 0:
+        return explicit
+    return int(args.s_layers) + int(args.prediction_layers)
 
 
 def estimate_stage_weighted_steps_per_epoch(
@@ -4441,13 +4632,16 @@ def infer_hf_hidden_size(*, model_name_or_path: str, trust_remote_code: bool = F
 @torch.no_grad()
 def initialize_model_embedding_from_hf(
     *,
-    model: CausalHierarchicalMemoryLM,
+    model: CausalMemoryLM,
     vocab: HFTokenizerVocab,
     model_name_or_path: str,
     trust_remote_code: bool = False,
 ) -> dict[str, int]:
     if AutoModelForCausalLM is None or AutoModel is None:
         raise ImportError("transformers is required to load HF pretrained embeddings.")
+    base_model = unwrap_model(model)
+    if not isinstance(base_model, CausalMemoryLM):
+        raise TypeError("HF embedding init requires a CausalMemoryLM-compatible model.")
     hf_model: object
     try:
         hf_model = AutoModelForCausalLM.from_pretrained(
@@ -4465,7 +4659,7 @@ def initialize_model_embedding_from_hf(
         if not hasattr(hf_model, "get_input_embeddings"):
             raise RuntimeError(f"Model {model_name_or_path} does not expose input embeddings.")
         hf_embedding = hf_model.get_input_embeddings().weight.detach().cpu()
-        target_weight = model.s_module.token_embedding.weight.detach()
+        target_weight = base_model.s_module.token_embedding.weight.detach()
         if target_weight.shape[1] != hf_embedding.shape[1]:
             raise ValueError(
                 f"Embedding dimension mismatch: target={target_weight.shape[1]}, hf={hf_embedding.shape[1]}"
@@ -4483,8 +4677,8 @@ def initialize_model_embedding_from_hf(
                 continue
             target_weight[int(token_id)].copy_(hf_embedding[source_index])
             copied += 1
-        if model.lm_head.weight.data_ptr() != model.s_module.token_embedding.weight.data_ptr():
-            model.lm_head.weight.copy_(model.s_module.token_embedding.weight)
+        if base_model.lm_head.weight.data_ptr() != base_model.s_module.token_embedding.weight.data_ptr():
+            base_model.lm_head.weight.copy_(base_model.s_module.token_embedding.weight)
         return {"copied": copied, "skipped": skipped}
     finally:
         del hf_model
@@ -4568,7 +4762,7 @@ def _eval_sample_priority(document: TokenizedDocument) -> tuple[int, str]:
 @torch.no_grad()
 def log_eval_samples_to_tensorboard(
     writer: SummaryWriter | None,
-    model: CausalHierarchicalMemoryLM,
+    model: CausalMemoryLM,
     documents: Sequence[TokenizedDocument],
     *,
     vocab: object | None,
@@ -4620,7 +4814,7 @@ def log_eval_samples_to_tensorboard(
 @torch.no_grad()
 def log_eval_samples_to_tensorboard_flat(
     writer: SummaryWriter | None,
-    model: CausalHierarchicalMemoryLM,
+    model: CausalMemoryLM,
     collection: FlatPretokenizedDirectory,
     documents: Sequence[FlatDocumentRef],
     *,
@@ -4683,13 +4877,14 @@ def log_eval_samples_to_tensorboard_flat(
 
 
 def run_model(
-    model: CausalHierarchicalMemoryLM,
+    model: CausalMemoryLM,
     batch: DocumentBatch,
     *,
     memory_state: Any | None,
     precision: str,
     grad_enabled: bool,
 ) -> tuple[torch.Tensor, float, Any | None]:
+    base_model = unwrap_model(model)
     autocast_dtype = resolve_autocast_dtype(precision)
     autocast_supported = (
         autocast_dtype is not None
@@ -4719,7 +4914,7 @@ def run_model(
                 raise RuntimeError("Model did not return query_layer for chunked LM-head loss.")
             main_loss = compute_masked_lm_head_loss(
                 output.query_layer.val,
-                model.lm_head.weight,
+                base_model.lm_head.weight,
                 batch.target,
                 batch.loss_mask,
             )
@@ -4737,12 +4932,13 @@ def run_model(
 
 
 def run_model_loss_tensor(
-    model: CausalHierarchicalMemoryLM,
+    model: CausalMemoryLM,
     batch: DocumentBatch,
     *,
     memory_state: Any | None,
     precision: str,
 ) -> tuple[torch.Tensor, Any | None]:
+    base_model = unwrap_model(model)
     autocast_dtype = resolve_autocast_dtype(precision)
     autocast_supported = (
         autocast_dtype is not None
@@ -4771,18 +4967,37 @@ def run_model_loss_tensor(
                 raise RuntimeError("Model did not return query_layer for chunked LM-head loss.")
             main_loss = compute_masked_lm_head_loss(
                 output.query_layer.val,
-                model.lm_head.weight,
+                base_model.lm_head.weight,
                 batch.target,
                 batch.loss_mask,
             )
     return main_loss, output.recurrent_state
 
 
+def _stats_model(model: torch.nn.Module) -> torch.nn.Module:
+    return unwrap_model(model)
+
+
+def set_model_track_stats(model: torch.nn.Module, enabled: bool) -> None:
+    base_model = _stats_model(model)
+    setter = getattr(base_model, "set_track_stats", None)
+    if callable(setter):
+        setter(bool(enabled))
+
+
+def collect_model_internal_stats(model: torch.nn.Module) -> dict[str, float]:
+    base_model = _stats_model(model)
+    collector = getattr(base_model, "collect_internal_stats", None)
+    if callable(collector):
+        return dict(collector())
+    return {}
+
+
 class Stage1CudaGraphRunner:
     def __init__(
         self,
         *,
-        model: CausalHierarchicalMemoryLM,
+        model: CausalMemoryLM,
         batch: DocumentBatch,
         precision: str,
     ) -> None:
@@ -4853,7 +5068,7 @@ class Stage1ForwardCudaGraphRunner:
     def __init__(
         self,
         *,
-        model: CausalHierarchicalMemoryLM,
+        model: CausalMemoryLM,
         batch: DocumentBatch,
         precision: str,
     ) -> None:
@@ -4916,7 +5131,7 @@ class Stage1ForwardCudaGraphRunner:
 
 
 def run_rnn_aux_model(
-    model: CausalHierarchicalMemoryLM,
+    model: CausalMemoryLM,
     rnn_aux_head: SharedEmbeddingRnnAuxHead,
     batch: DocumentBatch,
     *,
@@ -4947,7 +5162,7 @@ def run_rnn_aux_model(
 
 @torch.no_grad()
 def estimate_eval_loss(
-    model: CausalHierarchicalMemoryLM,
+    model: CausalMemoryLM,
     documents: Sequence[TokenizedDocument],
     *,
     eval_documents: int,
@@ -5000,7 +5215,7 @@ def estimate_eval_loss(
 
 @torch.no_grad()
 def estimate_eval_loss_flat(
-    model: CausalHierarchicalMemoryLM,
+    model: CausalMemoryLM,
     collection: FlatPretokenizedDirectory,
     documents: Sequence[FlatDocumentRef],
     *,
@@ -5061,7 +5276,7 @@ def estimate_eval_loss_flat(
 def save_checkpoint(
     path: Path,
     *,
-    model: CausalHierarchicalMemoryLM,
+    model: torch.nn.Module,
     rnn_aux_head: SharedEmbeddingRnnAuxHead | None,
     optimizer: torch.optim.Optimizer,
     rnn_aux_optimizer: torch.optim.Optimizer | None,
@@ -5079,7 +5294,7 @@ def save_checkpoint(
     cuda_rng_state: list[Tensor] | None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    checkpoint_model = getattr(model, "_orig_mod", model)
+    checkpoint_model = unwrap_model(model)
     torch.save(
         {
             "model_state_dict": checkpoint_model.state_dict(),
@@ -5178,12 +5393,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=1337)
 
     parser.add_argument("--seq-len", type=int, default=2048)
-    parser.add_argument("--dim", type=int, default=512)
+    parser.add_argument("--dim", type=int, default=384)
     parser.add_argument("--model-kind", choices=("causal_memory", "transformer"), default="causal_memory")
     parser.add_argument("--transformer-layers", type=int, default=5)
     parser.add_argument("--transformer-heads", type=int, default=6)
     parser.add_argument("--transformer-ff-mult", type=float, default=4.0)
     parser.add_argument("--transformer-dropout", type=float, default=0.0)
+    parser.add_argument("--propagation-layers", type=int, default=0)
     parser.add_argument("--s-layers", type=int, default=2)
     parser.add_argument("--memory-slots", type=int, nargs="+", default=[256, 64, 16])
     parser.add_argument("--memory-update-intervals", type=int, nargs="+")
@@ -5288,28 +5504,35 @@ def parse_args() -> argparse.Namespace:
         choices=("low_rank_bilinear", "diagonal_bilinear", "bilinear", "additive_low_rank", "query_norm_dot"),
         default="low_rank_bilinear",
     )
-    parser.add_argument("--pairwise-rank", type=int, default=64)
-    parser.add_argument("--route-rank", type=int, default=64)
-    parser.add_argument("--pairwise-heads", type=int, default=1)
+    parser.add_argument("--pairwise-rank", type=int, default=256)
+    parser.add_argument("--route-rank", type=int, default=256)
+    parser.add_argument("--pairwise-heads", type=int, default=4)
     parser.add_argument("--pairwise-frozen-heads", type=int, default=0)
     parser.add_argument("--pairwise-anchor-heads", type=int, default=0)
     parser.add_argument("--pairwise-anchor-kind", choices=("scaled_cosine", "diagonal_bilinear", "constant_one"), default="scaled_cosine")
-    parser.add_argument("--pairwise-head-aggregate", choices=("max", "mean", "sum", "head_mean", "smoothmax", "signed_smoothmax"), default="max")
+    parser.add_argument("--pairwise-head-aggregate", choices=("max", "mean", "sum", "head_mean", "smoothmax", "signed_smoothmax"), default="signed_smoothmax")
     parser.add_argument("--disable-sequence-anchor", action="store_true")
-    parser.add_argument("--route-heads", type=int, default=1)
+    parser.add_argument("--route-heads", type=int, default=4)
     parser.add_argument("--route-frozen-heads", type=int, default=0)
     parser.add_argument("--route-anchor-heads", type=int, default=0)
     parser.add_argument("--route-anchor-kind", choices=("fixed_projection", "query_norm_dot", "diagonal_bilinear", "constant_one"), default="fixed_projection")
     parser.add_argument("--unit-norm-values", action="store_true")
     parser.add_argument("--disable-forced-unit-norm-values", action="store_true")
+    parser.add_argument("--propagation-residual-gate-init", type=float, default=0.1)
     parser.add_argument("--implementation", choices=("reference", "streaming", "kernel", "native"), default="streaming")
     parser.add_argument("--knowledge-nodes", type=int, default=0)
     parser.add_argument("--knowledge-route-topk", type=int, default=0)
     parser.add_argument("--knowledge-propagation-topk", type=int, default=0)
     parser.add_argument("--knowledge-propagation-layers", type=int, default=1)
 
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=384)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
+    parser.add_argument(
+        "--data-seed",
+        type=int,
+        default=1337,
+        help="Controls train/val split and training document order independently from model init seed.",
+    )
     parser.add_argument("--stage1-batch-size", type=int, default=0)
     parser.add_argument("--stage2-batch-size", type=int, default=0)
     parser.add_argument("--stage3-batch-size", type=int, default=0)
@@ -5381,9 +5604,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-documents", type=int, default=8)
     parser.add_argument("--curriculum-stage1-ratio", type=float, default=0.1)
     parser.add_argument("--curriculum-stage2-ratio", type=float, default=0.4)
-    parser.add_argument("--curriculum-stage1-span", type=int, default=2)
-    parser.add_argument("--curriculum-stage2-span", type=int, default=4)
-    parser.add_argument("--curriculum-stage3-span", type=int, default=8)
+    parser.add_argument("--curriculum-stage1-span", type=int, default=1)
+    parser.add_argument("--curriculum-stage2-span", type=int, default=1)
+    parser.add_argument("--curriculum-stage3-span", type=int, default=1)
 
     parser.add_argument("--output-root", default="artifacts/training_runs")
     parser.add_argument("--run-name")
@@ -5483,7 +5706,7 @@ def configure_native_runtime_flags(args: argparse.Namespace) -> None:
 
 
 def build_parameter_groups(
-    model: CausalHierarchicalMemoryLM,
+    model: CausalMemoryLM,
     *,
     learning_rate: float,
     weight_decay: float,
@@ -5774,7 +5997,7 @@ def build_optimizer(
 
 
 def build_rnn_aux_optimizer(
-    model: CausalHierarchicalMemoryLM,
+    model: CausalMemoryLM,
     rnn_aux_head: SharedEmbeddingRnnAuxHead | None,
     *,
     name: str,
@@ -5892,14 +6115,48 @@ def main() -> None:
     ):
         raise ValueError("Stage batch sizes and grad accum steps must be non-negative.")
 
-    random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    device = resolve_device(args.device)
-    print(f"using device: {describe_device(device)}", flush=True)
+    distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
+    world_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
+    if distributed:
+        if not torch.cuda.is_available():
+            raise RuntimeError("Distributed training currently requires CUDA.")
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl")
+        device = torch.device("cuda", local_rank)
+    else:
+        device = resolve_device(args.device)
+    is_main_process = rank == 0
+    seed = int(args.seed) + rank
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    print(
+        f"using device: {describe_device(device)} | distributed={distributed} | "
+        f"rank={rank} | local_rank={local_rank} | world_size={world_size}",
+        flush=True,
+    )
 
-    stage1_batch_size = args.stage1_batch_size or args.batch_size
-    stage2_batch_size = args.stage2_batch_size or args.batch_size
-    stage3_batch_size = args.stage3_batch_size or args.batch_size
+    global_stage1_batch_size = args.stage1_batch_size or args.batch_size
+    global_stage2_batch_size = args.stage2_batch_size or args.batch_size
+    global_stage3_batch_size = args.stage3_batch_size or args.batch_size
+    stage1_batch_size = resolve_local_batch_size(
+        global_stage1_batch_size,
+        world_size=world_size,
+        label="stage1_batch_size",
+    )
+    stage2_batch_size = resolve_local_batch_size(
+        global_stage2_batch_size,
+        world_size=world_size,
+        label="stage2_batch_size",
+    )
+    stage3_batch_size = resolve_local_batch_size(
+        global_stage3_batch_size,
+        world_size=world_size,
+        label="stage3_batch_size",
+    )
     stage1_grad_accum_steps = args.stage1_grad_accum_steps or args.grad_accum_steps
     stage2_grad_accum_steps = args.stage2_grad_accum_steps or args.grad_accum_steps
     stage3_grad_accum_steps = args.stage3_grad_accum_steps or args.grad_accum_steps
@@ -6023,7 +6280,19 @@ def main() -> None:
             flat_collection,
             flat_collection.document_refs,
             train_fraction=args.train_fraction,
+            seed=args.data_seed,
         )
+        if distributed:
+            train_documents_flat = shard_sequence_for_rank(
+                train_documents_flat,
+                rank=rank,
+                world_size=world_size,
+            )
+            if not train_documents_flat:
+                raise RuntimeError(
+                    f"Distributed rank {rank} received no flat training documents. "
+                    "Increase dataset size or reduce world size."
+                )
         print("startup | split_train_val_flat_done", flush=True)
         train_bucket_summary = summarize_flat_document_buckets(flat_collection, train_documents_flat)
         val_bucket_summary = summarize_flat_document_buckets(flat_collection, val_documents_flat)
@@ -6052,7 +6321,22 @@ def main() -> None:
         print("startup | fixed_eval_sample_documents_flat_done", flush=True)
     else:
         assert documents is not None
-        train_documents, val_documents = split_train_val_documents(documents, train_fraction=args.train_fraction)
+        train_documents, val_documents = split_train_val_documents(
+            documents,
+            train_fraction=args.train_fraction,
+            seed=args.data_seed,
+        )
+        if distributed:
+            train_documents = shard_sequence_for_rank(
+                train_documents,
+                rank=rank,
+                world_size=world_size,
+            )
+            if not train_documents:
+                raise RuntimeError(
+                    f"Distributed rank {rank} received no tokenized training documents. "
+                    "Increase dataset size or reduce world size."
+                )
         print("startup | split_train_val_done", flush=True)
         train_bucket_summary = summarize_document_buckets(train_documents)
         val_bucket_summary = summarize_document_buckets(val_documents)
@@ -6104,7 +6388,14 @@ def main() -> None:
         args.lr_min_ratio = 0.25
         lowrank_lion_default_schedule_applied = True
     run_name = args.run_name or build_run_name(args)
-    run_dir = create_run_directory(args.output_root, run_name)
+    if distributed:
+        run_dir_payload = [""]
+        if is_main_process:
+            run_dir_payload[0] = str(create_run_directory(args.output_root, run_name))
+        dist.broadcast_object_list(run_dir_payload, src=0)
+        run_dir = Path(run_dir_payload[0])
+    else:
+        run_dir = create_run_directory(args.output_root, run_name)
     checkpoints_dir = ensure_directory(run_dir / "checkpoints")
 
     def create_training_batcher() -> DocumentChunkBatcher | FlatDocumentChunkBatcher:
@@ -6116,14 +6407,20 @@ def main() -> None:
                 device=device,
                 active_shards_per_bucket=args.pretokenized_active_shards_per_bucket,
                 shard_rotation_interval=args.pretokenized_shard_rotation_interval,
+                seed=args.data_seed + rank * 100_003,
             )
-        return DocumentChunkBatcher(train_documents, batch_size=stage1_batch_size, device=device)
+        return DocumentChunkBatcher(
+            train_documents,
+            batch_size=stage1_batch_size,
+            device=device,
+            seed=args.data_seed + rank * 100_003,
+        )
 
     def prebuild_from_batcher(
         source_batcher: DocumentChunkBatcher | FlatDocumentChunkBatcher,
         *,
         start_step_value: int,
-    ) -> tuple[list[DocumentBatch] | None, list[PrebuiltBatchBlock] | None, float]:
+    ) -> tuple[list[DocumentBatch] | None, list[PrebuiltBatchBlock | PrebuiltFlatBatchPlanBlock] | None, float]:
         print(
             f"startup | prebuild_train_batches_start | pin_memory={args.prebuild_pin_memory} | "
             f"workers={args.prebuild_workers} | worker_threads={args.prebuild_worker_threads}",
@@ -6143,9 +6440,15 @@ def main() -> None:
             stage1_grad_accum_steps=stage1_grad_accum_steps,
             stage2_grad_accum_steps=stage2_grad_accum_steps,
             stage3_grad_accum_steps=stage3_grad_accum_steps,
-            pin_memory=args.prebuild_pin_memory,
         )
-        if args.prebuild_workers > 1:
+        if isinstance(source_batcher, FlatDocumentChunkBatcher):
+            blocks, seconds = prebuild_flat_batch_plan_blocks(
+                source_batcher,
+                **prebuild_kwargs,
+            )
+            batches = None
+            print("startup | prebuild_mode=index_only_flat", flush=True)
+        elif args.prebuild_workers > 1:
             prebuild_cache_dir = (
                 Path(args.prebuild_cache_dir)
                 if args.prebuild_cache_dir
@@ -6154,6 +6457,7 @@ def main() -> None:
             blocks, seconds = build_prebuilt_batch_blocks_parallel(
                 source_batcher,
                 **prebuild_kwargs,
+                pin_memory=args.prebuild_pin_memory,
                 workers=args.prebuild_workers,
                 worker_threads=args.prebuild_worker_threads,
                 cache_dir=prebuild_cache_dir,
@@ -6163,6 +6467,7 @@ def main() -> None:
             batches, seconds = prebuild_training_batches(
                 source_batcher,
                 **prebuild_kwargs,
+                pin_memory=args.prebuild_pin_memory,
                 workers=1,
                 worker_threads=args.prebuild_worker_threads,
             )
@@ -6218,7 +6523,7 @@ def main() -> None:
         | None
     ) = None
     prebuilt_batches: list[DocumentBatch] | None = None
-    prebuilt_blocks: list[PrebuiltBatchBlock] | None = None
+    prebuilt_blocks: list[PrebuiltBatchBlock | PrebuiltFlatBatchPlanBlock] | None = None
     prebuild_seconds = 0.0
     if args.prebuild_train_batches and not args.resume_checkpoint:
         batcher = create_training_batcher()
@@ -6253,10 +6558,12 @@ def main() -> None:
             dropout=args.transformer_dropout,
         ).to(device)
     else:
-        model = CausalHierarchicalMemoryLM(
+        total_propagation_layers = int(args.s_layers) + int(args.prediction_layers)
+        model = CausalMemoryLM(
             vocab_size=vocab_size,
             dim=args.dim,
             max_seq_len=args.seq_len,
+            propagation_layers=total_propagation_layers,
             s_layers=args.s_layers,
             memory_slots=tuple(args.memory_slots),
             memory_update_intervals=None if args.memory_update_intervals is None else tuple(args.memory_update_intervals),
@@ -6300,6 +6607,7 @@ def main() -> None:
             route_anchor_kind=args.route_anchor_kind,
             implementation=args.implementation,
             unit_norm_values=args.unit_norm_values,
+            propagation_residual_gate_init=args.propagation_residual_gate_init,
             knowledge_nodes=args.knowledge_nodes,
             knowledge_route_topk=None if args.knowledge_route_topk <= 0 else args.knowledge_route_topk,
             knowledge_propagation_topk=None if args.knowledge_propagation_topk <= 0 else args.knowledge_propagation_topk,
@@ -6333,11 +6641,15 @@ def main() -> None:
     else:
         print(
             f"model=causal_memory_doc | params={parameter_count:,} | dim={args.dim} | seq_len={args.seq_len} | "
+            f"propagation_layers={total_propagation_layers} | legacy_s_layers={args.s_layers} | "
+            f"legacy_prediction_layers={args.prediction_layers} | "
             f"s_window={args.s_window} | s_microbatch_size={args.s_microbatch_size} | "
             f"scan_backend={args.scan_backend} | scan_checkpoint_chunk_size={args.scan_checkpoint_chunk_size} | "
             f"memory_slots={args.memory_slots} | memory_update_intervals={args.memory_update_intervals} | knowledge_nodes={args.knowledge_nodes} | "
             f"memory_train_mode={args.memory_train_mode} | memory_eval_mode={args.memory_eval_mode} | eval_topk={args.eval_topk or args.memory_topk} | "
             f"unit_norm_values={args.unit_norm_values} | feed_forward_layers={not args.disable_feed_forward_layers} | "
+            f"pairwise_head_aggregate={args.pairwise_head_aggregate} | "
+            f"propagation_residual_gate_init={args.propagation_residual_gate_init:g} | "
             f"memory_feed_forward_layers={not (args.disable_feed_forward_layers or args.disable_memory_feed_forward_layers)} | "
             f"disable_memory={args.disable_memory} | disable_memory_read={args.disable_memory_read} | "
             f"disable_memory_propagation={args.disable_memory_propagation} | "
@@ -6369,16 +6681,21 @@ def main() -> None:
         f"lr_decay_steps={args.lr_decay_steps} | lr_min_ratio={args.lr_min_ratio}",
         flush=True,
     )
-    if args.model_kind == "causal_memory" and args.disable_memory:
+    if args.model_kind == "causal_memory" and (
+        args.disable_memory or args.disable_memory_read or args.disable_memory_propagation
+    ):
         print(
-            "warning | disable_memory=True | memory, route, propagation, and skip paths are bypassed; "
-            "near-zero grads in those subsystems are expected and do not indicate a training bug",
+            "warning | legacy memory ablation flags are set, but the current CausalMemoryLM path is propagation-only; "
+            "those flags no longer change the forward graph",
             flush=True,
         )
     print(
-        f"curriculum_batches | stage1=batch{stage1_batch_size}/ga{stage1_grad_accum_steps} | "
-        f"stage2=batch{stage2_batch_size}/ga{stage2_grad_accum_steps} | "
-        f"stage3=batch{stage3_batch_size}/ga{stage3_grad_accum_steps}",
+        f"curriculum_batches | stage1=batch{stage1_batch_size}/ga{stage1_grad_accum_steps} "
+        f"(global={global_stage1_batch_size}) | "
+        f"stage2=batch{stage2_batch_size}/ga{stage2_grad_accum_steps} "
+        f"(global={global_stage2_batch_size}) | "
+        f"stage3=batch{stage3_batch_size}/ga{stage3_grad_accum_steps} "
+        f"(global={global_stage3_batch_size})",
         flush=True,
     )
     print(
@@ -6391,34 +6708,49 @@ def main() -> None:
         flush=True,
     )
 
-    write_json(
-        run_dir / "config.json",
-        {
-            "args": vars(args),
-            "training_policy": {
-                "forced_unit_norm_policy": forced_unit_norm_policy,
-                "lowrank_lion_default_schedule_applied": lowrank_lion_default_schedule_applied,
+    if is_main_process:
+        write_json(
+            run_dir / "config.json",
+            {
+                "args": vars(args),
+                "distributed": {
+                    "enabled": distributed,
+                    "world_size": world_size,
+                },
+                "local_batch_sizes": {
+                    "stage1": stage1_batch_size,
+                    "stage2": stage2_batch_size,
+                    "stage3": stage3_batch_size,
+                },
+                "global_batch_sizes": {
+                    "stage1": global_stage1_batch_size,
+                    "stage2": global_stage2_batch_size,
+                    "stage3": global_stage3_batch_size,
+                },
+                "training_policy": {
+                    "forced_unit_norm_policy": forced_unit_norm_policy,
+                    "lowrank_lion_default_schedule_applied": lowrank_lion_default_schedule_applied,
+                },
+                "tokenizer_label": tokenizer_label,
+                "tokenizer_model_path": tokenizer_model_path,
+                "parameter_count": parameter_count,
+                "rnn_aux_parameter_count": rnn_aux_parameter_count,
+                "corpus_metadata": corpus_metadata,
+                "fixed_eval_documents": (
+                    serialize_flat_document_refs(fixed_eval_documents_flat)
+                    if flat_collection is not None
+                    else serialize_tokenized_document_refs(fixed_eval_documents)
+                ),
+                "fixed_eval_sample_documents": (
+                    serialize_flat_document_refs(fixed_eval_sample_documents_flat)
+                    if flat_collection is not None
+                    else serialize_tokenized_document_refs(fixed_eval_sample_documents)
+                ),
             },
-            "tokenizer_label": tokenizer_label,
-            "tokenizer_model_path": tokenizer_model_path,
-            "parameter_count": parameter_count,
-            "rnn_aux_parameter_count": rnn_aux_parameter_count,
-            "corpus_metadata": corpus_metadata,
-            "fixed_eval_documents": (
-                serialize_flat_document_refs(fixed_eval_documents_flat)
-                if flat_collection is not None
-                else serialize_tokenized_document_refs(fixed_eval_documents)
-            ),
-            "fixed_eval_sample_documents": (
-                serialize_flat_document_refs(fixed_eval_sample_documents_flat)
-                if flat_collection is not None
-                else serialize_tokenized_document_refs(fixed_eval_sample_documents)
-            ),
-        },
-    )
+        )
 
     writer = None
-    if args.tensorboard:
+    if args.tensorboard and is_main_process:
         if SummaryWriter is None:
             raise ImportError("tensorboard is not installed.")
         writer = SummaryWriter(log_dir=str(run_dir / "tensorboard"))
@@ -6428,7 +6760,7 @@ def main() -> None:
             raise ValueError("--init-model-checkpoint cannot be combined with --resume-checkpoint.")
         init_checkpoint_path = Path(args.init_model_checkpoint)
         init_checkpoint = load_checkpoint(init_checkpoint_path, device=device)
-        model.load_state_dict(init_checkpoint["model_state_dict"])
+        unwrap_model(model).load_state_dict(init_checkpoint["model_state_dict"])
         print(
             f"initialized_model_checkpoint | path={init_checkpoint_path} | "
             f"source_step={init_checkpoint.get('step')} | "
@@ -6478,36 +6810,43 @@ def main() -> None:
     if args.resume_checkpoint:
         checkpoint_path = Path(args.resume_checkpoint)
         checkpoint = load_checkpoint(checkpoint_path, device=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
+        unwrap_model(model).load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         start_step = int(checkpoint.get("step", 0))
         checkpoint_val_loss = checkpoint.get("val_loss")
         if checkpoint_val_loss is not None:
             best_val_loss = float(checkpoint_val_loss)
-        if checkpoint.get("train_memory_state") is not None:
+        if not distributed and checkpoint.get("train_memory_state") is not None:
             train_memory_state = move_memory_state(checkpoint["train_memory_state"], device=device)
         batcher_state = checkpoint.get("batcher_state")
-        if isinstance(batcher_state, dict):
+        if not distributed and isinstance(batcher_state, dict):
             batcher.load_state_dict(batcher_state)
         active_stage_name = checkpoint.get("active_stage_name")
-        python_rng_state = checkpoint.get("python_rng_state")
-        if python_rng_state is not None:
-            random.setstate(python_rng_state)
-        torch_rng_state = checkpoint.get("torch_rng_state")
-        if isinstance(torch_rng_state, torch.Tensor):
-            torch.set_rng_state(torch_rng_state.to(dtype=torch.uint8, device="cpu"))
-        cuda_rng_state = checkpoint.get("cuda_rng_state")
-        if device.type == "cuda" and isinstance(cuda_rng_state, list) and cuda_rng_state:
-            torch.cuda.set_rng_state_all([
-                state.to(dtype=torch.uint8, device="cpu")
-                for state in cuda_rng_state
-                if isinstance(state, torch.Tensor)
-            ])
+        if not distributed:
+            python_rng_state = checkpoint.get("python_rng_state")
+            if python_rng_state is not None:
+                random.setstate(python_rng_state)
+            torch_rng_state = checkpoint.get("torch_rng_state")
+            if isinstance(torch_rng_state, torch.Tensor):
+                torch.set_rng_state(torch_rng_state.to(dtype=torch.uint8, device="cpu"))
+            cuda_rng_state = checkpoint.get("cuda_rng_state")
+            if device.type == "cuda" and isinstance(cuda_rng_state, list) and cuda_rng_state:
+                torch.cuda.set_rng_state_all([
+                    state.to(dtype=torch.uint8, device="cpu")
+                    for state in cuda_rng_state
+                    if isinstance(state, torch.Tensor)
+                ])
         print(
             f"resumed_checkpoint | path={checkpoint_path} | step={start_step} | "
             f"train_loss={checkpoint.get('train_loss')} | val_loss={checkpoint.get('val_loss')}",
             flush=True,
         )
+        if distributed:
+            print(
+                "resume_warning | distributed resume restores model/optimizer/step only; "
+                "memory state, batcher state, and RNG are reset per rank",
+                flush=True,
+            )
     if args.compile_model:
         compiler = getattr(torch, "compile", None)
         if compiler is None:
@@ -6521,6 +6860,14 @@ def main() -> None:
         )
         model = compiler(model, **compile_kwargs)
         print("startup | compile_model_done", flush=True)
+    if distributed:
+        model = DistributedDataParallel(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            broadcast_buffers=False,
+        )
+        print("startup | ddp_wrap_done", flush=True)
 
     def create_live_batch_provider(
         *,
@@ -6556,6 +6903,7 @@ def main() -> None:
             device=device,
             build_seconds=prebuild_seconds,
             blocks=prebuilt_blocks,
+            batcher=batcher if isinstance(batcher, FlatDocumentChunkBatcher) else None,
         )
         prebuilt_count = (
             len(prebuilt_batches)
@@ -6599,6 +6947,8 @@ def main() -> None:
         val_loss: float | None,
     ) -> None:
         nonlocal prefetcher
+        if not is_main_process:
+            return
         batcher_state = batcher.state_dict()
         if not args.prebuild_train_batches:
             prefetcher.close()
@@ -6677,6 +7027,13 @@ def main() -> None:
         last_span_loss_tensor: torch.Tensor | None = None
         loss_is_finite = True
         used_cuda_graph = False
+        should_collect_model_stats = (
+            writer is not None
+            and args.model_kind == "causal_memory"
+            and (step == 1 or step % 25 == 0)
+            and not args.cuda_graph_stage1
+        )
+        set_model_track_stats(model, should_collect_model_stats)
         for span_index in range(stage.document_span):
             batch = override_batch_reset(
                 prefetcher.next_batch(),
@@ -6767,6 +7124,10 @@ def main() -> None:
         else:
             optimizer.zero_grad(set_to_none=True)
             train_memory_state = None
+
+        model_stats = collect_model_internal_stats(model) if should_collect_model_stats else {}
+        if should_collect_model_stats:
+            set_model_track_stats(model, False)
 
         should_step_optimizer = step % stage.grad_accum_steps == 0 or step == total_steps
         grad_group_diagnostics: dict[str, dict[str, float | int]] = {}
@@ -6906,9 +7267,11 @@ def main() -> None:
                 writer.add_scalar(f"train/{stat_name}", stat_value, step)
             for bucket_name, bucket_weight in bucket_weights.items():
                 writer.add_scalar(f"train_bucket_weight/{bucket_name}", bucket_weight, step)
+            for stat_name, stat_value in model_stats.items():
+                writer.add_scalar(f"train_model/{stat_name}", stat_value, step)
 
         should_print_progress = step == 1 or step % 25 == 0
-        if should_print_progress:
+        if should_print_progress and is_main_process:
             elapsed = time.time() - start_time
             vi_lion_progress = ""
             if vi_lion_stats:
@@ -6926,7 +7289,7 @@ def main() -> None:
                 f"elapsed={elapsed:.1f}s{vi_lion_progress}",
                 flush=True,
             )
-        if grad_group_diagnostics:
+        if grad_group_diagnostics and is_main_process:
             group_messages = []
             for group_name, group_stats in sorted(
                 grad_group_diagnostics.items(),
@@ -6942,7 +7305,7 @@ def main() -> None:
             print("grad_diagnose | " + " | ".join(group_messages), flush=True)
 
         val_loss = None
-        should_eval = (
+        should_eval = is_main_process and (
             step == total_steps
             or (
                 step >= max(1, int(args.eval_start_step))
@@ -7016,12 +7379,13 @@ def main() -> None:
                     train_loss=train_loss,
                     val_loss=val_loss,
                 )
-                write_json(
-                    checkpoints_dir / "best.json",
-                    {"step": step, "train_loss": train_loss, "val_loss": val_loss},
-                )
+                if is_main_process:
+                    write_json(
+                        checkpoints_dir / "best.json",
+                        {"step": step, "train_loss": train_loss, "val_loss": val_loss},
+                    )
 
-        if step == total_steps or step % args.checkpoint_interval == 0:
+        if is_main_process and (step == total_steps or step % args.checkpoint_interval == 0):
             save_training_checkpoint(
                 checkpoints_dir / "last.pt",
                 step=step,
@@ -7046,14 +7410,18 @@ def main() -> None:
         if grad_group_diagnostics:
             row["grad_group_diagnostics"] = grad_group_diagnostics
         row.update(vi_lion_stats)
-        history_rows.append(row)
-        append_jsonl(run_dir / "history.jsonl", row)
+        if is_main_process:
+            history_rows.append(row)
+            append_jsonl(run_dir / "history.jsonl", row)
 
-    write_csv_rows(run_dir / "history.csv", history_rows)
+    if is_main_process:
+        write_csv_rows(run_dir / "history.csv", history_rows)
     prefetcher.close()
     if writer is not None:
         writer.flush()
         writer.close()
+    if distributed and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

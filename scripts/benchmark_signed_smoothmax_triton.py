@@ -15,7 +15,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from jakal_net.causal_memory_lm import CausalHierarchicalMemoryLM, MemoryScanOutput  # noqa: E402
+from jakal_net.causal_memory_lm import CausalMemoryLM, MemoryScanOutput  # noqa: E402
 from jakal_net.core import Layer  # noqa: E402
 from jakal_net.native_backend import (  # noqa: E402
     _LowRankMultiHeadMaxPropagationCausalDenseSignedAbs,
@@ -85,8 +85,8 @@ def _build_model(
     pairwise_heads: int,
     aggregate: str,
     device: torch.device,
-) -> CausalHierarchicalMemoryLM:
-    return CausalHierarchicalMemoryLM(
+) -> CausalMemoryLM:
+    return CausalMemoryLM(
         vocab_size=vocab_size,
         dim=dim,
         max_seq_len=seq_len,
@@ -149,7 +149,7 @@ def _max_grad_diff(
 
 
 def _forward_loss(
-    model: CausalHierarchicalMemoryLM,
+    model: CausalMemoryLM,
     batch: DocumentBatch,
     *,
     precision: str,
@@ -290,7 +290,7 @@ def _time_block(fn: Any, *, device: torch.device) -> float:
 
 def _benchmark_one_step_once(
     *,
-    model: CausalHierarchicalMemoryLM,
+    model: CausalMemoryLM,
     optimizer: torch.optim.Optimizer,
     batch: DocumentBatch,
     precision: str,
@@ -565,7 +565,7 @@ def run_diagonal_diagnose(args: argparse.Namespace) -> dict[str, object]:
     }
 
 
-def _get_diag_prop(model: CausalHierarchicalMemoryLM, stage: str):
+def _get_diag_prop(model: CausalMemoryLM, stage: str):
     if stage == "sequence":
         return model.s_module.sequence_layers[0]
     if stage == "prediction":
@@ -701,7 +701,7 @@ def run_diagonal_propagation_diagnose(args: argparse.Namespace) -> dict[str, obj
         return results
 
 
-def _get_lowrank_prop(model: CausalHierarchicalMemoryLM, stage: str):
+def _get_lowrank_prop(model: CausalMemoryLM, stage: str):
     if stage == "sequence":
         return model.s_module.sequence_layers[0]
     if stage == "prediction":

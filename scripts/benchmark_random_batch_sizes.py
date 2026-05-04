@@ -11,7 +11,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from jakal_net.causal_memory_lm import CausalHierarchicalMemoryLM  # noqa: E402
+from jakal_net.causal_memory_lm import CausalMemoryLM  # noqa: E402
 from train_causal_memory_lm import (  # noqa: E402
     DocumentBatch,
     TransformerBaselineLM,
@@ -63,7 +63,7 @@ def make_model(kind: str, *, vocab_size: int, seq_len: int, dim: int) -> torch.n
         kwargs["disable_memory_read"] = True
     else:
         raise ValueError(kind)
-    return CausalHierarchicalMemoryLM(**kwargs)
+    return CausalMemoryLM(**kwargs)
 
 
 def try_batch(model: torch.nn.Module, *, batch_size: int, vocab_size: int, seq_len: int, precision: str, device: torch.device) -> None:

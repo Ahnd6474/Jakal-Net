@@ -15,6 +15,7 @@ from train_causal_memory_lm import (
     CAUSAL_DOC_SPECIAL_TOKENS,
     _record_to_document,
     build_special_token_id_map,
+    build_tokenizer,
     load_serialized_documents,
     save_pretokenized_bundle,
     summarize_documents,
@@ -22,7 +23,6 @@ from train_causal_memory_lm import (
     tokenize_documents,
     validate_flat_pretokenized_shard,
 )
-from train_progressive_b_lm import build_tokenizer
 from lm_experiment_utils import _expand_sources
 
 
@@ -56,20 +56,24 @@ def split_jsonl_sources_round_robin(*, sources: Sequence[str], raw_shard_dir: Pa
 
 def build_tokenizer_from_cache(
     *,
+    tokenizer: str,
     tokenizer_prefix: str,
     subword_vocab_size: int,
+    hf_tokenizer_model: str | None,
 ):
     vocab, tokenizer_label, tokenizer_path = build_tokenizer(
         "",
         text_path=None,
-        tokenizer="byte_bpe",
+        tokenizer=tokenizer,
         subword_vocab_size=subword_vocab_size,
         subword_model_type="bpe",
-        tokenizer_prefix=tokenizer_prefix,
+        tokenizer_prefix=tokenizer_prefix if tokenizer == "byte_bpe" else None,
         subword_character_coverage=1.0,
         subword_input_sentence_size=0,
         subword_num_threads=0,
-        user_defined_symbols=CAUSAL_DOC_SPECIAL_TOKENS,
+        user_defined_symbols=CAUSAL_DOC_SPECIAL_TOKENS if tokenizer == "byte_bpe" else (),
+        hf_tokenizer_model=hf_tokenizer_model,
+        hf_trust_remote_code=False,
     )
     return vocab, tokenizer_label, tokenizer_path
 
@@ -78,8 +82,10 @@ def build_single_shard(
     *,
     raw_shard_path: Path | None,
     bundle_path: Path,
+    tokenizer: str,
     tokenizer_prefix: str,
     subword_vocab_size: int,
+    hf_tokenizer_model: str | None,
     seq_len: int,
     pretokenize_workers: int,
     processing_device: str | None,
@@ -127,10 +133,12 @@ def build_single_shard(
         flush=True,
     )
     vocab, tokenizer_label, tokenizer_path = build_tokenizer_from_cache(
+        tokenizer=tokenizer,
         tokenizer_prefix=tokenizer_prefix,
         subword_vocab_size=subword_vocab_size,
+        hf_tokenizer_model=hf_tokenizer_model,
     )
-    special_token_ids = build_special_token_id_map(vocab)
+    special_token_ids = build_special_token_id_map(vocab, tokenizer_label=tokenizer_label)
     tokenized_documents = tokenize_documents(
         documents,
         vocab=vocab,
@@ -166,8 +174,10 @@ def launch_parallel_shards(
     *,
     raw_shard_dir: Path | None,
     bundle_dir: Path,
+    tokenizer: str,
     tokenizer_prefix: str,
     subword_vocab_size: int,
+    hf_tokenizer_model: str | None,
     seq_len: int,
     pretokenize_workers: int,
     processing_device: str | None,
@@ -201,6 +211,8 @@ def launch_parallel_shards(
                 "build-shard",
                 "--bundle-path",
                 str(bundle_path),
+                "--tokenizer",
+                tokenizer,
                 "--shard-index",
                 str(shard_index),
                 "--num-shards",
@@ -214,6 +226,10 @@ def launch_parallel_shards(
                 "--pretokenize-workers",
                 str(pretokenize_workers),
             ]
+            if tokenizer == "hf_auto":
+                if not hf_tokenizer_model:
+                    raise ValueError("--hf-tokenizer-model is required when --tokenizer hf_auto is used.")
+                cmd.extend(["--hf-tokenizer-model", hf_tokenizer_model])
             for source in jsonl_sources:
                 cmd.extend(["--jsonl-source", source])
             if raw_shard_dir is not None:
@@ -243,12 +259,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bundle-dir")
     parser.add_argument("--raw-shard-path")
     parser.add_argument("--bundle-path")
+    parser.add_argument("--tokenizer", choices=("byte_bpe", "hf_auto"), default="byte_bpe")
     parser.add_argument("--shard-index", type=int)
     parser.add_argument("--num-shards", type=int, default=32)
     parser.add_argument("--parallel-shards", type=int, default=8)
     parser.add_argument("--pretokenize-workers", type=int, default=8)
     parser.add_argument("--tokenizer-prefix", required=True)
     parser.add_argument("--subword-vocab-size", type=int, default=16384)
+    parser.add_argument("--hf-tokenizer-model")
     parser.add_argument("--seq-len", type=int, default=512)
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--processing-device")
@@ -273,11 +291,15 @@ def main() -> None:
             raise ValueError(
                 "build-shard mode requires either --raw-shard-path or (--shard-index plus --jsonl-source)."
             )
+        if args.tokenizer == "hf_auto" and not args.hf_tokenizer_model:
+            raise ValueError("--hf-tokenizer-model is required when --tokenizer hf_auto is used.")
         build_single_shard(
             raw_shard_path=None if not args.raw_shard_path else Path(args.raw_shard_path),
             bundle_path=Path(args.bundle_path),
+            tokenizer=args.tokenizer,
             tokenizer_prefix=args.tokenizer_prefix,
             subword_vocab_size=args.subword_vocab_size,
+            hf_tokenizer_model=args.hf_tokenizer_model,
             seq_len=args.seq_len,
             pretokenize_workers=args.pretokenize_workers,
             processing_device=args.processing_device,
@@ -298,8 +320,10 @@ def main() -> None:
     launch_parallel_shards(
         raw_shard_dir=raw_shard_dir,
         bundle_dir=Path(args.bundle_dir),
+        tokenizer=args.tokenizer,
         tokenizer_prefix=args.tokenizer_prefix,
         subword_vocab_size=args.subword_vocab_size,
+        hf_tokenizer_model=args.hf_tokenizer_model,
         seq_len=args.seq_len,
         pretokenize_workers=args.pretokenize_workers,
         processing_device=args.processing_device,

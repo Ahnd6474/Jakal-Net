@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from jakal_net._architectural_common import apply_delta, unit_normalize_values
-from jakal_net.causal_memory_lm import CausalHierarchicalMemoryLM
+from jakal_net.causal_memory_lm import CausalMemoryLM
 from jakal_net.core import Layer
 
 
@@ -27,8 +27,8 @@ def timed(name: str):
     print(f"profile_section | {name} | {elapsed_ms:.3f} ms", flush=True)
 
 
-def build_model(args: argparse.Namespace, device: torch.device) -> CausalHierarchicalMemoryLM:
-    return CausalHierarchicalMemoryLM(
+def build_model(args: argparse.Namespace, device: torch.device) -> CausalMemoryLM:
+    return CausalMemoryLM(
         vocab_size=args.vocab_size,
         dim=args.dim,
         max_seq_len=args.seq_len,
@@ -65,7 +65,7 @@ def build_model(args: argparse.Namespace, device: torch.device) -> CausalHierarc
 
 
 def profile_s_encode_sections(
-    model: CausalHierarchicalMemoryLM,
+    model: CausalMemoryLM,
     input_ids: torch.Tensor,
 ) -> Layer:
     s_module = model.s_module
@@ -117,7 +117,7 @@ def profile_s_encode_sections(
 
 
 def profile_forward_sections(
-    model: CausalHierarchicalMemoryLM,
+    model: CausalMemoryLM,
     input_ids: torch.Tensor,
     *,
     autocast_dtype: torch.dtype | None,
