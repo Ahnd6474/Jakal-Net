@@ -6052,6 +6052,15 @@ def build_rnn_aux_optimizer(
 def main() -> None:
     args = parse_args()
     forced_unit_norm_policy = "none"
+    requested_stage_spans = (
+        int(args.curriculum_stage1_span),
+        int(args.curriculum_stage2_span),
+        int(args.curriculum_stage3_span),
+    )
+    args.curriculum_stage1_span = 1
+    args.curriculum_stage2_span = 1
+    args.curriculum_stage3_span = 1
+    forced_document_span_policy = "all_stage_spans_fixed_to_1"
     if not args.disable_forced_unit_norm_values:
         if args.model_kind == "causal_memory" and args.pairwise_kind == "diagonal_bilinear":
             args.unit_norm_values = True
@@ -6138,6 +6147,12 @@ def main() -> None:
         f"rank={rank} | local_rank={local_rank} | world_size={world_size}",
         flush=True,
     )
+    if requested_stage_spans != (1, 1, 1):
+        print(
+            "warning | overriding requested curriculum document spans to 1 | "
+            f"requested={requested_stage_spans}",
+            flush=True,
+        )
 
     global_stage1_batch_size = args.stage1_batch_size or args.batch_size
     global_stage2_batch_size = args.stage2_batch_size or args.batch_size
@@ -6674,6 +6689,7 @@ def main() -> None:
     )
     print(
         f"training_policy | forced_unit_norm_policy={forced_unit_norm_policy} | "
+        f"forced_document_span_policy={forced_document_span_policy} | "
         f"unit_norm_values={args.unit_norm_values} | "
         f"lowrank_lion_default_schedule_applied={lowrank_lion_default_schedule_applied} | "
         f"nomemory_lowrank_grad_scale={args.nomemory_lowrank_grad_scale} | "
@@ -6729,6 +6745,7 @@ def main() -> None:
                 },
                 "training_policy": {
                     "forced_unit_norm_policy": forced_unit_norm_policy,
+                    "forced_document_span_policy": forced_document_span_policy,
                     "lowrank_lion_default_schedule_applied": lowrank_lion_default_schedule_applied,
                 },
                 "tokenizer_label": tokenizer_label,
