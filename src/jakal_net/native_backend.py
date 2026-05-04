@@ -911,7 +911,6 @@ def _native_scan_layer_norm(input: Tensor, weight: Tensor, packed_bias: Tensor) 
 
 def _native_scan_signed_softmax_state(state: Tensor) -> Tensor:
     clean_state = torch.nan_to_num(state)
-    clean_state = F.layer_norm(clean_state, (clean_state.shape[-1],))
     magnitude = torch.softmax(clean_state.abs(), dim=-1)
     return torch.sign(clean_state) * magnitude * float(state.shape[-1])
 

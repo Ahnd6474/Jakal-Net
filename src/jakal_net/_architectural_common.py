@@ -48,7 +48,6 @@ def _unit_normalize_values_impl(val: Tensor, *, eps: float = UNIT_NORM_EPS) -> T
 
 def _signed_softmax_state_impl(state: Tensor) -> Tensor:
     clean_state = torch.nan_to_num(state)
-    clean_state = F.layer_norm(clean_state, (clean_state.shape[-1],))
     magnitude = torch.softmax(clean_state.abs(), dim=-1)
     state_mass = float(state.size(-1)) * STATE_MASS_PER_NODE
     return torch.sign(clean_state) * magnitude * state_mass
@@ -115,7 +114,7 @@ def make_pairwise(
     frozen_heads: int = 0,
     anchor_heads: int = 0,
     anchor_kind: str = "scaled_cosine",
-    aggregate: str = "max",
+    aggregate: str = "signed_smoothmax",
 ) -> nn.Module:
     if aggregate not in {"max", "mean", "sum", "head_mean", "smoothmax", "signed_smoothmax"}:
         raise ValueError(f"Unsupported pairwise head aggregate: {aggregate!r}.")

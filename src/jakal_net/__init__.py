@@ -1,4 +1,8 @@
-from jakal_net.causal_memory_lm import CausalHierarchicalMemoryLM, MemoryScanOutput, ModelRecurrentState
+from jakal_net.causal_memory_lm import (
+    CausalMemoryLM,
+    MemoryScanOutput,
+    ModelRecurrentState,
+)
 from jakal_net.core import Layer, LayerDelta
 from jakal_net.devices import describe_device, resolve_device
 from jakal_net.hierarchical_memory import BModule, BScanOutput
@@ -26,6 +30,7 @@ from jakal_net.modules import (
     SourceTargetHadamardMLPRoute,
 )
 from jakal_net.propagation import Propagation, SparsePropagation
+from jakal_net.propagation_stack import PropagationLayer, PropagationStack
 from jakal_net.sequence_module import SModule
 from jakal_net.transition import SparseTransition, Transition
 
@@ -36,7 +41,7 @@ __all__ = [
     "BilinearPairwiseRoute",
     "BModule",
     "BScanOutput",
-    "CausalHierarchicalMemoryLM",
+    "CausalMemoryLM",
     "describe_device",
     "DiagonalBilinearPairwise",
     "DiagonalBilinearRoute",
@@ -57,6 +62,8 @@ __all__ = [
     "native_available",
     "native_status",
     "Propagation",
+    "PropagationLayer",
+    "PropagationStack",
     "QueryNormalizedDotRoute",
     "ResidualFeedForward",
     "resolve_device",

@@ -105,6 +105,38 @@ def _disable_native_multihead_signed_smoothmax_path(pairwise_fn: object) -> bool
     return all(isinstance(head, LowRankBilinearPairwise) for head in pairwise_fn.heads)
 
 
+def _summarize_edges(
+    edges: Tensor,
+    *,
+    topk_indices: Tensor | None = None,
+) -> dict[str, float]:
+    masses = edges.abs()
+    probs = masses / masses.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    entropy = -(probs * probs.clamp_min(1e-12).log()).sum(dim=-1).mean()
+    source_load = masses.sum(dim=-2)
+    load_variance = source_load.var(unbiased=False)
+    active_sources = (source_load > 1e-6).to(dtype=torch.float32)
+    dead_source_ratio = 1.0 - active_sources.mean()
+    positive_ratio = (edges > 0).to(dtype=torch.float32).mean()
+    mean_abs = masses.mean()
+    signed_mean = edges.mean()
+    overlap = torch.tensor(0.0, device=edges.device)
+    if topk_indices is not None and topk_indices.shape[-2] > 1:
+        current = topk_indices[..., 1:, :]
+        previous = topk_indices[..., :-1, :]
+        pairwise_overlap = (current.unsqueeze(-1) == previous.unsqueeze(-2)).any(dim=-1)
+        overlap = pairwise_overlap.to(dtype=torch.float32).mean()
+    return {
+        "edge_entropy": float(entropy.item()),
+        "edge_source_load_variance": float(load_variance.item()),
+        "edge_dead_source_ratio": float(dead_source_ratio.item()),
+        "edge_positive_ratio": float(positive_ratio.item()),
+        "edge_mean_abs": float(mean_abs.item()),
+        "edge_signed_mean": float(signed_mean.item()),
+        "edge_topk_overlap": float(overlap.item()),
+    }
+
+
 class Propagation(nn.Module):
     def __init__(
         self,
@@ -138,6 +170,8 @@ class Propagation(nn.Module):
         self.source_block_size = source_block_size
         self.accumulator_dtype = accumulator_dtype
         self.use_direction_only = use_direction_only
+        self.track_stats = False
+        self.last_stats: dict[str, float] | None = None
 
     def _directional_val(self, state: Tensor, val: Tensor) -> Tensor:
         return val
@@ -218,6 +252,13 @@ class Propagation(nn.Module):
             delta_state = torch.einsum("...ij,...j->...i", edges, projected_state)
         delta_val = torch.einsum("...ij,...jd->...id", edges, projected_val)
         return LayerDelta(delta_state=delta_state, delta_val=delta_val)
+
+    def _record_stats(self, layer: Layer) -> None:
+        directional_val = self._directional_val(layer.state, layer.val)
+        scores = self.pairwise_fn(directional_val, directional_val)
+        validate_pairwise_scores(scores, layer)
+        edges = self._weight_edges(_compress_edges(scores, self.edge_compress_fn), layer.state)
+        self.last_stats = _summarize_edges(edges)
 
     def _compute_delta_streaming(self, layer: Layer) -> LayerDelta:
         directional_val = self._directional_val(layer.state, layer.val)
@@ -346,6 +387,10 @@ class Propagation(nn.Module):
         return Propagation._compute_delta_streaming(self, layer)
 
     def compute_delta(self, layer: Layer) -> LayerDelta:
+        if self.track_stats:
+            self._record_stats(layer)
+        else:
+            self.last_stats = None
         signed_smoothmax_lowrank_native = (
             self.implementation == "native"
             and _disable_native_multihead_signed_smoothmax_path(self.pairwise_fn)
@@ -478,6 +523,30 @@ class SparsePropagation(Propagation):
             delta_state = torch.einsum("...ij,...j->...i", masked_edges, projected_state)
         delta_val = torch.einsum("...ij,...jd->...id", masked_edges, projected_val)
         return LayerDelta(delta_state=delta_state, delta_val=delta_val)
+
+    def _record_stats(self, layer: Layer) -> None:
+        directional_val = self._directional_val(layer.state, layer.val)
+        scores = self.pairwise_fn(directional_val, directional_val)
+        validate_pairwise_scores(scores, layer)
+        topk_indices: Tensor | None = None
+        if self.sparse_type == "window":
+            mask_2d = causal_window_mask(
+                0,
+                layer.num_nodes,
+                0,
+                layer.num_nodes,
+                self.window or 0,
+                device=scores.device,
+            )
+            mask = mask_2d.view((1,) * (scores.ndim - 2) + mask_2d.shape)
+        else:
+            k = min(self.topk or layer.num_nodes, layer.num_nodes)
+            selected = select_topk(scores, k, dim=-1)
+            topk_indices = selected.indices
+            mask = build_topk_mask(scores, k)
+        masked_edges = _compress_edges(scores, self.edge_compress_fn, mask=mask)
+        masked_edges = self._weight_edges(masked_edges, layer.state)
+        self.last_stats = _summarize_edges(masked_edges, topk_indices=topk_indices)
 
     def _compute_window_delta_streaming(self, layer: Layer) -> LayerDelta:
         if _edge_compress_name(self.edge_compress_fn) == "signed_abs_softmax":
@@ -763,6 +832,10 @@ class SparsePropagation(Propagation):
         return self._compute_delta_streaming(layer)
 
     def compute_delta(self, layer: Layer) -> LayerDelta:
+        if self.track_stats:
+            self._record_stats(layer)
+        else:
+            self.last_stats = None
         signed_smoothmax_lowrank_dense_native = (
             self.implementation == "native"
             and _disable_native_multihead_signed_smoothmax_path(self.pairwise_fn)

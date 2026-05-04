@@ -257,7 +257,7 @@ class FixedProjectionRoute(nn.Module):
 
 
 class MultiHeadPairwise(nn.Module):
-    def __init__(self, heads: Sequence[nn.Module], *, aggregate: str = "max") -> None:
+    def __init__(self, heads: Sequence[nn.Module], *, aggregate: str = "signed_smoothmax") -> None:
         super().__init__()
         if not heads:
             raise ValueError("heads must contain at least one pairwise module.")

@@ -17,7 +17,7 @@ from train_causal_memory_lm import (  # noqa: E402
 )
 
 from jakal_net.causal_memory_lm import (  # noqa: E402
-    CausalHierarchicalMemoryLM,
+    CausalMemoryLM,
     MemoryScanOutput,
     ModelRecurrentState,
     ValueNormStateProjection,
@@ -29,7 +29,7 @@ from jakal_net.native_backend import _native_scan_uses_legacy_low_rank_extension
 class CausalMemoryLMTests(unittest.TestCase):
     def test_forward_returns_sequence_logits_and_memory(self) -> None:
         torch.manual_seed(7)
-        model = CausalHierarchicalMemoryLM(
+        model = CausalMemoryLM(
             vocab_size=32,
             dim=8,
             max_seq_len=12,
@@ -60,7 +60,7 @@ class CausalMemoryLMTests(unittest.TestCase):
         self.assertEqual(output.query_layer.val.shape, (2, 5, 8))
 
     def test_can_disable_only_memory_feed_forward_layers(self) -> None:
-        model = CausalHierarchicalMemoryLM(
+        model = CausalMemoryLM(
             vocab_size=32,
             dim=8,
             max_seq_len=12,
@@ -85,7 +85,7 @@ class CausalMemoryLMTests(unittest.TestCase):
             {"disable_memory_read": True},
             {"disable_memory_propagation": True},
         ):
-            model = CausalHierarchicalMemoryLM(
+            model = CausalMemoryLM(
                 vocab_size=32,
                 dim=8,
                 max_seq_len=12,
@@ -108,7 +108,7 @@ class CausalMemoryLMTests(unittest.TestCase):
 
     def test_reset_mask_preserves_fresh_path_for_selected_items(self) -> None:
         torch.manual_seed(8)
-        model = CausalHierarchicalMemoryLM(
+        model = CausalMemoryLM(
             vocab_size=24,
             dim=8,
             max_seq_len=12,
@@ -138,7 +138,7 @@ class CausalMemoryLMTests(unittest.TestCase):
 
     def test_s_microbatch_matches_full_batch_forward(self) -> None:
         torch.manual_seed(9)
-        base_model = CausalHierarchicalMemoryLM(
+        base_model = CausalMemoryLM(
             vocab_size=24,
             dim=8,
             max_seq_len=12,
@@ -151,7 +151,7 @@ class CausalMemoryLMTests(unittest.TestCase):
             pairwise_rank=4,
             route_rank=4,
         )
-        microbatched_model = CausalHierarchicalMemoryLM(
+        microbatched_model = CausalMemoryLM(
             vocab_size=24,
             dim=8,
             max_seq_len=12,
@@ -181,7 +181,7 @@ class CausalMemoryLMTests(unittest.TestCase):
 
     def test_forward_logits_remain_finite(self) -> None:
         torch.manual_seed(10)
-        model = CausalHierarchicalMemoryLM(
+        model = CausalMemoryLM(
             vocab_size=64,
             dim=16,
             max_seq_len=16,
@@ -202,7 +202,7 @@ class CausalMemoryLMTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(logits).all().item())
 
     def test_constructor_accepts_scan_backend_compatibility_args(self) -> None:
-        model = CausalHierarchicalMemoryLM(
+        model = CausalMemoryLM(
             vocab_size=64,
             dim=16,
             max_seq_len=16,
@@ -220,7 +220,7 @@ class CausalMemoryLMTests(unittest.TestCase):
         self.assertEqual(model.scan_checkpoint_chunk_size, 32)
 
     def test_feed_forward_layers_are_supported_by_native_scan(self) -> None:
-        model = CausalHierarchicalMemoryLM(
+        model = CausalMemoryLM(
             vocab_size=64,
             dim=16,
             max_seq_len=16,
@@ -235,7 +235,7 @@ class CausalMemoryLMTests(unittest.TestCase):
         self.assertTrue(model._native_scan_supported_config())
 
     def test_memory_train_eval_modes_select_dense_or_topk(self) -> None:
-        model = CausalHierarchicalMemoryLM(
+        model = CausalMemoryLM(
             vocab_size=64,
             dim=16,
             max_seq_len=16,
@@ -262,7 +262,7 @@ class CausalMemoryLMTests(unittest.TestCase):
         self.assertEqual(eval_packed["propagation_topks"], (2, 2))
 
     def test_multi_head_config_is_supported_by_native_fused_wrapper(self) -> None:
-        model = CausalHierarchicalMemoryLM(
+        model = CausalMemoryLM(
             vocab_size=64,
             dim=16,
             max_seq_len=16,
@@ -281,7 +281,7 @@ class CausalMemoryLMTests(unittest.TestCase):
         self.assertTrue(model._native_scan_supported_config())
 
     def test_diagonal_anchor_heads_are_supported_by_native_fused_wrapper(self) -> None:
-        model = CausalHierarchicalMemoryLM(
+        model = CausalMemoryLM(
             vocab_size=64,
             dim=16,
             max_seq_len=16,
@@ -312,7 +312,7 @@ class CausalMemoryLMTests(unittest.TestCase):
         )
 
     def test_constant_one_anchor_heads_stay_on_low_rank_native_path(self) -> None:
-        model = CausalHierarchicalMemoryLM(
+        model = CausalMemoryLM(
             vocab_size=64,
             dim=16,
             max_seq_len=16,
@@ -377,7 +377,7 @@ class CausalMemoryLMTests(unittest.TestCase):
             propagation_topk=3,
             implementation="reference",
         )
-        model = CausalHierarchicalMemoryLM(
+        model = CausalMemoryLM(
             vocab_size=32,
             dim=8,
             max_seq_len=12,
@@ -408,7 +408,7 @@ class CausalMemoryLMTests(unittest.TestCase):
 
     def test_model_can_build_internal_knowledge_module(self) -> None:
         torch.manual_seed(12)
-        model = CausalHierarchicalMemoryLM(
+        model = CausalMemoryLM(
             vocab_size=32,
             dim=8,
             max_seq_len=12,

@@ -47,7 +47,7 @@ from train_causal_memory_lm import (  # noqa: E402
     resolve_curriculum_stage,
 )
 from build_segmented_dialogue_corpus import dialogue_has_mixed_segments, segment_message_content_exact  # noqa: E402
-from jakal_net.causal_memory_lm import CausalHierarchicalMemoryLM  # noqa: E402
+from jakal_net.causal_memory_lm import CausalMemoryLM  # noqa: E402
 
 class TrainingTests(unittest.TestCase):
     def test_segment_message_content_exact_marks_code_and_math(self) -> None:
@@ -181,7 +181,7 @@ class TrainingTests(unittest.TestCase):
         self.assertEqual(stage3, TrainingCurriculumStage("stage3", 8, False, False, False))
 
     def test_apply_training_curriculum_freezes_memory_paths(self) -> None:
-        model = CausalHierarchicalMemoryLM(vocab_size=64, dim=16, max_seq_len=16, memory_slots=(8, 4))
+        model = CausalMemoryLM(vocab_size=64, dim=16, max_seq_len=16, memory_slots=(8, 4))
 
         apply_training_curriculum(model, TrainingCurriculumStage("stage1", 1, True, True, True))
 

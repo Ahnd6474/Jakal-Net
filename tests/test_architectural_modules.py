@@ -3,9 +3,21 @@ import unittest
 import torch
 
 from jakal_net import BModule, KModule, SModule
+from jakal_net._architectural_common import signed_softmax_state
+from jakal_net.native_backend import _native_scan_signed_softmax_state
 
 
 class ArchitecturalModuleTests(unittest.TestCase):
+    def test_signed_softmax_state_matches_unsigned_softmax_without_extra_layer_norm(self) -> None:
+        state = torch.tensor([[2.0, -1.0, 0.0, -3.0]], dtype=torch.float32)
+
+        expected = torch.sign(state) * torch.softmax(state.abs(), dim=-1) * state.shape[-1]
+        actual = signed_softmax_state(state)
+        native_actual = _native_scan_signed_softmax_state(state)
+
+        self.assertTrue(torch.allclose(actual, expected, atol=1e-6, rtol=1e-6))
+        self.assertTrue(torch.allclose(native_actual, expected, atol=1e-6, rtol=1e-6))
+
     def test_s_module_encodes_sequence_layer(self) -> None:
         torch.manual_seed(0)
         s_module = SModule(
@@ -25,6 +37,10 @@ class ArchitecturalModuleTests(unittest.TestCase):
 
         self.assertEqual(layer.state.shape, (2, 6))
         self.assertEqual(layer.val.shape, (2, 6, 8))
+        self.assertAlmostEqual(
+            float(s_module.sequence_stack.blocks[0].residual_gate.detach().item()),
+            0.1,
+        )
 
     def test_b_module_scan_returns_query_and_memory(self) -> None:
         torch.manual_seed(1)

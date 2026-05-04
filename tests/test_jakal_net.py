@@ -143,12 +143,29 @@ class JakalNetModuleTests(unittest.TestCase):
             head_b.weight.copy_(torch.tensor([3.0, 4.0]))
             head_a.bias.zero_()
             head_b.bias.zero_()
-        pairwise = MultiHeadPairwise([head_a, head_b])
+        pairwise = MultiHeadPairwise([head_a, head_b], aggregate="max")
         target = torch.tensor([[[1.0, 2.0], [0.5, -1.0]]])
         source = torch.tensor([[[2.0, 1.0], [1.0, -2.0]]])
 
         scores = pairwise(target, source)
         expected = torch.maximum(head_a(target, source), head_b(target, source))
+        self.assertTrue(torch.allclose(scores, expected, atol=1e-6, rtol=1e-6))
+
+    def test_multi_head_pairwise_defaults_to_signed_smoothmax(self) -> None:
+        head_a = DiagonalBilinearPairwise(dim=2)
+        head_b = DiagonalBilinearPairwise(dim=2)
+        with torch.no_grad():
+            head_a.weight.copy_(torch.tensor([1.0, 2.0]))
+            head_b.weight.copy_(torch.tensor([3.0, 4.0]))
+            head_a.bias.zero_()
+            head_b.bias.zero_()
+        pairwise = MultiHeadPairwise([head_a, head_b])
+        target = torch.tensor([[[1.0, 2.0], [0.5, -1.0]]])
+        source = torch.tensor([[[2.0, 1.0], [1.0, -2.0]]])
+
+        head_scores = torch.stack((head_a(target, source), head_b(target, source)), dim=-1)
+        expected = (head_scores * torch.softmax(head_scores.abs(), dim=-1)).sum(dim=-1)
+        scores = pairwise(target, source)
         self.assertTrue(torch.allclose(scores, expected, atol=1e-6, rtol=1e-6))
 
     def test_multi_head_route_matches_max_of_heads(self) -> None:

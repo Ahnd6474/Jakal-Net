@@ -1,19 +1,27 @@
 from __future__ import annotations
 
+from typing import TypeVar
+
 import torch
 from torch import Tensor, nn
-from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from jakal_net._architectural_common import (
-    apply_delta,
     make_pairwise,
     signed_abs_softmax_edges,
-    signed_softmax_state,
     softsign_state,
 )
 from jakal_net.core import Layer
 from jakal_net.modules import LearnedPositionEncoding, ResidualFeedForward, StateValueFeedForward
 from jakal_net.propagation import SparsePropagation
+from jakal_net.propagation_stack import (
+    PropagationStack,
+    apply_dense_delta_fastpath,
+    apply_propagation_ffn,
+    can_use_dense_apply_fastpath,
+    make_propagation_ffn,
+)
+
+TModule = TypeVar("TModule", bound=nn.Module)
 
 
 class SModule(nn.Module):
@@ -24,19 +32,21 @@ class SModule(nn.Module):
         dim: int,
         max_seq_len: int,
         s_layers: int,
+        additional_layers: int = 0,
         pairwise_kind: str,
         pairwise_rank: int,
         pairwise_heads: int = 1,
         pairwise_frozen_heads: int = 0,
         pairwise_anchor_heads: int = 0,
         pairwise_anchor_kind: str = "scaled_cosine",
-        pairwise_head_aggregate: str = "max",
+        pairwise_head_aggregate: str = "signed_smoothmax",
         sequence_anchor: bool = True,
         implementation: str,
         s_window: int | None = None,
         s_microbatch_size: int | None = None,
         checkpoint_sequence_layers: bool = False,
         unit_norm_values: bool = False,
+        propagation_residual_gate_init: float = 0.1,
         feed_forward_layers: bool = True,
         feed_forward_hidden_mult: float = 2.0,
         feed_forward_kind: str = "value",
@@ -53,6 +63,8 @@ class SModule(nn.Module):
             raise ValueError("max_seq_len must be positive.")
         if s_layers <= 0:
             raise ValueError("s_layers must be positive.")
+        if additional_layers < 0:
+            raise ValueError("additional_layers must be non-negative.")
         if s_microbatch_size is not None and s_microbatch_size <= 0:
             raise ValueError("s_microbatch_size must be positive when provided.")
         if feed_forward_hidden_mult <= 0.0:
@@ -64,9 +76,12 @@ class SModule(nn.Module):
         self.vocab_size = vocab_size
         self.dim = dim
         self.max_seq_len = max_seq_len
+        self.s_layers = int(s_layers)
+        self.additional_layers = int(additional_layers)
         self.s_microbatch_size = s_microbatch_size
         self.checkpoint_sequence_layers = checkpoint_sequence_layers
         self.unit_norm_values = unit_norm_values
+        self.propagation_residual_gate_init = float(propagation_residual_gate_init)
         self.feed_forward_layers = bool(feed_forward_layers)
         self.feed_forward_hidden_mult = float(feed_forward_hidden_mult)
         self.feed_forward_kind = feed_forward_kind
@@ -87,15 +102,15 @@ class SModule(nn.Module):
 
         if unit_norm_values:
             self.sequence_input_norm = nn.Identity()
-            self.sequence_norms = nn.ModuleList(nn.Identity() for _ in range(s_layers))
         else:
             self.sequence_input_norm = nn.LayerNorm(dim)
-            self.sequence_norms = nn.ModuleList(nn.LayerNorm(dim) for _ in range(s_layers))
+        sequence_norm_factory = nn.Identity if unit_norm_values else lambda: nn.LayerNorm(dim)
         sequence_window = max_seq_len if s_window is None else max(1, s_window)
         sequence_nodes = max_seq_len + (1 if self.sequence_anchor else 0)
         full_window_block_size = sequence_nodes if sequence_window + 1 >= sequence_nodes else None
-        self.sequence_layers = nn.ModuleList(
-            SparsePropagation(
+        self.sequence_stack = PropagationStack(
+            depth=self.total_layers,
+            propagation_factory=lambda: SparsePropagation(
                 pairwise_fn=make_pairwise(
                     pairwise_kind,
                     dim=dim,
@@ -115,32 +130,23 @@ class SModule(nn.Module):
                 target_block_size=full_window_block_size,
                 source_block_size=full_window_block_size,
                 use_direction_only=unit_norm_values,
-            )
-            for _ in range(s_layers)
-        )
-        self.sequence_ffns = nn.ModuleList(self._make_ffn() for _ in range(s_layers))
-
-    def _make_ffn(self) -> nn.Module:
-        if not self.feed_forward_layers:
-            return nn.Identity()
-        if self.feed_forward_kind == "state_val":
-            return StateValueFeedForward(
-                self.dim,
+            ),
+            norm_factory=sequence_norm_factory,
+            ffn_factory=lambda: make_propagation_ffn(
+                dim=self.dim,
+                enabled=self.feed_forward_layers,
+                kind=self.feed_forward_kind,
                 hidden_mult=self.feed_forward_hidden_mult,
                 residual_scale=self.feed_forward_residual_scale,
                 zero_init_output=self.feed_forward_zero_init_output,
                 activation=self.feed_forward_activation,
-            )
-        return ResidualFeedForward(
-            self.dim,
-            hidden_mult=self.feed_forward_hidden_mult,
-            activation=self.feed_forward_activation,
+            ),
+            unit_norm_values=self.unit_norm_values,
+            residual_gate_init=self.propagation_residual_gate_init,
         )
 
     def _can_use_dense_apply_fastpath(self, layer: Layer, propagation: SparsePropagation) -> bool:
-        if propagation.sparse_type != "window":
-            return False
-        return int(propagation.window or 0) + 1 >= int(layer.num_nodes)
+        return can_use_dense_apply_fastpath(layer, propagation)
 
     def _apply_dense_delta_fastpath(
         self,
@@ -149,40 +155,114 @@ class SModule(nn.Module):
         delta_val: Tensor,
         norm: nn.Module,
     ) -> Layer:
-        updated_val = layer.val + delta_val
-        val = norm(updated_val)
-        touched = delta_val.detach().abs().amax(dim=-1) > 0
-        val = torch.where(touched.unsqueeze(-1), val, updated_val)
-        return layer.with_tensors(
-            state=softsign_state(layer.state + delta_state)
-            if self.unit_norm_values
-            else signed_softmax_state(layer.state + delta_state),
-            val=val,
+        return apply_dense_delta_fastpath(
+            layer,
+            delta_state,
+            delta_val,
+            norm,
+            unit_norm_values=self.unit_norm_values,
         )
 
     def _apply_ffn(self, layer: Layer, ffn: nn.Module) -> Layer:
-        if isinstance(ffn, StateValueFeedForward):
-            state, val = ffn(layer.state, layer.val)
-            if self.unit_norm_values:
-                state = softsign_state(state)
-            return layer.with_tensors(state=state, val=val)
-        val = ffn(layer.val)
-        return layer.with_tensors(val=val)
+        return apply_propagation_ffn(layer, ffn, unit_norm_values=self.unit_norm_values)
+
+    @property
+    def total_layers(self) -> int:
+        return self.s_layers + self.additional_layers
+
+    def _layer_slice(
+        self,
+        modules: tuple[TModule, ...],
+        *,
+        start: int = 0,
+        end: int | None = None,
+    ) -> tuple[TModule, ...]:
+        return modules[start:end]
+
+    @property
+    def propagation_layers(self) -> tuple[SparsePropagation, ...]:
+        return self.sequence_stack.propagations
+
+    @property
+    def propagation_norms(self) -> tuple[nn.Module, ...]:
+        return self.sequence_stack.norms
+
+    @property
+    def propagation_ffns(self) -> tuple[nn.Module, ...]:
+        return self.sequence_stack.ffns
+
+    def set_track_stats(self, enabled: bool) -> None:
+        for propagation in self.propagation_layers:
+            propagation.track_stats = bool(enabled)
+            if not enabled:
+                propagation.last_stats = None
+
+    def collect_propagation_stats(self) -> dict[str, float]:
+        stats: dict[str, float] = {}
+        for index, block in enumerate(self.sequence_stack.blocks):
+            prefix = f"layer_{index:02d}"
+            stats[f"{prefix}/residual_gate"] = float(block.residual_gate.detach().float().item())
+            if getattr(block.propagation, "last_stats", None):
+                assert block.propagation.last_stats is not None
+                for key, value in block.propagation.last_stats.items():
+                    stats[f"{prefix}/{key}"] = float(value)
+        return stats
+
+    @property
+    def sequence_layers(self) -> tuple[SparsePropagation, ...]:
+        return self._layer_slice(self.propagation_layers, end=self.s_layers)
+
+    @property
+    def sequence_norms(self) -> tuple[nn.Module, ...]:
+        return self._layer_slice(self.propagation_norms, end=self.s_layers)
+
+    @property
+    def sequence_ffns(self) -> tuple[nn.Module, ...]:
+        return self._layer_slice(self.propagation_ffns, end=self.s_layers)
+
+    def run_propagation(
+        self,
+        layer: Layer,
+        *,
+        start: int = 0,
+        end: int | None = None,
+        checkpoint_layers: bool | None = None,
+    ) -> Layer:
+        if checkpoint_layers is None:
+            checkpoint_layers = self.checkpoint_sequence_layers
+        return self.sequence_stack.forward_range(
+            layer,
+            start=start,
+            end=end,
+            checkpoint_layers=checkpoint_layers,
+        )
 
     def encode(
         self,
         input_ids: Tensor,
         *,
         state_projection: nn.Module,
+        start: int = 0,
+        end: int | None = None,
     ) -> Layer:
         if self.s_microbatch_size is None or input_ids.shape[0] <= self.s_microbatch_size:
-            return self._encode_single(input_ids, state_projection=state_projection)
+            return self._encode_single(
+                input_ids,
+                state_projection=state_projection,
+                start=start,
+                end=end,
+            )
 
         chunks: list[Layer] = []
-        for start in range(0, input_ids.shape[0], self.s_microbatch_size):
-            end = min(start + self.s_microbatch_size, input_ids.shape[0])
+        for chunk_start in range(0, input_ids.shape[0], self.s_microbatch_size):
+            chunk_end = min(chunk_start + self.s_microbatch_size, input_ids.shape[0])
             chunks.append(
-                self._encode_single(input_ids[start:end], state_projection=state_projection)
+                self._encode_single(
+                    input_ids[chunk_start:chunk_end],
+                    state_projection=state_projection,
+                    start=start,
+                    end=end,
+                )
             )
         return Layer(
             dim=self.dim,
@@ -213,6 +293,8 @@ class SModule(nn.Module):
         input_ids: Tensor,
         *,
         state_projection: nn.Module,
+        start: int = 0,
+        end: int | None = None,
     ) -> Layer:
         if input_ids.ndim != 2:
             raise ValueError("input_ids must have shape [batch, seq_len].")
@@ -255,42 +337,9 @@ class SModule(nn.Module):
             seq_state = token_state
         num_nodes = int(seq_val.shape[1])
         layer = Layer(dim=self.dim, num_nodes=num_nodes, state=seq_state, val=seq_val)
-        for layer_index, (propagation, norm) in enumerate(zip(self.sequence_layers, self.sequence_norms)):
-            if self.checkpoint_sequence_layers and torch.is_grad_enabled():
-                def _run_sequence_layer(state: Tensor, val: Tensor) -> tuple[Tensor, Tensor]:
-                    current_layer = Layer(dim=self.dim, num_nodes=num_nodes, state=state, val=val)
-                    next_layer = apply_delta(
-                        current_layer,
-                        propagation.compute_delta(current_layer),
-                        residual=True,
-                        val_norm=norm,
-                        unit_norm_values=self.unit_norm_values,
-                    )
-                    return next_layer.state, next_layer.val
-
-                next_state, next_val = torch_checkpoint(
-                    _run_sequence_layer,
-                    layer.state,
-                    layer.val,
-                    use_reentrant=False,
-                )
-                layer = Layer(dim=self.dim, num_nodes=num_nodes, state=next_state, val=next_val)
-            else:
-                delta = propagation.compute_delta(layer)
-                if self._can_use_dense_apply_fastpath(layer, propagation):
-                    layer = self._apply_dense_delta_fastpath(
-                        layer,
-                        delta.delta_state,
-                        delta.delta_val,
-                        norm,
-                    )
-                else:
-                    layer = apply_delta(
-                        layer,
-                        delta,
-                        residual=True,
-                        val_norm=norm,
-                        unit_norm_values=self.unit_norm_values,
-                    )
-            layer = self._apply_ffn(layer, self.sequence_ffns[layer_index])
-        return layer
+        return self.run_propagation(
+            layer,
+            start=start,
+            end=end,
+            checkpoint_layers=self.checkpoint_sequence_layers,
+        )
