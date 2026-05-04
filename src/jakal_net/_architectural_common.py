@@ -41,7 +41,7 @@ def _maybe_compile(fn):
         return fn
 
 
-def _unit_normalize_values_impl(val: Tensor, *, eps: float = UNIT_NORM_EPS) -> Tensor:
+def _normalize_value_directions_impl(val: Tensor, *, eps: float = UNIT_NORM_EPS) -> Tensor:
     return F.normalize(torch.nan_to_num(val), p=2.0, dim=-1, eps=eps)
 
 
@@ -53,8 +53,13 @@ def _signed_softmax_state_impl(state: Tensor) -> Tensor:
     return torch.sign(clean_state) * magnitude * state_mass
 
 
-_COMPILED_UNIT_NORMALIZE_VALUES = _maybe_compile(_unit_normalize_values_impl)
+def _softsign_state_impl(state: Tensor) -> Tensor:
+    return F.softsign(torch.nan_to_num(state))
+
+
+_COMPILED_UNIT_NORMALIZE_VALUES = _maybe_compile(_normalize_value_directions_impl)
 _COMPILED_SIGNED_SOFTMAX_STATE = _maybe_compile(_signed_softmax_state_impl)
+_COMPILED_SOFTSIGN_STATE = _maybe_compile(_softsign_state_impl)
 
 
 def _make_single_pairwise(
@@ -219,7 +224,7 @@ def make_route(
     return MultiHeadRoute(head_modules)
 
 
-def unit_normalize_values(val: Tensor, *, eps: float = UNIT_NORM_EPS) -> Tensor:
+def normalize_value_directions(val: Tensor, *, eps: float = UNIT_NORM_EPS) -> Tensor:
     return _COMPILED_UNIT_NORMALIZE_VALUES(val, eps=eps)
 
 
@@ -227,16 +232,18 @@ def layer_with_val_norm(
     layer: Layer,
     norm: nn.LayerNorm,
     *,
-    unit_norm_values: bool = False,
+    direction_only_values: bool = False,
 ) -> Layer:
     val = norm(layer.val)
-    if unit_norm_values:
-        val = unit_normalize_values(val)
     return layer.with_tensors(val=val)
 
 
 def signed_softmax_state(state: Tensor) -> Tensor:
     return _COMPILED_SIGNED_SOFTMAX_STATE(state)
+
+
+def softsign_state(state: Tensor) -> Tensor:
+    return _COMPILED_SOFTSIGN_STATE(state)
 
 
 def signed_abs_softmax_edges(scores: Tensor) -> Tensor:
@@ -254,24 +261,20 @@ def apply_delta(
     *,
     residual: bool = True,
     val_norm: nn.LayerNorm | None = None,
-    unit_norm_values: bool = False,
+    direction_only_values: bool = False,
 ) -> Layer:
     updated = layer.apply_delta(delta, merge_mode="add" if residual else "replace")
-    state = signed_softmax_state(updated.state)
-    if val_norm is None and not unit_norm_values:
+    state = softsign_state(updated.state) if direction_only_values else signed_softmax_state(updated.state)
+    if val_norm is None:
         val = updated.val
     elif residual:
         touched = delta.delta_val.detach().abs().amax(dim=-1) > 0
         normalized_val = updated.val
         if val_norm is not None:
             normalized_val = val_norm(normalized_val)
-        if unit_norm_values:
-            normalized_val = unit_normalize_values(normalized_val)
         val = torch.where(touched.unsqueeze(-1), normalized_val, updated.val)
     else:
         val = updated.val if val_norm is None else val_norm(updated.val)
-        if unit_norm_values:
-            val = unit_normalize_values(val)
     return updated.with_tensors(state=state, val=val)
 
 
@@ -291,42 +294,44 @@ def init_linear(linear: nn.Linear, *, std: float = PARAM_INIT_STD) -> None:
 
 
 def init_pairwise_or_route_scales(module: nn.Module) -> None:
+    linear_std = float(getattr(module, "_init_linear_std", PARAM_INIT_STD))
+    low_rank_scale = float(getattr(module, "_init_low_rank_scale", LOW_RANK_SCALE_INIT))
     if getattr(module, "_constant_one_anchor", False):
         return
     if isinstance(module, (LowRankBilinearPairwise, LowRankBilinearRoute)):
-        module.weight.data.fill_(LOW_RANK_SCALE_INIT)
-        init_linear(module.source_proj)
-        init_linear(module.target_proj)
+        module.weight.data.fill_(low_rank_scale)
+        init_linear(module.source_proj, std=linear_std)
+        init_linear(module.target_proj, std=linear_std)
         if getattr(module, "bias", None) is not None:
             nn.init.zeros_(module.bias)
         return
     if isinstance(module, (DiagonalBilinearPairwise, DiagonalBilinearRoute)):
-        module.weight.data.fill_(LOW_RANK_SCALE_INIT)
+        module.weight.data.fill_(low_rank_scale)
         if getattr(module, "bias", None) is not None:
             nn.init.zeros_(module.bias)
         return
     if isinstance(module, BilinearPairwise):
-        nn.init.normal_(module.weight, mean=0.0, std=PARAM_INIT_STD)
+        nn.init.normal_(module.weight, mean=0.0, std=linear_std)
         if module.bias is not None:
             nn.init.zeros_(module.bias)
         return
     if isinstance(module, BilinearPairwiseRoute):
-        init_linear(module.source_proj)
-        init_linear(module.target_proj)
-        nn.init.normal_(module.weight, mean=0.0, std=PARAM_INIT_STD)
+        init_linear(module.source_proj, std=linear_std)
+        init_linear(module.target_proj, std=linear_std)
+        nn.init.normal_(module.weight, mean=0.0, std=linear_std)
         if module.bias is not None:
             nn.init.zeros_(module.bias)
         return
     if isinstance(module, AdditiveLowRankPairwise):
-        init_linear(module.target_proj)
-        init_linear(module.source_proj)
-        init_linear(module.target_out)
-        init_linear(module.source_out)
-        nn.init.normal_(module.interaction_weight, mean=0.0, std=PARAM_INIT_STD)
+        init_linear(module.target_proj, std=linear_std)
+        init_linear(module.source_proj, std=linear_std)
+        init_linear(module.target_out, std=linear_std)
+        init_linear(module.source_out, std=linear_std)
+        nn.init.normal_(module.interaction_weight, mean=0.0, std=linear_std)
         if module.bias is not None:
             nn.init.zeros_(module.bias)
         return
     if isinstance(module, AdditiveLowRankRoute):
         for layer in module.modules():
             if isinstance(layer, nn.Linear):
-                init_linear(layer)
+                init_linear(layer, std=linear_std)

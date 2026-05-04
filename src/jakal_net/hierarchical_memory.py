@@ -15,7 +15,7 @@ from jakal_net._architectural_common import (
     make_route,
     signed_abs_softmax_edges,
     signed_softmax_state,
-    unit_normalize_values,
+    softsign_state,
 )
 from jakal_net.core import Layer, LayerDelta
 from jakal_net.propagation import Propagation, SparsePropagation
@@ -55,13 +55,13 @@ class _MemoryLevel(nn.Module):
         memory_eval_mode: str,
         eval_topk: int | None,
         implementation: str,
-        unit_norm_values: bool,
+        direction_only_values: bool,
         disable_val_norm: bool = False,
     ) -> None:
         super().__init__()
         self.dim = dim
         self.num_slots = num_slots
-        self.unit_norm_values = unit_norm_values
+        self.direction_only_values = direction_only_values
         if memory_train_mode not in {"dense", "topk"}:
             raise ValueError(f"Unsupported memory_train_mode: {memory_train_mode!r}.")
         if memory_eval_mode not in {"dense", "topk"}:
@@ -91,7 +91,7 @@ class _MemoryLevel(nn.Module):
             route_compress_name="signed_abs_softmax",
             implementation=implementation,
             merge_mode="add",
-            use_direction_only=unit_norm_values,
+            use_direction_only=direction_only_values,
         )
         self.propagation = SparsePropagation(
             pairwise_fn=make_pairwise(
@@ -109,7 +109,7 @@ class _MemoryLevel(nn.Module):
             state_weight_edges=False,
             implementation=implementation,
             residual=True,
-            use_direction_only=unit_norm_values,
+            use_direction_only=direction_only_values,
         )
         self.val_norm = nn.Identity() if disable_val_norm else nn.LayerNorm(dim)
 
@@ -145,12 +145,10 @@ class _MemoryLevel(nn.Module):
         state = self.init_state.unsqueeze(0).expand(batch_size, -1).to(device=device, dtype=dtype)
         val = self.init_val.unsqueeze(0).expand(batch_size, -1, -1).to(device=device, dtype=dtype)
         val = self.val_norm(val.clone())
-        if self.unit_norm_values:
-            val = unit_normalize_values(val)
         return Layer(
             dim=self.dim,
             num_nodes=self.num_slots,
-            state=signed_softmax_state(state.clone()),
+            state=softsign_state(state.clone()) if self.direction_only_values else signed_softmax_state(state.clone()),
             val=val,
         )
 
@@ -179,8 +177,9 @@ class BModule(nn.Module):
         pairwise_anchor_kind: str = "scaled_cosine",
         route_anchor_kind: str = "fixed_projection",
         implementation: str,
-        unit_norm_values: bool = False,
+        direction_only_values: bool = False,
         feed_forward_layers: bool = True,
+        memory_propagation_layers: bool = True,
         feed_forward_hidden_mult: float = 2.0,
     ) -> None:
         super().__init__()
@@ -205,9 +204,10 @@ class BModule(nn.Module):
         self.memory_slots = tuple(int(slots) for slots in memory_slots)
         self.memory_update_intervals = tuple(int(interval) for interval in memory_update_intervals)
         self.num_memory_levels = len(self.memory_slots)
-        self.unit_norm_values = unit_norm_values
+        self.direction_only_values = direction_only_values
         self.implementation = implementation
         self.feed_forward_layers = bool(feed_forward_layers)
+        self.memory_propagation_layers = bool(memory_propagation_layers)
         self.feed_forward_hidden_mult = float(feed_forward_hidden_mult)
 
         self.memory_levels = nn.ModuleList(
@@ -231,8 +231,8 @@ class BModule(nn.Module):
                 memory_eval_mode=memory_eval_mode,
                 eval_topk=eval_topk,
                 implementation=implementation,
-                unit_norm_values=unit_norm_values,
-                disable_val_norm=unit_norm_values,
+                direction_only_values=direction_only_values,
+                disable_val_norm=direction_only_values,
             )
             for slots in self.memory_slots
         )
@@ -252,11 +252,11 @@ class BModule(nn.Module):
                 route_compress_name="signed_abs_softmax",
                 implementation=implementation,
                 merge_mode="add",
-                use_direction_only=unit_norm_values,
+                use_direction_only=direction_only_values,
             )
             for index in range(len(self.memory_slots) - 1)
         )
-        if unit_norm_values:
+        if direction_only_values:
             self.level_norms = nn.ModuleList(nn.Identity() for _ in self.memory_slots)
         else:
             self.level_norms = nn.ModuleList(nn.LayerNorm(dim) for _ in self.memory_slots)
@@ -287,7 +287,7 @@ class BModule(nn.Module):
                 route_compress_name="signed_abs_softmax",
                 implementation=implementation,
                 merge_mode="add",
-                use_direction_only=unit_norm_values,
+                use_direction_only=direction_only_values,
             )
             self.skip_gates["token_to_1"] = nn.Parameter(torch.tensor(-1.5))
         for level_index in range(2, len(self.memory_slots)):
@@ -307,7 +307,7 @@ class BModule(nn.Module):
                 route_compress_name="signed_abs_softmax",
                 implementation=implementation,
                 merge_mode="add",
-                use_direction_only=unit_norm_values,
+                use_direction_only=direction_only_values,
             )
             self.skip_gates[key] = nn.Parameter(torch.tensor(-1.5))
 
@@ -315,7 +315,7 @@ class BModule(nn.Module):
         nn.init.normal_(self.read_template_val, mean=0.0, std=0.02)
         self.read_projections = nn.ModuleList(nn.Linear(dim, dim, bias=False) for _ in self.memory_slots)
         self.read_gates = nn.ParameterList(nn.Parameter(torch.zeros(())) for _ in self.memory_slots)
-        self.bridge_input_norm = nn.Identity() if unit_norm_values else nn.LayerNorm(dim)
+        self.bridge_input_norm = nn.Identity() if direction_only_values else nn.LayerNorm(dim)
         self.bridge_to_levels = nn.ModuleList(
             SparseTransition(
                 route_fn=make_route(
@@ -332,15 +332,13 @@ class BModule(nn.Module):
                 route_compress_name="signed_abs_softmax",
                 implementation=implementation,
                 merge_mode="add",
-                use_direction_only=unit_norm_values,
+                use_direction_only=direction_only_values,
             )
             for slots in self.memory_slots
         )
 
     def _apply_level_ffn(self, level_index: int, layer: Layer) -> Layer:
         val = self.level_ffns[level_index](layer.val)
-        if self.unit_norm_values:
-            val = unit_normalize_values(val)
         return layer.with_tensors(val=val)
 
     def initialize_state(
@@ -357,10 +355,8 @@ class BModule(nn.Module):
 
     def constrain_layer(self, level_index: int, layer: Layer) -> Layer:
         level_module = self.memory_levels[level_index]
-        state = signed_softmax_state(layer.state)
+        state = softsign_state(layer.state) if self.direction_only_values else signed_softmax_state(layer.state)
         val = level_module.val_norm(layer.val)
-        if self.unit_norm_values:
-            val = unit_normalize_values(val)
         return layer.with_tensors(state=state, val=val)
 
     def constrain_memory_state(self, memory_state: Sequence[Layer]) -> tuple[Layer, ...]:
@@ -370,12 +366,7 @@ class BModule(nn.Module):
         )
 
     def unit_normalize_memory_values(self, memory_state: Sequence[Layer]) -> tuple[Layer, ...]:
-        if not self.unit_norm_values:
-            return tuple(memory_state)
-        return tuple(
-            layer.with_tensors(val=unit_normalize_values(layer.val))
-            for layer in memory_state
-        )
+        return tuple(memory_state)
 
     def reset_state(
         self,
@@ -414,17 +405,18 @@ class BModule(nn.Module):
             first_level_module.write.compute_delta(token_layer, level),
             residual=True,
             val_norm=first_level_module.val_norm,
-            unit_norm_values=self.unit_norm_values,
+            direction_only_values=self.direction_only_values,
         )
         level = self._apply_level_ffn(0, level)
-        level = apply_delta(
-            level,
-            first_level_module.compute_propagation_delta(level),
-            residual=True,
-            val_norm=first_level_module.val_norm,
-            unit_norm_values=self.unit_norm_values,
-        )
-        level = self._apply_level_ffn(0, level)
+        if self.memory_propagation_layers:
+            level = apply_delta(
+                level,
+                first_level_module.compute_propagation_delta(level),
+                residual=True,
+                val_norm=first_level_module.val_norm,
+                direction_only_values=self.direction_only_values,
+            )
+            level = self._apply_level_ffn(0, level)
         next_levels.append(level)
 
         for level_index in range(1, self.num_memory_levels):
@@ -442,7 +434,7 @@ class BModule(nn.Module):
                 ),
                 residual=True,
                 val_norm=level_module.val_norm,
-                unit_norm_values=self.unit_norm_values,
+                direction_only_values=self.direction_only_values,
             )
             level = self._apply_level_ffn(level_index, level)
             if level_index == 1 and "token_to_1" in self.skip_transitions:
@@ -459,7 +451,7 @@ class BModule(nn.Module):
                     ),
                     residual=True,
                     val_norm=level_module.val_norm,
-                    unit_norm_values=self.unit_norm_values,
+                    direction_only_values=self.direction_only_values,
                 )
                 level = self._apply_level_ffn(level_index, level)
             key = f"{level_index - 2}_to_{level_index}"
@@ -477,17 +469,18 @@ class BModule(nn.Module):
                     ),
                     residual=True,
                     val_norm=level_module.val_norm,
-                    unit_norm_values=self.unit_norm_values,
+                    direction_only_values=self.direction_only_values,
                 )
                 level = self._apply_level_ffn(level_index, level)
-            level = apply_delta(
-                level,
-                level_module.compute_propagation_delta(level),
-                residual=True,
-                val_norm=level_module.val_norm,
-                unit_norm_values=self.unit_norm_values,
-            )
-            level = self._apply_level_ffn(level_index, level)
+            if self.memory_propagation_layers:
+                level = apply_delta(
+                    level,
+                    level_module.compute_propagation_delta(level),
+                    residual=True,
+                    val_norm=level_module.val_norm,
+                    direction_only_values=self.direction_only_values,
+                )
+                level = self._apply_level_ffn(level_index, level)
             next_levels.append(level)
         return tuple(next_levels)
 
@@ -556,9 +549,9 @@ class BModule(nn.Module):
         summary = self.read(memory_state) if bridge_val is None else bridge_val
         bridge_val_tensor = self.bridge_input_norm(summary).unsqueeze(-2)
         bridge_state_source = bridge_val_tensor
-        if self.unit_norm_values:
-            bridge_val_tensor = unit_normalize_values(bridge_val_tensor)
         bridge_state = state_projection(bridge_state_source).squeeze(-1)
+        if self.direction_only_values:
+            bridge_state = softsign_state(bridge_state)
         return Layer(dim=self.dim, num_nodes=1, state=bridge_state, val=bridge_val_tensor)
 
     def inject_bridge(
@@ -581,7 +574,7 @@ class BModule(nn.Module):
                         delta,
                         residual=True,
                         val_norm=level_module.val_norm,
-                        unit_norm_values=self.unit_norm_values,
+                        direction_only_values=self.direction_only_values,
                     ),
                 )
             )
@@ -610,10 +603,13 @@ class BModule(nn.Module):
 
         for time_index in range(seq_len):
             token_val = aligned_s.narrow(1, time_index, 1).contiguous()
+            token_state = state_projection(token_val).squeeze(-1)
+            if self.direction_only_values:
+                token_state = softsign_state(token_state)
             token_layer = Layer(
                 dim=self.dim,
                 num_nodes=1,
-                state=state_projection(token_val).squeeze(-1),
+                state=token_state,
                 val=token_val,
             )
             current_memory = self.update(token_layer, current_memory, time_index=time_index)
@@ -646,11 +642,11 @@ class BModule(nn.Module):
             read_vector = self.read(current_memory)
             query_step = query_input_norm(projected_s[:, time_index, :] + read_vector)
             query_state_source[:, time_index, :] = query_step
-            if self.unit_norm_values:
-                query_step = unit_normalize_values(query_step)
             query_val[:, time_index, :] = query_step
 
         query_state = state_projection(query_state_source).squeeze(-1)
+        if self.direction_only_values:
+            query_state = softsign_state(query_state)
         return BScanOutput(
             query_layer=Layer(dim=self.dim, num_nodes=seq_len, state=query_state, val=query_val),
             memory_state=current_memory,

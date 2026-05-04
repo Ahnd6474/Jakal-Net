@@ -93,6 +93,36 @@ bool experimental_cuda_scan_fastpath_enabled() {
   return false;
 }
 
+bool experimental_scalar_dense_cuda_enabled() {
+  if (const char* raw = std::getenv("JAKAL_NET_ENABLE_SCALAR_DENSE_CUDA")) {
+    return std::string(raw) == "1" || std::string(raw) == "true" ||
+           std::string(raw) == "TRUE" || std::string(raw) == "yes";
+  }
+  return false;
+}
+
+bool experimental_tf32_score_tile_cuda_enabled() {
+  if (const char* raw = std::getenv("JAKAL_NET_ENABLE_TF32_SCORE_TILE_CUDA")) {
+    return std::string(raw) == "1" || std::string(raw) == "true" ||
+           std::string(raw) == "TRUE" || std::string(raw) == "yes";
+  }
+  return false;
+}
+
+bool experimental_tf32_propagation_fused_cuda_enabled() {
+  if (const char* raw = std::getenv("JAKAL_NET_ENABLE_TF32_PROP_FUSED_CUDA")) {
+    return std::string(raw) == "1" || std::string(raw) == "true" ||
+           std::string(raw) == "TRUE" || std::string(raw) == "yes";
+  }
+  return false;
+}
+
+bool can_use_full_dense_logits(
+    const torch::Tensor& reference,
+    int64_t batch_flat,
+    int64_t left_nodes,
+    int64_t right_nodes);
+
 std::tuple<torch::Tensor, torch::Tensor> merge_topk_scores_indices(
     const torch::Tensor& best_scores,
     const torch::Tensor& best_indices,
@@ -183,6 +213,59 @@ low_rank_propagation_topk_forward_cuda_wrapper(
 }
 
 std::tuple<torch::Tensor, torch::Tensor>
+low_rank_propagation_dense_forward_cuda_wrapper(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    int64_t compress_kind) {
+#ifdef WITH_CUDA
+  return jakal_net_low_rank_propagation_dense_forward_cuda(
+      weighted_projected_source,
+      projected_target,
+      projected_state,
+      projected_val,
+      compress_kind);
+#else
+  throw std::runtime_error(
+      "low_rank_propagation_dense_forward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+torch::Tensor low_rank_dense_scores_tf32_cuda_wrapper(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_target) {
+#ifdef WITH_CUDA
+  return jakal_net_low_rank_dense_scores_tf32_cuda(
+      weighted_projected_source,
+      projected_target);
+#else
+  throw std::runtime_error(
+      "low_rank_dense_scores_tf32_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor>
+low_rank_propagation_dense_tf32_forward_cuda_wrapper(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    double score_bias) {
+#ifdef WITH_CUDA
+  return jakal_net_low_rank_propagation_dense_tf32_forward_cuda(
+      weighted_projected_source,
+      projected_target,
+      projected_state,
+      projected_val,
+      score_bias);
+#else
+  throw std::runtime_error(
+      "low_rank_propagation_dense_tf32_forward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor>
 low_rank_propagation_window_forward_cuda_wrapper(
     const torch::Tensor& weighted_projected_source,
     const torch::Tensor& projected_target,
@@ -201,6 +284,48 @@ low_rank_propagation_window_forward_cuda_wrapper(
 #else
   throw std::runtime_error(
       "low_rank_propagation_window_forward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor>
+low_rank_propagation_window_signed_abs_forward_cuda_wrapper(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    int64_t window,
+    double score_bias) {
+#ifdef WITH_CUDA
+  return jakal_net_low_rank_propagation_window_signed_abs_forward_cuda(
+      weighted_projected_source,
+      projected_target,
+      projected_state,
+      projected_val,
+      window,
+      score_bias);
+#else
+  throw std::runtime_error(
+      "low_rank_propagation_window_signed_abs_forward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor>
+low_rank_propagation_causal_dense_signed_abs_forward_cuda_wrapper(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    double score_bias) {
+#ifdef WITH_CUDA
+  return jakal_net_low_rank_propagation_causal_dense_signed_abs_forward_cuda(
+      weighted_projected_source,
+      projected_target,
+      projected_state,
+      projected_val,
+      score_bias);
+#else
+  throw std::runtime_error(
+      "low_rank_propagation_causal_dense_signed_abs_forward_cuda requires a CUDA-enabled build.");
 #endif
 }
 
@@ -226,6 +351,50 @@ low_rank_propagation_window_entmax15_forward_cuda_wrapper(
 #endif
 }
 
+std::tuple<torch::Tensor, torch::Tensor>
+diagonal_propagation_causal_dense_signed_abs_forward_cuda_wrapper(
+    const torch::Tensor& layer_val,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    const torch::Tensor& normalized_weight,
+    const torch::Tensor& bias) {
+#ifdef WITH_CUDA
+  return jakal_net_diagonal_propagation_causal_dense_signed_abs_forward_cuda(
+      layer_val,
+      projected_state,
+      projected_val,
+      normalized_weight,
+      bias);
+#else
+  throw std::runtime_error(
+      "diagonal_propagation_causal_dense_signed_abs_forward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+diagonal_propagation_causal_dense_signed_abs_backward_cuda_wrapper(
+    const torch::Tensor& layer_val,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    const torch::Tensor& normalized_weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& grad_delta_state,
+    const torch::Tensor& grad_delta_val) {
+#ifdef WITH_CUDA
+  return jakal_net_diagonal_propagation_causal_dense_signed_abs_backward_cuda(
+      layer_val,
+      projected_state,
+      projected_val,
+      normalized_weight,
+      bias,
+      grad_delta_state,
+      grad_delta_val);
+#else
+  throw std::runtime_error(
+      "diagonal_propagation_causal_dense_signed_abs_backward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
 torch::Tensor softsign_backward_cuda_wrapper(
     const torch::Tensor& scores,
     const torch::Tensor& grad_edges) {
@@ -243,6 +412,20 @@ torch::Tensor softmax_backward_cuda_wrapper(
   return jakal_net_softmax_backward_cuda(routes, grad_routes);
 #else
   throw std::runtime_error("softmax_backward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor> nomemory_exact_scores_backward_cuda_wrapper(
+    const torch::Tensor& scores,
+    const torch::Tensor& edges,
+    const torch::Tensor& grad_pre_norm,
+    const torch::Tensor& val,
+    int64_t compress_kind) {
+#ifdef WITH_CUDA
+  return jakal_net_nomemory_exact_scores_backward_cuda(
+      scores, edges, grad_pre_norm, val, compress_kind);
+#else
+  throw std::runtime_error("nomemory_exact_scores_backward_cuda requires a CUDA-enabled build.");
 #endif
 }
 
@@ -290,6 +473,60 @@ low_rank_pairwise_topk_backward_cuda_wrapper(
 #else
   throw std::runtime_error(
       "low_rank_pairwise_topk_backward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+nomemory_low_rank_pairwise_backward_cuda_wrapper(
+    const torch::Tensor& layer_val,
+    const torch::Tensor& source_weight,
+    const torch::Tensor& target_weight,
+    const torch::Tensor& core_weight,
+    const torch::Tensor& projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& grad_scores) {
+#ifdef WITH_CUDA
+  return jakal_net_nomemory_low_rank_pairwise_backward_cuda(
+      layer_val,
+      source_weight,
+      target_weight,
+      core_weight,
+      projected_source,
+      projected_target,
+      grad_scores);
+#else
+  throw std::runtime_error(
+      "nomemory_low_rank_pairwise_backward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+nomemory_low_rank_exact_val_layer_backward_cuda_wrapper(
+    const torch::Tensor& layer_val,
+    const torch::Tensor& source_weight,
+    const torch::Tensor& target_weight,
+    const torch::Tensor& core_weight,
+    const torch::Tensor& scores,
+    const torch::Tensor& edges,
+    const torch::Tensor& norm_weight,
+    const torch::Tensor& norm_bias,
+    const torch::Tensor& grad_output,
+    int64_t compress_kind) {
+#ifdef WITH_CUDA
+  return jakal_net_nomemory_low_rank_exact_val_layer_backward_cuda(
+      layer_val,
+      source_weight,
+      target_weight,
+      core_weight,
+      scores,
+      edges,
+      norm_weight,
+      norm_bias,
+      grad_output,
+      compress_kind);
+#else
+  throw std::runtime_error(
+      "nomemory_low_rank_exact_val_layer_backward_cuda requires a CUDA-enabled build.");
 #endif
 }
 
@@ -504,8 +741,8 @@ torch::Tensor pairwise_scores(
       core_shape[projected_source.dim() - 1] = cast_core.size(1);
       auto weighted_source = projected_source * cast_core.view(core_shape);
       auto scores = torch::einsum(
-          "bhir,bhkr->bhik",
-          std::vector<torch::Tensor>{weighted_source, projected_target});
+          "bhkr,bhir->bhki",
+          std::vector<torch::Tensor>{projected_target, weighted_source});
       if (bias.has_value()) {
         std::vector<int64_t> bias_shape(scores.dim(), 1);
         bias_shape[scores.dim() - 3] = bias.value().size(0);
@@ -666,8 +903,8 @@ torch::Tensor pairwise_route_block_logits(
       core_shape[projected_source.dim() - 1] = cast_core.size(1);
       auto weighted_source = projected_source * cast_core.view(core_shape);
       auto scores = torch::einsum(
-          "bhir,bhkr->bhik",
-          std::vector<torch::Tensor>{weighted_source, projected_target});
+          "bhkr,bhir->bhki",
+          std::vector<torch::Tensor>{projected_target, weighted_source});
       if (bias.has_value()) {
         std::vector<int64_t> bias_shape(scores.dim(), 1);
         bias_shape[scores.dim() - 3] = bias.value().size(0);
@@ -884,6 +1121,10 @@ torch::Tensor signed_softmax_state(const torch::Tensor& state) {
   return torch::sign(clean_state) * magnitude * state_mass;
 }
 
+torch::Tensor softsign_state(const torch::Tensor& state) {
+  return softsign(torch::nan_to_num(state));
+}
+
 torch::Tensor signed_abs_softmax_scores(const torch::Tensor& scores) {
   auto clean_scores = torch::nan_to_num(scores);
   return torch::nan_to_num(torch::sign(clean_scores) * torch::softmax(clean_scores.abs(), -1));
@@ -1008,10 +1249,50 @@ NativeLayerState apply_delta_to_layer(
     const torch::Tensor& delta_state,
     const torch::Tensor& delta_val,
     const torch::Tensor& val_norm_weight,
-    const torch::Tensor& val_norm_bias) {
-  auto updated_state = signed_softmax_state(layer.state + delta_state);
+    const torch::Tensor& val_norm_bias,
+    const std::string& state_activation_name = "signed_softmax") {
+  torch::Tensor updated_state;
+  if (state_activation_name == "signed_softmax") {
+    updated_state = signed_softmax_state(layer.state + delta_state);
+  } else if (state_activation_name == "softsign") {
+    updated_state = softsign_state(layer.state + delta_state);
+  } else {
+    throw std::runtime_error("Unsupported state_activation_name: " + state_activation_name);
+  }
   auto updated_val = layer_norm_last_dim(layer.val + delta_val, val_norm_weight, val_norm_bias);
   return {updated_state, updated_val};
+}
+
+std::tuple<torch::Tensor, torch::Tensor> apply_delta_to_layer_public(
+    const torch::Tensor& layer_state,
+    const torch::Tensor& layer_val,
+    const torch::Tensor& delta_state,
+    const torch::Tensor& delta_val,
+    const torch::Tensor& val_norm_weight,
+    const torch::Tensor& val_norm_bias,
+    const std::string& state_activation_name,
+    bool use_fused_forward) {
+#ifdef WITH_CUDA
+  if (layer_state.is_cuda() || layer_val.is_cuda() || delta_state.is_cuda() || delta_val.is_cuda()) {
+    return jakal_net_apply_delta_to_layer_cuda(
+        layer_state,
+        layer_val,
+        delta_state,
+        delta_val,
+        val_norm_weight,
+        val_norm_bias,
+        state_activation_name,
+        use_fused_forward);
+  }
+#endif
+  auto updated = apply_delta_to_layer(
+      {layer_state, layer_val},
+      delta_state,
+      delta_val,
+      val_norm_weight,
+      val_norm_bias,
+      state_activation_name);
+  return {updated.state, updated.val};
 }
 
 torch::Tensor full_topk_indices(const torch::Tensor& scores) {
@@ -1259,6 +1540,81 @@ std::tuple<torch::Tensor, torch::Tensor> low_rank_propagation_topk_signed_abs(
   const auto nodes = layer_val.size(1);
   const auto k = topk <= 0 ? nodes : std::min<int64_t>(std::max<int64_t>(1, topk), nodes);
 
+#ifdef WITH_CUDA
+  if (layer_val.is_cuda() &&
+      layer_state.is_cuda() &&
+      !diagonal &&
+      topk <= 0 &&
+      compress_name == "signed_abs_softmax" &&
+      !c10::GradMode::is_enabled() &&
+      experimental_cuda_scan_fastpath_enabled() &&
+      experimental_scalar_dense_cuda_enabled() &&
+      jakal_net_low_rank_propagation_dense_forward_cuda_available()) {
+    torch::Tensor weighted_projected_source;
+    torch::Tensor projected_target;
+    if (multihead) {
+      auto projected_source = torch::einsum(
+          "bid,hrd->bhir",
+          std::vector<torch::Tensor>{layer_val, cast_source_weight}).contiguous();
+      std::vector<int64_t> core_shape(projected_source.dim(), 1);
+      core_shape[1] = cast_core_weight.size(0);
+      core_shape[3] = cast_core_weight.size(1);
+      weighted_projected_source =
+          (projected_source * cast_core_weight.view(core_shape)).contiguous();
+      projected_target = torch::einsum(
+          "bid,hrd->bhir",
+          std::vector<torch::Tensor>{layer_val, cast_target_weight}).contiguous();
+      if (cast_bias.has_value() && cast_bias.value().numel() != 0) {
+        auto bias_column = cast_bias.value()
+                               .to(weighted_projected_source.scalar_type())
+                               .reshape({1, cast_bias.value().numel(), 1, 1})
+                               .expand({weighted_projected_source.size(0),
+                                        weighted_projected_source.size(1),
+                                        weighted_projected_source.size(2),
+                                        1});
+        auto target_ones = torch::ones(
+            {projected_target.size(0), projected_target.size(1), projected_target.size(2), 1},
+            projected_target.options());
+        weighted_projected_source =
+            torch::cat({weighted_projected_source, bias_column}, -1).contiguous();
+        projected_target = torch::cat({projected_target, target_ones}, -1).contiguous();
+      }
+    } else {
+      projected_target =
+          torch::matmul(layer_val, cast_target_weight.transpose(0, 1)).contiguous();
+      auto projected_source =
+          torch::matmul(layer_val, cast_source_weight.transpose(0, 1)).contiguous();
+      weighted_projected_source =
+          (projected_source *
+           cast_core_weight.view({1, 1, -1}).to(projected_source.scalar_type())).contiguous();
+      if (cast_bias.has_value() && cast_bias.value().numel() != 0) {
+        auto bias_column = cast_bias.value()
+                               .to(weighted_projected_source.scalar_type())
+                               .reshape({1, 1, 1})
+                               .expand({weighted_projected_source.size(0),
+                                        weighted_projected_source.size(1),
+                                        1});
+        auto target_ones = torch::ones(
+            {projected_target.size(0), projected_target.size(1), 1},
+            projected_target.options());
+        weighted_projected_source =
+            torch::cat({weighted_projected_source, bias_column}, -1).contiguous();
+        projected_target = torch::cat({projected_target, target_ones}, -1).contiguous();
+      }
+    }
+    auto fused = low_rank_propagation_dense_forward_cuda_wrapper(
+        weighted_projected_source,
+        projected_target,
+        layer_state.to(torch::kFloat32).contiguous(),
+        layer_val.to(torch::kFloat32).contiguous(),
+        true);
+    return {
+        std::get<0>(fused).to(layer_state.scalar_type()),
+        std::get<1>(fused).to(layer_val.scalar_type()),
+    };
+  }
+#endif
+
   if (topk <= 0 &&
       (compress_name == "signed_abs_softmax" ||
        compress_name == "softmax" ||
@@ -1321,6 +1677,118 @@ std::tuple<torch::Tensor, torch::Tensor> low_rank_propagation_topk_signed_abs(
       }
       return scores;
     };
+    const bool single_effective_head =
+        !multihead || (precomputed_target.defined() && precomputed_target.dim() == 4 &&
+                       precomputed_target.size(1) == 1);
+    if (precompute_low_rank &&
+        single_effective_head &&
+        can_use_full_dense_logits(layer_val, layer_val.size(0), nodes, nodes)) {
+      auto full_target = multihead ? precomputed_target.select(1, 0).contiguous()
+                                   : precomputed_target;
+      auto full_weighted_source =
+          multihead ? precomputed_weighted_source.select(1, 0).contiguous()
+                    : precomputed_weighted_source;
+      if (experimental_tf32_propagation_fused_cuda_enabled() &&
+          compress_name == "signed_abs_softmax" &&
+          full_target.is_cuda() &&
+          full_weighted_source.is_cuda() &&
+          layer_state.is_cuda() &&
+          layer_val.is_cuda() &&
+          full_target.size(1) % 16 == 0 &&
+          full_weighted_source.size(1) % 16 == 0 &&
+          full_target.size(2) % 8 == 0 &&
+          jakal_net_low_rank_propagation_dense_tf32_forward_cuda_available()) {
+        double score_bias = 0.0;
+        if (cast_bias.has_value() && cast_bias.value().numel() != 0) {
+          auto full_bias = cast_bias.value().numel() == 1
+              ? cast_bias.value()
+              : cast_bias.value().select(0, 0);
+          score_bias = full_bias.item<double>();
+        }
+        auto fused = low_rank_propagation_dense_tf32_forward_cuda_wrapper(
+            full_weighted_source.to(torch::kFloat32).contiguous(),
+            full_target.to(torch::kFloat32).contiguous(),
+            layer_state.to(torch::kFloat32).contiguous(),
+            layer_val.to(torch::kFloat32).contiguous(),
+            score_bias);
+        return {
+            std::get<0>(fused).to(layer_state.scalar_type()),
+            std::get<1>(fused).to(layer_val.scalar_type()),
+        };
+      }
+      if (experimental_tf32_score_tile_cuda_enabled() &&
+          full_target.is_cuda() &&
+          full_weighted_source.is_cuda() &&
+          full_target.size(1) % 16 == 0 &&
+          full_weighted_source.size(1) % 16 == 0 &&
+          full_target.size(2) % 8 == 0 &&
+          jakal_net_low_rank_dense_scores_tf32_cuda_available()) {
+        auto scores = low_rank_dense_scores_tf32_cuda_wrapper(
+            full_weighted_source.to(torch::kFloat32).contiguous(),
+            full_target.to(torch::kFloat32).contiguous());
+        if (cast_bias.has_value() && cast_bias.value().numel() != 0) {
+          auto full_bias = cast_bias.value().numel() == 1
+              ? cast_bias.value()
+              : cast_bias.value().select(0, 0);
+          scores = scores + full_bias.to(scores.scalar_type());
+        }
+        torch::Tensor edges;
+        if (compress_name == "softsign") {
+          edges = compress_scores(compress_name, scores);
+        } else {
+          auto clean_scores = torch::nan_to_num(scores).to(torch::kFloat32);
+          auto stats = compress_name == "signed_abs_softmax" ? clean_scores.abs() : clean_scores;
+          edges = torch::softmax(stats, -1);
+          if (compress_name == "signed_abs_softmax") {
+            edges = edges * torch::sign(clean_scores);
+          }
+        }
+        const auto state_acc_dtype = dense_scan_accumulator_dtype(layer_state.scalar_type());
+        const auto val_acc_dtype = dense_scan_accumulator_dtype(layer_val.scalar_type());
+        auto delta_state = torch::bmm(
+            edges.to(state_acc_dtype),
+            layer_state.to(state_acc_dtype).unsqueeze(-1)).squeeze(-1);
+        auto delta_val = torch::bmm(
+            edges.to(val_acc_dtype),
+            layer_val.to(val_acc_dtype));
+        return {
+            delta_state.to(layer_state.scalar_type()),
+            delta_val.to(layer_val.scalar_type()),
+        };
+      }
+      auto scores = torch::bmm(
+          full_target,
+          full_weighted_source.transpose(1, 2));
+      if (cast_bias.has_value() && cast_bias.value().numel() != 0) {
+        auto full_bias = cast_bias.value().numel() == 1
+            ? cast_bias.value()
+            : cast_bias.value().select(0, 0);
+        scores = scores + full_bias.to(scores.scalar_type());
+      }
+      torch::Tensor edges;
+      if (compress_name == "softsign") {
+        edges = compress_scores(compress_name, scores);
+      } else {
+        auto clean_scores = torch::nan_to_num(scores).to(torch::kFloat32);
+        auto stats = compress_name == "signed_abs_softmax" ? clean_scores.abs() : clean_scores;
+        edges = torch::softmax(stats, -1);
+        if (compress_name == "signed_abs_softmax") {
+          edges = edges * torch::sign(clean_scores);
+        }
+      }
+      const auto state_acc_dtype = dense_scan_accumulator_dtype(layer_state.scalar_type());
+      const auto val_acc_dtype = dense_scan_accumulator_dtype(layer_val.scalar_type());
+      auto delta_state = torch::bmm(
+          edges.to(state_acc_dtype),
+          layer_state.to(state_acc_dtype).unsqueeze(-1)).squeeze(-1);
+      auto delta_val = torch::bmm(
+          edges.to(val_acc_dtype),
+          layer_val.to(val_acc_dtype));
+      return {
+          delta_state.to(layer_state.scalar_type()),
+          delta_val.to(layer_val.scalar_type()),
+      };
+    }
     const auto state_acc_dtype = dense_scan_accumulator_dtype(layer_state.scalar_type());
     const auto val_acc_dtype = dense_scan_accumulator_dtype(layer_val.scalar_type());
     auto delta_state = torch::zeros(
@@ -1565,6 +2033,2259 @@ void require_int_vector_size(
         name + " has unexpected length: got " + std::to_string(values.size()) +
         ", expected " + std::to_string(expected) + ".");
   }
+}
+
+std::string nomemory_compress_name_from_kind(int64_t compress_kind) {
+  if (compress_kind == 0) {
+    return "softsign";
+  }
+  if (compress_kind == 1) {
+    return "signed_abs_softmax";
+  }
+  throw std::runtime_error("Unsupported nomemory compress kind: " + std::to_string(compress_kind));
+}
+
+torch::Tensor nomemory_causal_window_mask(
+    int64_t target_nodes,
+    int64_t source_nodes,
+    int64_t window,
+    const torch::Tensor& reference) {
+  auto long_options = reference.options().dtype(torch::kLong);
+  auto target_index = torch::arange(target_nodes, long_options).view({target_nodes, 1});
+  auto source_index = torch::arange(source_nodes, long_options).view({1, source_nodes});
+  auto mask = source_index <= target_index;
+  if (window >= 0 && window + 1 < source_nodes) {
+    mask = mask.logical_and(source_index >= (target_index - window));
+  }
+  return mask.unsqueeze(0);
+}
+
+torch::Tensor nomemory_compress_scores(
+    const torch::Tensor& scores,
+    const torch::Tensor& mask,
+    int64_t compress_kind) {
+  auto clean_scores = torch::nan_to_num(scores);
+  auto bool_mask = mask.to(torch::kBool);
+  if (compress_kind == 0) {
+    auto edges = softsign(clean_scores);
+    return edges * bool_mask.to(edges.scalar_type());
+  }
+  if (compress_kind == 1) {
+    auto masked_stats = clean_scores.abs().masked_fill(~bool_mask, -1e4);
+    auto probs = torch::softmax(masked_stats, -1);
+    auto edges = torch::sign(clean_scores) * probs;
+    return edges * bool_mask.to(edges.scalar_type());
+  }
+  throw std::runtime_error("Unsupported nomemory compress kind: " + std::to_string(compress_kind));
+}
+
+std::string nomemory_pairwise_kind_from_weights(
+    const torch::Tensor& source_weight,
+    const torch::Tensor& target_weight,
+    const torch::Tensor& core_weight) {
+  if (source_weight.dim() == 3 && target_weight.dim() == 3 && core_weight.dim() == 2) {
+    return "multihead_max_low_rank_bilinear";
+  }
+  if (source_weight.dim() == 2 && target_weight.dim() == 2 && core_weight.dim() == 1) {
+    return "low_rank_bilinear";
+  }
+  throw std::runtime_error("Unsupported nomemory pairwise weight ranks.");
+}
+
+torch::Tensor nomemory_exact_dense_scores(
+    const torch::Tensor& layer_val,
+    const torch::Tensor& source_weight,
+    const torch::Tensor& target_weight,
+    const torch::Tensor& core_weight,
+    const torch::Tensor& bias,
+    const std::string& pairwise_kind) {
+  const auto acc_dtype = torch::kFloat32;
+  if (pairwise_kind == "multihead_max_low_rank_bilinear") {
+    auto projected_target = torch::einsum(
+        "bnd,hrd->bhnr",
+        std::vector<torch::Tensor>{layer_val, target_weight}).contiguous();
+    auto projected_source = torch::einsum(
+        "bnd,hrd->bhnr",
+        std::vector<torch::Tensor>{layer_val, source_weight});
+    auto weighted_projected_source =
+        (projected_source * core_weight.view({1, core_weight.size(0), 1, core_weight.size(1)})).contiguous();
+    auto head_scores = torch::einsum(
+        "bhnr,bhmr->bhnm",
+        std::vector<torch::Tensor>{projected_target, weighted_projected_source});
+    if (bias.defined() && bias.numel() != 0) {
+      head_scores = head_scores + bias.to(head_scores.scalar_type()).view({1, bias.size(0), 1, 1});
+    }
+    return std::get<0>(head_scores.max(1));
+  }
+
+  auto projected_target = torch::matmul(layer_val, target_weight.transpose(0, 1)).contiguous();
+  auto projected_source = torch::matmul(layer_val, source_weight.transpose(0, 1));
+  auto weighted_projected_source =
+      (projected_source * core_weight.view({1, 1, core_weight.size(0)})).contiguous();
+
+#ifdef WITH_CUDA
+  if (experimental_tf32_score_tile_cuda_enabled() &&
+      projected_target.is_cuda() &&
+      weighted_projected_source.is_cuda() &&
+      projected_target.size(1) % 16 == 0 &&
+      weighted_projected_source.size(1) % 16 == 0 &&
+      projected_target.size(2) % 8 == 0 &&
+      jakal_net_low_rank_dense_scores_tf32_cuda_available()) {
+    auto scores = low_rank_dense_scores_tf32_cuda_wrapper(
+        weighted_projected_source.to(acc_dtype).contiguous(),
+        projected_target.to(acc_dtype).contiguous());
+    if (bias.defined() && bias.numel() != 0) {
+      scores = scores + bias.to(scores.scalar_type());
+    }
+    return scores;
+  }
+#endif
+
+  auto scores = torch::bmm(
+      projected_target.to(acc_dtype),
+      weighted_projected_source.to(acc_dtype).transpose(1, 2));
+  if (bias.defined() && bias.numel() != 0) {
+    scores = scores + bias.to(scores.scalar_type());
+  }
+  return scores;
+}
+
+torch::Tensor nomemory_apply_exact_val_layer(
+    const torch::Tensor& layer_val,
+    const torch::Tensor& source_weight,
+    const torch::Tensor& target_weight,
+    const torch::Tensor& core_weight,
+    const torch::Tensor& bias,
+    int64_t compress_kind,
+    int64_t window,
+    const torch::Tensor& norm_weight,
+    const torch::Tensor& norm_bias,
+    bool use_fused_forward = false) {
+  auto pairwise_kind = nomemory_pairwise_kind_from_weights(source_weight, target_weight, core_weight);
+  if (use_fused_forward &&
+      layer_val.dim() == 3 &&
+      window + 1 >= layer_val.size(1) &&
+      (compress_kind == 0 || compress_kind == 1) &&
+      (pairwise_kind == "low_rank_bilinear" || pairwise_kind == "multihead_max_low_rank_bilinear")) {
+    if (pairwise_kind == "low_rank_bilinear" && layer_val.is_cuda()) {
+      const auto acc_dtype = torch::kFloat32;
+      auto projected_target = torch::matmul(layer_val, target_weight.transpose(0, 1)).contiguous();
+      auto projected_source = torch::matmul(layer_val, source_weight.transpose(0, 1));
+      auto weighted_projected_source =
+          (projected_source * core_weight.view({1, 1, core_weight.size(0)})).contiguous();
+      auto projected_state = torch::zeros(
+          {layer_val.size(0), layer_val.size(1)},
+          layer_val.options().dtype(acc_dtype));
+      auto projected_val = layer_val.to(acc_dtype).contiguous();
+      const double score_bias =
+          (bias.defined() && bias.numel() != 0) ? bias.item<double>() : 0.0;
+      std::tuple<torch::Tensor, torch::Tensor> fused;
+      if (compress_kind == 1) {
+        fused = low_rank_propagation_causal_dense_signed_abs_forward_cuda_wrapper(
+            weighted_projected_source.to(acc_dtype).contiguous(),
+            projected_target.to(acc_dtype).contiguous(),
+            projected_state,
+            projected_val,
+            score_bias);
+      } else {
+        fused = low_rank_propagation_window_forward_cuda_wrapper(
+            weighted_projected_source.to(acc_dtype).contiguous(),
+            projected_target.to(acc_dtype).contiguous(),
+            projected_state,
+            projected_val,
+            window,
+            score_bias);
+      }
+      auto delta_val = std::get<1>(fused).to(layer_val.scalar_type());
+      return layer_norm_last_dim(
+          layer_val + delta_val,
+          norm_weight,
+          packed_optional_tensor(norm_bias));
+    }
+    auto scores = nomemory_exact_dense_scores(
+        layer_val,
+        source_weight,
+        target_weight,
+        core_weight,
+        bias,
+        pairwise_kind);
+    auto mask = nomemory_causal_window_mask(
+        layer_val.size(1),
+        layer_val.size(1),
+        window,
+        layer_val);
+    auto edges = nomemory_compress_scores(scores, mask, compress_kind);
+    const auto val_acc_dtype = accumulator_dtype(layer_val.scalar_type());
+    auto delta_val = torch::bmm(
+        edges.to(val_acc_dtype),
+        layer_val.to(val_acc_dtype)).to(layer_val.scalar_type());
+    return layer_norm_last_dim(
+        layer_val + delta_val,
+        norm_weight,
+        packed_optional_tensor(norm_bias));
+  }
+  auto scores = pairwise_scores(
+      pairwise_kind,
+      layer_val,
+      layer_val,
+      core_weight,
+      packed_optional_tensor(bias),
+      source_weight,
+      c10::nullopt,
+      target_weight,
+      c10::nullopt);
+  auto mask = nomemory_causal_window_mask(
+      layer_val.size(1),
+      layer_val.size(1),
+      window,
+      layer_val);
+  auto edges = nomemory_compress_scores(scores, mask, compress_kind);
+  const auto val_acc_dtype = accumulator_dtype(layer_val.scalar_type());
+  auto delta_val = torch::bmm(
+      edges.to(val_acc_dtype),
+      layer_val.to(val_acc_dtype)).to(layer_val.scalar_type());
+  return layer_norm_last_dim(
+      layer_val + delta_val,
+      norm_weight,
+      packed_optional_tensor(norm_bias));
+}
+
+struct NomemoryLayerNormBackwardResult {
+  torch::Tensor grad_input;
+  torch::Tensor grad_weight;
+  torch::Tensor grad_bias;
+};
+
+NomemoryLayerNormBackwardResult nomemory_layer_norm_backward_last_dim(
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& grad_output) {
+  if (!weight.defined() || weight.numel() == 0) {
+    return {
+        grad_output,
+        torch::Tensor(),
+        torch::Tensor(),
+    };
+  }
+  const auto acc_dtype = accumulator_dtype(input.scalar_type());
+  auto flat_input = input.to(acc_dtype).reshape({-1, input.size(-1)});
+  auto flat_grad = grad_output.to(acc_dtype).reshape({-1, grad_output.size(-1)});
+  auto mean = flat_input.mean(-1, true);
+  auto centered = flat_input - mean;
+  auto var = (centered * centered).mean(-1, true);
+  auto rstd = torch::rsqrt(var + 1e-5);
+  auto normalized = centered * rstd;
+  auto cast_weight = weight.to(acc_dtype);
+  auto flat_scaled_grad = flat_grad * cast_weight.view({1, -1});
+  auto mean_scaled_grad = flat_scaled_grad.mean(-1, true);
+  auto mean_scaled_normalized = (flat_scaled_grad * normalized).mean(-1, true);
+  auto flat_grad_input =
+      (flat_scaled_grad - mean_scaled_grad - normalized * mean_scaled_normalized) * rstd;
+  auto grad_weight = (flat_grad * normalized).sum(0).reshape_as(weight).to(weight.scalar_type());
+  torch::Tensor grad_bias;
+  if (bias.defined() && bias.numel() != 0) {
+    grad_bias = flat_grad.sum(0).reshape_as(bias).to(bias.scalar_type());
+  }
+  return {
+      flat_grad_input.reshape_as(input).to(input.scalar_type()),
+      grad_weight,
+      grad_bias,
+  };
+}
+
+torch::Tensor nomemory_compress_backward(
+    const torch::Tensor& scores,
+    const torch::Tensor& edges,
+    const torch::Tensor& mask,
+    const torch::Tensor& grad_edges,
+    int64_t compress_kind) {
+  auto clean_scores = torch::nan_to_num(scores);
+  auto bool_mask = mask.to(torch::kBool);
+  const auto acc_dtype = accumulator_dtype(scores.scalar_type());
+  auto grad_edges_acc = grad_edges.to(acc_dtype);
+  if (compress_kind == 0) {
+#ifdef WITH_CUDA
+    if (clean_scores.is_cuda() && grad_edges_acc.is_cuda()) {
+      auto masked_grad_edges = grad_edges_acc * bool_mask.to(acc_dtype);
+      return softsign_backward_cuda_wrapper(
+                 clean_scores.to(acc_dtype).contiguous(),
+                 masked_grad_edges.contiguous())
+                 .to(acc_dtype) *
+          bool_mask.to(acc_dtype);
+    }
+#endif
+    auto denom = torch::pow(1 + clean_scores.abs().to(acc_dtype), 2);
+    return (grad_edges_acc / denom) * bool_mask.to(acc_dtype);
+  }
+  if (compress_kind == 1) {
+    auto signs = torch::sign(clean_scores).to(acc_dtype);
+    auto edges_acc = edges.to(acc_dtype);
+    auto probs = edges_acc * signs;
+#ifdef WITH_CUDA
+    if (clean_scores.is_cuda() && probs.is_cuda() && grad_edges_acc.is_cuda()) {
+      auto grad_probs = (grad_edges_acc * signs) * bool_mask.to(acc_dtype);
+      auto grad_abs_scores = softmax_backward_cuda_wrapper(
+          probs.contiguous(),
+          grad_probs.contiguous()).to(acc_dtype);
+      return (grad_abs_scores * signs) * bool_mask.to(acc_dtype);
+    }
+#endif
+    auto dot = (grad_edges_acc * edges_acc).sum(-1, true);
+    auto grad_scores = signs * probs * (signs * grad_edges_acc - dot);
+    return grad_scores * bool_mask.to(acc_dtype);
+  }
+  throw std::runtime_error("Unsupported nomemory compress kind: " + std::to_string(compress_kind));
+}
+
+struct NomemoryPairwiseBackwardResult {
+  torch::Tensor grad_layer_val;
+  torch::Tensor grad_source_weight;
+  torch::Tensor grad_target_weight;
+  torch::Tensor grad_core_weight;
+  torch::Tensor grad_bias;
+};
+
+NomemoryPairwiseBackwardResult nomemory_low_rank_pairwise_backward(
+    const torch::Tensor& layer_val,
+    const torch::Tensor& source_weight,
+    const torch::Tensor& target_weight,
+    const torch::Tensor& core_weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& grad_scores) {
+  const auto acc_dtype = accumulator_dtype(layer_val.scalar_type());
+  auto val_acc = layer_val.to(acc_dtype);
+  auto source_weight_acc = source_weight.to(acc_dtype);
+  auto target_weight_acc = target_weight.to(acc_dtype);
+  auto core_weight_acc = core_weight.to(acc_dtype);
+  auto grad_scores_acc = grad_scores.to(acc_dtype);
+  auto projected_source = torch::matmul(val_acc, source_weight_acc.transpose(0, 1));
+  auto projected_target = torch::matmul(val_acc, target_weight_acc.transpose(0, 1));
+#ifdef WITH_CUDA
+  if (layer_val.is_cuda() &&
+      source_weight.is_cuda() &&
+      target_weight.is_cuda() &&
+      core_weight.is_cuda() &&
+      grad_scores.is_cuda()) {
+    auto grads = nomemory_low_rank_pairwise_backward_cuda_wrapper(
+        val_acc.contiguous(),
+        source_weight_acc.contiguous(),
+        target_weight_acc.contiguous(),
+        core_weight_acc.contiguous(),
+        projected_source.contiguous(),
+        projected_target.contiguous(),
+        grad_scores_acc.contiguous());
+    torch::Tensor grad_bias;
+    if (bias.defined() && bias.numel() != 0) {
+      grad_bias = std::get<4>(grads).reshape_as(bias).to(bias.scalar_type());
+    }
+    NomemoryPairwiseBackwardResult result;
+    result.grad_layer_val = std::get<0>(grads).to(layer_val.scalar_type());
+    result.grad_source_weight = std::get<1>(grads).to(source_weight.scalar_type());
+    result.grad_target_weight = std::get<2>(grads).to(target_weight.scalar_type());
+    result.grad_core_weight = std::get<3>(grads).to(core_weight.scalar_type());
+    result.grad_bias = grad_bias;
+    return result;
+  }
+#endif
+  auto weighted_source = projected_source * core_weight_acc.view({1, 1, -1});
+  auto grad_projected_target = torch::bmm(grad_scores_acc, weighted_source);
+  auto grad_weighted_source = torch::bmm(grad_scores_acc.transpose(1, 2), projected_target);
+  auto grad_projected_source = grad_weighted_source * core_weight_acc.view({1, 1, -1});
+  auto grad_layer_val = torch::matmul(grad_projected_target, target_weight_acc) +
+                        torch::matmul(grad_projected_source, source_weight_acc);
+  auto grad_source_weight = torch::einsum(
+      "bnr,bnd->rd",
+      std::vector<torch::Tensor>{grad_projected_source, val_acc}).to(source_weight.scalar_type());
+  auto grad_target_weight = torch::einsum(
+      "bnr,bnd->rd",
+      std::vector<torch::Tensor>{grad_projected_target, val_acc}).to(target_weight.scalar_type());
+  auto grad_core_weight =
+      (grad_weighted_source * projected_source)
+          .sum(std::vector<int64_t>{0, 1})
+          .to(core_weight.scalar_type());
+  torch::Tensor grad_bias;
+  if (bias.defined() && bias.numel() != 0) {
+    grad_bias = grad_scores_acc.sum().reshape_as(bias).to(bias.scalar_type());
+  }
+  NomemoryPairwiseBackwardResult result;
+  result.grad_layer_val = grad_layer_val.to(layer_val.scalar_type());
+  result.grad_source_weight = grad_source_weight;
+  result.grad_target_weight = grad_target_weight;
+  result.grad_core_weight = grad_core_weight;
+  result.grad_bias = grad_bias;
+  return result;
+}
+
+NomemoryPairwiseBackwardResult nomemory_multihead_max_low_rank_pairwise_backward(
+    const torch::Tensor& layer_val,
+    const torch::Tensor& source_weight,
+    const torch::Tensor& target_weight,
+    const torch::Tensor& core_weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& grad_scores) {
+  const auto acc_dtype = accumulator_dtype(layer_val.scalar_type());
+  auto val_acc = layer_val.to(acc_dtype);
+  auto source_weight_acc = source_weight.to(acc_dtype);
+  auto target_weight_acc = target_weight.to(acc_dtype);
+  auto core_weight_acc = core_weight.to(acc_dtype);
+  auto grad_scores_acc = grad_scores.to(acc_dtype);
+  auto projected_source = torch::einsum(
+      "bid,hrd->bhir",
+      std::vector<torch::Tensor>{val_acc, source_weight_acc});
+  auto projected_target = torch::einsum(
+      "bkd,hrd->bhkr",
+      std::vector<torch::Tensor>{val_acc, target_weight_acc});
+  auto weighted_source = projected_source * core_weight_acc.view({1, core_weight_acc.size(0), 1, core_weight_acc.size(1)});
+  auto head_scores = torch::einsum(
+      "bhkr,bhir->bhki",
+      std::vector<torch::Tensor>{projected_target, weighted_source});
+  if (bias.defined() && bias.numel() != 0) {
+    head_scores = head_scores + bias.to(acc_dtype).view({1, bias.size(0), 1, 1});
+  }
+  auto max_result = head_scores.max(1, true);
+  auto argmax = std::get<1>(max_result);
+  auto grad_head_scores = torch::zeros_like(head_scores);
+  grad_head_scores.scatter_(1, argmax, grad_scores_acc.unsqueeze(1));
+  auto grad_projected_target = torch::einsum(
+      "bhki,bhir->bhkr",
+      std::vector<torch::Tensor>{grad_head_scores, weighted_source});
+  auto grad_weighted_source = torch::einsum(
+      "bhki,bhkr->bhir",
+      std::vector<torch::Tensor>{grad_head_scores, projected_target});
+  auto grad_projected_source =
+      grad_weighted_source * core_weight_acc.view({1, core_weight_acc.size(0), 1, core_weight_acc.size(1)});
+  auto grad_layer_val = torch::einsum(
+      "bhkr,hrd->bkd",
+      std::vector<torch::Tensor>{grad_projected_target, target_weight_acc}) +
+      torch::einsum(
+          "bhir,hrd->bid",
+          std::vector<torch::Tensor>{grad_projected_source, source_weight_acc});
+  auto grad_source_weight = torch::einsum(
+      "bhir,bid->hrd",
+      std::vector<torch::Tensor>{grad_projected_source, val_acc}).to(source_weight.scalar_type());
+  auto grad_target_weight = torch::einsum(
+      "bhkr,bkd->hrd",
+      std::vector<torch::Tensor>{grad_projected_target, val_acc}).to(target_weight.scalar_type());
+  auto grad_core_weight =
+      (grad_weighted_source * projected_source)
+          .sum(std::vector<int64_t>{0, 2})
+          .to(core_weight.scalar_type());
+  torch::Tensor grad_bias;
+  if (bias.defined() && bias.numel() != 0) {
+    grad_bias = grad_head_scores.sum(std::vector<int64_t>{0, 2, 3}).reshape_as(bias).to(bias.scalar_type());
+  }
+  NomemoryPairwiseBackwardResult result;
+  result.grad_layer_val = grad_layer_val.to(layer_val.scalar_type());
+  result.grad_source_weight = grad_source_weight;
+  result.grad_target_weight = grad_target_weight;
+  result.grad_core_weight = grad_core_weight;
+  result.grad_bias = grad_bias;
+  return result;
+}
+
+struct NomemoryValLayerBackwardResult {
+  torch::Tensor grad_layer_val;
+  torch::Tensor grad_source_weight;
+  torch::Tensor grad_target_weight;
+  torch::Tensor grad_core_weight;
+  torch::Tensor grad_bias;
+  torch::Tensor grad_norm_weight;
+  torch::Tensor grad_norm_bias;
+};
+
+NomemoryValLayerBackwardResult nomemory_backward_exact_val_layer(
+    const torch::Tensor& layer_val,
+    const torch::Tensor& source_weight,
+    const torch::Tensor& target_weight,
+    const torch::Tensor& core_weight,
+    const torch::Tensor& bias,
+    int64_t compress_kind,
+    int64_t window,
+    const torch::Tensor& norm_weight,
+    const torch::Tensor& norm_bias,
+    const torch::Tensor& grad_output) {
+  auto pairwise_kind = nomemory_pairwise_kind_from_weights(source_weight, target_weight, core_weight);
+  auto scores = pairwise_scores(
+      pairwise_kind,
+      layer_val,
+      layer_val,
+      core_weight,
+      packed_optional_tensor(bias),
+      source_weight,
+      c10::nullopt,
+      target_weight,
+      c10::nullopt);
+  auto mask = nomemory_causal_window_mask(
+      layer_val.size(1),
+      layer_val.size(1),
+      window,
+      layer_val);
+  auto edges = nomemory_compress_scores(scores, mask, compress_kind);
+  const auto acc_dtype = accumulator_dtype(layer_val.scalar_type());
+  auto val_acc = layer_val.to(acc_dtype);
+  auto edges_acc = edges.to(acc_dtype);
+  auto delta_val_acc = torch::bmm(edges_acc, val_acc);
+  auto pre_norm = (val_acc + delta_val_acc).to(layer_val.scalar_type());
+  auto norm_grads = nomemory_layer_norm_backward_last_dim(
+      pre_norm,
+      norm_weight,
+      norm_bias,
+      grad_output);
+  auto grad_pre_norm_acc = norm_grads.grad_input.to(acc_dtype);
+  if (pairwise_kind == "low_rank_bilinear" &&
+      scores.is_cuda() &&
+      edges.is_cuda() &&
+      grad_output.is_cuda() &&
+      layer_val.is_cuda() &&
+      source_weight.is_cuda() &&
+      target_weight.is_cuda() &&
+      core_weight.is_cuda() &&
+      window + 1 >= layer_val.size(1) &&
+      (compress_kind == 0 || compress_kind == 1)) {
+    auto fused = nomemory_low_rank_exact_val_layer_backward_cuda_wrapper(
+        val_acc.contiguous(),
+        source_weight.to(acc_dtype).contiguous(),
+        target_weight.to(acc_dtype).contiguous(),
+        core_weight.to(acc_dtype).contiguous(),
+        scores.to(acc_dtype).contiguous(),
+        edges.to(acc_dtype).contiguous(),
+        norm_weight.to(acc_dtype).contiguous(),
+        packed_optional_tensor(norm_bias).has_value()
+            ? packed_optional_tensor(norm_bias).value().to(acc_dtype).contiguous()
+            : torch::Tensor(),
+        grad_output.to(acc_dtype).contiguous(),
+        compress_kind);
+    torch::Tensor grad_bias;
+    if (bias.defined() && bias.numel() != 0) {
+      grad_bias = std::get<4>(fused).reshape_as(bias).to(bias.scalar_type());
+    }
+    return {
+        std::get<0>(fused).to(layer_val.scalar_type()),
+        std::get<1>(fused).to(source_weight.scalar_type()),
+        std::get<2>(fused).to(target_weight.scalar_type()),
+        std::get<3>(fused).to(core_weight.scalar_type()),
+        grad_bias,
+        std::get<5>(fused).defined() ? std::get<5>(fused).to(norm_weight.scalar_type()) : torch::Tensor(),
+        std::get<6>(fused).defined() && norm_bias.defined() && norm_bias.numel() != 0
+            ? std::get<6>(fused).reshape_as(norm_bias).to(norm_bias.scalar_type())
+            : torch::Tensor(),
+    };
+  }
+  torch::Tensor grad_scores;
+  torch::Tensor grad_layer_from_reduce;
+#ifdef WITH_CUDA
+  if (scores.is_cuda() &&
+      edges.is_cuda() &&
+      grad_pre_norm_acc.is_cuda() &&
+      val_acc.is_cuda() &&
+      window + 1 >= layer_val.size(1) &&
+      (compress_kind == 0 || compress_kind == 1)) {
+    auto fused_backward = nomemory_exact_scores_backward_cuda_wrapper(
+        scores.to(acc_dtype).contiguous(),
+        edges.to(acc_dtype).contiguous(),
+        grad_pre_norm_acc.contiguous(),
+        val_acc.contiguous(),
+        compress_kind);
+    grad_scores = std::get<0>(fused_backward);
+    grad_layer_from_reduce = std::get<1>(fused_backward);
+  } else {
+#endif
+    auto grad_edges = torch::bmm(grad_pre_norm_acc, val_acc.transpose(1, 2));
+    grad_layer_from_reduce = torch::bmm(edges_acc.transpose(1, 2), grad_pre_norm_acc);
+    grad_scores = nomemory_compress_backward(
+        scores,
+        edges,
+        mask,
+        grad_edges,
+        compress_kind);
+#ifdef WITH_CUDA
+  }
+#endif
+  NomemoryPairwiseBackwardResult pairwise_grads;
+  if (pairwise_kind == "low_rank_bilinear") {
+    pairwise_grads = nomemory_low_rank_pairwise_backward(
+        layer_val,
+        source_weight,
+        target_weight,
+        core_weight,
+        bias,
+        grad_scores);
+  } else if (pairwise_kind == "multihead_max_low_rank_bilinear") {
+    pairwise_grads = nomemory_multihead_max_low_rank_pairwise_backward(
+        layer_val,
+        source_weight,
+        target_weight,
+        core_weight,
+        bias,
+        grad_scores);
+  } else {
+    throw std::runtime_error("Unsupported nomemory pairwise kind in backward: " + pairwise_kind);
+  }
+  auto grad_layer_val =
+      norm_grads.grad_input + grad_layer_from_reduce.to(layer_val.scalar_type()) + pairwise_grads.grad_layer_val;
+  return {
+      grad_layer_val,
+      pairwise_grads.grad_source_weight,
+      pairwise_grads.grad_target_weight,
+      pairwise_grads.grad_core_weight,
+      pairwise_grads.grad_bias,
+      norm_grads.grad_weight,
+      norm_grads.grad_bias,
+  };
+}
+
+torch::Tensor nomemory_build_initial_sequence_val(
+    const torch::Tensor& token_val,
+    const torch::Tensor& anchor_val) {
+  auto expanded_anchor_val = cast_tensor_like(anchor_val, token_val);
+  return torch::cat({expanded_anchor_val, token_val}, 1);
+}
+
+torch::Tensor nomemory_build_prediction_val(
+    const torch::Tensor& aligned_s,
+    const torch::Tensor& s_prediction_weight,
+    const torch::Tensor& prediction_input_norm_weight,
+    const torch::Tensor& prediction_input_norm_bias) {
+  return layer_norm_last_dim(
+      linear3d(aligned_s, s_prediction_weight, c10::nullopt),
+      prediction_input_norm_weight,
+      packed_optional_tensor(prediction_input_norm_bias));
+}
+
+torch::Tensor nomemory_run_exact_val_layers_range(
+    torch::Tensor layer_val,
+    const std::vector<torch::Tensor>& source_weights,
+    const std::vector<torch::Tensor>& target_weights,
+    const std::vector<torch::Tensor>& core_weights,
+    const std::vector<torch::Tensor>& biases,
+    const std::vector<torch::Tensor>& norm_weights,
+    const std::vector<torch::Tensor>& norm_biases,
+    const std::vector<int64_t>& compress_kinds,
+    const std::vector<int64_t>& windows,
+    int64_t start_index,
+    int64_t end_index,
+    bool use_fused_forward = false) {
+  for (int64_t layer_index = start_index; layer_index < end_index; ++layer_index) {
+    layer_val = nomemory_apply_exact_val_layer(
+        layer_val,
+        source_weights[static_cast<size_t>(layer_index)],
+        target_weights[static_cast<size_t>(layer_index)],
+        core_weights[static_cast<size_t>(layer_index)],
+        biases[static_cast<size_t>(layer_index)],
+        compress_kinds[static_cast<size_t>(layer_index)],
+        windows[static_cast<size_t>(layer_index)],
+        norm_weights[static_cast<size_t>(layer_index)],
+        norm_biases[static_cast<size_t>(layer_index)],
+        use_fused_forward);
+  }
+  return layer_val;
+}
+
+torch::Tensor nomemory_apply_exact_val_ffn_layer(
+    const torch::Tensor& layer_val,
+    const torch::Tensor& source_weight,
+    const torch::Tensor& target_weight,
+    const torch::Tensor& core_weight,
+    const torch::Tensor& bias,
+    int64_t compress_kind,
+    int64_t window,
+    const torch::Tensor& norm_weight,
+    const torch::Tensor& norm_bias,
+    const torch::Tensor& ffn_norm_weight,
+    const torch::Tensor& ffn_norm_bias,
+    const torch::Tensor& ffn_in_weight,
+    const torch::Tensor& ffn_in_bias,
+    const torch::Tensor& ffn_out_weight,
+    const torch::Tensor& ffn_out_bias,
+    bool use_fused_forward = false) {
+  auto updated_val = nomemory_apply_exact_val_layer(
+      layer_val,
+      source_weight,
+      target_weight,
+      core_weight,
+      bias,
+      compress_kind,
+      window,
+      norm_weight,
+      norm_bias,
+      use_fused_forward);
+  NativeLayerState layer_state{torch::Tensor(), updated_val};
+  return apply_ffn_to_layer(
+      layer_state,
+      ffn_norm_weight,
+      ffn_norm_bias,
+      ffn_in_weight,
+      ffn_in_bias,
+      ffn_out_weight,
+      ffn_out_bias).val;
+}
+
+torch::Tensor nomemory_run_exact_val_ffn_layers_range(
+    torch::Tensor layer_val,
+    const std::vector<torch::Tensor>& source_weights,
+    const std::vector<torch::Tensor>& target_weights,
+    const std::vector<torch::Tensor>& core_weights,
+    const std::vector<torch::Tensor>& biases,
+    const std::vector<torch::Tensor>& norm_weights,
+    const std::vector<torch::Tensor>& norm_biases,
+    const std::vector<torch::Tensor>& ffn_norm_weights,
+    const std::vector<torch::Tensor>& ffn_norm_biases,
+    const std::vector<torch::Tensor>& ffn_in_weights,
+    const std::vector<torch::Tensor>& ffn_in_biases,
+    const std::vector<torch::Tensor>& ffn_out_weights,
+    const std::vector<torch::Tensor>& ffn_out_biases,
+    const std::vector<int64_t>& compress_kinds,
+    const std::vector<int64_t>& windows,
+    int64_t start_index,
+    int64_t end_index,
+    bool use_fused_forward = false) {
+  for (int64_t layer_index = start_index; layer_index < end_index; ++layer_index) {
+    layer_val = nomemory_apply_exact_val_ffn_layer(
+        layer_val,
+        source_weights[static_cast<size_t>(layer_index)],
+        target_weights[static_cast<size_t>(layer_index)],
+        core_weights[static_cast<size_t>(layer_index)],
+        biases[static_cast<size_t>(layer_index)],
+        compress_kinds[static_cast<size_t>(layer_index)],
+        windows[static_cast<size_t>(layer_index)],
+        norm_weights[static_cast<size_t>(layer_index)],
+        norm_biases[static_cast<size_t>(layer_index)],
+        ffn_norm_weights[static_cast<size_t>(layer_index)],
+        ffn_norm_biases[static_cast<size_t>(layer_index)],
+        ffn_in_weights[static_cast<size_t>(layer_index)],
+        ffn_in_biases[static_cast<size_t>(layer_index)],
+        ffn_out_weights[static_cast<size_t>(layer_index)],
+        ffn_out_biases[static_cast<size_t>(layer_index)],
+        use_fused_forward);
+  }
+  return layer_val;
+}
+
+std::tuple<torch::Tensor, std::vector<torch::Tensor>> nomemory_causal_stack_forward_impl(
+    const torch::Tensor& token_val,
+    const torch::Tensor& anchor_state,
+    const torch::Tensor& anchor_val,
+    const torch::Tensor& s_prediction_weight,
+    const torch::Tensor& prediction_input_norm_weight,
+    const torch::Tensor& prediction_input_norm_bias,
+    const std::vector<torch::Tensor>& sequence_source_weights,
+    const std::vector<torch::Tensor>& sequence_target_weights,
+    const std::vector<torch::Tensor>& sequence_core_weights,
+    const std::vector<torch::Tensor>& sequence_biases,
+    const std::vector<torch::Tensor>& sequence_norm_weights,
+    const std::vector<torch::Tensor>& sequence_norm_biases,
+    const std::vector<int64_t>& sequence_compress_kinds,
+    const std::vector<int64_t>& sequence_windows,
+    const std::vector<int64_t>& sequence_target_block_sizes,
+    const std::vector<int64_t>& sequence_source_block_sizes,
+    const std::vector<torch::Tensor>& prediction_source_weights,
+    const std::vector<torch::Tensor>& prediction_target_weights,
+    const std::vector<torch::Tensor>& prediction_core_weights,
+    const std::vector<torch::Tensor>& prediction_biases,
+    const std::vector<torch::Tensor>& prediction_norm_weights,
+    const std::vector<torch::Tensor>& prediction_norm_biases,
+    const std::vector<int64_t>& prediction_compress_kinds,
+    const std::vector<int64_t>& prediction_windows,
+    const std::vector<int64_t>& prediction_target_block_sizes,
+    const std::vector<int64_t>& prediction_source_block_sizes,
+    const std::string& state_activation_name,
+    bool return_trace,
+    bool use_fused_forward) {
+  const auto num_sequence_layers = sequence_source_weights.size();
+  const auto num_prediction_layers = prediction_source_weights.size();
+  require_vector_size(sequence_target_weights, num_sequence_layers, "sequence_target_weights");
+  require_vector_size(sequence_core_weights, num_sequence_layers, "sequence_core_weights");
+  require_vector_size(sequence_biases, num_sequence_layers, "sequence_biases");
+  require_vector_size(sequence_norm_weights, num_sequence_layers, "sequence_norm_weights");
+  require_vector_size(sequence_norm_biases, num_sequence_layers, "sequence_norm_biases");
+  require_int_vector_size(sequence_compress_kinds, num_sequence_layers, "sequence_compress_kinds");
+  require_int_vector_size(sequence_windows, num_sequence_layers, "sequence_windows");
+  require_int_vector_size(sequence_target_block_sizes, num_sequence_layers, "sequence_target_block_sizes");
+  require_int_vector_size(sequence_source_block_sizes, num_sequence_layers, "sequence_source_block_sizes");
+  require_vector_size(prediction_target_weights, num_prediction_layers, "prediction_target_weights");
+  require_vector_size(prediction_core_weights, num_prediction_layers, "prediction_core_weights");
+  require_vector_size(prediction_biases, num_prediction_layers, "prediction_biases");
+  require_vector_size(prediction_norm_weights, num_prediction_layers, "prediction_norm_weights");
+  require_vector_size(prediction_norm_biases, num_prediction_layers, "prediction_norm_biases");
+  require_int_vector_size(prediction_compress_kinds, num_prediction_layers, "prediction_compress_kinds");
+  require_int_vector_size(prediction_windows, num_prediction_layers, "prediction_windows");
+  require_int_vector_size(prediction_target_block_sizes, num_prediction_layers, "prediction_target_block_sizes");
+  require_int_vector_size(prediction_source_block_sizes, num_prediction_layers, "prediction_source_block_sizes");
+
+  (void)anchor_state;
+  (void)state_activation_name;
+  auto sequence_val = nomemory_build_initial_sequence_val(
+      token_val,
+      anchor_val);
+
+  std::vector<torch::Tensor> trace_tensors;
+  if (return_trace) {
+    trace_tensors.reserve(num_sequence_layers + 1 + num_prediction_layers);
+    for (size_t layer_index = 0; layer_index < num_sequence_layers; ++layer_index) {
+      trace_tensors.push_back(sequence_val);
+      sequence_val = nomemory_apply_exact_val_layer(
+          sequence_val,
+          sequence_source_weights[layer_index],
+          sequence_target_weights[layer_index],
+          sequence_core_weights[layer_index],
+          sequence_biases[layer_index],
+          sequence_compress_kinds[layer_index],
+          sequence_windows[layer_index],
+          sequence_norm_weights[layer_index],
+          sequence_norm_biases[layer_index]);
+    }
+  } else {
+    sequence_val = nomemory_run_exact_val_layers_range(
+        sequence_val,
+        sequence_source_weights,
+        sequence_target_weights,
+        sequence_core_weights,
+        sequence_biases,
+        sequence_norm_weights,
+        sequence_norm_biases,
+        sequence_compress_kinds,
+        sequence_windows,
+        0,
+        static_cast<int64_t>(num_sequence_layers),
+        use_fused_forward);
+  }
+
+  auto aligned_s = sequence_val.slice(1, 1, sequence_val.size(1));
+  if (return_trace) {
+    trace_tensors.push_back(aligned_s);
+  }
+  auto prediction_val = nomemory_build_prediction_val(
+      aligned_s,
+      s_prediction_weight,
+      prediction_input_norm_weight,
+      prediction_input_norm_bias);
+  if (return_trace) {
+    for (size_t layer_index = 0; layer_index < num_prediction_layers; ++layer_index) {
+      trace_tensors.push_back(prediction_val);
+      prediction_val = nomemory_apply_exact_val_layer(
+          prediction_val,
+          prediction_source_weights[layer_index],
+          prediction_target_weights[layer_index],
+          prediction_core_weights[layer_index],
+          prediction_biases[layer_index],
+          prediction_compress_kinds[layer_index],
+          prediction_windows[layer_index],
+          prediction_norm_weights[layer_index],
+          prediction_norm_biases[layer_index]);
+    }
+  } else {
+    prediction_val = nomemory_run_exact_val_layers_range(
+        prediction_val,
+        prediction_source_weights,
+        prediction_target_weights,
+        prediction_core_weights,
+        prediction_biases,
+        prediction_norm_weights,
+        prediction_norm_biases,
+        prediction_compress_kinds,
+        prediction_windows,
+        0,
+        static_cast<int64_t>(num_prediction_layers),
+        use_fused_forward);
+  }
+  return {prediction_val, trace_tensors};
+}
+
+torch::Tensor nomemory_causal_stack_fused(
+    const torch::Tensor& token_val,
+    const torch::Tensor& anchor_state,
+    const torch::Tensor& anchor_val,
+    const torch::Tensor& s_prediction_weight,
+    const torch::Tensor& prediction_input_norm_weight,
+    const torch::Tensor& prediction_input_norm_bias,
+    const std::vector<torch::Tensor>& sequence_source_weights,
+    const std::vector<torch::Tensor>& sequence_target_weights,
+    const std::vector<torch::Tensor>& sequence_core_weights,
+    const std::vector<torch::Tensor>& sequence_biases,
+    const std::vector<torch::Tensor>& sequence_norm_weights,
+    const std::vector<torch::Tensor>& sequence_norm_biases,
+    const std::vector<int64_t>& sequence_compress_kinds,
+    const std::vector<int64_t>& sequence_windows,
+    const std::vector<int64_t>& sequence_target_block_sizes,
+    const std::vector<int64_t>& sequence_source_block_sizes,
+    const std::vector<torch::Tensor>& prediction_source_weights,
+    const std::vector<torch::Tensor>& prediction_target_weights,
+    const std::vector<torch::Tensor>& prediction_core_weights,
+    const std::vector<torch::Tensor>& prediction_biases,
+    const std::vector<torch::Tensor>& prediction_norm_weights,
+    const std::vector<torch::Tensor>& prediction_norm_biases,
+    const std::vector<int64_t>& prediction_compress_kinds,
+    const std::vector<int64_t>& prediction_windows,
+    const std::vector<int64_t>& prediction_target_block_sizes,
+    const std::vector<int64_t>& prediction_source_block_sizes,
+    const std::string& state_activation_name) {
+  require_supported_device(token_val, "token_val");
+  return std::get<0>(nomemory_causal_stack_forward_impl(
+      token_val,
+      anchor_state,
+      anchor_val,
+      s_prediction_weight,
+      prediction_input_norm_weight,
+      prediction_input_norm_bias,
+      sequence_source_weights,
+      sequence_target_weights,
+      sequence_core_weights,
+      sequence_biases,
+      sequence_norm_weights,
+      sequence_norm_biases,
+      sequence_compress_kinds,
+      sequence_windows,
+      sequence_target_block_sizes,
+      sequence_source_block_sizes,
+      prediction_source_weights,
+      prediction_target_weights,
+      prediction_core_weights,
+      prediction_biases,
+      prediction_norm_weights,
+      prediction_norm_biases,
+      prediction_compress_kinds,
+      prediction_windows,
+      prediction_target_block_sizes,
+      prediction_source_block_sizes,
+      state_activation_name,
+      false,
+      true));
+}
+
+std::tuple<torch::Tensor, std::vector<torch::Tensor>> nomemory_causal_stack_fused_trace(
+    const torch::Tensor& token_val,
+    const torch::Tensor& anchor_state,
+    const torch::Tensor& anchor_val,
+    const torch::Tensor& s_prediction_weight,
+    const torch::Tensor& prediction_input_norm_weight,
+    const torch::Tensor& prediction_input_norm_bias,
+    const std::vector<torch::Tensor>& sequence_source_weights,
+    const std::vector<torch::Tensor>& sequence_target_weights,
+    const std::vector<torch::Tensor>& sequence_core_weights,
+    const std::vector<torch::Tensor>& sequence_biases,
+    const std::vector<torch::Tensor>& sequence_norm_weights,
+    const std::vector<torch::Tensor>& sequence_norm_biases,
+    const std::vector<int64_t>& sequence_compress_kinds,
+    const std::vector<int64_t>& sequence_windows,
+    const std::vector<int64_t>& sequence_target_block_sizes,
+    const std::vector<int64_t>& sequence_source_block_sizes,
+    const std::vector<torch::Tensor>& prediction_source_weights,
+    const std::vector<torch::Tensor>& prediction_target_weights,
+    const std::vector<torch::Tensor>& prediction_core_weights,
+    const std::vector<torch::Tensor>& prediction_biases,
+    const std::vector<torch::Tensor>& prediction_norm_weights,
+    const std::vector<torch::Tensor>& prediction_norm_biases,
+    const std::vector<int64_t>& prediction_compress_kinds,
+    const std::vector<int64_t>& prediction_windows,
+    const std::vector<int64_t>& prediction_target_block_sizes,
+    const std::vector<int64_t>& prediction_source_block_sizes,
+    const std::string& state_activation_name) {
+  require_supported_device(token_val, "token_val");
+  return nomemory_causal_stack_forward_impl(
+      token_val,
+      anchor_state,
+      anchor_val,
+      s_prediction_weight,
+      prediction_input_norm_weight,
+      prediction_input_norm_bias,
+      sequence_source_weights,
+      sequence_target_weights,
+      sequence_core_weights,
+      sequence_biases,
+      sequence_norm_weights,
+      sequence_norm_biases,
+      sequence_compress_kinds,
+      sequence_windows,
+      sequence_target_block_sizes,
+      sequence_source_block_sizes,
+      prediction_source_weights,
+      prediction_target_weights,
+      prediction_core_weights,
+      prediction_biases,
+      prediction_norm_weights,
+      prediction_norm_biases,
+      prediction_compress_kinds,
+      prediction_windows,
+      prediction_target_block_sizes,
+      prediction_source_block_sizes,
+      state_activation_name,
+      true,
+      false);
+}
+
+std::vector<torch::Tensor> nomemory_causal_stack_fused_backward_cuda(
+    const torch::Tensor& token_val,
+    const torch::Tensor& anchor_state,
+    const torch::Tensor& anchor_val,
+    const torch::Tensor& s_prediction_weight,
+    const torch::Tensor& prediction_input_norm_weight,
+    const torch::Tensor& prediction_input_norm_bias,
+    const std::vector<torch::Tensor>& sequence_source_weights,
+    const std::vector<torch::Tensor>& sequence_target_weights,
+    const std::vector<torch::Tensor>& sequence_core_weights,
+    const std::vector<torch::Tensor>& sequence_biases,
+    const std::vector<torch::Tensor>& sequence_norm_weights,
+    const std::vector<torch::Tensor>& sequence_norm_biases,
+    const std::vector<int64_t>& sequence_compress_kinds,
+    const std::vector<int64_t>& sequence_windows,
+    const std::vector<int64_t>& sequence_target_block_sizes,
+    const std::vector<int64_t>& sequence_source_block_sizes,
+    const std::vector<torch::Tensor>& prediction_source_weights,
+    const std::vector<torch::Tensor>& prediction_target_weights,
+    const std::vector<torch::Tensor>& prediction_core_weights,
+    const std::vector<torch::Tensor>& prediction_biases,
+    const std::vector<torch::Tensor>& prediction_norm_weights,
+    const std::vector<torch::Tensor>& prediction_norm_biases,
+    const std::vector<int64_t>& prediction_compress_kinds,
+    const std::vector<int64_t>& prediction_windows,
+    const std::vector<int64_t>& prediction_target_block_sizes,
+    const std::vector<int64_t>& prediction_source_block_sizes,
+    const std::string& state_activation_name,
+    const std::vector<torch::Tensor>& trace_tensors,
+    const torch::Tensor& grad_query_val) {
+  if (!token_val.is_cuda()) {
+    throw std::runtime_error("nomemory_causal_stack_fused_backward_cuda requires CUDA inputs.");
+  }
+#ifdef WITH_CUDA
+  c10::AutoGradMode enable_grad(true);
+  auto make_leaf = [](const torch::Tensor& tensor) {
+    auto leaf = tensor.detach();
+    leaf.set_requires_grad(tensor.requires_grad());
+    return leaf;
+  };
+  auto make_boundary_leaf = [](const torch::Tensor& tensor) {
+    auto leaf = tensor.detach();
+    leaf.set_requires_grad(true);
+    return leaf;
+  };
+  auto compute_grads = [](const torch::Tensor& output,
+                          const std::vector<torch::Tensor>& inputs,
+                          const torch::Tensor& grad_output) {
+    torch::autograd::variable_list grad_inputs;
+    std::vector<int64_t> grad_input_map(inputs.size(), -1);
+    for (size_t index = 0; index < inputs.size(); ++index) {
+      if (inputs[index].defined() && inputs[index].requires_grad()) {
+        grad_input_map[index] = static_cast<int64_t>(grad_inputs.size());
+        grad_inputs.push_back(inputs[index]);
+      }
+    }
+    torch::autograd::variable_list local_outputs{output};
+    torch::autograd::variable_list local_grad_outputs{grad_output};
+    pybind11::gil_scoped_release no_gil;
+    auto grads = torch::autograd::grad(
+        local_outputs,
+        grad_inputs,
+        local_grad_outputs,
+        std::nullopt,
+        false,
+        true);
+    std::vector<torch::Tensor> results(inputs.size());
+    for (size_t index = 0; index < inputs.size(); ++index) {
+      if (grad_input_map[index] >= 0) {
+        results[index] = grads[static_cast<size_t>(grad_input_map[index])];
+      }
+    }
+    return results;
+  };
+
+  auto token_val_leaf = make_leaf(token_val);
+  auto anchor_state_leaf = make_leaf(anchor_state);
+  auto anchor_val_leaf = make_leaf(anchor_val);
+  auto s_prediction_weight_leaf = make_leaf(s_prediction_weight);
+  auto prediction_input_norm_weight_leaf = make_leaf(prediction_input_norm_weight);
+  auto prediction_input_norm_bias_leaf = make_leaf(prediction_input_norm_bias);
+
+  std::vector<torch::Tensor> sequence_source_weights_leaves;
+  std::vector<torch::Tensor> sequence_target_weights_leaves;
+  std::vector<torch::Tensor> sequence_core_weights_leaves;
+  std::vector<torch::Tensor> sequence_biases_leaves;
+  std::vector<torch::Tensor> sequence_norm_weights_leaves;
+  std::vector<torch::Tensor> sequence_norm_biases_leaves;
+  std::vector<torch::Tensor> prediction_source_weights_leaves;
+  std::vector<torch::Tensor> prediction_target_weights_leaves;
+  std::vector<torch::Tensor> prediction_core_weights_leaves;
+  std::vector<torch::Tensor> prediction_biases_leaves;
+  std::vector<torch::Tensor> prediction_norm_weights_leaves;
+  std::vector<torch::Tensor> prediction_norm_biases_leaves;
+  for (const auto& tensor : sequence_source_weights) sequence_source_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : sequence_target_weights) sequence_target_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : sequence_core_weights) sequence_core_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : sequence_biases) sequence_biases_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : sequence_norm_weights) sequence_norm_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : sequence_norm_biases) sequence_norm_biases_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : prediction_source_weights) prediction_source_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : prediction_target_weights) prediction_target_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : prediction_core_weights) prediction_core_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : prediction_biases) prediction_biases_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : prediction_norm_weights) prediction_norm_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : prediction_norm_biases) prediction_norm_biases_leaves.push_back(make_leaf(tensor));
+
+  const auto num_sequence_layers = sequence_source_weights.size();
+  const auto num_prediction_layers = prediction_source_weights.size();
+  const auto expected_trace_tensors = num_sequence_layers + 1 + num_prediction_layers;
+  if (trace_tensors.size() == expected_trace_tensors && num_sequence_layers > 0) {
+    const int64_t sequence_split = std::max<int64_t>(1, static_cast<int64_t>(num_sequence_layers / 2));
+    const size_t aligned_trace_index = num_sequence_layers;
+    const size_t prediction_trace_start = num_sequence_layers + 1;
+
+    std::vector<torch::Tensor> grad_sequence_source_weights(num_sequence_layers);
+    std::vector<torch::Tensor> grad_sequence_target_weights(num_sequence_layers);
+    std::vector<torch::Tensor> grad_sequence_core_weights(num_sequence_layers);
+    std::vector<torch::Tensor> grad_sequence_biases(num_sequence_layers);
+    std::vector<torch::Tensor> grad_sequence_norm_weights(num_sequence_layers);
+    std::vector<torch::Tensor> grad_sequence_norm_biases(num_sequence_layers);
+    std::vector<torch::Tensor> grad_prediction_source_weights(num_prediction_layers);
+    std::vector<torch::Tensor> grad_prediction_target_weights(num_prediction_layers);
+    std::vector<torch::Tensor> grad_prediction_core_weights(num_prediction_layers);
+    std::vector<torch::Tensor> grad_prediction_biases(num_prediction_layers);
+    std::vector<torch::Tensor> grad_prediction_norm_weights(num_prediction_layers);
+    std::vector<torch::Tensor> grad_prediction_norm_biases(num_prediction_layers);
+    torch::Tensor grad_s_prediction_weight;
+    torch::Tensor grad_prediction_input_norm_weight;
+    torch::Tensor grad_prediction_input_norm_bias;
+    torch::Tensor grad_token_val;
+    torch::Tensor grad_anchor_val;
+
+    auto prediction_input_leaf = make_boundary_leaf(trace_tensors[prediction_trace_start]);
+    auto prediction_output = nomemory_run_exact_val_layers_range(
+        prediction_input_leaf,
+        prediction_source_weights_leaves,
+        prediction_target_weights_leaves,
+        prediction_core_weights_leaves,
+        prediction_biases_leaves,
+        prediction_norm_weights_leaves,
+        prediction_norm_biases_leaves,
+        prediction_compress_kinds,
+        prediction_windows,
+        0,
+        static_cast<int64_t>(num_prediction_layers),
+        false);
+    std::vector<torch::Tensor> prediction_inputs;
+    prediction_inputs.push_back(prediction_input_leaf);
+    for (const auto& tensor : prediction_source_weights_leaves) prediction_inputs.push_back(tensor);
+    for (const auto& tensor : prediction_target_weights_leaves) prediction_inputs.push_back(tensor);
+    for (const auto& tensor : prediction_core_weights_leaves) prediction_inputs.push_back(tensor);
+    for (const auto& tensor : prediction_biases_leaves) prediction_inputs.push_back(tensor);
+    for (const auto& tensor : prediction_norm_weights_leaves) prediction_inputs.push_back(tensor);
+    for (const auto& tensor : prediction_norm_biases_leaves) prediction_inputs.push_back(tensor);
+    auto prediction_grads = compute_grads(prediction_output, prediction_inputs, grad_query_val);
+    auto grad_prediction_input = prediction_grads[0];
+    size_t grad_offset = 1;
+    for (size_t index = 0; index < num_prediction_layers; ++index) grad_prediction_source_weights[index] = prediction_grads[grad_offset + index];
+    grad_offset += num_prediction_layers;
+    for (size_t index = 0; index < num_prediction_layers; ++index) grad_prediction_target_weights[index] = prediction_grads[grad_offset + index];
+    grad_offset += num_prediction_layers;
+    for (size_t index = 0; index < num_prediction_layers; ++index) grad_prediction_core_weights[index] = prediction_grads[grad_offset + index];
+    grad_offset += num_prediction_layers;
+    for (size_t index = 0; index < num_prediction_layers; ++index) grad_prediction_biases[index] = prediction_grads[grad_offset + index];
+    grad_offset += num_prediction_layers;
+    for (size_t index = 0; index < num_prediction_layers; ++index) grad_prediction_norm_weights[index] = prediction_grads[grad_offset + index];
+    grad_offset += num_prediction_layers;
+    for (size_t index = 0; index < num_prediction_layers; ++index) grad_prediction_norm_biases[index] = prediction_grads[grad_offset + index];
+
+    auto aligned_s_leaf = make_boundary_leaf(trace_tensors[aligned_trace_index]);
+    auto prediction_input = nomemory_build_prediction_val(
+        aligned_s_leaf,
+        s_prediction_weight_leaf,
+        prediction_input_norm_weight_leaf,
+        prediction_input_norm_bias_leaf);
+    auto prediction_projection_grads = compute_grads(
+        prediction_input,
+        {
+            aligned_s_leaf,
+            s_prediction_weight_leaf,
+            prediction_input_norm_weight_leaf,
+            prediction_input_norm_bias_leaf,
+        },
+        grad_prediction_input);
+    auto grad_aligned_s = prediction_projection_grads[0];
+    grad_s_prediction_weight = prediction_projection_grads[1];
+    grad_prediction_input_norm_weight = prediction_projection_grads[2];
+    grad_prediction_input_norm_bias = prediction_projection_grads[3];
+
+    auto sequence_mid_leaf = make_boundary_leaf(trace_tensors[static_cast<size_t>(sequence_split)]);
+    auto sequence_tail = nomemory_run_exact_val_layers_range(
+        sequence_mid_leaf,
+        sequence_source_weights_leaves,
+        sequence_target_weights_leaves,
+        sequence_core_weights_leaves,
+        sequence_biases_leaves,
+        sequence_norm_weights_leaves,
+        sequence_norm_biases_leaves,
+        sequence_compress_kinds,
+        sequence_windows,
+        sequence_split,
+        static_cast<int64_t>(num_sequence_layers),
+        false);
+    auto aligned_tail = sequence_tail.slice(1, 1, sequence_tail.size(1));
+    std::vector<torch::Tensor> sequence_tail_inputs;
+    sequence_tail_inputs.push_back(sequence_mid_leaf);
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) {
+      sequence_tail_inputs.push_back(sequence_source_weights_leaves[index]);
+    }
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) {
+      sequence_tail_inputs.push_back(sequence_target_weights_leaves[index]);
+    }
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) {
+      sequence_tail_inputs.push_back(sequence_core_weights_leaves[index]);
+    }
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) {
+      sequence_tail_inputs.push_back(sequence_biases_leaves[index]);
+    }
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) {
+      sequence_tail_inputs.push_back(sequence_norm_weights_leaves[index]);
+    }
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) {
+      sequence_tail_inputs.push_back(sequence_norm_biases_leaves[index]);
+    }
+    auto sequence_tail_grads = compute_grads(aligned_tail, sequence_tail_inputs, grad_aligned_s);
+    auto grad_sequence_mid = sequence_tail_grads[0];
+    grad_offset = 1;
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) {
+      grad_sequence_source_weights[index] = sequence_tail_grads[grad_offset++];
+    }
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) {
+      grad_sequence_target_weights[index] = sequence_tail_grads[grad_offset++];
+    }
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) {
+      grad_sequence_core_weights[index] = sequence_tail_grads[grad_offset++];
+    }
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) {
+      grad_sequence_biases[index] = sequence_tail_grads[grad_offset++];
+    }
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) {
+      grad_sequence_norm_weights[index] = sequence_tail_grads[grad_offset++];
+    }
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) {
+      grad_sequence_norm_biases[index] = sequence_tail_grads[grad_offset++];
+    }
+
+    auto sequence_head_leaf = make_boundary_leaf(trace_tensors[0]);
+    auto sequence_head = nomemory_run_exact_val_layers_range(
+        sequence_head_leaf,
+        sequence_source_weights_leaves,
+        sequence_target_weights_leaves,
+        sequence_core_weights_leaves,
+        sequence_biases_leaves,
+        sequence_norm_weights_leaves,
+        sequence_norm_biases_leaves,
+        sequence_compress_kinds,
+        sequence_windows,
+        0,
+        sequence_split,
+        false);
+    std::vector<torch::Tensor> sequence_head_inputs;
+    sequence_head_inputs.push_back(sequence_head_leaf);
+    for (int64_t index = 0; index < sequence_split; ++index) sequence_head_inputs.push_back(sequence_source_weights_leaves[static_cast<size_t>(index)]);
+    for (int64_t index = 0; index < sequence_split; ++index) sequence_head_inputs.push_back(sequence_target_weights_leaves[static_cast<size_t>(index)]);
+    for (int64_t index = 0; index < sequence_split; ++index) sequence_head_inputs.push_back(sequence_core_weights_leaves[static_cast<size_t>(index)]);
+    for (int64_t index = 0; index < sequence_split; ++index) sequence_head_inputs.push_back(sequence_biases_leaves[static_cast<size_t>(index)]);
+    for (int64_t index = 0; index < sequence_split; ++index) sequence_head_inputs.push_back(sequence_norm_weights_leaves[static_cast<size_t>(index)]);
+    for (int64_t index = 0; index < sequence_split; ++index) sequence_head_inputs.push_back(sequence_norm_biases_leaves[static_cast<size_t>(index)]);
+    auto sequence_head_grads = compute_grads(sequence_head, sequence_head_inputs, grad_sequence_mid);
+    auto grad_sequence_initial = sequence_head_grads[0];
+    grad_offset = 1;
+    for (int64_t index = 0; index < sequence_split; ++index) {
+      grad_sequence_source_weights[static_cast<size_t>(index)] = sequence_head_grads[grad_offset++];
+    }
+    for (int64_t index = 0; index < sequence_split; ++index) {
+      grad_sequence_target_weights[static_cast<size_t>(index)] = sequence_head_grads[grad_offset++];
+    }
+    for (int64_t index = 0; index < sequence_split; ++index) {
+      grad_sequence_core_weights[static_cast<size_t>(index)] = sequence_head_grads[grad_offset++];
+    }
+    for (int64_t index = 0; index < sequence_split; ++index) {
+      grad_sequence_biases[static_cast<size_t>(index)] = sequence_head_grads[grad_offset++];
+    }
+    for (int64_t index = 0; index < sequence_split; ++index) {
+      grad_sequence_norm_weights[static_cast<size_t>(index)] = sequence_head_grads[grad_offset++];
+    }
+    for (int64_t index = 0; index < sequence_split; ++index) {
+      grad_sequence_norm_biases[static_cast<size_t>(index)] = sequence_head_grads[grad_offset++];
+    }
+
+    auto token_val_root = make_leaf(token_val);
+    auto anchor_val_root = make_leaf(anchor_val);
+    auto sequence_initial = nomemory_build_initial_sequence_val(token_val_root, anchor_val_root);
+    auto root_grads = compute_grads(
+        sequence_initial,
+        {token_val_root, anchor_val_root},
+        grad_sequence_initial);
+    grad_token_val = root_grads[0];
+    grad_anchor_val = root_grads[1];
+
+    std::vector<torch::Tensor> all_grads;
+    all_grads.reserve(6 + num_sequence_layers * 6 + num_prediction_layers * 6);
+    all_grads.push_back(grad_token_val);
+    all_grads.push_back(torch::Tensor());
+    all_grads.push_back(grad_anchor_val);
+    all_grads.push_back(grad_s_prediction_weight);
+    all_grads.push_back(grad_prediction_input_norm_weight);
+    all_grads.push_back(grad_prediction_input_norm_bias);
+    for (const auto& tensor : grad_sequence_source_weights) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_sequence_target_weights) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_sequence_core_weights) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_sequence_biases) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_sequence_norm_weights) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_sequence_norm_biases) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_prediction_source_weights) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_prediction_target_weights) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_prediction_core_weights) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_prediction_biases) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_prediction_norm_weights) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_prediction_norm_biases) all_grads.push_back(tensor);
+    return all_grads;
+  }
+
+  auto outputs = nomemory_causal_stack_forward_impl(
+      token_val_leaf,
+      anchor_state_leaf,
+      anchor_val_leaf,
+      s_prediction_weight_leaf,
+      prediction_input_norm_weight_leaf,
+      prediction_input_norm_bias_leaf,
+      sequence_source_weights_leaves,
+      sequence_target_weights_leaves,
+      sequence_core_weights_leaves,
+      sequence_biases_leaves,
+      sequence_norm_weights_leaves,
+      sequence_norm_biases_leaves,
+      sequence_compress_kinds,
+      sequence_windows,
+      sequence_target_block_sizes,
+      sequence_source_block_sizes,
+      prediction_source_weights_leaves,
+      prediction_target_weights_leaves,
+      prediction_core_weights_leaves,
+      prediction_biases_leaves,
+      prediction_norm_weights_leaves,
+      prediction_norm_biases_leaves,
+      prediction_compress_kinds,
+      prediction_windows,
+      prediction_target_block_sizes,
+      prediction_source_block_sizes,
+      state_activation_name,
+      false,
+      false);
+
+  std::vector<torch::Tensor> all_inputs;
+  all_inputs.push_back(token_val_leaf);
+  all_inputs.push_back(anchor_state_leaf);
+  all_inputs.push_back(anchor_val_leaf);
+  all_inputs.push_back(s_prediction_weight_leaf);
+  all_inputs.push_back(prediction_input_norm_weight_leaf);
+  all_inputs.push_back(prediction_input_norm_bias_leaf);
+  for (const auto& tensor : sequence_source_weights_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : sequence_target_weights_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : sequence_core_weights_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : sequence_biases_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : sequence_norm_weights_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : sequence_norm_biases_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : prediction_source_weights_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : prediction_target_weights_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : prediction_core_weights_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : prediction_biases_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : prediction_norm_weights_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : prediction_norm_biases_leaves) all_inputs.push_back(tensor);
+
+  torch::autograd::variable_list grad_inputs;
+  std::vector<int64_t> grad_input_map(all_inputs.size(), -1);
+  for (size_t index = 0; index < all_inputs.size(); ++index) {
+    if (all_inputs[index].defined() && all_inputs[index].requires_grad()) {
+      grad_input_map[index] = static_cast<int64_t>(grad_inputs.size());
+      grad_inputs.push_back(all_inputs[index]);
+    }
+  }
+  torch::autograd::variable_list local_outputs{std::get<0>(outputs)};
+  torch::autograd::variable_list local_grad_outputs{
+      grad_query_val.defined() ? grad_query_val : torch::zeros_like(std::get<0>(outputs))};
+  pybind11::gil_scoped_release no_gil;
+  auto grads = torch::autograd::grad(
+      local_outputs,
+      grad_inputs,
+      local_grad_outputs,
+      std::nullopt,
+      false,
+      true);
+
+  std::vector<torch::Tensor> all_grads;
+  all_grads.reserve(all_inputs.size());
+  for (size_t index = 0; index < all_inputs.size(); ++index) {
+    if (grad_input_map[index] < 0) {
+      all_grads.push_back(torch::Tensor());
+    } else {
+      all_grads.push_back(grads[static_cast<size_t>(grad_input_map[index])]);
+    }
+  }
+  return all_grads;
+#else
+  throw std::runtime_error("nomemory_causal_stack_fused_backward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+std::tuple<torch::Tensor, std::vector<torch::Tensor>> nomemory_causal_stack_ffn_forward_impl(
+    const torch::Tensor& token_val,
+    const torch::Tensor& anchor_state,
+    const torch::Tensor& anchor_val,
+    const torch::Tensor& s_prediction_weight,
+    const torch::Tensor& prediction_input_norm_weight,
+    const torch::Tensor& prediction_input_norm_bias,
+    const std::vector<torch::Tensor>& sequence_source_weights,
+    const std::vector<torch::Tensor>& sequence_target_weights,
+    const std::vector<torch::Tensor>& sequence_core_weights,
+    const std::vector<torch::Tensor>& sequence_biases,
+    const std::vector<torch::Tensor>& sequence_norm_weights,
+    const std::vector<torch::Tensor>& sequence_norm_biases,
+    const std::vector<torch::Tensor>& sequence_ffn_norm_weights,
+    const std::vector<torch::Tensor>& sequence_ffn_norm_biases,
+    const std::vector<torch::Tensor>& sequence_ffn_in_weights,
+    const std::vector<torch::Tensor>& sequence_ffn_in_biases,
+    const std::vector<torch::Tensor>& sequence_ffn_out_weights,
+    const std::vector<torch::Tensor>& sequence_ffn_out_biases,
+    const std::vector<int64_t>& sequence_compress_kinds,
+    const std::vector<int64_t>& sequence_windows,
+    const std::vector<int64_t>& sequence_target_block_sizes,
+    const std::vector<int64_t>& sequence_source_block_sizes,
+    const std::vector<torch::Tensor>& prediction_source_weights,
+    const std::vector<torch::Tensor>& prediction_target_weights,
+    const std::vector<torch::Tensor>& prediction_core_weights,
+    const std::vector<torch::Tensor>& prediction_biases,
+    const std::vector<torch::Tensor>& prediction_norm_weights,
+    const std::vector<torch::Tensor>& prediction_norm_biases,
+    const std::vector<torch::Tensor>& prediction_ffn_norm_weights,
+    const std::vector<torch::Tensor>& prediction_ffn_norm_biases,
+    const std::vector<torch::Tensor>& prediction_ffn_in_weights,
+    const std::vector<torch::Tensor>& prediction_ffn_in_biases,
+    const std::vector<torch::Tensor>& prediction_ffn_out_weights,
+    const std::vector<torch::Tensor>& prediction_ffn_out_biases,
+    const std::vector<int64_t>& prediction_compress_kinds,
+    const std::vector<int64_t>& prediction_windows,
+    const std::vector<int64_t>& prediction_target_block_sizes,
+    const std::vector<int64_t>& prediction_source_block_sizes,
+    const std::string& state_activation_name,
+    bool return_trace,
+    bool use_fused_forward) {
+  const auto num_sequence_layers = sequence_source_weights.size();
+  const auto num_prediction_layers = prediction_source_weights.size();
+  require_vector_size(sequence_target_weights, num_sequence_layers, "sequence_target_weights");
+  require_vector_size(sequence_core_weights, num_sequence_layers, "sequence_core_weights");
+  require_vector_size(sequence_biases, num_sequence_layers, "sequence_biases");
+  require_vector_size(sequence_norm_weights, num_sequence_layers, "sequence_norm_weights");
+  require_vector_size(sequence_norm_biases, num_sequence_layers, "sequence_norm_biases");
+  require_vector_size(sequence_ffn_norm_weights, num_sequence_layers, "sequence_ffn_norm_weights");
+  require_vector_size(sequence_ffn_norm_biases, num_sequence_layers, "sequence_ffn_norm_biases");
+  require_vector_size(sequence_ffn_in_weights, num_sequence_layers, "sequence_ffn_in_weights");
+  require_vector_size(sequence_ffn_in_biases, num_sequence_layers, "sequence_ffn_in_biases");
+  require_vector_size(sequence_ffn_out_weights, num_sequence_layers, "sequence_ffn_out_weights");
+  require_vector_size(sequence_ffn_out_biases, num_sequence_layers, "sequence_ffn_out_biases");
+  require_int_vector_size(sequence_compress_kinds, num_sequence_layers, "sequence_compress_kinds");
+  require_int_vector_size(sequence_windows, num_sequence_layers, "sequence_windows");
+  require_int_vector_size(sequence_target_block_sizes, num_sequence_layers, "sequence_target_block_sizes");
+  require_int_vector_size(sequence_source_block_sizes, num_sequence_layers, "sequence_source_block_sizes");
+  require_vector_size(prediction_target_weights, num_prediction_layers, "prediction_target_weights");
+  require_vector_size(prediction_core_weights, num_prediction_layers, "prediction_core_weights");
+  require_vector_size(prediction_biases, num_prediction_layers, "prediction_biases");
+  require_vector_size(prediction_norm_weights, num_prediction_layers, "prediction_norm_weights");
+  require_vector_size(prediction_norm_biases, num_prediction_layers, "prediction_norm_biases");
+  require_vector_size(prediction_ffn_norm_weights, num_prediction_layers, "prediction_ffn_norm_weights");
+  require_vector_size(prediction_ffn_norm_biases, num_prediction_layers, "prediction_ffn_norm_biases");
+  require_vector_size(prediction_ffn_in_weights, num_prediction_layers, "prediction_ffn_in_weights");
+  require_vector_size(prediction_ffn_in_biases, num_prediction_layers, "prediction_ffn_in_biases");
+  require_vector_size(prediction_ffn_out_weights, num_prediction_layers, "prediction_ffn_out_weights");
+  require_vector_size(prediction_ffn_out_biases, num_prediction_layers, "prediction_ffn_out_biases");
+  require_int_vector_size(prediction_compress_kinds, num_prediction_layers, "prediction_compress_kinds");
+  require_int_vector_size(prediction_windows, num_prediction_layers, "prediction_windows");
+  require_int_vector_size(prediction_target_block_sizes, num_prediction_layers, "prediction_target_block_sizes");
+  require_int_vector_size(prediction_source_block_sizes, num_prediction_layers, "prediction_source_block_sizes");
+
+  (void)anchor_state;
+  (void)state_activation_name;
+  auto sequence_val = nomemory_build_initial_sequence_val(token_val, anchor_val);
+
+  std::vector<torch::Tensor> trace_tensors;
+  if (return_trace) {
+    trace_tensors.reserve(num_sequence_layers + 1 + num_prediction_layers);
+    for (size_t layer_index = 0; layer_index < num_sequence_layers; ++layer_index) {
+      trace_tensors.push_back(sequence_val);
+      sequence_val = nomemory_apply_exact_val_ffn_layer(
+          sequence_val,
+          sequence_source_weights[layer_index],
+          sequence_target_weights[layer_index],
+          sequence_core_weights[layer_index],
+          sequence_biases[layer_index],
+          sequence_compress_kinds[layer_index],
+          sequence_windows[layer_index],
+          sequence_norm_weights[layer_index],
+          sequence_norm_biases[layer_index],
+          sequence_ffn_norm_weights[layer_index],
+          sequence_ffn_norm_biases[layer_index],
+          sequence_ffn_in_weights[layer_index],
+          sequence_ffn_in_biases[layer_index],
+          sequence_ffn_out_weights[layer_index],
+          sequence_ffn_out_biases[layer_index]);
+    }
+  } else {
+    sequence_val = nomemory_run_exact_val_ffn_layers_range(
+        sequence_val,
+        sequence_source_weights,
+        sequence_target_weights,
+        sequence_core_weights,
+        sequence_biases,
+        sequence_norm_weights,
+        sequence_norm_biases,
+        sequence_ffn_norm_weights,
+        sequence_ffn_norm_biases,
+        sequence_ffn_in_weights,
+        sequence_ffn_in_biases,
+        sequence_ffn_out_weights,
+        sequence_ffn_out_biases,
+        sequence_compress_kinds,
+        sequence_windows,
+        0,
+        static_cast<int64_t>(num_sequence_layers),
+        use_fused_forward);
+  }
+
+  auto aligned_s = sequence_val.slice(1, 1, sequence_val.size(1));
+  if (return_trace) {
+    trace_tensors.push_back(aligned_s);
+  }
+  auto prediction_val = nomemory_build_prediction_val(
+      aligned_s,
+      s_prediction_weight,
+      prediction_input_norm_weight,
+      prediction_input_norm_bias);
+  if (return_trace) {
+    for (size_t layer_index = 0; layer_index < num_prediction_layers; ++layer_index) {
+      trace_tensors.push_back(prediction_val);
+      prediction_val = nomemory_apply_exact_val_ffn_layer(
+          prediction_val,
+          prediction_source_weights[layer_index],
+          prediction_target_weights[layer_index],
+          prediction_core_weights[layer_index],
+          prediction_biases[layer_index],
+          prediction_compress_kinds[layer_index],
+          prediction_windows[layer_index],
+          prediction_norm_weights[layer_index],
+          prediction_norm_biases[layer_index],
+          prediction_ffn_norm_weights[layer_index],
+          prediction_ffn_norm_biases[layer_index],
+          prediction_ffn_in_weights[layer_index],
+          prediction_ffn_in_biases[layer_index],
+          prediction_ffn_out_weights[layer_index],
+          prediction_ffn_out_biases[layer_index]);
+    }
+  } else {
+    prediction_val = nomemory_run_exact_val_ffn_layers_range(
+        prediction_val,
+        prediction_source_weights,
+        prediction_target_weights,
+        prediction_core_weights,
+        prediction_biases,
+        prediction_norm_weights,
+        prediction_norm_biases,
+        prediction_ffn_norm_weights,
+        prediction_ffn_norm_biases,
+        prediction_ffn_in_weights,
+        prediction_ffn_in_biases,
+        prediction_ffn_out_weights,
+        prediction_ffn_out_biases,
+        prediction_compress_kinds,
+        prediction_windows,
+        0,
+        static_cast<int64_t>(num_prediction_layers),
+        use_fused_forward);
+  }
+  return {prediction_val, trace_tensors};
+}
+
+torch::Tensor nomemory_causal_stack_ffn_fused(
+    const torch::Tensor& token_val,
+    const torch::Tensor& anchor_state,
+    const torch::Tensor& anchor_val,
+    const torch::Tensor& s_prediction_weight,
+    const torch::Tensor& prediction_input_norm_weight,
+    const torch::Tensor& prediction_input_norm_bias,
+    const std::vector<torch::Tensor>& sequence_source_weights,
+    const std::vector<torch::Tensor>& sequence_target_weights,
+    const std::vector<torch::Tensor>& sequence_core_weights,
+    const std::vector<torch::Tensor>& sequence_biases,
+    const std::vector<torch::Tensor>& sequence_norm_weights,
+    const std::vector<torch::Tensor>& sequence_norm_biases,
+    const std::vector<torch::Tensor>& sequence_ffn_norm_weights,
+    const std::vector<torch::Tensor>& sequence_ffn_norm_biases,
+    const std::vector<torch::Tensor>& sequence_ffn_in_weights,
+    const std::vector<torch::Tensor>& sequence_ffn_in_biases,
+    const std::vector<torch::Tensor>& sequence_ffn_out_weights,
+    const std::vector<torch::Tensor>& sequence_ffn_out_biases,
+    const std::vector<int64_t>& sequence_compress_kinds,
+    const std::vector<int64_t>& sequence_windows,
+    const std::vector<int64_t>& sequence_target_block_sizes,
+    const std::vector<int64_t>& sequence_source_block_sizes,
+    const std::vector<torch::Tensor>& prediction_source_weights,
+    const std::vector<torch::Tensor>& prediction_target_weights,
+    const std::vector<torch::Tensor>& prediction_core_weights,
+    const std::vector<torch::Tensor>& prediction_biases,
+    const std::vector<torch::Tensor>& prediction_norm_weights,
+    const std::vector<torch::Tensor>& prediction_norm_biases,
+    const std::vector<torch::Tensor>& prediction_ffn_norm_weights,
+    const std::vector<torch::Tensor>& prediction_ffn_norm_biases,
+    const std::vector<torch::Tensor>& prediction_ffn_in_weights,
+    const std::vector<torch::Tensor>& prediction_ffn_in_biases,
+    const std::vector<torch::Tensor>& prediction_ffn_out_weights,
+    const std::vector<torch::Tensor>& prediction_ffn_out_biases,
+    const std::vector<int64_t>& prediction_compress_kinds,
+    const std::vector<int64_t>& prediction_windows,
+    const std::vector<int64_t>& prediction_target_block_sizes,
+    const std::vector<int64_t>& prediction_source_block_sizes,
+    const std::string& state_activation_name) {
+  require_supported_device(token_val, "token_val");
+  return std::get<0>(nomemory_causal_stack_ffn_forward_impl(
+      token_val,
+      anchor_state,
+      anchor_val,
+      s_prediction_weight,
+      prediction_input_norm_weight,
+      prediction_input_norm_bias,
+      sequence_source_weights,
+      sequence_target_weights,
+      sequence_core_weights,
+      sequence_biases,
+      sequence_norm_weights,
+      sequence_norm_biases,
+      sequence_ffn_norm_weights,
+      sequence_ffn_norm_biases,
+      sequence_ffn_in_weights,
+      sequence_ffn_in_biases,
+      sequence_ffn_out_weights,
+      sequence_ffn_out_biases,
+      sequence_compress_kinds,
+      sequence_windows,
+      sequence_target_block_sizes,
+      sequence_source_block_sizes,
+      prediction_source_weights,
+      prediction_target_weights,
+      prediction_core_weights,
+      prediction_biases,
+      prediction_norm_weights,
+      prediction_norm_biases,
+      prediction_ffn_norm_weights,
+      prediction_ffn_norm_biases,
+      prediction_ffn_in_weights,
+      prediction_ffn_in_biases,
+      prediction_ffn_out_weights,
+      prediction_ffn_out_biases,
+      prediction_compress_kinds,
+      prediction_windows,
+      prediction_target_block_sizes,
+      prediction_source_block_sizes,
+      state_activation_name,
+      false,
+      true));
+}
+
+std::tuple<torch::Tensor, std::vector<torch::Tensor>> nomemory_causal_stack_ffn_fused_trace(
+    const torch::Tensor& token_val,
+    const torch::Tensor& anchor_state,
+    const torch::Tensor& anchor_val,
+    const torch::Tensor& s_prediction_weight,
+    const torch::Tensor& prediction_input_norm_weight,
+    const torch::Tensor& prediction_input_norm_bias,
+    const std::vector<torch::Tensor>& sequence_source_weights,
+    const std::vector<torch::Tensor>& sequence_target_weights,
+    const std::vector<torch::Tensor>& sequence_core_weights,
+    const std::vector<torch::Tensor>& sequence_biases,
+    const std::vector<torch::Tensor>& sequence_norm_weights,
+    const std::vector<torch::Tensor>& sequence_norm_biases,
+    const std::vector<torch::Tensor>& sequence_ffn_norm_weights,
+    const std::vector<torch::Tensor>& sequence_ffn_norm_biases,
+    const std::vector<torch::Tensor>& sequence_ffn_in_weights,
+    const std::vector<torch::Tensor>& sequence_ffn_in_biases,
+    const std::vector<torch::Tensor>& sequence_ffn_out_weights,
+    const std::vector<torch::Tensor>& sequence_ffn_out_biases,
+    const std::vector<int64_t>& sequence_compress_kinds,
+    const std::vector<int64_t>& sequence_windows,
+    const std::vector<int64_t>& sequence_target_block_sizes,
+    const std::vector<int64_t>& sequence_source_block_sizes,
+    const std::vector<torch::Tensor>& prediction_source_weights,
+    const std::vector<torch::Tensor>& prediction_target_weights,
+    const std::vector<torch::Tensor>& prediction_core_weights,
+    const std::vector<torch::Tensor>& prediction_biases,
+    const std::vector<torch::Tensor>& prediction_norm_weights,
+    const std::vector<torch::Tensor>& prediction_norm_biases,
+    const std::vector<torch::Tensor>& prediction_ffn_norm_weights,
+    const std::vector<torch::Tensor>& prediction_ffn_norm_biases,
+    const std::vector<torch::Tensor>& prediction_ffn_in_weights,
+    const std::vector<torch::Tensor>& prediction_ffn_in_biases,
+    const std::vector<torch::Tensor>& prediction_ffn_out_weights,
+    const std::vector<torch::Tensor>& prediction_ffn_out_biases,
+    const std::vector<int64_t>& prediction_compress_kinds,
+    const std::vector<int64_t>& prediction_windows,
+    const std::vector<int64_t>& prediction_target_block_sizes,
+    const std::vector<int64_t>& prediction_source_block_sizes,
+    const std::string& state_activation_name) {
+  require_supported_device(token_val, "token_val");
+  return nomemory_causal_stack_ffn_forward_impl(
+      token_val,
+      anchor_state,
+      anchor_val,
+      s_prediction_weight,
+      prediction_input_norm_weight,
+      prediction_input_norm_bias,
+      sequence_source_weights,
+      sequence_target_weights,
+      sequence_core_weights,
+      sequence_biases,
+      sequence_norm_weights,
+      sequence_norm_biases,
+      sequence_ffn_norm_weights,
+      sequence_ffn_norm_biases,
+      sequence_ffn_in_weights,
+      sequence_ffn_in_biases,
+      sequence_ffn_out_weights,
+      sequence_ffn_out_biases,
+      sequence_compress_kinds,
+      sequence_windows,
+      sequence_target_block_sizes,
+      sequence_source_block_sizes,
+      prediction_source_weights,
+      prediction_target_weights,
+      prediction_core_weights,
+      prediction_biases,
+      prediction_norm_weights,
+      prediction_norm_biases,
+      prediction_ffn_norm_weights,
+      prediction_ffn_norm_biases,
+      prediction_ffn_in_weights,
+      prediction_ffn_in_biases,
+      prediction_ffn_out_weights,
+      prediction_ffn_out_biases,
+      prediction_compress_kinds,
+      prediction_windows,
+      prediction_target_block_sizes,
+      prediction_source_block_sizes,
+      state_activation_name,
+      false,
+      false);
+}
+
+std::vector<torch::Tensor> nomemory_causal_stack_ffn_fused_backward_cuda(
+    const torch::Tensor& token_val,
+    const torch::Tensor& anchor_state,
+    const torch::Tensor& anchor_val,
+    const torch::Tensor& s_prediction_weight,
+    const torch::Tensor& prediction_input_norm_weight,
+    const torch::Tensor& prediction_input_norm_bias,
+    const std::vector<torch::Tensor>& sequence_source_weights,
+    const std::vector<torch::Tensor>& sequence_target_weights,
+    const std::vector<torch::Tensor>& sequence_core_weights,
+    const std::vector<torch::Tensor>& sequence_biases,
+    const std::vector<torch::Tensor>& sequence_norm_weights,
+    const std::vector<torch::Tensor>& sequence_norm_biases,
+    const std::vector<torch::Tensor>& sequence_ffn_norm_weights,
+    const std::vector<torch::Tensor>& sequence_ffn_norm_biases,
+    const std::vector<torch::Tensor>& sequence_ffn_in_weights,
+    const std::vector<torch::Tensor>& sequence_ffn_in_biases,
+    const std::vector<torch::Tensor>& sequence_ffn_out_weights,
+    const std::vector<torch::Tensor>& sequence_ffn_out_biases,
+    const std::vector<int64_t>& sequence_compress_kinds,
+    const std::vector<int64_t>& sequence_windows,
+    const std::vector<int64_t>& sequence_target_block_sizes,
+    const std::vector<int64_t>& sequence_source_block_sizes,
+    const std::vector<torch::Tensor>& prediction_source_weights,
+    const std::vector<torch::Tensor>& prediction_target_weights,
+    const std::vector<torch::Tensor>& prediction_core_weights,
+    const std::vector<torch::Tensor>& prediction_biases,
+    const std::vector<torch::Tensor>& prediction_norm_weights,
+    const std::vector<torch::Tensor>& prediction_norm_biases,
+    const std::vector<torch::Tensor>& prediction_ffn_norm_weights,
+    const std::vector<torch::Tensor>& prediction_ffn_norm_biases,
+    const std::vector<torch::Tensor>& prediction_ffn_in_weights,
+    const std::vector<torch::Tensor>& prediction_ffn_in_biases,
+    const std::vector<torch::Tensor>& prediction_ffn_out_weights,
+    const std::vector<torch::Tensor>& prediction_ffn_out_biases,
+    const std::vector<int64_t>& prediction_compress_kinds,
+    const std::vector<int64_t>& prediction_windows,
+    const std::vector<int64_t>& prediction_target_block_sizes,
+    const std::vector<int64_t>& prediction_source_block_sizes,
+    const std::string& state_activation_name,
+    const std::vector<torch::Tensor>& trace_tensors,
+    const torch::Tensor& grad_query_val) {
+  if (!token_val.is_cuda()) {
+    throw std::runtime_error("nomemory_causal_stack_ffn_fused_backward_cuda requires CUDA inputs.");
+  }
+#ifdef WITH_CUDA
+  c10::AutoGradMode enable_grad(true);
+  auto make_leaf = [](const torch::Tensor& tensor) {
+    auto leaf = tensor.detach();
+    leaf.set_requires_grad(tensor.requires_grad());
+    return leaf;
+  };
+  auto make_boundary_leaf = [](const torch::Tensor& tensor) {
+    auto leaf = tensor.detach();
+    leaf.set_requires_grad(true);
+    return leaf;
+  };
+  auto compute_grads = [](const torch::Tensor& output,
+                          const std::vector<torch::Tensor>& inputs,
+                          const torch::Tensor& grad_output) {
+    torch::autograd::variable_list grad_inputs;
+    std::vector<int64_t> grad_input_map(inputs.size(), -1);
+    for (size_t index = 0; index < inputs.size(); ++index) {
+      if (inputs[index].defined() && inputs[index].requires_grad()) {
+        grad_input_map[index] = static_cast<int64_t>(grad_inputs.size());
+        grad_inputs.push_back(inputs[index]);
+      }
+    }
+    torch::autograd::variable_list local_outputs{output};
+    torch::autograd::variable_list local_grad_outputs{grad_output};
+    pybind11::gil_scoped_release no_gil;
+    auto grads = torch::autograd::grad(
+        local_outputs,
+        grad_inputs,
+        local_grad_outputs,
+        std::nullopt,
+        false,
+        true);
+    std::vector<torch::Tensor> results(inputs.size());
+    for (size_t index = 0; index < inputs.size(); ++index) {
+      if (grad_input_map[index] >= 0) {
+        results[index] = grads[static_cast<size_t>(grad_input_map[index])];
+      }
+    }
+    return results;
+  };
+
+  auto token_val_leaf = make_leaf(token_val);
+  auto anchor_state_leaf = make_leaf(anchor_state);
+  auto anchor_val_leaf = make_leaf(anchor_val);
+  auto s_prediction_weight_leaf = make_leaf(s_prediction_weight);
+  auto prediction_input_norm_weight_leaf = make_leaf(prediction_input_norm_weight);
+  auto prediction_input_norm_bias_leaf = make_leaf(prediction_input_norm_bias);
+
+  std::vector<torch::Tensor> sequence_source_weights_leaves;
+  std::vector<torch::Tensor> sequence_target_weights_leaves;
+  std::vector<torch::Tensor> sequence_core_weights_leaves;
+  std::vector<torch::Tensor> sequence_biases_leaves;
+  std::vector<torch::Tensor> sequence_norm_weights_leaves;
+  std::vector<torch::Tensor> sequence_norm_biases_leaves;
+  std::vector<torch::Tensor> sequence_ffn_norm_weights_leaves;
+  std::vector<torch::Tensor> sequence_ffn_norm_biases_leaves;
+  std::vector<torch::Tensor> sequence_ffn_in_weights_leaves;
+  std::vector<torch::Tensor> sequence_ffn_in_biases_leaves;
+  std::vector<torch::Tensor> sequence_ffn_out_weights_leaves;
+  std::vector<torch::Tensor> sequence_ffn_out_biases_leaves;
+  std::vector<torch::Tensor> prediction_source_weights_leaves;
+  std::vector<torch::Tensor> prediction_target_weights_leaves;
+  std::vector<torch::Tensor> prediction_core_weights_leaves;
+  std::vector<torch::Tensor> prediction_biases_leaves;
+  std::vector<torch::Tensor> prediction_norm_weights_leaves;
+  std::vector<torch::Tensor> prediction_norm_biases_leaves;
+  std::vector<torch::Tensor> prediction_ffn_norm_weights_leaves;
+  std::vector<torch::Tensor> prediction_ffn_norm_biases_leaves;
+  std::vector<torch::Tensor> prediction_ffn_in_weights_leaves;
+  std::vector<torch::Tensor> prediction_ffn_in_biases_leaves;
+  std::vector<torch::Tensor> prediction_ffn_out_weights_leaves;
+  std::vector<torch::Tensor> prediction_ffn_out_biases_leaves;
+  for (const auto& tensor : sequence_source_weights) sequence_source_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : sequence_target_weights) sequence_target_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : sequence_core_weights) sequence_core_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : sequence_biases) sequence_biases_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : sequence_norm_weights) sequence_norm_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : sequence_norm_biases) sequence_norm_biases_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : sequence_ffn_norm_weights) sequence_ffn_norm_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : sequence_ffn_norm_biases) sequence_ffn_norm_biases_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : sequence_ffn_in_weights) sequence_ffn_in_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : sequence_ffn_in_biases) sequence_ffn_in_biases_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : sequence_ffn_out_weights) sequence_ffn_out_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : sequence_ffn_out_biases) sequence_ffn_out_biases_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : prediction_source_weights) prediction_source_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : prediction_target_weights) prediction_target_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : prediction_core_weights) prediction_core_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : prediction_biases) prediction_biases_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : prediction_norm_weights) prediction_norm_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : prediction_norm_biases) prediction_norm_biases_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : prediction_ffn_norm_weights) prediction_ffn_norm_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : prediction_ffn_norm_biases) prediction_ffn_norm_biases_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : prediction_ffn_in_weights) prediction_ffn_in_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : prediction_ffn_in_biases) prediction_ffn_in_biases_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : prediction_ffn_out_weights) prediction_ffn_out_weights_leaves.push_back(make_leaf(tensor));
+  for (const auto& tensor : prediction_ffn_out_biases) prediction_ffn_out_biases_leaves.push_back(make_leaf(tensor));
+
+  const auto num_sequence_layers = sequence_source_weights.size();
+  const auto num_prediction_layers = prediction_source_weights.size();
+  const auto expected_trace_tensors = num_sequence_layers + 1 + num_prediction_layers;
+  if (trace_tensors.size() == expected_trace_tensors && num_sequence_layers > 0) {
+    const int64_t sequence_split = std::max<int64_t>(1, static_cast<int64_t>(num_sequence_layers / 2));
+    const size_t aligned_trace_index = num_sequence_layers;
+    const size_t prediction_trace_start = num_sequence_layers + 1;
+
+    std::vector<torch::Tensor> grad_sequence_source_weights(num_sequence_layers);
+    std::vector<torch::Tensor> grad_sequence_target_weights(num_sequence_layers);
+    std::vector<torch::Tensor> grad_sequence_core_weights(num_sequence_layers);
+    std::vector<torch::Tensor> grad_sequence_biases(num_sequence_layers);
+    std::vector<torch::Tensor> grad_sequence_norm_weights(num_sequence_layers);
+    std::vector<torch::Tensor> grad_sequence_norm_biases(num_sequence_layers);
+    std::vector<torch::Tensor> grad_sequence_ffn_norm_weights(num_sequence_layers);
+    std::vector<torch::Tensor> grad_sequence_ffn_norm_biases(num_sequence_layers);
+    std::vector<torch::Tensor> grad_sequence_ffn_in_weights(num_sequence_layers);
+    std::vector<torch::Tensor> grad_sequence_ffn_in_biases(num_sequence_layers);
+    std::vector<torch::Tensor> grad_sequence_ffn_out_weights(num_sequence_layers);
+    std::vector<torch::Tensor> grad_sequence_ffn_out_biases(num_sequence_layers);
+    std::vector<torch::Tensor> grad_prediction_source_weights(num_prediction_layers);
+    std::vector<torch::Tensor> grad_prediction_target_weights(num_prediction_layers);
+    std::vector<torch::Tensor> grad_prediction_core_weights(num_prediction_layers);
+    std::vector<torch::Tensor> grad_prediction_biases(num_prediction_layers);
+    std::vector<torch::Tensor> grad_prediction_norm_weights(num_prediction_layers);
+    std::vector<torch::Tensor> grad_prediction_norm_biases(num_prediction_layers);
+    std::vector<torch::Tensor> grad_prediction_ffn_norm_weights(num_prediction_layers);
+    std::vector<torch::Tensor> grad_prediction_ffn_norm_biases(num_prediction_layers);
+    std::vector<torch::Tensor> grad_prediction_ffn_in_weights(num_prediction_layers);
+    std::vector<torch::Tensor> grad_prediction_ffn_in_biases(num_prediction_layers);
+    std::vector<torch::Tensor> grad_prediction_ffn_out_weights(num_prediction_layers);
+    std::vector<torch::Tensor> grad_prediction_ffn_out_biases(num_prediction_layers);
+    torch::Tensor grad_s_prediction_weight;
+    torch::Tensor grad_prediction_input_norm_weight;
+    torch::Tensor grad_prediction_input_norm_bias;
+    torch::Tensor grad_token_val;
+    torch::Tensor grad_anchor_val;
+
+    auto prediction_input_leaf = make_boundary_leaf(trace_tensors[prediction_trace_start]);
+    auto prediction_output = nomemory_run_exact_val_ffn_layers_range(
+        prediction_input_leaf,
+        prediction_source_weights_leaves,
+        prediction_target_weights_leaves,
+        prediction_core_weights_leaves,
+        prediction_biases_leaves,
+        prediction_norm_weights_leaves,
+        prediction_norm_biases_leaves,
+        prediction_ffn_norm_weights_leaves,
+        prediction_ffn_norm_biases_leaves,
+        prediction_ffn_in_weights_leaves,
+        prediction_ffn_in_biases_leaves,
+        prediction_ffn_out_weights_leaves,
+        prediction_ffn_out_biases_leaves,
+        prediction_compress_kinds,
+        prediction_windows,
+        0,
+        static_cast<int64_t>(num_prediction_layers),
+        false);
+    std::vector<torch::Tensor> prediction_inputs;
+    prediction_inputs.push_back(prediction_input_leaf);
+    for (const auto& tensor : prediction_source_weights_leaves) prediction_inputs.push_back(tensor);
+    for (const auto& tensor : prediction_target_weights_leaves) prediction_inputs.push_back(tensor);
+    for (const auto& tensor : prediction_core_weights_leaves) prediction_inputs.push_back(tensor);
+    for (const auto& tensor : prediction_biases_leaves) prediction_inputs.push_back(tensor);
+    for (const auto& tensor : prediction_norm_weights_leaves) prediction_inputs.push_back(tensor);
+    for (const auto& tensor : prediction_norm_biases_leaves) prediction_inputs.push_back(tensor);
+    for (const auto& tensor : prediction_ffn_norm_weights_leaves) prediction_inputs.push_back(tensor);
+    for (const auto& tensor : prediction_ffn_norm_biases_leaves) prediction_inputs.push_back(tensor);
+    for (const auto& tensor : prediction_ffn_in_weights_leaves) prediction_inputs.push_back(tensor);
+    for (const auto& tensor : prediction_ffn_in_biases_leaves) prediction_inputs.push_back(tensor);
+    for (const auto& tensor : prediction_ffn_out_weights_leaves) prediction_inputs.push_back(tensor);
+    for (const auto& tensor : prediction_ffn_out_biases_leaves) prediction_inputs.push_back(tensor);
+    auto prediction_grads = compute_grads(prediction_output, prediction_inputs, grad_query_val);
+    auto grad_prediction_input = prediction_grads[0];
+    size_t grad_offset = 1;
+    for (size_t index = 0; index < num_prediction_layers; ++index) grad_prediction_source_weights[index] = prediction_grads[grad_offset + index];
+    grad_offset += num_prediction_layers;
+    for (size_t index = 0; index < num_prediction_layers; ++index) grad_prediction_target_weights[index] = prediction_grads[grad_offset + index];
+    grad_offset += num_prediction_layers;
+    for (size_t index = 0; index < num_prediction_layers; ++index) grad_prediction_core_weights[index] = prediction_grads[grad_offset + index];
+    grad_offset += num_prediction_layers;
+    for (size_t index = 0; index < num_prediction_layers; ++index) grad_prediction_biases[index] = prediction_grads[grad_offset + index];
+    grad_offset += num_prediction_layers;
+    for (size_t index = 0; index < num_prediction_layers; ++index) grad_prediction_norm_weights[index] = prediction_grads[grad_offset + index];
+    grad_offset += num_prediction_layers;
+    for (size_t index = 0; index < num_prediction_layers; ++index) grad_prediction_norm_biases[index] = prediction_grads[grad_offset + index];
+    grad_offset += num_prediction_layers;
+    for (size_t index = 0; index < num_prediction_layers; ++index) grad_prediction_ffn_norm_weights[index] = prediction_grads[grad_offset + index];
+    grad_offset += num_prediction_layers;
+    for (size_t index = 0; index < num_prediction_layers; ++index) grad_prediction_ffn_norm_biases[index] = prediction_grads[grad_offset + index];
+    grad_offset += num_prediction_layers;
+    for (size_t index = 0; index < num_prediction_layers; ++index) grad_prediction_ffn_in_weights[index] = prediction_grads[grad_offset + index];
+    grad_offset += num_prediction_layers;
+    for (size_t index = 0; index < num_prediction_layers; ++index) grad_prediction_ffn_in_biases[index] = prediction_grads[grad_offset + index];
+    grad_offset += num_prediction_layers;
+    for (size_t index = 0; index < num_prediction_layers; ++index) grad_prediction_ffn_out_weights[index] = prediction_grads[grad_offset + index];
+    grad_offset += num_prediction_layers;
+    for (size_t index = 0; index < num_prediction_layers; ++index) grad_prediction_ffn_out_biases[index] = prediction_grads[grad_offset + index];
+
+    auto aligned_s_leaf = make_boundary_leaf(trace_tensors[aligned_trace_index]);
+    auto prediction_input = nomemory_build_prediction_val(
+        aligned_s_leaf,
+        s_prediction_weight_leaf,
+        prediction_input_norm_weight_leaf,
+        prediction_input_norm_bias_leaf);
+    auto prediction_projection_grads = compute_grads(
+        prediction_input,
+        {
+            aligned_s_leaf,
+            s_prediction_weight_leaf,
+            prediction_input_norm_weight_leaf,
+            prediction_input_norm_bias_leaf,
+        },
+        grad_prediction_input);
+    auto grad_aligned_s = prediction_projection_grads[0];
+    grad_s_prediction_weight = prediction_projection_grads[1];
+    grad_prediction_input_norm_weight = prediction_projection_grads[2];
+    grad_prediction_input_norm_bias = prediction_projection_grads[3];
+
+    auto sequence_mid_leaf = make_boundary_leaf(trace_tensors[static_cast<size_t>(sequence_split)]);
+    auto sequence_tail = nomemory_run_exact_val_ffn_layers_range(
+        sequence_mid_leaf,
+        sequence_source_weights_leaves,
+        sequence_target_weights_leaves,
+        sequence_core_weights_leaves,
+        sequence_biases_leaves,
+        sequence_norm_weights_leaves,
+        sequence_norm_biases_leaves,
+        sequence_ffn_norm_weights_leaves,
+        sequence_ffn_norm_biases_leaves,
+        sequence_ffn_in_weights_leaves,
+        sequence_ffn_in_biases_leaves,
+        sequence_ffn_out_weights_leaves,
+        sequence_ffn_out_biases_leaves,
+        sequence_compress_kinds,
+        sequence_windows,
+        sequence_split,
+        static_cast<int64_t>(num_sequence_layers),
+        false);
+    auto aligned_tail = sequence_tail.slice(1, 1, sequence_tail.size(1));
+    std::vector<torch::Tensor> sequence_tail_inputs;
+    sequence_tail_inputs.push_back(sequence_mid_leaf);
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) sequence_tail_inputs.push_back(sequence_source_weights_leaves[index]);
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) sequence_tail_inputs.push_back(sequence_target_weights_leaves[index]);
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) sequence_tail_inputs.push_back(sequence_core_weights_leaves[index]);
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) sequence_tail_inputs.push_back(sequence_biases_leaves[index]);
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) sequence_tail_inputs.push_back(sequence_norm_weights_leaves[index]);
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) sequence_tail_inputs.push_back(sequence_norm_biases_leaves[index]);
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) sequence_tail_inputs.push_back(sequence_ffn_norm_weights_leaves[index]);
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) sequence_tail_inputs.push_back(sequence_ffn_norm_biases_leaves[index]);
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) sequence_tail_inputs.push_back(sequence_ffn_in_weights_leaves[index]);
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) sequence_tail_inputs.push_back(sequence_ffn_in_biases_leaves[index]);
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) sequence_tail_inputs.push_back(sequence_ffn_out_weights_leaves[index]);
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) sequence_tail_inputs.push_back(sequence_ffn_out_biases_leaves[index]);
+    auto sequence_tail_grads = compute_grads(aligned_tail, sequence_tail_inputs, grad_aligned_s);
+    auto grad_sequence_mid = sequence_tail_grads[0];
+    grad_offset = 1;
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) grad_sequence_source_weights[index] = sequence_tail_grads[grad_offset++];
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) grad_sequence_target_weights[index] = sequence_tail_grads[grad_offset++];
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) grad_sequence_core_weights[index] = sequence_tail_grads[grad_offset++];
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) grad_sequence_biases[index] = sequence_tail_grads[grad_offset++];
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) grad_sequence_norm_weights[index] = sequence_tail_grads[grad_offset++];
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) grad_sequence_norm_biases[index] = sequence_tail_grads[grad_offset++];
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) grad_sequence_ffn_norm_weights[index] = sequence_tail_grads[grad_offset++];
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) grad_sequence_ffn_norm_biases[index] = sequence_tail_grads[grad_offset++];
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) grad_sequence_ffn_in_weights[index] = sequence_tail_grads[grad_offset++];
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) grad_sequence_ffn_in_biases[index] = sequence_tail_grads[grad_offset++];
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) grad_sequence_ffn_out_weights[index] = sequence_tail_grads[grad_offset++];
+    for (size_t index = static_cast<size_t>(sequence_split); index < num_sequence_layers; ++index) grad_sequence_ffn_out_biases[index] = sequence_tail_grads[grad_offset++];
+
+    auto sequence_head_leaf = make_boundary_leaf(trace_tensors[0]);
+    auto sequence_head = nomemory_run_exact_val_ffn_layers_range(
+        sequence_head_leaf,
+        sequence_source_weights_leaves,
+        sequence_target_weights_leaves,
+        sequence_core_weights_leaves,
+        sequence_biases_leaves,
+        sequence_norm_weights_leaves,
+        sequence_norm_biases_leaves,
+        sequence_ffn_norm_weights_leaves,
+        sequence_ffn_norm_biases_leaves,
+        sequence_ffn_in_weights_leaves,
+        sequence_ffn_in_biases_leaves,
+        sequence_ffn_out_weights_leaves,
+        sequence_ffn_out_biases_leaves,
+        sequence_compress_kinds,
+        sequence_windows,
+        0,
+        sequence_split,
+        false);
+    std::vector<torch::Tensor> sequence_head_inputs;
+    sequence_head_inputs.push_back(sequence_head_leaf);
+    for (int64_t index = 0; index < sequence_split; ++index) sequence_head_inputs.push_back(sequence_source_weights_leaves[static_cast<size_t>(index)]);
+    for (int64_t index = 0; index < sequence_split; ++index) sequence_head_inputs.push_back(sequence_target_weights_leaves[static_cast<size_t>(index)]);
+    for (int64_t index = 0; index < sequence_split; ++index) sequence_head_inputs.push_back(sequence_core_weights_leaves[static_cast<size_t>(index)]);
+    for (int64_t index = 0; index < sequence_split; ++index) sequence_head_inputs.push_back(sequence_biases_leaves[static_cast<size_t>(index)]);
+    for (int64_t index = 0; index < sequence_split; ++index) sequence_head_inputs.push_back(sequence_norm_weights_leaves[static_cast<size_t>(index)]);
+    for (int64_t index = 0; index < sequence_split; ++index) sequence_head_inputs.push_back(sequence_norm_biases_leaves[static_cast<size_t>(index)]);
+    for (int64_t index = 0; index < sequence_split; ++index) sequence_head_inputs.push_back(sequence_ffn_norm_weights_leaves[static_cast<size_t>(index)]);
+    for (int64_t index = 0; index < sequence_split; ++index) sequence_head_inputs.push_back(sequence_ffn_norm_biases_leaves[static_cast<size_t>(index)]);
+    for (int64_t index = 0; index < sequence_split; ++index) sequence_head_inputs.push_back(sequence_ffn_in_weights_leaves[static_cast<size_t>(index)]);
+    for (int64_t index = 0; index < sequence_split; ++index) sequence_head_inputs.push_back(sequence_ffn_in_biases_leaves[static_cast<size_t>(index)]);
+    for (int64_t index = 0; index < sequence_split; ++index) sequence_head_inputs.push_back(sequence_ffn_out_weights_leaves[static_cast<size_t>(index)]);
+    for (int64_t index = 0; index < sequence_split; ++index) sequence_head_inputs.push_back(sequence_ffn_out_biases_leaves[static_cast<size_t>(index)]);
+    auto sequence_head_grads = compute_grads(sequence_head, sequence_head_inputs, grad_sequence_mid);
+    auto grad_sequence_initial = sequence_head_grads[0];
+    grad_offset = 1;
+    for (int64_t index = 0; index < sequence_split; ++index) grad_sequence_source_weights[static_cast<size_t>(index)] = sequence_head_grads[grad_offset++];
+    for (int64_t index = 0; index < sequence_split; ++index) grad_sequence_target_weights[static_cast<size_t>(index)] = sequence_head_grads[grad_offset++];
+    for (int64_t index = 0; index < sequence_split; ++index) grad_sequence_core_weights[static_cast<size_t>(index)] = sequence_head_grads[grad_offset++];
+    for (int64_t index = 0; index < sequence_split; ++index) grad_sequence_biases[static_cast<size_t>(index)] = sequence_head_grads[grad_offset++];
+    for (int64_t index = 0; index < sequence_split; ++index) grad_sequence_norm_weights[static_cast<size_t>(index)] = sequence_head_grads[grad_offset++];
+    for (int64_t index = 0; index < sequence_split; ++index) grad_sequence_norm_biases[static_cast<size_t>(index)] = sequence_head_grads[grad_offset++];
+    for (int64_t index = 0; index < sequence_split; ++index) grad_sequence_ffn_norm_weights[static_cast<size_t>(index)] = sequence_head_grads[grad_offset++];
+    for (int64_t index = 0; index < sequence_split; ++index) grad_sequence_ffn_norm_biases[static_cast<size_t>(index)] = sequence_head_grads[grad_offset++];
+    for (int64_t index = 0; index < sequence_split; ++index) grad_sequence_ffn_in_weights[static_cast<size_t>(index)] = sequence_head_grads[grad_offset++];
+    for (int64_t index = 0; index < sequence_split; ++index) grad_sequence_ffn_in_biases[static_cast<size_t>(index)] = sequence_head_grads[grad_offset++];
+    for (int64_t index = 0; index < sequence_split; ++index) grad_sequence_ffn_out_weights[static_cast<size_t>(index)] = sequence_head_grads[grad_offset++];
+    for (int64_t index = 0; index < sequence_split; ++index) grad_sequence_ffn_out_biases[static_cast<size_t>(index)] = sequence_head_grads[grad_offset++];
+
+    auto token_val_root = make_leaf(token_val);
+    auto anchor_val_root = make_leaf(anchor_val);
+    auto sequence_initial = nomemory_build_initial_sequence_val(token_val_root, anchor_val_root);
+    auto root_grads = compute_grads(
+        sequence_initial,
+        {token_val_root, anchor_val_root},
+        grad_sequence_initial);
+    grad_token_val = root_grads[0];
+    grad_anchor_val = root_grads[1];
+
+    std::vector<torch::Tensor> all_grads;
+    all_grads.reserve(6 + num_sequence_layers * 12 + num_prediction_layers * 12);
+    all_grads.push_back(grad_token_val);
+    all_grads.push_back(torch::Tensor());
+    all_grads.push_back(grad_anchor_val);
+    all_grads.push_back(grad_s_prediction_weight);
+    all_grads.push_back(grad_prediction_input_norm_weight);
+    all_grads.push_back(grad_prediction_input_norm_bias);
+    for (const auto& tensor : grad_sequence_source_weights) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_sequence_target_weights) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_sequence_core_weights) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_sequence_biases) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_sequence_norm_weights) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_sequence_norm_biases) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_prediction_source_weights) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_prediction_target_weights) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_prediction_core_weights) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_prediction_biases) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_prediction_norm_weights) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_prediction_norm_biases) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_sequence_ffn_norm_weights) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_sequence_ffn_norm_biases) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_sequence_ffn_in_weights) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_sequence_ffn_in_biases) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_sequence_ffn_out_weights) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_sequence_ffn_out_biases) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_prediction_ffn_norm_weights) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_prediction_ffn_norm_biases) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_prediction_ffn_in_weights) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_prediction_ffn_in_biases) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_prediction_ffn_out_weights) all_grads.push_back(tensor);
+    for (const auto& tensor : grad_prediction_ffn_out_biases) all_grads.push_back(tensor);
+    return all_grads;
+  }
+
+  auto outputs = nomemory_causal_stack_ffn_forward_impl(
+      token_val_leaf,
+      anchor_state_leaf,
+      anchor_val_leaf,
+      s_prediction_weight_leaf,
+      prediction_input_norm_weight_leaf,
+      prediction_input_norm_bias_leaf,
+      sequence_source_weights_leaves,
+      sequence_target_weights_leaves,
+      sequence_core_weights_leaves,
+      sequence_biases_leaves,
+      sequence_norm_weights_leaves,
+      sequence_norm_biases_leaves,
+      sequence_ffn_norm_weights_leaves,
+      sequence_ffn_norm_biases_leaves,
+      sequence_ffn_in_weights_leaves,
+      sequence_ffn_in_biases_leaves,
+      sequence_ffn_out_weights_leaves,
+      sequence_ffn_out_biases_leaves,
+      sequence_compress_kinds,
+      sequence_windows,
+      sequence_target_block_sizes,
+      sequence_source_block_sizes,
+      prediction_source_weights_leaves,
+      prediction_target_weights_leaves,
+      prediction_core_weights_leaves,
+      prediction_biases_leaves,
+      prediction_norm_weights_leaves,
+      prediction_norm_biases_leaves,
+      prediction_ffn_norm_weights_leaves,
+      prediction_ffn_norm_biases_leaves,
+      prediction_ffn_in_weights_leaves,
+      prediction_ffn_in_biases_leaves,
+      prediction_ffn_out_weights_leaves,
+      prediction_ffn_out_biases_leaves,
+      prediction_compress_kinds,
+      prediction_windows,
+      prediction_target_block_sizes,
+      prediction_source_block_sizes,
+      state_activation_name,
+      false,
+      false);
+
+  std::vector<torch::Tensor> all_inputs;
+  all_inputs.push_back(token_val_leaf);
+  all_inputs.push_back(anchor_state_leaf);
+  all_inputs.push_back(anchor_val_leaf);
+  all_inputs.push_back(s_prediction_weight_leaf);
+  all_inputs.push_back(prediction_input_norm_weight_leaf);
+  all_inputs.push_back(prediction_input_norm_bias_leaf);
+  for (const auto& tensor : sequence_source_weights_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : sequence_target_weights_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : sequence_core_weights_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : sequence_biases_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : sequence_norm_weights_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : sequence_norm_biases_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : prediction_source_weights_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : prediction_target_weights_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : prediction_core_weights_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : prediction_biases_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : prediction_norm_weights_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : prediction_norm_biases_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : sequence_ffn_norm_weights_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : sequence_ffn_norm_biases_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : sequence_ffn_in_weights_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : sequence_ffn_in_biases_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : sequence_ffn_out_weights_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : sequence_ffn_out_biases_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : prediction_ffn_norm_weights_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : prediction_ffn_norm_biases_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : prediction_ffn_in_weights_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : prediction_ffn_in_biases_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : prediction_ffn_out_weights_leaves) all_inputs.push_back(tensor);
+  for (const auto& tensor : prediction_ffn_out_biases_leaves) all_inputs.push_back(tensor);
+
+  torch::autograd::variable_list grad_inputs;
+  std::vector<int64_t> grad_input_map(all_inputs.size(), -1);
+  for (size_t index = 0; index < all_inputs.size(); ++index) {
+    if (all_inputs[index].defined() && all_inputs[index].requires_grad()) {
+      grad_input_map[index] = static_cast<int64_t>(grad_inputs.size());
+      grad_inputs.push_back(all_inputs[index]);
+    }
+  }
+  torch::autograd::variable_list local_outputs{std::get<0>(outputs)};
+  torch::autograd::variable_list local_grad_outputs{
+      grad_query_val.defined() ? grad_query_val : torch::zeros_like(std::get<0>(outputs))};
+  pybind11::gil_scoped_release no_gil;
+  auto grads = torch::autograd::grad(
+      local_outputs,
+      grad_inputs,
+      local_grad_outputs,
+      std::nullopt,
+      false,
+      true);
+
+  std::vector<torch::Tensor> all_grads;
+  all_grads.reserve(all_inputs.size());
+  for (size_t index = 0; index < all_inputs.size(); ++index) {
+    if (grad_input_map[index] < 0) {
+      all_grads.push_back(torch::Tensor());
+    } else {
+      all_grads.push_back(grads[static_cast<size_t>(grad_input_map[index])]);
+    }
+  }
+  return all_grads;
+#else
+  throw std::runtime_error("nomemory_causal_stack_ffn_fused_backward_cuda requires a CUDA-enabled build.");
+#endif
 }
 
 std::tuple<torch::Tensor, std::vector<torch::Tensor>> causal_memory_scan_fused(
@@ -3145,6 +5866,11 @@ std::vector<std::string> supported_ops() {
       "propagation_window",
       "propagation_topk",
       "propagation_query_dense",
+      "apply_delta_to_layer",
+      "nomemory_causal_stack_fused",
+      "nomemory_causal_stack_ffn_fused",
+      "nomemory_causal_stack_fused_trace",
+      "nomemory_causal_stack_ffn_fused_trace",
       "transition_dense",
       "transition_pairwise_dense",
       "transition_pairwise_topk",
@@ -3164,13 +5890,22 @@ std::vector<std::string> supported_ops() {
             "query_topk_reduce_backward_cuda",
             "low_rank_pairwise_topk_forward_cuda",
             "low_rank_propagation_topk_forward_cuda",
+            "low_rank_propagation_dense_forward_cuda",
+            "low_rank_dense_scores_tf32_cuda",
+            "low_rank_propagation_dense_tf32_forward_cuda",
             "low_rank_propagation_window_forward_cuda",
+            "low_rank_propagation_window_signed_abs_forward_cuda",
+            "low_rank_propagation_causal_dense_signed_abs_forward_cuda",
+            "diagonal_propagation_causal_dense_signed_abs_forward_cuda",
+            "diagonal_propagation_causal_dense_signed_abs_backward_cuda",
             "low_rank_propagation_window_entmax15_forward_cuda",
             "softsign_backward_cuda",
             "softmax_backward_cuda",
             "diagonal_pairwise_topk_backward_cuda",
             "low_rank_pairwise_topk_backward_cuda",
             "causal_memory_scan_fused_backward_cuda",
+            "nomemory_causal_stack_fused_backward_cuda",
+            "nomemory_causal_stack_ffn_fused_backward_cuda",
         });
   }
   return ops;
@@ -4645,6 +7380,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("supported_ops", &supported_ops, "List supported native ops");
   m.def("supported_devices", &supported_devices, "List supported native devices");
   m.def("backend_name", &backend_name, "Return native backend name");
+  m.def(
+      "apply_delta_to_layer",
+      &apply_delta_to_layer_public,
+      "Native layer state/value delta apply");
   m.def("propagation_dense", &propagation_dense, "Native dense propagation");
   m.def("propagation_query_dense", &propagation_query_dense, "Native dense query-conditioned propagation");
   m.def("propagation_window", &propagation_window, "Native window propagation");
@@ -4663,9 +7402,37 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       &low_rank_propagation_topk_forward_cuda_wrapper,
       "CUDA fused low-rank propagation top-k forward");
   m.def(
+      "low_rank_propagation_dense_forward_cuda",
+      &low_rank_propagation_dense_forward_cuda_wrapper,
+      "CUDA fused low-rank propagation dense forward");
+  m.def(
+      "low_rank_dense_scores_tf32_cuda",
+      &low_rank_dense_scores_tf32_cuda_wrapper,
+      "CUDA TF32 WMMA low-rank dense score tile forward");
+  m.def(
+      "low_rank_propagation_dense_tf32_forward_cuda",
+      &low_rank_propagation_dense_tf32_forward_cuda_wrapper,
+      "CUDA TF32 WMMA fused low-rank dense propagation forward");
+  m.def(
       "low_rank_propagation_window_forward_cuda",
       &low_rank_propagation_window_forward_cuda_wrapper,
       "CUDA fused low-rank propagation window forward");
+  m.def(
+      "low_rank_propagation_window_signed_abs_forward_cuda",
+      &low_rank_propagation_window_signed_abs_forward_cuda_wrapper,
+      "CUDA fused low-rank propagation window forward with signed_abs_softmax");
+  m.def(
+      "low_rank_propagation_causal_dense_signed_abs_forward_cuda",
+      &low_rank_propagation_causal_dense_signed_abs_forward_cuda_wrapper,
+      "CUDA fused low-rank propagation causal dense forward with signed_abs_softmax");
+  m.def(
+      "diagonal_propagation_causal_dense_signed_abs_forward_cuda",
+      &diagonal_propagation_causal_dense_signed_abs_forward_cuda_wrapper,
+      "CUDA fused diagonal propagation causal dense forward with signed_abs_softmax");
+  m.def(
+      "diagonal_propagation_causal_dense_signed_abs_backward_cuda",
+      &diagonal_propagation_causal_dense_signed_abs_backward_cuda_wrapper,
+      "CUDA fused diagonal propagation causal dense backward with signed_abs_softmax");
   m.def(
       "low_rank_propagation_window_entmax15_forward_cuda",
       &low_rank_propagation_window_entmax15_forward_cuda_wrapper,
@@ -4706,4 +7473,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "causal_memory_scan_fused_backward_cuda",
       &causal_memory_scan_fused_backward_cuda,
       "CUDA backward for fused causal-memory scan");
+  m.def(
+      "nomemory_causal_stack_fused",
+      &nomemory_causal_stack_fused,
+      "Native fused nomemory causal stack");
+  m.def(
+      "nomemory_causal_stack_fused_trace",
+      &nomemory_causal_stack_fused_trace,
+      "Native fused nomemory causal stack with trace");
+  m.def(
+      "nomemory_causal_stack_ffn_fused",
+      &nomemory_causal_stack_ffn_fused,
+      "Native fused nomemory causal stack with FFN");
+  m.def(
+      "nomemory_causal_stack_ffn_fused_trace",
+      &nomemory_causal_stack_ffn_fused_trace,
+      "Native fused nomemory causal stack with FFN trace");
+  m.def(
+      "nomemory_causal_stack_fused_backward_cuda",
+      &nomemory_causal_stack_fused_backward_cuda,
+      "CUDA backward for fused nomemory causal stack");
+  m.def(
+      "nomemory_causal_stack_ffn_fused_backward_cuda",
+      &nomemory_causal_stack_ffn_fused_backward_cuda,
+      "CUDA backward for fused nomemory causal stack with FFN");
 }

@@ -36,6 +36,8 @@ DISABLE_NATIVE_ENV = "JAKAL_NET_DISABLE_NATIVE"
 EXPERIMENTAL_FUSED_TRAINING_ENV = "JAKAL_NET_ENABLE_EXPERIMENTAL_FUSED_TRAINING"
 EXPERIMENTAL_FUSED_TRAINING_CHECKPOINT_STRIDE_ENV = "JAKAL_NET_FUSED_TRAINING_CHECKPOINT_STRIDE"
 EXPERIMENTAL_SCAN_BACKWARD_CUDA_ENV = "JAKAL_NET_ENABLE_EXPERIMENTAL_SCAN_BACKWARD_CUDA"
+EXPERIMENTAL_CAUSAL_DENSE_PROP_FORWARD_CUDA_ENV = "JAKAL_NET_ENABLE_CAUSAL_DENSE_PROP_FORWARD_CUDA"
+EXPERIMENTAL_DIAGONAL_DENSE_PROP_CUDA_ENV = "JAKAL_NET_ENABLE_DIAGONAL_DENSE_PROP_CUDA"
 
 _FULL_TOPK_INDEX_CACHE: dict[tuple[str, tuple[int, ...]], Tensor] = {}
 
@@ -56,6 +58,10 @@ _NATIVE_STATUS: NativeStatus | None = None
 
 def _module_name() -> str:
     return os.environ.get(NATIVE_MODULE_ENV, DEFAULT_NATIVE_MODULE)
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip() in {"1", "true", "TRUE", "yes"}
 
 
 def _candidate_module_paths() -> tuple[Path, ...]:
@@ -170,6 +176,26 @@ def native_supports(op_name: str) -> bool:
 def native_supports_device(device_type: str) -> bool:
     status = native_status()
     return status.available and device_type in status.supported_devices
+
+
+def dense_apply_native_available(device_type: str) -> bool:
+    return native_supports("apply_delta_to_layer") and native_supports_device(device_type)
+
+
+def nomemory_causal_stack_fused_native_available(device_type: str) -> bool:
+    return (
+        native_supports("nomemory_causal_stack_fused")
+        and native_supports("nomemory_causal_stack_fused_backward_cuda")
+        and native_supports_device(device_type)
+    )
+
+
+def nomemory_causal_stack_ffn_fused_native_available(device_type: str) -> bool:
+    return (
+        native_supports("nomemory_causal_stack_ffn_fused")
+        and native_supports("nomemory_causal_stack_ffn_fused_backward_cuda")
+        and native_supports_device(device_type)
+    )
 
 
 def _native_scan_uses_legacy_low_rank_extension(
@@ -678,6 +704,14 @@ def _experimental_scan_backward_cuda_enabled() -> bool:
     }
 
 
+def _experimental_causal_dense_prop_forward_cuda_enabled() -> bool:
+    return _env_flag(EXPERIMENTAL_CAUSAL_DENSE_PROP_FORWARD_CUDA_ENV)
+
+
+def _experimental_diagonal_dense_prop_cuda_enabled() -> bool:
+    return _env_flag(EXPERIMENTAL_DIAGONAL_DENSE_PROP_CUDA_ENV)
+
+
 def _flatten_causal_memory_scan_args(
     *,
     aligned_s: Tensor,
@@ -861,6 +895,10 @@ def _native_scan_signed_softmax_state(state: Tensor) -> Tensor:
     clean_state = F.layer_norm(clean_state, (clean_state.shape[-1],))
     magnitude = torch.softmax(clean_state.abs(), dim=-1)
     return torch.sign(clean_state) * magnitude * float(state.shape[-1])
+
+
+def _native_scan_softsign_state(state: Tensor) -> Tensor:
+    return F.softsign(torch.nan_to_num(state))
 
 
 def _native_scan_signed_abs_softmax(scores: Tensor) -> Tensor:
@@ -1123,10 +1161,57 @@ def _native_scan_apply_delta(
     delta_val: Tensor,
     val_norm_weight: Tensor,
     val_norm_bias: Tensor,
+    *,
+    state_activation_name: str = "signed_softmax",
 ) -> tuple[Tensor, Tensor]:
-    next_state = _native_scan_signed_softmax_state(layer_state + delta_state)
+    if state_activation_name == "signed_softmax":
+        next_state = _native_scan_signed_softmax_state(layer_state + delta_state)
+    elif state_activation_name == "softsign":
+        next_state = _native_scan_softsign_state(layer_state + delta_state)
+    else:
+        raise ValueError(f"Unsupported state_activation_name: {state_activation_name!r}.")
     next_val = _native_scan_layer_norm(layer_val + delta_val, val_norm_weight, val_norm_bias)
     return next_state, next_val
+
+
+def dense_apply_native(
+    *,
+    layer_state: Tensor,
+    layer_val: Tensor,
+    delta_state: Tensor,
+    delta_val: Tensor,
+    val_norm_weight: Tensor,
+    val_norm_bias: Tensor,
+    state_activation_name: str = "signed_softmax",
+) -> tuple[Tensor, Tensor]:
+    if dense_apply_native_available(layer_state.device.type):
+        result = _native_module().apply_delta_to_layer(
+            layer_state,
+            layer_val,
+            delta_state,
+            delta_val,
+            val_norm_weight,
+            val_norm_bias,
+            state_activation_name,
+            True,
+        )
+        if (
+            isinstance(result, tuple)
+            and len(result) == 2
+            and isinstance(result[0], Tensor)
+            and isinstance(result[1], Tensor)
+        ):
+            return result
+        raise TypeError("apply_delta_to_layer must return (state, val).")
+    return _native_scan_apply_delta(
+        layer_state,
+        layer_val,
+        delta_state,
+        delta_val,
+        val_norm_weight,
+        val_norm_bias,
+        state_activation_name=state_activation_name,
+    )
 
 
 def _native_scan_read_memory(
@@ -2095,6 +2180,13 @@ def _signed_abs_softmax_from_scores(scores: Tensor) -> Tensor:
     return torch.sign(clean_scores) * torch.softmax(clean_scores.abs(), dim=-1)
 
 
+def _masked_signed_abs_softmax_from_scores(scores: Tensor, mask: Tensor) -> Tensor:
+    clean_scores = torch.nan_to_num(scores)
+    stats = clean_scores.abs().masked_fill(~mask, float("-inf"))
+    probs = torch.softmax(stats, dim=-1)
+    return torch.sign(clean_scores) * probs * mask.to(dtype=probs.dtype)
+
+
 def _signed_abs_softmax_backward(scores: Tensor, grad_routes: Tensor) -> Tensor:
     clean_scores = torch.nan_to_num(scores)
     signs = torch.sign(clean_scores)
@@ -2102,6 +2194,15 @@ def _signed_abs_softmax_backward(scores: Tensor, grad_routes: Tensor) -> Tensor:
     signed_routes = signs * probs
     dot = (grad_routes * signed_routes).sum(dim=-1, keepdim=True)
     return signs * probs * (signs * grad_routes - dot)
+
+
+def _masked_signed_abs_softmax_backward(scores: Tensor, edges: Tensor, grad_routes: Tensor, mask: Tensor) -> Tensor:
+    clean_scores = torch.nan_to_num(scores)
+    signs = torch.sign(clean_scores)
+    probs = edges * signs
+    dot = (grad_routes * edges).sum(dim=-1, keepdim=True)
+    grad_scores = signs * probs * (signs * grad_routes - dot)
+    return grad_scores * mask.to(dtype=grad_scores.dtype)
 
 
 def _packed_true_mask(scores: Tensor) -> Tensor:
@@ -2226,6 +2327,707 @@ def _save_optional_tensor(tensor: Tensor | None, reference: Tensor) -> Tensor:
 
 def _load_optional_tensor(tensor: Tensor) -> Tensor | None:
     return None if tensor.numel() == 0 else tensor
+
+
+def _split_nomemory_stack_layer_tensors(
+    layer_tensors: tuple[Tensor, ...],
+    num_layers: int,
+) -> tuple[tuple[Tensor, ...], tuple[Tensor, ...], tuple[Tensor, ...], tuple[Tensor, ...], tuple[Tensor, ...], tuple[Tensor, ...]]:
+    expected = num_layers * 6
+    if len(layer_tensors) != expected:
+        raise ValueError(f"Expected {expected} layer tensors, got {len(layer_tensors)}.")
+    source_weights: list[Tensor] = []
+    target_weights: list[Tensor] = []
+    core_weights: list[Tensor] = []
+    bias_tensors: list[Tensor] = []
+    norm_weights: list[Tensor] = []
+    norm_biases: list[Tensor] = []
+    for offset in range(0, expected, 6):
+        source_weights.append(layer_tensors[offset])
+        target_weights.append(layer_tensors[offset + 1])
+        core_weights.append(layer_tensors[offset + 2])
+        bias_tensors.append(layer_tensors[offset + 3])
+        norm_weights.append(layer_tensors[offset + 4])
+        norm_biases.append(layer_tensors[offset + 5])
+    return (
+        tuple(source_weights),
+        tuple(target_weights),
+        tuple(core_weights),
+        tuple(bias_tensors),
+        tuple(norm_weights),
+        tuple(norm_biases),
+    )
+
+
+def _split_nomemory_stack_ffn_layer_tensors(
+    layer_tensors: tuple[Tensor, ...],
+    num_layers: int,
+) -> tuple[
+    tuple[Tensor, ...],
+    tuple[Tensor, ...],
+    tuple[Tensor, ...],
+    tuple[Tensor, ...],
+    tuple[Tensor, ...],
+    tuple[Tensor, ...],
+]:
+    expected = num_layers * 6
+    if len(layer_tensors) != expected:
+        raise ValueError(f"Expected {expected} FFN layer tensors, got {len(layer_tensors)}.")
+    norm_weights: list[Tensor] = []
+    norm_biases: list[Tensor] = []
+    in_weights: list[Tensor] = []
+    in_biases: list[Tensor] = []
+    out_weights: list[Tensor] = []
+    out_biases: list[Tensor] = []
+    for offset in range(0, expected, 6):
+        norm_weights.append(layer_tensors[offset])
+        norm_biases.append(layer_tensors[offset + 1])
+        in_weights.append(layer_tensors[offset + 2])
+        in_biases.append(layer_tensors[offset + 3])
+        out_weights.append(layer_tensors[offset + 4])
+        out_biases.append(layer_tensors[offset + 5])
+    return (
+        tuple(norm_weights),
+        tuple(norm_biases),
+        tuple(in_weights),
+        tuple(in_biases),
+        tuple(out_weights),
+        tuple(out_biases),
+    )
+
+
+def _split_nomemory_stack_specs(
+    specs: tuple[tuple[int, int, int, int], ...],
+) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    compress_kinds: list[int] = []
+    windows: list[int] = []
+    target_block_sizes: list[int] = []
+    source_block_sizes: list[int] = []
+    for compress_kind, window, target_block_size, source_block_size in specs:
+        compress_kinds.append(int(compress_kind))
+        windows.append(int(window))
+        target_block_sizes.append(int(target_block_size))
+        source_block_sizes.append(int(source_block_size))
+    return (
+        tuple(compress_kinds),
+        tuple(windows),
+        tuple(target_block_sizes),
+        tuple(source_block_sizes),
+    )
+
+
+def nomemory_causal_stack_fused_native(
+    *,
+    token_val: Tensor,
+    anchor_state: Tensor,
+    anchor_val: Tensor,
+    s_prediction_weight: Tensor,
+    prediction_input_norm_weight: Tensor,
+    prediction_input_norm_bias: Tensor | None,
+    sequence_tensors: tuple[Tensor, ...],
+    prediction_tensors: tuple[Tensor, ...],
+    sequence_specs: tuple[tuple[int, int, int, int], ...],
+    prediction_specs: tuple[tuple[int, int, int, int], ...],
+    state_activation_name: str,
+) -> Tensor:
+    num_sequence_layers = len(sequence_specs)
+    num_prediction_layers = len(prediction_specs)
+    (
+        sequence_source_weights,
+        sequence_target_weights,
+        sequence_core_weights,
+        sequence_biases,
+        sequence_norm_weights,
+        sequence_norm_biases,
+    ) = _split_nomemory_stack_layer_tensors(sequence_tensors, num_sequence_layers)
+    (
+        prediction_source_weights,
+        prediction_target_weights,
+        prediction_core_weights,
+        prediction_biases,
+        prediction_norm_weights,
+        prediction_norm_biases,
+    ) = _split_nomemory_stack_layer_tensors(prediction_tensors, num_prediction_layers)
+    (
+        sequence_compress_kinds,
+        sequence_windows,
+        sequence_target_block_sizes,
+        sequence_source_block_sizes,
+    ) = _split_nomemory_stack_specs(sequence_specs)
+    (
+        prediction_compress_kinds,
+        prediction_windows,
+        prediction_target_block_sizes,
+        prediction_source_block_sizes,
+    ) = _split_nomemory_stack_specs(prediction_specs)
+    result = _native_module().nomemory_causal_stack_fused(
+        token_val,
+        anchor_state,
+        anchor_val,
+        s_prediction_weight,
+        prediction_input_norm_weight,
+        _save_optional_tensor(prediction_input_norm_bias, token_val),
+        list(sequence_source_weights),
+        list(sequence_target_weights),
+        list(sequence_core_weights),
+        list(sequence_biases),
+        list(sequence_norm_weights),
+        list(sequence_norm_biases),
+        list(sequence_compress_kinds),
+        list(sequence_windows),
+        list(sequence_target_block_sizes),
+        list(sequence_source_block_sizes),
+        list(prediction_source_weights),
+        list(prediction_target_weights),
+        list(prediction_core_weights),
+        list(prediction_biases),
+        list(prediction_norm_weights),
+        list(prediction_norm_biases),
+        list(prediction_compress_kinds),
+        list(prediction_windows),
+        list(prediction_target_block_sizes),
+        list(prediction_source_block_sizes),
+        state_activation_name,
+    )
+    if not isinstance(result, Tensor):
+        raise TypeError("nomemory_causal_stack_fused must return a Tensor.")
+    return result
+
+
+def nomemory_causal_stack_fused_trace_native(
+    *,
+    token_val: Tensor,
+    anchor_state: Tensor,
+    anchor_val: Tensor,
+    s_prediction_weight: Tensor,
+    prediction_input_norm_weight: Tensor,
+    prediction_input_norm_bias: Tensor | None,
+    sequence_tensors: tuple[Tensor, ...],
+    prediction_tensors: tuple[Tensor, ...],
+    sequence_specs: tuple[tuple[int, int, int, int], ...],
+    prediction_specs: tuple[tuple[int, int, int, int], ...],
+    state_activation_name: str,
+) -> tuple[Tensor, tuple[Tensor, ...]]:
+    num_sequence_layers = len(sequence_specs)
+    num_prediction_layers = len(prediction_specs)
+    (
+        sequence_source_weights,
+        sequence_target_weights,
+        sequence_core_weights,
+        sequence_biases,
+        sequence_norm_weights,
+        sequence_norm_biases,
+    ) = _split_nomemory_stack_layer_tensors(sequence_tensors, num_sequence_layers)
+    (
+        prediction_source_weights,
+        prediction_target_weights,
+        prediction_core_weights,
+        prediction_biases,
+        prediction_norm_weights,
+        prediction_norm_biases,
+    ) = _split_nomemory_stack_layer_tensors(prediction_tensors, num_prediction_layers)
+    (
+        sequence_compress_kinds,
+        sequence_windows,
+        sequence_target_block_sizes,
+        sequence_source_block_sizes,
+    ) = _split_nomemory_stack_specs(sequence_specs)
+    (
+        prediction_compress_kinds,
+        prediction_windows,
+        prediction_target_block_sizes,
+        prediction_source_block_sizes,
+    ) = _split_nomemory_stack_specs(prediction_specs)
+    result = _native_module().nomemory_causal_stack_fused_trace(
+        token_val,
+        anchor_state,
+        anchor_val,
+        s_prediction_weight,
+        prediction_input_norm_weight,
+        _save_optional_tensor(prediction_input_norm_bias, token_val),
+        list(sequence_source_weights),
+        list(sequence_target_weights),
+        list(sequence_core_weights),
+        list(sequence_biases),
+        list(sequence_norm_weights),
+        list(sequence_norm_biases),
+        list(sequence_compress_kinds),
+        list(sequence_windows),
+        list(sequence_target_block_sizes),
+        list(sequence_source_block_sizes),
+        list(prediction_source_weights),
+        list(prediction_target_weights),
+        list(prediction_core_weights),
+        list(prediction_biases),
+        list(prediction_norm_weights),
+        list(prediction_norm_biases),
+        list(prediction_compress_kinds),
+        list(prediction_windows),
+        list(prediction_target_block_sizes),
+        list(prediction_source_block_sizes),
+        state_activation_name,
+    )
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise TypeError("nomemory_causal_stack_fused_trace must return (query_val, trace_tensors).")
+    query_val, trace_tensors = result
+    if not isinstance(query_val, Tensor):
+        raise TypeError("nomemory_causal_stack_fused_trace query_val must be a Tensor.")
+    if not isinstance(trace_tensors, (list, tuple)):
+        raise TypeError("nomemory_causal_stack_fused_trace trace_tensors must be a sequence.")
+    return query_val, tuple(trace_tensors)
+
+
+def _nomemory_causal_stack_fused_backward_cuda(
+    *,
+    token_val: Tensor,
+    anchor_state: Tensor,
+    anchor_val: Tensor,
+    s_prediction_weight: Tensor,
+    prediction_input_norm_weight: Tensor,
+    prediction_input_norm_bias: Tensor | None,
+    sequence_tensors: tuple[Tensor, ...],
+    prediction_tensors: tuple[Tensor, ...],
+    sequence_specs: tuple[tuple[int, int, int, int], ...],
+    prediction_specs: tuple[tuple[int, int, int, int], ...],
+    state_activation_name: str,
+    trace_tensors: tuple[Tensor, ...],
+    grad_query_val: Tensor,
+) -> tuple[Tensor | None, ...]:
+    num_sequence_layers = len(sequence_specs)
+    num_prediction_layers = len(prediction_specs)
+    (
+        sequence_source_weights,
+        sequence_target_weights,
+        sequence_core_weights,
+        sequence_biases,
+        sequence_norm_weights,
+        sequence_norm_biases,
+    ) = _split_nomemory_stack_layer_tensors(sequence_tensors, num_sequence_layers)
+    (
+        prediction_source_weights,
+        prediction_target_weights,
+        prediction_core_weights,
+        prediction_biases,
+        prediction_norm_weights,
+        prediction_norm_biases,
+    ) = _split_nomemory_stack_layer_tensors(prediction_tensors, num_prediction_layers)
+    (
+        sequence_compress_kinds,
+        sequence_windows,
+        sequence_target_block_sizes,
+        sequence_source_block_sizes,
+    ) = _split_nomemory_stack_specs(sequence_specs)
+    (
+        prediction_compress_kinds,
+        prediction_windows,
+        prediction_target_block_sizes,
+        prediction_source_block_sizes,
+    ) = _split_nomemory_stack_specs(prediction_specs)
+    result = _native_module().nomemory_causal_stack_fused_backward_cuda(
+        token_val,
+        anchor_state,
+        anchor_val,
+        s_prediction_weight,
+        prediction_input_norm_weight,
+        _save_optional_tensor(prediction_input_norm_bias, token_val),
+        list(sequence_source_weights),
+        list(sequence_target_weights),
+        list(sequence_core_weights),
+        list(sequence_biases),
+        list(sequence_norm_weights),
+        list(sequence_norm_biases),
+        list(sequence_compress_kinds),
+        list(sequence_windows),
+        list(sequence_target_block_sizes),
+        list(sequence_source_block_sizes),
+        list(prediction_source_weights),
+        list(prediction_target_weights),
+        list(prediction_core_weights),
+        list(prediction_biases),
+        list(prediction_norm_weights),
+        list(prediction_norm_biases),
+        list(prediction_compress_kinds),
+        list(prediction_windows),
+        list(prediction_target_block_sizes),
+        list(prediction_source_block_sizes),
+        state_activation_name,
+        list(trace_tensors),
+        grad_query_val,
+    )
+    expected = 6 + len(sequence_tensors) + len(prediction_tensors)
+    if not isinstance(result, (list, tuple)) or len(result) != expected:
+        raise TypeError("nomemory_causal_stack_fused_backward_cuda must return one grad per saved tensor.")
+    result = tuple(None if grad is None else grad for grad in result)
+    base_grads = list(result[:6])
+    offset = 6
+    grouped_sequence_grads = [result[offset + (index * num_sequence_layers): offset + ((index + 1) * num_sequence_layers)] for index in range(6)]
+    offset += num_sequence_layers * 6
+    grouped_prediction_grads = [result[offset + (index * num_prediction_layers): offset + ((index + 1) * num_prediction_layers)] for index in range(6)]
+    flat_grads: list[Tensor | None] = base_grads
+    for layer_index in range(num_sequence_layers):
+        for group_index in range(6):
+            flat_grads.append(grouped_sequence_grads[group_index][layer_index])
+    for layer_index in range(num_prediction_layers):
+        for group_index in range(6):
+            flat_grads.append(grouped_prediction_grads[group_index][layer_index])
+    return tuple(flat_grads)
+
+
+def nomemory_causal_stack_ffn_fused_native(
+    *,
+    token_val: Tensor,
+    anchor_state: Tensor,
+    anchor_val: Tensor,
+    s_prediction_weight: Tensor,
+    prediction_input_norm_weight: Tensor,
+    prediction_input_norm_bias: Tensor | None,
+    sequence_tensors: tuple[Tensor, ...],
+    prediction_tensors: tuple[Tensor, ...],
+    sequence_ffn_tensors: tuple[Tensor, ...],
+    prediction_ffn_tensors: tuple[Tensor, ...],
+    sequence_specs: tuple[tuple[int, int, int, int], ...],
+    prediction_specs: tuple[tuple[int, int, int, int], ...],
+    state_activation_name: str,
+) -> Tensor:
+    num_sequence_layers = len(sequence_specs)
+    num_prediction_layers = len(prediction_specs)
+    (
+        sequence_source_weights,
+        sequence_target_weights,
+        sequence_core_weights,
+        sequence_biases,
+        sequence_norm_weights,
+        sequence_norm_biases,
+    ) = _split_nomemory_stack_layer_tensors(sequence_tensors, num_sequence_layers)
+    (
+        prediction_source_weights,
+        prediction_target_weights,
+        prediction_core_weights,
+        prediction_biases,
+        prediction_norm_weights,
+        prediction_norm_biases,
+    ) = _split_nomemory_stack_layer_tensors(prediction_tensors, num_prediction_layers)
+    (
+        sequence_ffn_norm_weights,
+        sequence_ffn_norm_biases,
+        sequence_ffn_in_weights,
+        sequence_ffn_in_biases,
+        sequence_ffn_out_weights,
+        sequence_ffn_out_biases,
+    ) = _split_nomemory_stack_ffn_layer_tensors(sequence_ffn_tensors, num_sequence_layers)
+    (
+        prediction_ffn_norm_weights,
+        prediction_ffn_norm_biases,
+        prediction_ffn_in_weights,
+        prediction_ffn_in_biases,
+        prediction_ffn_out_weights,
+        prediction_ffn_out_biases,
+    ) = _split_nomemory_stack_ffn_layer_tensors(prediction_ffn_tensors, num_prediction_layers)
+    (
+        sequence_compress_kinds,
+        sequence_windows,
+        sequence_target_block_sizes,
+        sequence_source_block_sizes,
+    ) = _split_nomemory_stack_specs(sequence_specs)
+    (
+        prediction_compress_kinds,
+        prediction_windows,
+        prediction_target_block_sizes,
+        prediction_source_block_sizes,
+    ) = _split_nomemory_stack_specs(prediction_specs)
+    result = _native_module().nomemory_causal_stack_ffn_fused(
+        token_val,
+        anchor_state,
+        anchor_val,
+        s_prediction_weight,
+        prediction_input_norm_weight,
+        _save_optional_tensor(prediction_input_norm_bias, token_val),
+        list(sequence_source_weights),
+        list(sequence_target_weights),
+        list(sequence_core_weights),
+        list(sequence_biases),
+        list(sequence_norm_weights),
+        list(sequence_norm_biases),
+        list(sequence_ffn_norm_weights),
+        list(sequence_ffn_norm_biases),
+        list(sequence_ffn_in_weights),
+        list(sequence_ffn_in_biases),
+        list(sequence_ffn_out_weights),
+        list(sequence_ffn_out_biases),
+        list(sequence_compress_kinds),
+        list(sequence_windows),
+        list(sequence_target_block_sizes),
+        list(sequence_source_block_sizes),
+        list(prediction_source_weights),
+        list(prediction_target_weights),
+        list(prediction_core_weights),
+        list(prediction_biases),
+        list(prediction_norm_weights),
+        list(prediction_norm_biases),
+        list(prediction_ffn_norm_weights),
+        list(prediction_ffn_norm_biases),
+        list(prediction_ffn_in_weights),
+        list(prediction_ffn_in_biases),
+        list(prediction_ffn_out_weights),
+        list(prediction_ffn_out_biases),
+        list(prediction_compress_kinds),
+        list(prediction_windows),
+        list(prediction_target_block_sizes),
+        list(prediction_source_block_sizes),
+        state_activation_name,
+    )
+    if not isinstance(result, Tensor):
+        raise TypeError("nomemory_causal_stack_ffn_fused must return a Tensor.")
+    return result
+
+
+def nomemory_causal_stack_ffn_fused_trace_native(
+    *,
+    token_val: Tensor,
+    anchor_state: Tensor,
+    anchor_val: Tensor,
+    s_prediction_weight: Tensor,
+    prediction_input_norm_weight: Tensor,
+    prediction_input_norm_bias: Tensor | None,
+    sequence_tensors: tuple[Tensor, ...],
+    prediction_tensors: tuple[Tensor, ...],
+    sequence_ffn_tensors: tuple[Tensor, ...],
+    prediction_ffn_tensors: tuple[Tensor, ...],
+    sequence_specs: tuple[tuple[int, int, int, int], ...],
+    prediction_specs: tuple[tuple[int, int, int, int], ...],
+    state_activation_name: str,
+) -> tuple[Tensor, tuple[Tensor, ...]]:
+    num_sequence_layers = len(sequence_specs)
+    num_prediction_layers = len(prediction_specs)
+    (
+        sequence_source_weights,
+        sequence_target_weights,
+        sequence_core_weights,
+        sequence_biases,
+        sequence_norm_weights,
+        sequence_norm_biases,
+    ) = _split_nomemory_stack_layer_tensors(sequence_tensors, num_sequence_layers)
+    (
+        prediction_source_weights,
+        prediction_target_weights,
+        prediction_core_weights,
+        prediction_biases,
+        prediction_norm_weights,
+        prediction_norm_biases,
+    ) = _split_nomemory_stack_layer_tensors(prediction_tensors, num_prediction_layers)
+    (
+        sequence_ffn_norm_weights,
+        sequence_ffn_norm_biases,
+        sequence_ffn_in_weights,
+        sequence_ffn_in_biases,
+        sequence_ffn_out_weights,
+        sequence_ffn_out_biases,
+    ) = _split_nomemory_stack_ffn_layer_tensors(sequence_ffn_tensors, num_sequence_layers)
+    (
+        prediction_ffn_norm_weights,
+        prediction_ffn_norm_biases,
+        prediction_ffn_in_weights,
+        prediction_ffn_in_biases,
+        prediction_ffn_out_weights,
+        prediction_ffn_out_biases,
+    ) = _split_nomemory_stack_ffn_layer_tensors(prediction_ffn_tensors, num_prediction_layers)
+    (
+        sequence_compress_kinds,
+        sequence_windows,
+        sequence_target_block_sizes,
+        sequence_source_block_sizes,
+    ) = _split_nomemory_stack_specs(sequence_specs)
+    (
+        prediction_compress_kinds,
+        prediction_windows,
+        prediction_target_block_sizes,
+        prediction_source_block_sizes,
+    ) = _split_nomemory_stack_specs(prediction_specs)
+    result = _native_module().nomemory_causal_stack_ffn_fused_trace(
+        token_val,
+        anchor_state,
+        anchor_val,
+        s_prediction_weight,
+        prediction_input_norm_weight,
+        _save_optional_tensor(prediction_input_norm_bias, token_val),
+        list(sequence_source_weights),
+        list(sequence_target_weights),
+        list(sequence_core_weights),
+        list(sequence_biases),
+        list(sequence_norm_weights),
+        list(sequence_norm_biases),
+        list(sequence_ffn_norm_weights),
+        list(sequence_ffn_norm_biases),
+        list(sequence_ffn_in_weights),
+        list(sequence_ffn_in_biases),
+        list(sequence_ffn_out_weights),
+        list(sequence_ffn_out_biases),
+        list(sequence_compress_kinds),
+        list(sequence_windows),
+        list(sequence_target_block_sizes),
+        list(sequence_source_block_sizes),
+        list(prediction_source_weights),
+        list(prediction_target_weights),
+        list(prediction_core_weights),
+        list(prediction_biases),
+        list(prediction_norm_weights),
+        list(prediction_norm_biases),
+        list(prediction_ffn_norm_weights),
+        list(prediction_ffn_norm_biases),
+        list(prediction_ffn_in_weights),
+        list(prediction_ffn_in_biases),
+        list(prediction_ffn_out_weights),
+        list(prediction_ffn_out_biases),
+        list(prediction_compress_kinds),
+        list(prediction_windows),
+        list(prediction_target_block_sizes),
+        list(prediction_source_block_sizes),
+        state_activation_name,
+    )
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise TypeError("nomemory_causal_stack_ffn_fused_trace must return (query_val, trace_tensors).")
+    query_val, trace_tensors = result
+    if not isinstance(query_val, Tensor):
+        raise TypeError("nomemory_causal_stack_ffn_fused_trace query_val must be a Tensor.")
+    if not isinstance(trace_tensors, (list, tuple)):
+        raise TypeError("nomemory_causal_stack_ffn_fused_trace trace_tensors must be a sequence.")
+    return query_val, tuple(trace_tensors)
+
+
+def _nomemory_causal_stack_ffn_fused_backward_cuda(
+    *,
+    token_val: Tensor,
+    anchor_state: Tensor,
+    anchor_val: Tensor,
+    s_prediction_weight: Tensor,
+    prediction_input_norm_weight: Tensor,
+    prediction_input_norm_bias: Tensor | None,
+    sequence_tensors: tuple[Tensor, ...],
+    prediction_tensors: tuple[Tensor, ...],
+    sequence_ffn_tensors: tuple[Tensor, ...],
+    prediction_ffn_tensors: tuple[Tensor, ...],
+    sequence_specs: tuple[tuple[int, int, int, int], ...],
+    prediction_specs: tuple[tuple[int, int, int, int], ...],
+    state_activation_name: str,
+    trace_tensors: tuple[Tensor, ...],
+    grad_query_val: Tensor,
+) -> tuple[Tensor | None, ...]:
+    num_sequence_layers = len(sequence_specs)
+    num_prediction_layers = len(prediction_specs)
+    (
+        sequence_source_weights,
+        sequence_target_weights,
+        sequence_core_weights,
+        sequence_biases,
+        sequence_norm_weights,
+        sequence_norm_biases,
+    ) = _split_nomemory_stack_layer_tensors(sequence_tensors, num_sequence_layers)
+    (
+        prediction_source_weights,
+        prediction_target_weights,
+        prediction_core_weights,
+        prediction_biases,
+        prediction_norm_weights,
+        prediction_norm_biases,
+    ) = _split_nomemory_stack_layer_tensors(prediction_tensors, num_prediction_layers)
+    (
+        sequence_ffn_norm_weights,
+        sequence_ffn_norm_biases,
+        sequence_ffn_in_weights,
+        sequence_ffn_in_biases,
+        sequence_ffn_out_weights,
+        sequence_ffn_out_biases,
+    ) = _split_nomemory_stack_ffn_layer_tensors(sequence_ffn_tensors, num_sequence_layers)
+    (
+        prediction_ffn_norm_weights,
+        prediction_ffn_norm_biases,
+        prediction_ffn_in_weights,
+        prediction_ffn_in_biases,
+        prediction_ffn_out_weights,
+        prediction_ffn_out_biases,
+    ) = _split_nomemory_stack_ffn_layer_tensors(prediction_ffn_tensors, num_prediction_layers)
+    (
+        sequence_compress_kinds,
+        sequence_windows,
+        sequence_target_block_sizes,
+        sequence_source_block_sizes,
+    ) = _split_nomemory_stack_specs(sequence_specs)
+    (
+        prediction_compress_kinds,
+        prediction_windows,
+        prediction_target_block_sizes,
+        prediction_source_block_sizes,
+    ) = _split_nomemory_stack_specs(prediction_specs)
+    result = _native_module().nomemory_causal_stack_ffn_fused_backward_cuda(
+        token_val,
+        anchor_state,
+        anchor_val,
+        s_prediction_weight,
+        prediction_input_norm_weight,
+        _save_optional_tensor(prediction_input_norm_bias, token_val),
+        list(sequence_source_weights),
+        list(sequence_target_weights),
+        list(sequence_core_weights),
+        list(sequence_biases),
+        list(sequence_norm_weights),
+        list(sequence_norm_biases),
+        list(sequence_ffn_norm_weights),
+        list(sequence_ffn_norm_biases),
+        list(sequence_ffn_in_weights),
+        list(sequence_ffn_in_biases),
+        list(sequence_ffn_out_weights),
+        list(sequence_ffn_out_biases),
+        list(sequence_compress_kinds),
+        list(sequence_windows),
+        list(sequence_target_block_sizes),
+        list(sequence_source_block_sizes),
+        list(prediction_source_weights),
+        list(prediction_target_weights),
+        list(prediction_core_weights),
+        list(prediction_biases),
+        list(prediction_norm_weights),
+        list(prediction_norm_biases),
+        list(prediction_ffn_norm_weights),
+        list(prediction_ffn_norm_biases),
+        list(prediction_ffn_in_weights),
+        list(prediction_ffn_in_biases),
+        list(prediction_ffn_out_weights),
+        list(prediction_ffn_out_biases),
+        list(prediction_compress_kinds),
+        list(prediction_windows),
+        list(prediction_target_block_sizes),
+        list(prediction_source_block_sizes),
+        state_activation_name,
+        list(trace_tensors),
+        grad_query_val,
+    )
+    expected = 6 + len(sequence_tensors) + len(prediction_tensors) + len(sequence_ffn_tensors) + len(prediction_ffn_tensors)
+    if not isinstance(result, (list, tuple)) or len(result) != expected:
+        raise TypeError("nomemory_causal_stack_ffn_fused_backward_cuda must return one grad per saved tensor.")
+    result = tuple(None if grad is None else grad for grad in result)
+    base_grads = list(result[:6])
+    offset = 6
+    grouped_sequence_grads = [result[offset + (index * num_sequence_layers): offset + ((index + 1) * num_sequence_layers)] for index in range(6)]
+    offset += num_sequence_layers * 6
+    grouped_prediction_grads = [result[offset + (index * num_prediction_layers): offset + ((index + 1) * num_prediction_layers)] for index in range(6)]
+    offset += num_prediction_layers * 6
+    grouped_sequence_ffn_grads = [result[offset + (index * num_sequence_layers): offset + ((index + 1) * num_sequence_layers)] for index in range(6)]
+    offset += num_sequence_layers * 6
+    grouped_prediction_ffn_grads = [result[offset + (index * num_prediction_layers): offset + ((index + 1) * num_prediction_layers)] for index in range(6)]
+    flat_grads: list[Tensor | None] = base_grads
+    for layer_index in range(num_sequence_layers):
+        for group_index in range(6):
+            flat_grads.append(grouped_sequence_grads[group_index][layer_index])
+    for layer_index in range(num_prediction_layers):
+        for group_index in range(6):
+            flat_grads.append(grouped_prediction_grads[group_index][layer_index])
+    for layer_index in range(num_sequence_layers):
+        for group_index in range(6):
+            flat_grads.append(grouped_sequence_ffn_grads[group_index][layer_index])
+    for layer_index in range(num_prediction_layers):
+        for group_index in range(6):
+            flat_grads.append(grouped_prediction_ffn_grads[group_index][layer_index])
+    return tuple(flat_grads)
 
 
 def _accumulator_dtype_for(tensor: Tensor) -> torch.dtype:
@@ -3848,6 +4650,56 @@ def _low_rank_dense_signed_abs_forward(
     )
 
 
+def _low_rank_dense_signed_abs_forward_native(
+    layer_val: Tensor,
+    projected_state: Tensor,
+    projected_val: Tensor,
+    source_weight: Tensor,
+    target_weight: Tensor,
+    core_weight: Tensor,
+    bias: Tensor | None,
+) -> tuple[Tensor, Tensor]:
+    (
+        flat_val,
+        flat_projected_state,
+        flat_projected_val,
+        batch_shape,
+        nodes,
+        out_dim,
+    ) = _flatten_dense_tensors(layer_val, projected_state, projected_val)
+    projected_target = torch.matmul(flat_val, target_weight.t()).contiguous()
+    weighted_source = (
+        torch.matmul(flat_val, source_weight.t())
+        * core_weight.to(dtype=flat_val.dtype).view(1, 1, -1)
+    ).contiguous()
+    if bias is not None:
+        bias_column = bias.to(dtype=weighted_source.dtype).reshape(1, 1, 1).expand(
+            weighted_source.size(0),
+            weighted_source.size(1),
+            1,
+        )
+        target_ones = torch.ones(
+            projected_target.size(0),
+            projected_target.size(1),
+            1,
+            dtype=projected_target.dtype,
+            device=projected_target.device,
+        )
+        weighted_source = torch.cat((weighted_source, bias_column), dim=-1).contiguous()
+        projected_target = torch.cat((projected_target, target_ones), dim=-1).contiguous()
+    delta_state, delta_val = _native_module().low_rank_propagation_dense_forward_cuda(
+        weighted_source,
+        projected_target,
+        flat_projected_state.to(dtype=torch.float32).contiguous(),
+        flat_projected_val.to(dtype=torch.float32).contiguous(),
+        1,
+    )
+    return (
+        delta_state.to(dtype=projected_state.dtype).reshape(*batch_shape, nodes),
+        delta_val.to(dtype=projected_val.dtype).reshape(*batch_shape, nodes, out_dim),
+    )
+
+
 class _LowRankPropagationDenseSignedAbsRecompute(Function):
     @staticmethod
     def forward(
@@ -3872,6 +4724,20 @@ class _LowRankPropagationDenseSignedAbsRecompute(Function):
             core_weight,
             _save_optional_tensor(bias, core_weight),
         )
+        if (
+            os.environ.get("JAKAL_NET_ENABLE_SCALAR_DENSE_CUDA", "").strip()
+            in {"1", "true", "TRUE", "yes"}
+            and hasattr(_native_module(), "low_rank_propagation_dense_forward_cuda")
+        ):
+            return _low_rank_dense_signed_abs_forward_native(
+                layer_val,
+                projected_state,
+                projected_val,
+                source_weight,
+                target_weight,
+                core_weight,
+                bias,
+            )
         return _low_rank_dense_signed_abs_forward(
             layer_val,
             projected_state,
@@ -4098,6 +4964,182 @@ class _LowRankPropagationTopK(Function):
         )
 
 
+class _DiagonalPropagationCausalDenseSignedAbs(Function):
+    @staticmethod
+    def forward(
+        ctx: Any,
+        layer_val: Tensor,
+        projected_state: Tensor,
+        projected_val: Tensor,
+        normalized_weight: Tensor,
+        bias: Tensor,
+        has_bias: bool,
+    ) -> tuple[Tensor, Tensor]:
+        (
+            flat_val,
+            flat_projected_state,
+            flat_projected_val,
+            batch_shape,
+            nodes,
+            out_dim,
+        ) = _flatten_dense_tensors(layer_val, projected_state, projected_val)
+        if out_dim != flat_val.shape[-1]:
+            raise ValueError("diagonal causal dense propagation requires projected_val dim == layer dim.")
+        flat_val = flat_val.contiguous()
+        state_f32 = flat_projected_state.to(dtype=torch.float32).contiguous()
+        val_f32 = flat_projected_val.to(dtype=torch.float32).contiguous()
+        norm_weight = normalized_weight.to(dtype=flat_val.dtype).contiguous()
+        bias_arg = bias.to(dtype=flat_val.dtype).contiguous() if has_bias else torch.empty(
+            0,
+            dtype=flat_val.dtype,
+            device=flat_val.device,
+        )
+        delta_state, delta_val = _native_module().diagonal_propagation_causal_dense_signed_abs_forward_cuda(
+            flat_val,
+            state_f32,
+            val_f32,
+            norm_weight,
+            bias_arg,
+        )
+        ctx.has_bias = bool(has_bias)
+        ctx.batch_shape = batch_shape
+        ctx.nodes = nodes
+        ctx.out_dim = out_dim
+        ctx.layer_dtype = layer_val.dtype
+        ctx.projected_state_dtype = projected_state.dtype
+        ctx.projected_val_dtype = projected_val.dtype
+        ctx.normalized_weight_dtype = normalized_weight.dtype
+        ctx.save_for_backward(flat_val, state_f32, val_f32, norm_weight, bias_arg)
+        return (
+            delta_state.to(dtype=projected_state.dtype).reshape(*batch_shape, nodes),
+            delta_val.to(dtype=projected_val.dtype).reshape(*batch_shape, nodes, out_dim),
+        )
+
+    @staticmethod
+    def backward(ctx: Any, grad_delta_state: Tensor, grad_delta_val: Tensor) -> tuple[Any, ...]:
+        flat_val, state_f32, val_f32, norm_weight, bias = ctx.saved_tensors
+        flat_grad_state = grad_delta_state.reshape(-1, ctx.nodes).to(dtype=torch.float32).contiguous()
+        flat_grad_val = grad_delta_val.reshape(-1, ctx.nodes, ctx.out_dim).to(dtype=torch.float32).contiguous()
+        (
+            grad_layer,
+            grad_projected_state,
+            grad_projected_val,
+            grad_norm_weight,
+            grad_bias,
+        ) = _native_module().diagonal_propagation_causal_dense_signed_abs_backward_cuda(
+            flat_val,
+            state_f32,
+            val_f32,
+            norm_weight,
+            bias,
+            flat_grad_state,
+            flat_grad_val,
+        )
+        grad_bias_out = grad_bias.reshape(()) if ctx.has_bias else None
+        return (
+            grad_layer.reshape(*ctx.batch_shape, ctx.nodes, ctx.out_dim).to(dtype=ctx.layer_dtype),
+            grad_projected_state.reshape(*ctx.batch_shape, ctx.nodes).to(dtype=ctx.projected_state_dtype),
+            grad_projected_val.reshape(*ctx.batch_shape, ctx.nodes, ctx.out_dim).to(dtype=ctx.projected_val_dtype),
+            grad_norm_weight.to(dtype=ctx.normalized_weight_dtype),
+            grad_bias_out,
+            None,
+        )
+
+
+class _DiagonalPropagationCausalDenseSignedAbsMatmul(Function):
+    @staticmethod
+    def forward(
+        ctx: Any,
+        layer_val: Tensor,
+        projected_state: Tensor,
+        projected_val: Tensor,
+        normalized_weight: Tensor,
+        bias: Tensor,
+        has_bias: bool,
+    ) -> tuple[Tensor, Tensor]:
+        (
+            flat_val,
+            flat_projected_state,
+            flat_projected_val,
+            batch_shape,
+            nodes,
+            out_dim,
+        ) = _flatten_dense_tensors(layer_val, projected_state, projected_val)
+        if out_dim != flat_val.shape[-1]:
+            raise ValueError("diagonal causal dense propagation requires projected_val dim == layer dim.")
+        flat_val = flat_val.contiguous()
+        state_f32 = flat_projected_state.to(dtype=torch.float32).contiguous()
+        val_f32 = flat_projected_val.to(dtype=torch.float32).contiguous()
+        weight = normalized_weight.to(dtype=flat_val.dtype).view(1, 1, -1)
+        q = flat_val * weight
+        scores = torch.bmm(q, flat_val.transpose(1, 2)).to(dtype=torch.float32)
+        if has_bias:
+            scores = scores + bias.to(dtype=torch.float32)
+        mask = torch.ones((nodes, nodes), dtype=torch.bool, device=flat_val.device).tril()
+        scores = scores.masked_fill(~mask.view(1, nodes, nodes), 0.0)
+        stats = scores.abs().masked_fill(~mask.view(1, nodes, nodes), float("-inf"))
+        probs = torch.softmax(stats, dim=-1)
+        edges = torch.sign(scores) * probs * mask.view(1, nodes, nodes).to(dtype=probs.dtype)
+        delta_state = torch.bmm(edges, state_f32.unsqueeze(-1)).squeeze(-1)
+        delta_val = torch.bmm(edges, val_f32)
+        ctx.has_bias = bool(has_bias)
+        ctx.batch_shape = batch_shape
+        ctx.nodes = nodes
+        ctx.out_dim = out_dim
+        ctx.layer_dtype = layer_val.dtype
+        ctx.projected_state_dtype = projected_state.dtype
+        ctx.projected_val_dtype = projected_val.dtype
+        ctx.normalized_weight_dtype = normalized_weight.dtype
+        ctx.save_for_backward(flat_val, state_f32, val_f32, normalized_weight, bias)
+        return (
+            delta_state.to(dtype=projected_state.dtype).reshape(*batch_shape, nodes),
+            delta_val.to(dtype=projected_val.dtype).reshape(*batch_shape, nodes, out_dim),
+        )
+
+    @staticmethod
+    def backward(ctx: Any, grad_delta_state: Tensor, grad_delta_val: Tensor) -> tuple[Any, ...]:
+        flat_val, state_f32, val_f32, normalized_weight, bias = ctx.saved_tensors
+        nodes = ctx.nodes
+        out_dim = ctx.out_dim
+        flat_grad_state = grad_delta_state.reshape(-1, nodes).to(dtype=torch.float32).contiguous()
+        flat_grad_val = grad_delta_val.reshape(-1, nodes, out_dim).to(dtype=torch.float32).contiguous()
+        weight = normalized_weight.to(dtype=flat_val.dtype).view(1, 1, -1)
+        q = flat_val * weight
+        scores = torch.bmm(q, flat_val.transpose(1, 2)).to(dtype=torch.float32)
+        if ctx.has_bias:
+            scores = scores + bias.to(dtype=torch.float32)
+        mask = torch.ones((nodes, nodes), dtype=torch.bool, device=flat_val.device).tril()
+        mask_3d = mask.view(1, nodes, nodes)
+        scores = scores.masked_fill(~mask_3d, 0.0)
+        stats = scores.abs().masked_fill(~mask_3d, float("-inf"))
+        probs = torch.softmax(stats, dim=-1)
+        signs = torch.sign(scores)
+        edges = signs * probs * mask_3d.to(dtype=probs.dtype)
+
+        grad_edges = flat_grad_state.unsqueeze(-1) * state_f32.unsqueeze(1)
+        grad_edges = grad_edges + torch.bmm(flat_grad_val, val_f32.transpose(1, 2))
+        grad_edges = grad_edges * mask_3d.to(dtype=grad_edges.dtype)
+        dot = (grad_edges * edges).sum(dim=-1, keepdim=True)
+        grad_scores = signs * probs * (signs * grad_edges - dot)
+        grad_scores = grad_scores * mask_3d.to(dtype=grad_scores.dtype)
+
+        grad_q = torch.bmm(grad_scores.to(dtype=flat_val.dtype), flat_val)
+        grad_key_val = torch.bmm(grad_scores.transpose(1, 2).to(dtype=flat_val.dtype), q)
+        grad_layer = grad_key_val + grad_q * weight
+        grad_norm_weight = (grad_q * flat_val).sum(dim=(0, 1)).to(dtype=normalized_weight.dtype)
+        grad_projected_state = torch.bmm(edges.transpose(1, 2), flat_grad_state.unsqueeze(-1)).squeeze(-1)
+        grad_projected_val = torch.bmm(edges.transpose(1, 2), flat_grad_val)
+        grad_bias = grad_scores.sum().reshape(()) if ctx.has_bias else None
+        return (
+            grad_layer.reshape(*ctx.batch_shape, nodes, out_dim).to(dtype=ctx.layer_dtype),
+            grad_projected_state.reshape(*ctx.batch_shape, nodes).to(dtype=ctx.projected_state_dtype),
+            grad_projected_val.reshape(*ctx.batch_shape, nodes, out_dim).to(dtype=ctx.projected_val_dtype),
+            grad_norm_weight.to(dtype=ctx.normalized_weight_dtype),
+            grad_bias,
+            None,
+        )
+
+
 class _LowRankPropagationWindow(Function):
     @staticmethod
     def forward(
@@ -4129,7 +5171,7 @@ class _LowRankPropagationWindow(Function):
         )
         score_bias = float(bias.item()) if bias is not None else 0.0
         module = _native_module()
-        if int(compress_kind) == 1:
+        if int(compress_kind) == 2:
             delta_state, delta_val = module.low_rank_propagation_window_entmax15_forward_cuda(
                 weighted_projected_source,
                 projected_target,
@@ -4138,6 +5180,26 @@ class _LowRankPropagationWindow(Function):
                 int(window),
                 score_bias,
             )
+        elif int(compress_kind) == 1:
+            state_f32 = flat_projected_state.to(dtype=torch.float32).contiguous()
+            val_f32 = flat_projected_val.to(dtype=torch.float32).contiguous()
+            if int(window) + 1 >= int(nodes):
+                delta_state, delta_val = module.low_rank_propagation_causal_dense_signed_abs_forward_cuda(
+                    weighted_projected_source,
+                    projected_target,
+                    state_f32,
+                    val_f32,
+                    score_bias,
+                )
+            else:
+                delta_state, delta_val = module.low_rank_propagation_window_signed_abs_forward_cuda(
+                    weighted_projected_source,
+                    projected_target,
+                    state_f32,
+                    val_f32,
+                    int(window),
+                    score_bias,
+                )
         else:
             delta_state, delta_val = module.low_rank_propagation_window_forward_cuda(
                 weighted_projected_source,
@@ -4204,9 +5266,11 @@ class _LowRankPropagationWindow(Function):
         ).sum(dim=-1)
         if bias is not None:
             scores = scores + bias
-        if ctx.compress_kind == 1:
+        if ctx.compress_kind == 2:
             packed_mask = valid.contiguous()
             edges = torch.ops.jakal_net.signed_entmax15(scores, packed_mask)
+        elif ctx.compress_kind == 1:
+            edges = _masked_signed_abs_softmax_from_scores(scores, valid)
         else:
             edges = torch.nn.functional.softsign(scores)
             edges = edges * valid.to(dtype=edges.dtype)
@@ -4236,7 +5300,7 @@ class _LowRankPropagationWindow(Function):
         )
         valid_f32 = valid.to(dtype=grad_edges.dtype)
         grad_edges = grad_edges * valid_f32
-        if ctx.compress_kind == 1:
+        if ctx.compress_kind == 2:
             grad_scores = torch.ops.jakal_net.signed_entmax15_backward(
                 scores.contiguous(),
                 edges.contiguous(),
@@ -4244,6 +5308,13 @@ class _LowRankPropagationWindow(Function):
                 valid.contiguous(),
             )
             grad_scores = grad_scores * valid_f32
+        elif ctx.compress_kind == 1:
+            grad_scores = _masked_signed_abs_softmax_backward(
+                scores.contiguous(),
+                edges.contiguous(),
+                grad_edges.contiguous(),
+                valid.contiguous(),
+            )
         else:
             grad_scores = module.softsign_backward_cuda(
                 scores.contiguous(),
@@ -4411,6 +5482,33 @@ def propagation_window_native(
 ) -> Any:
     if not supports_pairwise_kernel(pairwise_fn):
         raise TypeError("Unsupported pairwise_fn for native propagation.")
+    use_diagonal_causal_dense_cuda = (
+        _experimental_diagonal_dense_prop_cuda_enabled()
+        and edge_compress_name == "signed_abs_softmax"
+        and isinstance(pairwise_fn, DiagonalBilinearPairwise)
+        and native_supports("diagonal_propagation_causal_dense_signed_abs_forward_cuda")
+        and native_supports("diagonal_propagation_causal_dense_signed_abs_backward_cuda")
+        and _cuda_float_tensor(layer_val)
+        and _cuda_float_tensor(projected_state)
+        and _cuda_float_tensor(projected_val)
+        and int(window) + 1 >= int(layer_val.shape[-2])
+        and int(projected_val.shape[-1]) == int(layer_val.shape[-1])
+    )
+    if use_diagonal_causal_dense_cuda:
+        bias = (
+            pairwise_fn.bias
+            if getattr(pairwise_fn, "bias", None) is not None
+            else torch.empty(0, dtype=layer_val.dtype, device=layer_val.device)
+        )
+        delta_state, delta_val = _DiagonalPropagationCausalDenseSignedAbsMatmul.apply(
+            layer_val,
+            projected_state,
+            projected_val,
+            pairwise_fn.normalized_weight(),
+            bias,
+            getattr(pairwise_fn, "bias", None) is not None,
+        )
+        return LayerDelta(delta_state=delta_state, delta_val=delta_val)
     use_entmax15_cuda_autograd = (
         _experimental_fused_training_enabled()
         and edge_compress_name == "signed_entmax15"
@@ -4418,6 +5516,18 @@ def propagation_window_native(
         and native_supports("query_topk_reduce_backward_cuda")
         and native_supports("low_rank_pairwise_topk_backward_cuda")
         and native_supports("low_rank_propagation_window_entmax15_forward_cuda")
+        and isinstance(pairwise_fn, LowRankBilinearPairwise)
+        and _cuda_float_tensor(layer_val)
+        and _cuda_float_tensor(projected_state)
+        and _cuda_float_tensor(projected_val)
+    )
+    use_signed_abs_cuda_autograd = (
+        _experimental_fused_training_enabled()
+        and _experimental_causal_dense_prop_forward_cuda_enabled()
+        and edge_compress_name == "signed_abs_softmax"
+        and _query_backward_ops_available()
+        and native_supports("low_rank_propagation_causal_dense_signed_abs_forward_cuda")
+        and native_supports("low_rank_pairwise_topk_backward_cuda")
         and isinstance(pairwise_fn, LowRankBilinearPairwise)
         and _cuda_float_tensor(layer_val)
         and _cuda_float_tensor(projected_state)
@@ -4434,7 +5544,7 @@ def propagation_window_native(
         and _cuda_float_tensor(projected_state)
         and _cuda_float_tensor(projected_val)
     )
-    if use_cuda_autograd or use_entmax15_cuda_autograd:
+    if use_cuda_autograd or use_signed_abs_cuda_autograd or use_entmax15_cuda_autograd:
         delta_state, delta_val = _LowRankPropagationWindow.apply(
             layer_val,
             projected_state,
@@ -4443,7 +5553,11 @@ def propagation_window_native(
             pairwise_fn.target_proj.weight,
             pairwise_fn.weight,
             pairwise_fn.bias,
-            1 if edge_compress_name == "signed_entmax15" else 0,
+            2
+            if edge_compress_name == "signed_entmax15"
+            else 1
+            if edge_compress_name == "signed_abs_softmax"
+            else 0,
             window,
             target_block_size,
             source_block_size,

@@ -11,6 +11,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <torch/csrc/autograd/autograd.h>
+#include <mma.h>
 
 bool jakal_net_compiled_with_cuda_source() {
   return true;
@@ -32,6 +33,30 @@ bool jakal_net_low_rank_propagation_window_forward_cuda_available() {
   return true;
 }
 
+bool jakal_net_low_rank_propagation_window_signed_abs_forward_cuda_available() {
+  return true;
+}
+
+bool jakal_net_low_rank_propagation_causal_dense_signed_abs_forward_cuda_available() {
+  return true;
+}
+
+bool jakal_net_diagonal_propagation_causal_dense_signed_abs_cuda_available() {
+  return true;
+}
+
+bool jakal_net_low_rank_propagation_dense_forward_cuda_available() {
+  return true;
+}
+
+bool jakal_net_low_rank_dense_scores_tf32_cuda_available() {
+  return true;
+}
+
+bool jakal_net_low_rank_propagation_dense_tf32_forward_cuda_available() {
+  return true;
+}
+
 bool jakal_net_low_rank_propagation_window_entmax15_forward_cuda_available() {
   return true;
 }
@@ -40,7 +65,11 @@ namespace {
 
 constexpr int kPairwiseTopkForwardThreads = 128;
 constexpr int kPairwiseTopkForwardMaxK = 64;
+constexpr int kDenseForwardValTile = 16;
 constexpr float kNegativeInfinity = -INFINITY;
+constexpr int kWmmaTf32TileM = 16;
+constexpr int kWmmaTf32TileN = 16;
+constexpr int kWmmaTf32TileK = 8;
 
 
 int64_t scan_cuda_dense_block_size() {
@@ -94,6 +123,554 @@ __device__ inline void insert_descending_topk(
 
 __device__ inline float softsignf_device(float value) {
   return value / (1.0f + fabsf(value));
+}
+
+__device__ inline void atomicMaxFloat(float* address, float value) {
+  int* address_as_int = reinterpret_cast<int*>(address);
+  int old = *address_as_int;
+  int assumed;
+  do {
+    assumed = old;
+    if (__int_as_float(assumed) >= value) {
+      break;
+    }
+    old = atomicCAS(address_as_int, assumed, __float_as_int(value));
+  } while (assumed != old);
+}
+
+__global__ void low_rank_dense_scores_tf32_kernel(
+    const float* __restrict__ weighted_projected_source,
+    const float* __restrict__ projected_target,
+    float* __restrict__ scores,
+    int64_t batch_flat,
+    int64_t target_nodes,
+    int64_t source_nodes,
+    int64_t rank_dim) {
+  using namespace nvcuda;
+  const int64_t target_tile = blockIdx.x * kWmmaTf32TileM;
+  const int64_t source_tile = blockIdx.y * kWmmaTf32TileN;
+  const int64_t batch = blockIdx.z;
+
+  wmma::fragment<wmma::matrix_a, kWmmaTf32TileM, kWmmaTf32TileN, kWmmaTf32TileK, wmma::precision::tf32, wmma::row_major> a_frag;
+  wmma::fragment<wmma::matrix_b, kWmmaTf32TileM, kWmmaTf32TileN, kWmmaTf32TileK, wmma::precision::tf32, wmma::col_major> b_frag;
+  wmma::fragment<wmma::accumulator, kWmmaTf32TileM, kWmmaTf32TileN, kWmmaTf32TileK, float> acc_frag;
+  wmma::fill_fragment(acc_frag, 0.0f);
+
+  const float* target_base =
+      projected_target + (batch * target_nodes + target_tile) * rank_dim;
+  const float* source_base =
+      weighted_projected_source + (batch * source_nodes + source_tile) * rank_dim;
+
+  for (int64_t rank_start = 0; rank_start < rank_dim; rank_start += kWmmaTf32TileK) {
+    wmma::load_matrix_sync(a_frag, target_base + rank_start, rank_dim);
+    wmma::load_matrix_sync(b_frag, source_base + rank_start, rank_dim);
+    wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+  }
+
+  float* score_base = scores + (batch * target_nodes + target_tile) * source_nodes + source_tile;
+  wmma::store_matrix_sync(score_base, acc_frag, source_nodes, wmma::mem_row_major);
+}
+
+__device__ inline void low_rank_dense_wmma_score_tile(
+    const float* __restrict__ weighted_projected_source,
+    const float* __restrict__ projected_target,
+    float* __restrict__ shared_scores,
+    int64_t batch,
+    int64_t target_tile,
+    int64_t source_tile,
+    int64_t target_nodes,
+    int64_t source_nodes,
+    int64_t rank_dim) {
+  using namespace nvcuda;
+  wmma::fragment<wmma::matrix_a, kWmmaTf32TileM, kWmmaTf32TileN, kWmmaTf32TileK, wmma::precision::tf32, wmma::row_major> a_frag;
+  wmma::fragment<wmma::matrix_b, kWmmaTf32TileM, kWmmaTf32TileN, kWmmaTf32TileK, wmma::precision::tf32, wmma::col_major> b_frag;
+  wmma::fragment<wmma::accumulator, kWmmaTf32TileM, kWmmaTf32TileN, kWmmaTf32TileK, float> acc_frag;
+  wmma::fill_fragment(acc_frag, 0.0f);
+  const float* target_base =
+      projected_target + (batch * target_nodes + target_tile) * rank_dim;
+  const float* source_base =
+      weighted_projected_source + (batch * source_nodes + source_tile) * rank_dim;
+  for (int64_t rank_start = 0; rank_start < rank_dim; rank_start += kWmmaTf32TileK) {
+    wmma::load_matrix_sync(a_frag, target_base + rank_start, rank_dim);
+    wmma::load_matrix_sync(b_frag, source_base + rank_start, rank_dim);
+    wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+  }
+  wmma::store_matrix_sync(shared_scores, acc_frag, kWmmaTf32TileN, wmma::mem_row_major);
+}
+
+__global__ void low_rank_propagation_dense_tf32_stats_kernel(
+    const float* __restrict__ weighted_projected_source,
+    const float* __restrict__ projected_target,
+    float* __restrict__ row_max,
+    float* __restrict__ row_denom,
+    int64_t batch_flat,
+    int64_t target_nodes,
+    int64_t source_nodes,
+    int64_t rank_dim,
+    float score_bias) {
+  const int tid = threadIdx.x;
+  const int64_t target_tile = blockIdx.x * kWmmaTf32TileM;
+  const int64_t batch = blockIdx.y;
+  extern __shared__ float shared[];
+  float* shared_scores = shared;
+  float* shared_rows = shared + kWmmaTf32TileM * kWmmaTf32TileN;
+
+  if (tid < kWmmaTf32TileM) {
+    shared_rows[tid] = 0.0f;
+  }
+  __syncthreads();
+  for (int64_t source_tile = 0; source_tile < source_nodes; source_tile += kWmmaTf32TileN) {
+    if (tid < 32) {
+      low_rank_dense_wmma_score_tile(
+          weighted_projected_source,
+          projected_target,
+          shared_scores,
+          batch,
+          target_tile,
+          source_tile,
+          target_nodes,
+          source_nodes,
+          rank_dim);
+    }
+    __syncthreads();
+    if (tid < kWmmaTf32TileM) {
+      float row_max_local = shared_rows[tid];
+      for (int col = 0; col < kWmmaTf32TileN; ++col) {
+        row_max_local = fmaxf(
+            row_max_local,
+            fabsf(shared_scores[tid * kWmmaTf32TileN + col] + score_bias));
+      }
+      shared_rows[tid] = row_max_local;
+    }
+    __syncthreads();
+  }
+  if (tid < kWmmaTf32TileM) {
+    row_max[batch * target_nodes + target_tile + tid] = shared_rows[tid];
+    shared_rows[kWmmaTf32TileM + tid] = 0.0f;
+  }
+  __syncthreads();
+  for (int64_t source_tile = 0; source_tile < source_nodes; source_tile += kWmmaTf32TileN) {
+    if (tid < 32) {
+      low_rank_dense_wmma_score_tile(
+          weighted_projected_source,
+          projected_target,
+          shared_scores,
+          batch,
+          target_tile,
+          source_tile,
+          target_nodes,
+          source_nodes,
+          rank_dim);
+    }
+    __syncthreads();
+    if (tid < kWmmaTf32TileM) {
+      const float max_stat = shared_rows[tid];
+      float denom = shared_rows[kWmmaTf32TileM + tid];
+      for (int col = 0; col < kWmmaTf32TileN; ++col) {
+        denom += expf(fabsf(shared_scores[tid * kWmmaTf32TileN + col] + score_bias) - max_stat);
+      }
+      shared_rows[kWmmaTf32TileM + tid] = denom;
+    }
+    __syncthreads();
+  }
+  if (tid < kWmmaTf32TileM) {
+    const float denom = shared_rows[kWmmaTf32TileM + tid];
+    row_denom[batch * target_nodes + target_tile + tid] = denom > 0.0f ? denom : 1.0f;
+  }
+}
+
+__global__ void low_rank_propagation_dense_tf32_accum_kernel(
+    const float* __restrict__ weighted_projected_source,
+    const float* __restrict__ projected_target,
+    const float* __restrict__ projected_state,
+    const float* __restrict__ projected_val,
+    const float* __restrict__ row_max,
+    const float* __restrict__ row_denom,
+    float* __restrict__ delta_state,
+    float* __restrict__ delta_val,
+    int64_t batch_flat,
+    int64_t target_nodes,
+    int64_t source_nodes,
+    int64_t rank_dim,
+    int64_t out_dim,
+    float score_bias) {
+  const int tid = threadIdx.x;
+  const int64_t target_tile = blockIdx.x * kWmmaTf32TileM;
+  const int64_t val_tile = blockIdx.y * kWmmaTf32TileN;
+  const int64_t batch = blockIdx.z;
+  extern __shared__ float shared[];
+  float* shared_scores = shared;
+  float* shared_state_acc = shared + kWmmaTf32TileM * kWmmaTf32TileN;
+  float local_val_acc = 0.0f;
+  const int row = tid / kWmmaTf32TileN;
+  const int out_col = tid - row * kWmmaTf32TileN;
+
+  if (val_tile == 0 && tid < kWmmaTf32TileM) {
+    shared_state_acc[tid] = 0.0f;
+  }
+  __syncthreads();
+
+  for (int64_t source_tile = 0; source_tile < source_nodes; source_tile += kWmmaTf32TileN) {
+    if (tid < 32) {
+      low_rank_dense_wmma_score_tile(
+          weighted_projected_source,
+          projected_target,
+          shared_scores,
+          batch,
+          target_tile,
+          source_tile,
+          target_nodes,
+          source_nodes,
+          rank_dim);
+    }
+    __syncthreads();
+    if (tid < kWmmaTf32TileM * kWmmaTf32TileN) {
+      const int64_t target = target_tile + row;
+      const int64_t out = val_tile + out_col;
+      const float max_stat = row_max[batch * target_nodes + target];
+      const float denom = row_denom[batch * target_nodes + target];
+      for (int col = 0; col < kWmmaTf32TileN; ++col) {
+        const int64_t source = source_tile + col;
+        const float score = shared_scores[row * kWmmaTf32TileN + col] + score_bias;
+        float edge = expf(fabsf(score) - max_stat) / denom;
+        if (score < 0.0f) {
+          edge = -edge;
+        } else if (score == 0.0f) {
+          edge = 0.0f;
+        }
+        if (out < out_dim) {
+          local_val_acc += edge * projected_val[(batch * source_nodes + source) * out_dim + out];
+        }
+        if (val_tile == 0 && out_col == 0) {
+          shared_state_acc[row] += edge * projected_state[batch * source_nodes + source];
+        }
+      }
+    }
+    __syncthreads();
+  }
+  if (tid < kWmmaTf32TileM * kWmmaTf32TileN) {
+    const int64_t target = target_tile + row;
+    const int64_t out = val_tile + out_col;
+    if (out < out_dim) {
+      delta_val[(batch * target_nodes + target) * out_dim + out] = local_val_acc;
+    }
+  }
+  if (val_tile == 0 && tid < kWmmaTf32TileM) {
+    delta_state[batch * target_nodes + target_tile + tid] = shared_state_acc[tid];
+  }
+}
+
+__global__ void low_rank_propagation_dense_tf32_shared_edges_kernel(
+    const float* __restrict__ weighted_projected_source,
+    const float* __restrict__ projected_target,
+    const float* __restrict__ projected_state,
+    const float* __restrict__ projected_val,
+    float* __restrict__ delta_state,
+    float* __restrict__ delta_val,
+    int64_t batch_flat,
+    int64_t target_nodes,
+    int64_t source_nodes,
+    int64_t rank_dim,
+    int64_t out_dim,
+    float score_bias) {
+  const int tid = threadIdx.x;
+  const int64_t target_tile = blockIdx.x * kWmmaTf32TileM;
+  const int64_t batch = blockIdx.y;
+  extern __shared__ float shared[];
+  float* shared_edges = shared;
+  float* shared_scores = shared_edges + kWmmaTf32TileM * source_nodes;
+  float* row_max = shared_scores + kWmmaTf32TileM * kWmmaTf32TileN;
+  float* row_denom = row_max + kWmmaTf32TileM;
+
+  for (int row = tid; row < kWmmaTf32TileM; row += blockDim.x) {
+    row_max[row] = 0.0f;
+    row_denom[row] = 0.0f;
+  }
+  __syncthreads();
+
+  for (int64_t source_tile = 0; source_tile < source_nodes; source_tile += kWmmaTf32TileN) {
+    if (tid < 32) {
+      low_rank_dense_wmma_score_tile(
+          weighted_projected_source,
+          projected_target,
+          shared_scores,
+          batch,
+          target_tile,
+          source_tile,
+          target_nodes,
+          source_nodes,
+          rank_dim);
+    }
+    __syncthreads();
+    for (int linear = tid; linear < kWmmaTf32TileM * kWmmaTf32TileN; linear += blockDim.x) {
+      const int row = linear / kWmmaTf32TileN;
+      const int col = linear - row * kWmmaTf32TileN;
+      const int64_t source = source_tile + col;
+      const float score = shared_scores[linear] + score_bias;
+      shared_edges[row * source_nodes + source] = score;
+      atomicMaxFloat(&row_max[row], fabsf(score));
+    }
+    __syncthreads();
+  }
+
+  for (int linear = tid; linear < kWmmaTf32TileM * source_nodes; linear += blockDim.x) {
+    const int row = linear / source_nodes;
+    float score = shared_edges[linear];
+    atomicAdd(&row_denom[row], expf(fabsf(score) - row_max[row]));
+  }
+  __syncthreads();
+
+  for (int linear = tid; linear < kWmmaTf32TileM * source_nodes; linear += blockDim.x) {
+    const int row = linear / source_nodes;
+    const float score = shared_edges[linear];
+    const float denom = row_denom[row] > 0.0f ? row_denom[row] : 1.0f;
+    float edge = expf(fabsf(score) - row_max[row]) / denom;
+    if (score < 0.0f) {
+      edge = -edge;
+    } else if (score == 0.0f) {
+      edge = 0.0f;
+    }
+    shared_edges[linear] = edge;
+  }
+  __syncthreads();
+
+  for (int row = tid; row < kWmmaTf32TileM; row += blockDim.x) {
+    float acc = 0.0f;
+    for (int64_t source = 0; source < source_nodes; ++source) {
+      acc += shared_edges[row * source_nodes + source] *
+             projected_state[batch * source_nodes + source];
+    }
+    delta_state[batch * target_nodes + target_tile + row] = acc;
+  }
+
+  if (tid < 32) {
+    using namespace nvcuda;
+    wmma::fragment<wmma::matrix_a, kWmmaTf32TileM, kWmmaTf32TileN, kWmmaTf32TileK, wmma::precision::tf32, wmma::row_major> edge_frag;
+    wmma::fragment<wmma::matrix_b, kWmmaTf32TileM, kWmmaTf32TileN, kWmmaTf32TileK, wmma::precision::tf32, wmma::row_major> val_frag;
+    wmma::fragment<wmma::accumulator, kWmmaTf32TileM, kWmmaTf32TileN, kWmmaTf32TileK, float> acc_frag;
+    for (int64_t out_tile = 0; out_tile < out_dim; out_tile += kWmmaTf32TileN) {
+      wmma::fill_fragment(acc_frag, 0.0f);
+      for (int64_t source_tile = 0; source_tile < source_nodes; source_tile += kWmmaTf32TileK) {
+        wmma::load_matrix_sync(
+            edge_frag,
+            shared_edges + source_tile,
+            source_nodes);
+        wmma::load_matrix_sync(
+            val_frag,
+            projected_val + (batch * source_nodes + source_tile) * out_dim + out_tile,
+            out_dim);
+        wmma::mma_sync(acc_frag, edge_frag, val_frag, acc_frag);
+      }
+      wmma::store_matrix_sync(
+          delta_val + (batch * target_nodes + target_tile) * out_dim + out_tile,
+          acc_frag,
+          out_dim,
+          wmma::mem_row_major);
+    }
+  }
+}
+
+template <typename scalar_t>
+__global__ void scan_signed_softmax_state_kernel(
+    const scalar_t* __restrict__ state,
+    const scalar_t* __restrict__ delta_state,
+    scalar_t* __restrict__ output,
+    int64_t batch_flat,
+    int64_t nodes) {
+  const int64_t batch = blockIdx.x;
+  const int tid = threadIdx.x;
+  extern __shared__ float shared[];
+
+  float local_sum = 0.0f;
+  float local_sq_sum = 0.0f;
+  const int64_t row_base = batch * nodes;
+  for (int64_t node = tid; node < nodes; node += blockDim.x) {
+    float value = static_cast<float>(state[row_base + node]) +
+                  static_cast<float>(delta_state[row_base + node]);
+    if (!isfinite(value)) {
+      value = 0.0f;
+    }
+    local_sum += value;
+    local_sq_sum += value * value;
+  }
+  shared[tid] = local_sum;
+  shared[blockDim.x + tid] = local_sq_sum;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      shared[tid] += shared[tid + stride];
+      shared[blockDim.x + tid] += shared[blockDim.x + tid + stride];
+    }
+    __syncthreads();
+  }
+  const float mean = shared[0] / static_cast<float>(nodes);
+  const float variance = fmaxf(shared[blockDim.x] / static_cast<float>(nodes) - mean * mean, 0.0f);
+  const float inv_std = rsqrtf(variance + 1.0e-5f);
+
+  float local_max = 0.0f;
+  for (int64_t node = tid; node < nodes; node += blockDim.x) {
+    float value = static_cast<float>(state[row_base + node]) +
+                  static_cast<float>(delta_state[row_base + node]);
+    if (!isfinite(value)) {
+      value = 0.0f;
+    }
+    const float normalized = (value - mean) * inv_std;
+    local_max = fmaxf(local_max, fabsf(normalized));
+  }
+  shared[tid] = local_max;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      shared[tid] = fmaxf(shared[tid], shared[tid + stride]);
+    }
+    __syncthreads();
+  }
+  const float max_abs = shared[0];
+
+  float local_denom = 0.0f;
+  for (int64_t node = tid; node < nodes; node += blockDim.x) {
+    float value = static_cast<float>(state[row_base + node]) +
+                  static_cast<float>(delta_state[row_base + node]);
+    if (!isfinite(value)) {
+      value = 0.0f;
+    }
+    const float normalized = (value - mean) * inv_std;
+    local_denom += expf(fabsf(normalized) - max_abs);
+  }
+  shared[tid] = local_denom;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      shared[tid] += shared[tid + stride];
+    }
+    __syncthreads();
+  }
+  const float denom = shared[0] > 0.0f ? shared[0] : 1.0f;
+  const float state_mass = static_cast<float>(nodes);
+
+  for (int64_t node = tid; node < nodes; node += blockDim.x) {
+    float value = static_cast<float>(state[row_base + node]) +
+                  static_cast<float>(delta_state[row_base + node]);
+    if (!isfinite(value)) {
+      value = 0.0f;
+    }
+    const float normalized = (value - mean) * inv_std;
+    float sign = 0.0f;
+    if (normalized > 0.0f) {
+      sign = 1.0f;
+    } else if (normalized < 0.0f) {
+      sign = -1.0f;
+    }
+    output[row_base + node] =
+        static_cast<scalar_t>(sign * expf(fabsf(normalized) - max_abs) / denom * state_mass);
+  }
+}
+
+template <typename scalar_t>
+__global__ void scan_softsign_state_kernel(
+    const scalar_t* __restrict__ state,
+    const scalar_t* __restrict__ delta_state,
+    scalar_t* __restrict__ output,
+    int64_t total) {
+  const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= total) {
+    return;
+  }
+  float value = static_cast<float>(state[index]) + static_cast<float>(delta_state[index]);
+  if (!isfinite(value)) {
+    value = 0.0f;
+  }
+  output[index] = static_cast<scalar_t>(value / (1.0f + fabsf(value)));
+}
+
+template <typename scalar_t>
+__global__ void scan_val_add_layer_norm_kernel(
+    const scalar_t* __restrict__ val,
+    const scalar_t* __restrict__ delta_val,
+    const scalar_t* __restrict__ weight,
+    const scalar_t* __restrict__ bias,
+    scalar_t* __restrict__ output,
+    int64_t rows,
+    int64_t dim,
+    bool has_weight,
+    bool has_bias) {
+  const int64_t row = blockIdx.x;
+  const int tid = threadIdx.x;
+  extern __shared__ float shared[];
+
+  float local_sum = 0.0f;
+  float local_sq_sum = 0.0f;
+  const int64_t row_base = row * dim;
+  for (int64_t feature = tid; feature < dim; feature += blockDim.x) {
+    float value = static_cast<float>(val[row_base + feature]) +
+                  static_cast<float>(delta_val[row_base + feature]);
+    local_sum += value;
+    local_sq_sum += value * value;
+  }
+  shared[tid] = local_sum;
+  shared[blockDim.x + tid] = local_sq_sum;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      shared[tid] += shared[tid + stride];
+      shared[blockDim.x + tid] += shared[blockDim.x + tid + stride];
+    }
+    __syncthreads();
+  }
+  const float mean = shared[0] / static_cast<float>(dim);
+  const float variance = fmaxf(shared[blockDim.x] / static_cast<float>(dim) - mean * mean, 0.0f);
+  const float inv_std = rsqrtf(variance + 1.0e-5f);
+
+  for (int64_t feature = tid; feature < dim; feature += blockDim.x) {
+    float normalized =
+        (static_cast<float>(val[row_base + feature]) +
+         static_cast<float>(delta_val[row_base + feature]) - mean) * inv_std;
+    if (has_weight) {
+      normalized *= static_cast<float>(weight[feature]);
+    }
+    if (has_bias) {
+      normalized += static_cast<float>(bias[feature]);
+    }
+    output[row_base + feature] = static_cast<scalar_t>(normalized);
+  }
+}
+
+template <typename scalar_t>
+__global__ void scan_bias_gelu_kernel(
+    scalar_t* __restrict__ hidden,
+    const scalar_t* __restrict__ bias,
+    int64_t total,
+    int64_t dim,
+    bool has_bias) {
+  const int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+  if (linear >= total) {
+    return;
+  }
+  float value = static_cast<float>(hidden[linear]);
+  if (has_bias) {
+    value += static_cast<float>(bias[linear % dim]);
+  }
+  value = 0.5f * value * (1.0f + erff(value * 0.70710678118654752440f));
+  hidden[linear] = static_cast<scalar_t>(value);
+}
+
+template <typename scalar_t>
+__global__ void scan_residual_bias_add_kernel(
+    const scalar_t* __restrict__ residual,
+    scalar_t* __restrict__ delta,
+    const scalar_t* __restrict__ bias,
+    int64_t total,
+    int64_t dim,
+    bool has_bias) {
+  const int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+  if (linear >= total) {
+    return;
+  }
+  float value = static_cast<float>(delta[linear]);
+  if (has_bias) {
+    value += static_cast<float>(bias[linear % dim]);
+  }
+  delta[linear] = static_cast<scalar_t>(static_cast<float>(residual[linear]) + value);
 }
 
 template <typename scalar_t>
@@ -770,6 +1347,235 @@ __global__ void low_rank_propagation_topk_forward_multihead_kernel(
 }
 
 template <typename scalar_t>
+__device__ inline float low_rank_dense_score_at(
+    const scalar_t* __restrict__ weighted_projected_source,
+    const scalar_t* __restrict__ projected_target,
+    int64_t batch,
+    int64_t target,
+    int64_t source,
+    int64_t num_heads,
+    int64_t target_nodes,
+    int64_t source_nodes,
+    int64_t rank_dim,
+    bool multihead) {
+  if (multihead) {
+    float best_score = kNegativeInfinity;
+    for (int64_t head = 0; head < num_heads; ++head) {
+      const int64_t target_offset =
+          (((batch * num_heads + head) * target_nodes + target) * rank_dim);
+      const int64_t source_offset =
+          (((batch * num_heads + head) * source_nodes + source) * rank_dim);
+      float score = 0.0f;
+      for (int64_t feature = 0; feature < rank_dim; ++feature) {
+        score += static_cast<float>(projected_target[target_offset + feature]) *
+                 static_cast<float>(weighted_projected_source[source_offset + feature]);
+      }
+      best_score = fmaxf(best_score, score);
+    }
+    return best_score;
+  }
+  const int64_t target_offset = (batch * target_nodes + target) * rank_dim;
+  const int64_t source_offset = (batch * source_nodes + source) * rank_dim;
+  float score = 0.0f;
+  for (int64_t feature = 0; feature < rank_dim; ++feature) {
+    score += static_cast<float>(projected_target[target_offset + feature]) *
+             static_cast<float>(weighted_projected_source[source_offset + feature]);
+  }
+  return score;
+}
+
+template <typename scalar_t>
+__global__ void low_rank_propagation_dense_stats_kernel(
+    const scalar_t* __restrict__ weighted_projected_source,
+    const scalar_t* __restrict__ projected_target,
+    float* __restrict__ row_max,
+    float* __restrict__ row_denom,
+    int64_t batch_flat,
+    int64_t num_heads,
+    int64_t target_nodes,
+    int64_t source_nodes,
+    int64_t rank_dim,
+    int64_t compress_kind,
+    bool multihead) {
+  const int64_t linear_row = blockIdx.x;
+  const int64_t batch = linear_row / target_nodes;
+  const int64_t target = linear_row - batch * target_nodes;
+  const int tid = threadIdx.x;
+  extern __shared__ float shared[];
+
+  if (compress_kind != kCompressSignedAbsSoftmax) {
+    if (tid == 0) {
+      row_max[linear_row] = 0.0f;
+      row_denom[linear_row] = 1.0f;
+    }
+    return;
+  }
+
+  float max_stat = compress_kind == kCompressSignedAbsSoftmax ? 0.0f : kNegativeInfinity;
+  for (int64_t source = tid; source < source_nodes; source += blockDim.x) {
+    max_stat = fmaxf(
+        max_stat,
+        fabsf(low_rank_dense_score_at(
+            weighted_projected_source,
+            projected_target,
+            batch,
+            target,
+            source,
+            num_heads,
+            target_nodes,
+            source_nodes,
+            rank_dim,
+            multihead)));
+  }
+  shared[tid] = max_stat;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      shared[tid] = fmaxf(shared[tid], shared[tid + stride]);
+    }
+    __syncthreads();
+  }
+  max_stat = shared[0];
+
+  float local_denom = 0.0f;
+  for (int64_t source = tid; source < source_nodes; source += blockDim.x) {
+    local_denom += expf(
+        fabsf(low_rank_dense_score_at(
+            weighted_projected_source,
+            projected_target,
+            batch,
+            target,
+            source,
+            num_heads,
+            target_nodes,
+            source_nodes,
+            rank_dim,
+            multihead)) -
+        max_stat);
+  }
+  shared[tid] = local_denom;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      shared[tid] += shared[tid + stride];
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    row_max[linear_row] = max_stat;
+    row_denom[linear_row] = shared[0] > 0.0f ? shared[0] : 1.0f;
+  }
+}
+
+template <typename scalar_t>
+__global__ void low_rank_propagation_dense_accum_kernel(
+    const scalar_t* __restrict__ weighted_projected_source,
+    const scalar_t* __restrict__ projected_target,
+    const float* __restrict__ projected_state,
+    const float* __restrict__ projected_val,
+    const float* __restrict__ row_max,
+    const float* __restrict__ row_denom,
+    float* __restrict__ delta_state,
+    float* __restrict__ delta_val,
+    int64_t batch_flat,
+    int64_t num_heads,
+    int64_t target_nodes,
+    int64_t source_nodes,
+    int64_t rank_dim,
+    int64_t out_dim,
+    int64_t compress_kind,
+    bool multihead) {
+  const int64_t linear_row = blockIdx.x;
+  const int64_t batch = linear_row / target_nodes;
+  const int64_t target = linear_row - batch * target_nodes;
+  const int64_t tile_start = blockIdx.y * kDenseForwardValTile;
+  const int tid = threadIdx.x;
+  extern __shared__ float shared[];
+  const float max_stat = row_max[linear_row];
+  const float denom = row_denom[linear_row];
+
+  float state_acc = 0.0f;
+  float val_acc[kDenseForwardValTile];
+  for (int64_t tile = 0; tile < kDenseForwardValTile; ++tile) {
+    val_acc[tile] = 0.0f;
+  }
+  const int64_t state_base = batch * source_nodes;
+  const int64_t val_base = batch * source_nodes * out_dim;
+  for (int64_t source = tid; source < source_nodes; source += blockDim.x) {
+    const float score = low_rank_dense_score_at(
+        weighted_projected_source,
+        projected_target,
+        batch,
+        target,
+        source,
+        num_heads,
+        target_nodes,
+        source_nodes,
+        rank_dim,
+        multihead);
+    float edge;
+    if (compress_kind == kCompressSignedAbsSoftmax) {
+      edge = expf(fabsf(score) - max_stat) / denom;
+      if (score < 0.0f) {
+        edge = -edge;
+      } else if (score == 0.0f) {
+        edge = 0.0f;
+      }
+    } else {
+      edge = softsignf_device(score);
+    }
+    if (blockIdx.y == 0) {
+      state_acc += edge * projected_state[state_base + source];
+    }
+    for (int64_t tile = 0; tile < kDenseForwardValTile; ++tile) {
+      const int64_t out = tile_start + tile;
+      if (out < out_dim) {
+        val_acc[tile] += edge * projected_val[val_base + source * out_dim + out];
+      }
+    }
+  }
+
+  if (blockIdx.y == 0) {
+    shared[tid] = state_acc;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) {
+        shared[tid] += shared[tid + stride];
+      }
+      __syncthreads();
+    }
+    if (tid == 0) {
+      delta_state[linear_row] = shared[0];
+    }
+  } else {
+    __syncthreads();
+  }
+
+  float* val_shared = shared;
+  for (int64_t tile = 0; tile < kDenseForwardValTile; ++tile) {
+    val_shared[tile * blockDim.x + tid] = val_acc[tile];
+  }
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      for (int64_t tile = 0; tile < kDenseForwardValTile; ++tile) {
+        val_shared[tile * blockDim.x + tid] += val_shared[tile * blockDim.x + tid + stride];
+      }
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    const int64_t delta_val_base = linear_row * out_dim;
+    for (int64_t tile = 0; tile < kDenseForwardValTile; ++tile) {
+      const int64_t out = tile_start + tile;
+      if (out < out_dim) {
+        delta_val[delta_val_base + out] = val_shared[tile * blockDim.x];
+      }
+    }
+  }
+}
+
+template <typename scalar_t>
 __global__ void low_rank_propagation_window_forward_kernel(
     const scalar_t* __restrict__ weighted_projected_source,
     const scalar_t* __restrict__ projected_target,
@@ -828,6 +1634,351 @@ __global__ void low_rank_propagation_window_forward_kernel(
       acc += edge * projected_val[projected_val_base + source * out_dim + out];
     }
     delta_val[delta_val_base + out] = acc;
+  }
+}
+
+template <typename scalar_t>
+__global__ void low_rank_propagation_window_signed_abs_forward_kernel(
+    const scalar_t* __restrict__ weighted_projected_source,
+    const scalar_t* __restrict__ projected_target,
+    const float* __restrict__ projected_state,
+    const float* __restrict__ projected_val,
+    float* __restrict__ delta_state,
+    float* __restrict__ delta_val,
+    int64_t batch_flat,
+    int64_t target_nodes,
+    int64_t source_nodes,
+    int64_t rank_dim,
+    int64_t out_dim,
+    int64_t window,
+    float score_bias) {
+  const int64_t linear_row = blockIdx.x;
+  const int64_t batch = linear_row / target_nodes;
+  const int64_t target = linear_row - batch * target_nodes;
+  const int tid = threadIdx.x;
+
+  const int64_t source_start = target > window ? target - window : 0;
+  const int64_t source_end = source_nodes < (target + 1) ? source_nodes : (target + 1);
+  const int64_t active_sources = source_end > source_start ? (source_end - source_start) : 0;
+  const int64_t target_offset = (batch * target_nodes + target) * rank_dim;
+  const int64_t state_base = batch * source_nodes;
+  const int64_t projected_val_base = batch * source_nodes * out_dim;
+  const int64_t delta_val_base = linear_row * out_dim;
+
+  extern __shared__ float shared[];
+  float* shared_scores = shared;
+  float* shared_edges = shared_scores + active_sources;
+  float* reduce = shared_edges + active_sources;
+
+  float local_max = 0.0f;
+  for (int64_t offset = tid; offset < active_sources; offset += blockDim.x) {
+    const int64_t source = source_start + offset;
+    const int64_t source_offset = (batch * source_nodes + source) * rank_dim;
+    float score = score_bias;
+    for (int64_t feature = 0; feature < rank_dim; ++feature) {
+      score += static_cast<float>(projected_target[target_offset + feature]) *
+               static_cast<float>(weighted_projected_source[source_offset + feature]);
+    }
+    if (!isfinite(score)) {
+      score = 0.0f;
+    }
+    shared_scores[offset] = score;
+    local_max = fmaxf(local_max, fabsf(score));
+  }
+  reduce[tid] = local_max;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduce[tid] = fmaxf(reduce[tid], reduce[tid + stride]);
+    }
+    __syncthreads();
+  }
+  const float max_stat = reduce[0];
+
+  float local_sum = 0.0f;
+  for (int64_t offset = tid; offset < active_sources; offset += blockDim.x) {
+    local_sum += expf(fabsf(shared_scores[offset]) - max_stat);
+  }
+  reduce[tid] = local_sum;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduce[tid] += reduce[tid + stride];
+    }
+    __syncthreads();
+  }
+  const float denom = reduce[0] > 0.0f ? reduce[0] : 1.0f;
+
+  for (int64_t offset = tid; offset < active_sources; offset += blockDim.x) {
+    const float score = shared_scores[offset];
+    float edge = expf(fabsf(score) - max_stat) / denom;
+    if (score < 0.0f) {
+      edge = -edge;
+    } else if (score == 0.0f) {
+      edge = 0.0f;
+    }
+    shared_edges[offset] = edge;
+  }
+  __syncthreads();
+
+  float state_acc = 0.0f;
+  for (int64_t offset = tid; offset < active_sources; offset += blockDim.x) {
+    const int64_t source = source_start + offset;
+    state_acc += shared_edges[offset] * projected_state[state_base + source];
+  }
+  reduce[tid] = state_acc;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduce[tid] += reduce[tid + stride];
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    delta_state[linear_row] = reduce[0];
+  }
+  __syncthreads();
+
+  for (int64_t out = tid; out < out_dim; out += blockDim.x) {
+    float acc = 0.0f;
+    for (int64_t offset = 0; offset < active_sources; ++offset) {
+      const int64_t source = source_start + offset;
+      acc += shared_edges[offset] * projected_val[projected_val_base + source * out_dim + out];
+    }
+    delta_val[delta_val_base + out] = acc;
+  }
+}
+
+template <typename scalar_t>
+__global__ void diagonal_causal_signed_abs_forward_kernel(
+    const scalar_t* __restrict__ layer_val,
+    const float* __restrict__ projected_state,
+    const float* __restrict__ projected_val,
+    const scalar_t* __restrict__ normalized_weight,
+    const scalar_t* __restrict__ bias,
+    float* __restrict__ delta_state,
+    float* __restrict__ delta_val,
+    int64_t batch_flat,
+    int64_t nodes,
+    int64_t dim,
+    bool has_bias) {
+  const int64_t linear_row = blockIdx.x;
+  const int64_t batch = linear_row / nodes;
+  const int64_t target = linear_row - batch * nodes;
+  const int tid = threadIdx.x;
+  const int64_t active_sources = target + 1;
+  extern __shared__ float shared[];
+  float* scores = shared;
+  float* edges = scores + active_sources;
+  float* reduce = edges + active_sources;
+  const int64_t val_base = batch * nodes * dim;
+  const int64_t state_base = batch * nodes;
+  const int64_t target_offset = val_base + target * dim;
+
+  float local_max = 0.0f;
+  for (int64_t source = tid; source < active_sources; source += blockDim.x) {
+    const int64_t source_offset = val_base + source * dim;
+    float score = has_bias ? static_cast<float>(*bias) : 0.0f;
+    for (int64_t feature = 0; feature < dim; ++feature) {
+      score += static_cast<float>(layer_val[target_offset + feature]) *
+               static_cast<float>(normalized_weight[feature]) *
+               static_cast<float>(layer_val[source_offset + feature]);
+    }
+    if (!isfinite(score)) {
+      score = 0.0f;
+    }
+    scores[source] = score;
+    local_max = fmaxf(local_max, fabsf(score));
+  }
+  reduce[tid] = local_max;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduce[tid] = fmaxf(reduce[tid], reduce[tid + stride]);
+    }
+    __syncthreads();
+  }
+  const float row_max = reduce[0];
+
+  float local_sum = 0.0f;
+  for (int64_t source = tid; source < active_sources; source += blockDim.x) {
+    local_sum += expf(fabsf(scores[source]) - row_max);
+  }
+  reduce[tid] = local_sum;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduce[tid] += reduce[tid + stride];
+    }
+    __syncthreads();
+  }
+  const float denom = reduce[0] > 0.0f ? reduce[0] : 1.0f;
+
+  float state_acc = 0.0f;
+  for (int64_t source = tid; source < active_sources; source += blockDim.x) {
+    const float score = scores[source];
+    float edge = expf(fabsf(score) - row_max) / denom;
+    if (score < 0.0f) {
+      edge = -edge;
+    } else if (score == 0.0f) {
+      edge = 0.0f;
+    }
+    edges[source] = edge;
+    state_acc += edge * projected_state[state_base + source];
+  }
+  reduce[tid] = state_acc;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduce[tid] += reduce[tid + stride];
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    delta_state[linear_row] = reduce[0];
+  }
+  __syncthreads();
+
+  const int64_t delta_val_base = linear_row * dim;
+  for (int64_t feature = tid; feature < dim; feature += blockDim.x) {
+    float acc = 0.0f;
+    for (int64_t source = 0; source < active_sources; ++source) {
+      acc += edges[source] * projected_val[val_base + source * dim + feature];
+    }
+    delta_val[delta_val_base + feature] = acc;
+  }
+}
+
+template <typename scalar_t>
+__global__ void diagonal_causal_signed_abs_backward_kernel(
+    const scalar_t* __restrict__ layer_val,
+    const float* __restrict__ projected_state,
+    const float* __restrict__ projected_val,
+    const scalar_t* __restrict__ normalized_weight,
+    const scalar_t* __restrict__ bias,
+    const float* __restrict__ grad_delta_state,
+    const float* __restrict__ grad_delta_val,
+    float* __restrict__ grad_layer_val,
+    float* __restrict__ grad_projected_state,
+    float* __restrict__ grad_projected_val,
+    float* __restrict__ grad_normalized_weight,
+    float* __restrict__ grad_bias,
+    int64_t batch_flat,
+    int64_t nodes,
+    int64_t dim,
+    bool has_bias) {
+  const int64_t linear_row = blockIdx.x;
+  const int64_t batch = linear_row / nodes;
+  const int64_t target = linear_row - batch * nodes;
+  const int tid = threadIdx.x;
+  const int64_t active_sources = target + 1;
+  extern __shared__ float shared[];
+  float* scores = shared;
+  float* edges = scores + active_sources;
+  float* grad_edges = edges + active_sources;
+  float* reduce = grad_edges + active_sources;
+  const int64_t val_base = batch * nodes * dim;
+  const int64_t state_base = batch * nodes;
+  const int64_t target_offset = val_base + target * dim;
+
+  float local_max = 0.0f;
+  for (int64_t source = tid; source < active_sources; source += blockDim.x) {
+    const int64_t source_offset = val_base + source * dim;
+    float score = has_bias ? static_cast<float>(*bias) : 0.0f;
+    for (int64_t feature = 0; feature < dim; ++feature) {
+      score += static_cast<float>(layer_val[target_offset + feature]) *
+               static_cast<float>(normalized_weight[feature]) *
+               static_cast<float>(layer_val[source_offset + feature]);
+    }
+    if (!isfinite(score)) {
+      score = 0.0f;
+    }
+    scores[source] = score;
+    local_max = fmaxf(local_max, fabsf(score));
+  }
+  reduce[tid] = local_max;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduce[tid] = fmaxf(reduce[tid], reduce[tid + stride]);
+    }
+    __syncthreads();
+  }
+  const float row_max = reduce[0];
+
+  float local_sum = 0.0f;
+  for (int64_t source = tid; source < active_sources; source += blockDim.x) {
+    local_sum += expf(fabsf(scores[source]) - row_max);
+  }
+  reduce[tid] = local_sum;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduce[tid] += reduce[tid + stride];
+    }
+    __syncthreads();
+  }
+  const float denom = reduce[0] > 0.0f ? reduce[0] : 1.0f;
+
+  for (int64_t source = tid; source < active_sources; source += blockDim.x) {
+    const float score = scores[source];
+    float edge = expf(fabsf(score) - row_max) / denom;
+    if (score < 0.0f) {
+      edge = -edge;
+    } else if (score == 0.0f) {
+      edge = 0.0f;
+    }
+    edges[source] = edge;
+  }
+  __syncthreads();
+
+  const float g_state = grad_delta_state[linear_row];
+  const int64_t grad_val_base = linear_row * dim;
+  float local_dot = 0.0f;
+  for (int64_t source = tid; source < active_sources; source += blockDim.x) {
+    const int64_t source_offset = val_base + source * dim;
+    float ge = g_state * projected_state[state_base + source];
+    for (int64_t feature = 0; feature < dim; ++feature) {
+      ge += grad_delta_val[grad_val_base + feature] *
+            projected_val[source_offset + feature];
+    }
+    grad_edges[source] = ge;
+    local_dot += ge * edges[source];
+    atomicAdd(grad_projected_state + state_base + source, edges[source] * g_state);
+    for (int64_t feature = 0; feature < dim; ++feature) {
+      atomicAdd(
+          grad_projected_val + source_offset + feature,
+          edges[source] * grad_delta_val[grad_val_base + feature]);
+    }
+  }
+  reduce[tid] = local_dot;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduce[tid] += reduce[tid + stride];
+    }
+    __syncthreads();
+  }
+  const float edge_dot = reduce[0];
+
+  for (int64_t source = tid; source < active_sources; source += blockDim.x) {
+    const float score = scores[source];
+    const float sign = score > 0.0f ? 1.0f : (score < 0.0f ? -1.0f : 0.0f);
+    const float prob = fabsf(edges[source]);
+    const float grad_score =
+        sign == 0.0f ? 0.0f : sign * prob * (sign * grad_edges[source] - edge_dot);
+    if (has_bias) {
+      atomicAdd(grad_bias, grad_score);
+    }
+    const int64_t source_offset = val_base + source * dim;
+    for (int64_t feature = 0; feature < dim; ++feature) {
+      const float target_val = static_cast<float>(layer_val[target_offset + feature]);
+      const float source_val = static_cast<float>(layer_val[source_offset + feature]);
+      const float weight = static_cast<float>(normalized_weight[feature]);
+      atomicAdd(grad_layer_val + target_offset + feature, grad_score * weight * source_val);
+      atomicAdd(grad_layer_val + source_offset + feature, grad_score * weight * target_val);
+      atomicAdd(grad_normalized_weight + feature, grad_score * target_val * source_val);
+    }
   }
 }
 
@@ -1509,6 +2660,269 @@ jakal_net_low_rank_propagation_topk_forward_cuda(
 }
 
 std::tuple<torch::Tensor, torch::Tensor>
+jakal_net_low_rank_propagation_dense_forward_cuda(
+    const torch::Tensor& weighted_projected_source,
+    torch::Tensor projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    int64_t compress_kind) {
+  require_cuda_contiguous(weighted_projected_source, "weighted_projected_source");
+  require_cuda_contiguous(projected_target, "projected_target");
+  require_cuda_contiguous(projected_state, "projected_state");
+  require_cuda_contiguous(projected_val, "projected_val");
+  if (compress_kind != kCompressSignedAbsSoftmax && compress_kind != 0) {
+    throw std::runtime_error("dense fused propagation supports signed_abs_softmax and softsign.");
+  }
+  const bool multihead =
+      weighted_projected_source.dim() == 4 && projected_target.dim() == 4;
+  if ((!multihead && (weighted_projected_source.dim() != 3 || projected_target.dim() != 3)) ||
+      (multihead && (weighted_projected_source.dim() != 4 || projected_target.dim() != 4))) {
+    throw std::runtime_error(
+        "weighted_projected_source and projected_target must be shaped [batch, nodes, rank] or [batch, heads, nodes, rank].");
+  }
+  if (projected_state.dim() != 2 || projected_val.dim() != 3) {
+    throw std::runtime_error(
+        "projected_state and projected_val must be shaped [batch, source_nodes] and [batch, source_nodes, out_dim].");
+  }
+  if (weighted_projected_source.size(0) != projected_target.size(0) ||
+      weighted_projected_source.size(0) != projected_state.size(0) ||
+      weighted_projected_source.size(0) != projected_val.size(0)) {
+    throw std::runtime_error("All fused low-rank dense inputs must share batch_flat.");
+  }
+  const auto source_nodes = multihead ? weighted_projected_source.size(2) : weighted_projected_source.size(1);
+  const auto target_nodes = multihead ? projected_target.size(2) : projected_target.size(1);
+  const auto rank_dim = multihead ? weighted_projected_source.size(3) : weighted_projected_source.size(2);
+  if (source_nodes != projected_state.size(1) ||
+      source_nodes != projected_val.size(1)) {
+    throw std::runtime_error("projected_state/projected_val must share source_nodes.");
+  }
+  if (rank_dim != (multihead ? projected_target.size(3) : projected_target.size(2))) {
+    throw std::runtime_error("weighted_projected_source and projected_target must share rank_dim.");
+  }
+  if (projected_state.scalar_type() != torch::kFloat32 ||
+      projected_val.scalar_type() != torch::kFloat32) {
+    throw std::runtime_error("projected_state and projected_val must be float32 accumulators.");
+  }
+  if (weighted_projected_source.scalar_type() != projected_target.scalar_type()) {
+    projected_target = projected_target.to(weighted_projected_source.scalar_type()).contiguous();
+  }
+
+  const auto batch_flat = weighted_projected_source.size(0);
+  const auto num_heads = multihead ? weighted_projected_source.size(1) : 1;
+  const auto out_dim = projected_val.size(2);
+  auto row_max = torch::empty({batch_flat, target_nodes}, projected_state.options());
+  auto row_denom = torch::empty({batch_flat, target_nodes}, projected_state.options());
+  auto delta_state = torch::empty({batch_flat, target_nodes}, projected_state.options());
+  auto delta_val = torch::empty({batch_flat, target_nodes, out_dim}, projected_val.options());
+
+  constexpr int threads = kPairwiseTopkForwardThreads;
+  const dim3 stats_blocks(batch_flat * target_nodes);
+  const dim3 accum_blocks(batch_flat * target_nodes, (out_dim + kDenseForwardValTile - 1) / kDenseForwardValTile);
+  const auto shmem = std::max<int64_t>(2 * threads, kDenseForwardValTile * threads) * sizeof(float);
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf,
+      torch::kBFloat16,
+      weighted_projected_source.scalar_type(),
+      "low_rank_propagation_dense_forward_cuda",
+      [&] {
+        low_rank_propagation_dense_stats_kernel<scalar_t>
+            <<<stats_blocks, threads, threads * sizeof(float), stream>>>(
+                weighted_projected_source.data_ptr<scalar_t>(),
+                projected_target.data_ptr<scalar_t>(),
+                row_max.data_ptr<float>(),
+                row_denom.data_ptr<float>(),
+                batch_flat,
+                num_heads,
+                target_nodes,
+                source_nodes,
+                rank_dim,
+                compress_kind,
+                multihead);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        low_rank_propagation_dense_accum_kernel<scalar_t>
+            <<<accum_blocks, threads, shmem, stream>>>(
+                weighted_projected_source.data_ptr<scalar_t>(),
+                projected_target.data_ptr<scalar_t>(),
+                projected_state.data_ptr<float>(),
+                projected_val.data_ptr<float>(),
+                row_max.data_ptr<float>(),
+                row_denom.data_ptr<float>(),
+                delta_state.data_ptr<float>(),
+                delta_val.data_ptr<float>(),
+                batch_flat,
+                num_heads,
+                target_nodes,
+                source_nodes,
+                rank_dim,
+                out_dim,
+                compress_kind,
+                multihead);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+      });
+  return {delta_state, delta_val};
+}
+
+torch::Tensor jakal_net_low_rank_dense_scores_tf32_cuda(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_target) {
+  require_cuda_contiguous(weighted_projected_source, "weighted_projected_source");
+  require_cuda_contiguous(projected_target, "projected_target");
+  if (weighted_projected_source.dim() != 3 || projected_target.dim() != 3) {
+    throw std::runtime_error(
+        "TF32 dense score tile kernel requires [batch, nodes, rank] tensors.");
+  }
+  if (weighted_projected_source.scalar_type() != torch::kFloat32 ||
+      projected_target.scalar_type() != torch::kFloat32) {
+    throw std::runtime_error("TF32 dense score tile kernel requires float32 inputs.");
+  }
+  if (weighted_projected_source.size(0) != projected_target.size(0) ||
+      weighted_projected_source.size(2) != projected_target.size(2)) {
+    throw std::runtime_error("TF32 dense score tile inputs must share batch and rank.");
+  }
+  const auto batch_flat = weighted_projected_source.size(0);
+  const auto source_nodes = weighted_projected_source.size(1);
+  const auto target_nodes = projected_target.size(1);
+  const auto rank_dim = weighted_projected_source.size(2);
+  if (target_nodes % kWmmaTf32TileM != 0 ||
+      source_nodes % kWmmaTf32TileN != 0 ||
+      rank_dim % kWmmaTf32TileK != 0) {
+    throw std::runtime_error(
+        "TF32 dense score tile kernel requires target/source multiples of 16 and rank multiple of 8.");
+  }
+  auto scores = torch::empty(
+      {batch_flat, target_nodes, source_nodes},
+      projected_target.options().dtype(torch::kFloat32));
+  const dim3 blocks(
+      target_nodes / kWmmaTf32TileM,
+      source_nodes / kWmmaTf32TileN,
+      batch_flat);
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  low_rank_dense_scores_tf32_kernel<<<blocks, 32, 0, stream>>>(
+      weighted_projected_source.data_ptr<float>(),
+      projected_target.data_ptr<float>(),
+      scores.data_ptr<float>(),
+      batch_flat,
+      target_nodes,
+      source_nodes,
+      rank_dim);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return scores;
+}
+
+std::tuple<torch::Tensor, torch::Tensor>
+jakal_net_low_rank_propagation_dense_tf32_forward_cuda(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    double score_bias) {
+  require_cuda_contiguous(weighted_projected_source, "weighted_projected_source");
+  require_cuda_contiguous(projected_target, "projected_target");
+  require_cuda_contiguous(projected_state, "projected_state");
+  require_cuda_contiguous(projected_val, "projected_val");
+  if (weighted_projected_source.dim() != 3 || projected_target.dim() != 3) {
+    throw std::runtime_error(
+        "TF32 dense propagation kernel requires [batch, nodes, rank] score inputs.");
+  }
+  if (projected_state.dim() != 2 || projected_val.dim() != 3) {
+    throw std::runtime_error(
+        "TF32 dense propagation kernel requires projected_state [batch, nodes] and projected_val [batch, nodes, out_dim].");
+  }
+  if (weighted_projected_source.scalar_type() != torch::kFloat32 ||
+      projected_target.scalar_type() != torch::kFloat32 ||
+      projected_state.scalar_type() != torch::kFloat32 ||
+      projected_val.scalar_type() != torch::kFloat32) {
+    throw std::runtime_error("TF32 dense propagation kernel requires float32 inputs.");
+  }
+  if (weighted_projected_source.size(0) != projected_target.size(0) ||
+      weighted_projected_source.size(0) != projected_state.size(0) ||
+      weighted_projected_source.size(0) != projected_val.size(0) ||
+      weighted_projected_source.size(1) != projected_state.size(1) ||
+      weighted_projected_source.size(1) != projected_val.size(1) ||
+      weighted_projected_source.size(2) != projected_target.size(2)) {
+    throw std::runtime_error("TF32 dense propagation inputs have incompatible shapes.");
+  }
+  const auto batch_flat = weighted_projected_source.size(0);
+  const auto source_nodes = weighted_projected_source.size(1);
+  const auto target_nodes = projected_target.size(1);
+  const auto rank_dim = weighted_projected_source.size(2);
+  const auto out_dim = projected_val.size(2);
+  if (target_nodes % kWmmaTf32TileM != 0 ||
+      source_nodes % kWmmaTf32TileN != 0 ||
+      rank_dim % kWmmaTf32TileK != 0) {
+    throw std::runtime_error(
+        "TF32 dense propagation kernel requires target/source multiples of 16 and rank multiple of 8.");
+  }
+  auto row_max = torch::empty({batch_flat, target_nodes}, projected_state.options());
+  auto row_denom = torch::empty({batch_flat, target_nodes}, projected_state.options());
+  auto delta_state = torch::empty({batch_flat, target_nodes}, projected_state.options());
+  auto delta_val = torch::empty({batch_flat, target_nodes, out_dim}, projected_val.options());
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  if (source_nodes <= 512) {
+    const dim3 blocks(target_nodes / kWmmaTf32TileM, batch_flat);
+    const auto shmem =
+        (kWmmaTf32TileM * source_nodes +
+         kWmmaTf32TileM * kWmmaTf32TileN +
+         2 * kWmmaTf32TileM) *
+        sizeof(float);
+    low_rank_propagation_dense_tf32_shared_edges_kernel<<<blocks, 256, shmem, stream>>>(
+        weighted_projected_source.data_ptr<float>(),
+        projected_target.data_ptr<float>(),
+        projected_state.data_ptr<float>(),
+        projected_val.data_ptr<float>(),
+        delta_state.data_ptr<float>(),
+        delta_val.data_ptr<float>(),
+        batch_flat,
+        target_nodes,
+        source_nodes,
+        rank_dim,
+        out_dim,
+        static_cast<float>(score_bias));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {delta_state, delta_val};
+  }
+  const dim3 stats_blocks(target_nodes / kWmmaTf32TileM, batch_flat);
+  const dim3 accum_blocks(
+      target_nodes / kWmmaTf32TileM,
+      (out_dim + kWmmaTf32TileN - 1) / kWmmaTf32TileN,
+      batch_flat);
+  const auto stats_shmem =
+      (kWmmaTf32TileM * kWmmaTf32TileN + 2 * kWmmaTf32TileM) * sizeof(float);
+  const auto accum_shmem =
+      (kWmmaTf32TileM * kWmmaTf32TileN + kWmmaTf32TileM) * sizeof(float);
+  low_rank_propagation_dense_tf32_stats_kernel<<<stats_blocks, 32, stats_shmem, stream>>>(
+      weighted_projected_source.data_ptr<float>(),
+      projected_target.data_ptr<float>(),
+      row_max.data_ptr<float>(),
+      row_denom.data_ptr<float>(),
+      batch_flat,
+      target_nodes,
+      source_nodes,
+      rank_dim,
+      static_cast<float>(score_bias));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  low_rank_propagation_dense_tf32_accum_kernel
+      <<<accum_blocks, kWmmaTf32TileM * kWmmaTf32TileN, accum_shmem, stream>>>(
+          weighted_projected_source.data_ptr<float>(),
+          projected_target.data_ptr<float>(),
+          projected_state.data_ptr<float>(),
+          projected_val.data_ptr<float>(),
+          row_max.data_ptr<float>(),
+          row_denom.data_ptr<float>(),
+          delta_state.data_ptr<float>(),
+          delta_val.data_ptr<float>(),
+          batch_flat,
+          target_nodes,
+          source_nodes,
+          rank_dim,
+          out_dim,
+          static_cast<float>(score_bias));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {delta_state, delta_val};
+}
+
+std::tuple<torch::Tensor, torch::Tensor>
 jakal_net_low_rank_propagation_window_forward_cuda(
     const torch::Tensor& weighted_projected_source,
     torch::Tensor projected_target,
@@ -1589,6 +3003,265 @@ jakal_net_low_rank_propagation_window_forward_cuda(
       });
 
   return {delta_state, delta_val};
+}
+
+std::tuple<torch::Tensor, torch::Tensor>
+jakal_net_low_rank_propagation_window_signed_abs_forward_cuda(
+    const torch::Tensor& weighted_projected_source,
+    torch::Tensor projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    int64_t window,
+    double score_bias) {
+  require_cuda_contiguous(weighted_projected_source, "weighted_projected_source");
+  require_cuda_contiguous(projected_target, "projected_target");
+  require_cuda_contiguous(projected_state, "projected_state");
+  require_cuda_contiguous(projected_val, "projected_val");
+  if (window < 0) {
+    throw std::runtime_error("window must be non-negative.");
+  }
+  if (weighted_projected_source.dim() != 3 || projected_target.dim() != 3) {
+    throw std::runtime_error(
+        "weighted_projected_source and projected_target must be shaped [batch, nodes, rank].");
+  }
+  if (projected_state.dim() != 2 || projected_val.dim() != 3) {
+    throw std::runtime_error(
+        "projected_state and projected_val must be shaped [batch, source_nodes] and [batch, source_nodes, out_dim].");
+  }
+  if (weighted_projected_source.size(0) != projected_target.size(0) ||
+      weighted_projected_source.size(0) != projected_state.size(0) ||
+      weighted_projected_source.size(0) != projected_val.size(0)) {
+    throw std::runtime_error("All fused low-rank inputs must share batch_flat.");
+  }
+  if (weighted_projected_source.size(1) != projected_state.size(1) ||
+      weighted_projected_source.size(1) != projected_val.size(1)) {
+    throw std::runtime_error("projected_state/projected_val must share source_nodes.");
+  }
+  if (weighted_projected_source.size(2) != projected_target.size(2)) {
+    throw std::runtime_error("weighted_projected_source and projected_target must share rank_dim.");
+  }
+  if (projected_state.scalar_type() != torch::kFloat32 ||
+      projected_val.scalar_type() != torch::kFloat32) {
+    throw std::runtime_error("projected_state and projected_val must be float32 accumulators.");
+  }
+  if (weighted_projected_source.scalar_type() != projected_target.scalar_type()) {
+    projected_target = projected_target.to(weighted_projected_source.scalar_type());
+  }
+
+  const auto batch_flat = weighted_projected_source.size(0);
+  const auto source_nodes = weighted_projected_source.size(1);
+  const auto target_nodes = projected_target.size(1);
+  const auto rank_dim = weighted_projected_source.size(2);
+  const auto out_dim = projected_val.size(2);
+
+  auto delta_state = torch::empty({batch_flat, target_nodes}, projected_state.options());
+  auto delta_val = torch::empty({batch_flat, target_nodes, out_dim}, projected_val.options());
+
+  const auto blocks = batch_flat * target_nodes;
+  constexpr int threads = kPairwiseTopkForwardThreads;
+  const auto width = std::min<int64_t>(window + 1, source_nodes);
+  const auto shared_bytes = static_cast<size_t>((2 * width + threads) * sizeof(float));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf,
+      torch::kBFloat16,
+      weighted_projected_source.scalar_type(),
+      "low_rank_propagation_window_signed_abs_forward_cuda",
+      [&] {
+        low_rank_propagation_window_signed_abs_forward_kernel<scalar_t>
+            <<<blocks, threads, shared_bytes, stream>>>(
+                weighted_projected_source.data_ptr<scalar_t>(),
+                projected_target.data_ptr<scalar_t>(),
+                projected_state.data_ptr<float>(),
+                projected_val.data_ptr<float>(),
+                delta_state.data_ptr<float>(),
+                delta_val.data_ptr<float>(),
+                batch_flat,
+                target_nodes,
+                source_nodes,
+                rank_dim,
+                out_dim,
+                window,
+                static_cast<float>(score_bias));
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+      });
+
+  return {delta_state, delta_val};
+}
+
+std::tuple<torch::Tensor, torch::Tensor>
+jakal_net_low_rank_propagation_causal_dense_signed_abs_forward_cuda(
+    const torch::Tensor& weighted_projected_source,
+    torch::Tensor projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    double score_bias) {
+  require_cuda_contiguous(weighted_projected_source, "weighted_projected_source");
+  require_cuda_contiguous(projected_target, "projected_target");
+  require_cuda_contiguous(projected_state, "projected_state");
+  require_cuda_contiguous(projected_val, "projected_val");
+  if (weighted_projected_source.dim() != 3 || projected_target.dim() != 3) {
+    throw std::runtime_error(
+        "weighted_projected_source and projected_target must be shaped [batch, nodes, rank].");
+  }
+  const auto source_nodes = weighted_projected_source.size(1);
+  return jakal_net_low_rank_propagation_window_signed_abs_forward_cuda(
+      weighted_projected_source,
+      projected_target,
+      projected_state,
+      projected_val,
+      source_nodes,
+      score_bias);
+}
+
+std::tuple<torch::Tensor, torch::Tensor>
+jakal_net_diagonal_propagation_causal_dense_signed_abs_forward_cuda(
+    const torch::Tensor& layer_val,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    const torch::Tensor& normalized_weight,
+    const torch::Tensor& bias) {
+  require_cuda_contiguous(layer_val, "layer_val");
+  require_cuda_contiguous(projected_state, "projected_state");
+  require_cuda_contiguous(projected_val, "projected_val");
+  require_cuda_contiguous(normalized_weight, "normalized_weight");
+  if (bias.defined() && bias.numel() != 0) {
+    require_cuda_contiguous(bias, "bias");
+  }
+  if (layer_val.dim() != 3 || projected_state.dim() != 2 || projected_val.dim() != 3) {
+    throw std::runtime_error(
+        "diagonal causal dense forward expects layer_val [batch, nodes, dim], projected_state [batch, nodes], projected_val [batch, nodes, dim].");
+  }
+  if (projected_state.scalar_type() != torch::kFloat32 ||
+      projected_val.scalar_type() != torch::kFloat32) {
+    throw std::runtime_error("projected_state/projected_val must be float32.");
+  }
+  if (layer_val.scalar_type() != normalized_weight.scalar_type()) {
+    throw std::runtime_error("layer_val and normalized_weight must share dtype.");
+  }
+  const auto batch_flat = layer_val.size(0);
+  const auto nodes = layer_val.size(1);
+  const auto dim = layer_val.size(2);
+  if (projected_state.size(0) != batch_flat || projected_state.size(1) != nodes ||
+      projected_val.size(0) != batch_flat || projected_val.size(1) != nodes ||
+      projected_val.size(2) != dim || normalized_weight.numel() != dim) {
+    throw std::runtime_error("diagonal causal dense forward input shapes are incompatible.");
+  }
+  const bool has_bias = bias.defined() && bias.numel() != 0;
+  if (has_bias && (bias.numel() != 1 || bias.scalar_type() != layer_val.scalar_type())) {
+    throw std::runtime_error("bias must be a scalar with layer_val dtype.");
+  }
+  auto delta_state = torch::empty({batch_flat, nodes}, projected_state.options());
+  auto delta_val = torch::empty({batch_flat, nodes, dim}, projected_val.options());
+  constexpr int threads = kPairwiseTopkForwardThreads;
+  const auto shmem = static_cast<size_t>((2 * nodes + threads) * sizeof(float));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf,
+      torch::kBFloat16,
+      layer_val.scalar_type(),
+      "diagonal_propagation_causal_dense_signed_abs_forward_cuda",
+      [&] {
+        diagonal_causal_signed_abs_forward_kernel<scalar_t>
+            <<<batch_flat * nodes, threads, shmem, stream>>>(
+                layer_val.data_ptr<scalar_t>(),
+                projected_state.data_ptr<float>(),
+                projected_val.data_ptr<float>(),
+                normalized_weight.data_ptr<scalar_t>(),
+                has_bias ? bias.data_ptr<scalar_t>() : nullptr,
+                delta_state.data_ptr<float>(),
+                delta_val.data_ptr<float>(),
+                batch_flat,
+                nodes,
+                dim,
+                has_bias);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+      });
+  return {delta_state, delta_val};
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+jakal_net_diagonal_propagation_causal_dense_signed_abs_backward_cuda(
+    const torch::Tensor& layer_val,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    const torch::Tensor& normalized_weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& grad_delta_state,
+    const torch::Tensor& grad_delta_val) {
+  require_cuda_contiguous(layer_val, "layer_val");
+  require_cuda_contiguous(projected_state, "projected_state");
+  require_cuda_contiguous(projected_val, "projected_val");
+  require_cuda_contiguous(normalized_weight, "normalized_weight");
+  require_cuda_contiguous(grad_delta_state, "grad_delta_state");
+  require_cuda_contiguous(grad_delta_val, "grad_delta_val");
+  if (bias.defined() && bias.numel() != 0) {
+    require_cuda_contiguous(bias, "bias");
+  }
+  if (layer_val.dim() != 3 || projected_state.dim() != 2 || projected_val.dim() != 3 ||
+      grad_delta_state.dim() != 2 || grad_delta_val.dim() != 3) {
+    throw std::runtime_error("diagonal causal dense backward received invalid ranks.");
+  }
+  if (projected_state.scalar_type() != torch::kFloat32 ||
+      projected_val.scalar_type() != torch::kFloat32 ||
+      grad_delta_state.scalar_type() != torch::kFloat32 ||
+      grad_delta_val.scalar_type() != torch::kFloat32) {
+    throw std::runtime_error("projected/grad tensors must be float32.");
+  }
+  if (layer_val.scalar_type() != normalized_weight.scalar_type()) {
+    throw std::runtime_error("layer_val and normalized_weight must share dtype.");
+  }
+  const auto batch_flat = layer_val.size(0);
+  const auto nodes = layer_val.size(1);
+  const auto dim = layer_val.size(2);
+  if (projected_state.size(0) != batch_flat || projected_state.size(1) != nodes ||
+      projected_val.size(0) != batch_flat || projected_val.size(1) != nodes ||
+      projected_val.size(2) != dim ||
+      grad_delta_state.size(0) != batch_flat || grad_delta_state.size(1) != nodes ||
+      grad_delta_val.size(0) != batch_flat || grad_delta_val.size(1) != nodes ||
+      grad_delta_val.size(2) != dim || normalized_weight.numel() != dim) {
+    throw std::runtime_error("diagonal causal dense backward input shapes are incompatible.");
+  }
+  const bool has_bias = bias.defined() && bias.numel() != 0;
+  if (has_bias && (bias.numel() != 1 || bias.scalar_type() != layer_val.scalar_type())) {
+    throw std::runtime_error("bias must be a scalar with layer_val dtype.");
+  }
+  auto grad_layer_val = torch::zeros({batch_flat, nodes, dim}, projected_val.options());
+  auto grad_projected_state = torch::zeros({batch_flat, nodes}, projected_state.options());
+  auto grad_projected_val = torch::zeros({batch_flat, nodes, dim}, projected_val.options());
+  auto grad_normalized_weight = torch::zeros({dim}, projected_val.options());
+  auto grad_bias = torch::zeros({1}, projected_val.options());
+  constexpr int threads = kPairwiseTopkForwardThreads;
+  const auto shmem = static_cast<size_t>((3 * nodes + threads) * sizeof(float));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf,
+      torch::kBFloat16,
+      layer_val.scalar_type(),
+      "diagonal_propagation_causal_dense_signed_abs_backward_cuda",
+      [&] {
+        diagonal_causal_signed_abs_backward_kernel<scalar_t>
+            <<<batch_flat * nodes, threads, shmem, stream>>>(
+                layer_val.data_ptr<scalar_t>(),
+                projected_state.data_ptr<float>(),
+                projected_val.data_ptr<float>(),
+                normalized_weight.data_ptr<scalar_t>(),
+                has_bias ? bias.data_ptr<scalar_t>() : nullptr,
+                grad_delta_state.data_ptr<float>(),
+                grad_delta_val.data_ptr<float>(),
+                grad_layer_val.data_ptr<float>(),
+                grad_projected_state.data_ptr<float>(),
+                grad_projected_val.data_ptr<float>(),
+                grad_normalized_weight.data_ptr<float>(),
+                grad_bias.data_ptr<float>(),
+                batch_flat,
+                nodes,
+                dim,
+                has_bias);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+      });
+  return {grad_layer_val, grad_projected_state, grad_projected_val, grad_normalized_weight, grad_bias};
 }
 
 std::tuple<torch::Tensor, torch::Tensor>
@@ -1810,6 +3483,252 @@ torch::Tensor jakal_net_softmax_backward_cuda(
   return grad_scores;
 }
 
+template <typename scalar_t>
+__global__ void nomemory_exact_grad_edges_kernel(
+    const scalar_t* __restrict__ grad_pre_norm,
+    const scalar_t* __restrict__ val,
+    const scalar_t* __restrict__ edges,
+    float* __restrict__ grad_edges,
+    float* __restrict__ row_dot,
+    int64_t batch_flat,
+    int64_t target_nodes,
+    int64_t source_nodes,
+    int64_t dim,
+    int64_t compress_kind) {
+  const int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+  const int64_t total = batch_flat * target_nodes * source_nodes;
+  if (linear >= total) {
+    return;
+  }
+  const int64_t source = linear % source_nodes;
+  const int64_t target_linear = linear / source_nodes;
+  const int64_t target = target_linear % target_nodes;
+  const int64_t batch = target_linear / target_nodes;
+
+  const int64_t grad_base = (batch * target_nodes + target) * dim;
+  const int64_t val_base = (batch * source_nodes + source) * dim;
+  float grad_edge = 0.0f;
+  for (int64_t d = 0; d < dim; ++d) {
+    grad_edge += static_cast<float>(grad_pre_norm[grad_base + d]) *
+                 static_cast<float>(val[val_base + d]);
+  }
+  grad_edges[linear] = grad_edge;
+  if (compress_kind == kCompressSignedAbsSoftmax) {
+    atomicAdd(
+        &row_dot[batch * target_nodes + target],
+        grad_edge * static_cast<float>(edges[linear]));
+  }
+}
+
+template <typename scalar_t>
+__global__ void nomemory_exact_grad_scores_kernel(
+    const scalar_t* __restrict__ scores,
+    const scalar_t* __restrict__ edges,
+    const float* __restrict__ grad_edges,
+    const float* __restrict__ row_dot,
+    float* __restrict__ grad_scores,
+    int64_t total,
+    int64_t source_nodes,
+    int64_t compress_kind) {
+  const int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+  if (linear >= total) {
+    return;
+  }
+  if (compress_kind == 0) {
+    const float score = static_cast<float>(scores[linear]);
+    const float denom = 1.0f + fabsf(score);
+    grad_scores[linear] = grad_edges[linear] / (denom * denom);
+    return;
+  }
+  const int64_t target_linear = linear / source_nodes;
+  const float score = static_cast<float>(scores[linear]);
+  const float edge = static_cast<float>(edges[linear]);
+  const float sign = score > 0.0f ? 1.0f : (score < 0.0f ? -1.0f : 0.0f);
+  const float grad_edge = grad_edges[linear];
+  const float dot = row_dot[target_linear];
+  const float prob = edge * sign;
+  grad_scores[linear] = sign * prob * (sign * grad_edge - dot);
+}
+
+template <typename scalar_t>
+__global__ void nomemory_exact_reduce_backward_kernel(
+    const scalar_t* __restrict__ edges,
+    const scalar_t* __restrict__ grad_pre_norm,
+    float* __restrict__ grad_layer_from_reduce,
+    int64_t batch_flat,
+    int64_t target_nodes,
+    int64_t source_nodes,
+    int64_t dim) {
+  const int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+  const int64_t total = batch_flat * source_nodes * dim;
+  if (linear >= total) {
+    return;
+  }
+  const int64_t d = linear % dim;
+  const int64_t source_linear = linear / dim;
+  const int64_t source = source_linear % source_nodes;
+  const int64_t batch = source_linear / source_nodes;
+
+  float acc = 0.0f;
+  const int64_t edge_batch_base = batch * target_nodes * source_nodes;
+  const int64_t grad_batch_base = batch * target_nodes * dim;
+  for (int64_t target = 0; target < target_nodes; ++target) {
+    acc += static_cast<float>(edges[edge_batch_base + target * source_nodes + source]) *
+           static_cast<float>(grad_pre_norm[grad_batch_base + target * dim + d]);
+  }
+  grad_layer_from_reduce[linear] = acc;
+}
+
+std::tuple<torch::Tensor, torch::Tensor>
+jakal_net_nomemory_exact_scores_backward_cuda(
+    const torch::Tensor& scores,
+    const torch::Tensor& edges,
+    const torch::Tensor& grad_pre_norm,
+    const torch::Tensor& val,
+    int64_t compress_kind) {
+  require_cuda_contiguous(scores, "scores");
+  require_cuda_contiguous(edges, "edges");
+  require_cuda_contiguous(grad_pre_norm, "grad_pre_norm");
+  require_cuda_contiguous(val, "val");
+  if (scores.dim() != 3 || edges.dim() != 3 || grad_pre_norm.dim() != 3 || val.dim() != 3) {
+    throw std::runtime_error("nomemory exact backward tensors must be rank-3.");
+  }
+  if (scores.sizes() != edges.sizes()) {
+    throw std::runtime_error("scores and edges must share shape.");
+  }
+  if (scores.size(0) != grad_pre_norm.size(0) ||
+      scores.size(1) != grad_pre_norm.size(1) ||
+      scores.size(0) != val.size(0) ||
+      scores.size(2) != val.size(1)) {
+    throw std::runtime_error("nomemory exact backward tensor shapes do not align.");
+  }
+  if (compress_kind != 0 && compress_kind != kCompressSignedAbsSoftmax) {
+    throw std::runtime_error("nomemory exact backward CUDA supports softsign and signed_abs_softmax only.");
+  }
+
+  const auto batch_flat = scores.size(0);
+  const auto target_nodes = scores.size(1);
+  const auto source_nodes = scores.size(2);
+  const auto dim = grad_pre_norm.size(2);
+
+  auto float_options = scores.options().dtype(torch::kFloat32);
+  auto grad_edges = torch::empty(scores.sizes(), float_options);
+  auto grad_scores = torch::empty(scores.sizes(), float_options);
+  auto grad_layer_from_reduce = torch::empty({batch_flat, source_nodes, dim}, float_options);
+  auto row_dot = torch::zeros({batch_flat, target_nodes}, float_options);
+
+  constexpr int threads = 256;
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const int64_t edge_total = batch_flat * target_nodes * source_nodes;
+  const int64_t reduce_total = batch_flat * source_nodes * dim;
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf,
+      torch::kBFloat16,
+      scores.scalar_type(),
+      "nomemory_exact_scores_backward_cuda",
+      [&] {
+        nomemory_exact_grad_edges_kernel<scalar_t>
+            <<<(edge_total + threads - 1) / threads, threads, 0, stream>>>(
+                grad_pre_norm.data_ptr<scalar_t>(),
+                val.data_ptr<scalar_t>(),
+                edges.data_ptr<scalar_t>(),
+                grad_edges.data_ptr<float>(),
+                row_dot.data_ptr<float>(),
+                batch_flat,
+                target_nodes,
+                source_nodes,
+                dim,
+                compress_kind);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        nomemory_exact_grad_scores_kernel<scalar_t>
+            <<<(edge_total + threads - 1) / threads, threads, 0, stream>>>(
+                scores.data_ptr<scalar_t>(),
+                edges.data_ptr<scalar_t>(),
+                grad_edges.data_ptr<float>(),
+                row_dot.data_ptr<float>(),
+                grad_scores.data_ptr<float>(),
+                edge_total,
+                source_nodes,
+                compress_kind);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        nomemory_exact_reduce_backward_kernel<scalar_t>
+            <<<(reduce_total + threads - 1) / threads, threads, 0, stream>>>(
+                edges.data_ptr<scalar_t>(),
+                grad_pre_norm.data_ptr<scalar_t>(),
+                grad_layer_from_reduce.data_ptr<float>(),
+                batch_flat,
+                target_nodes,
+                source_nodes,
+                dim);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+      });
+
+  return {grad_scores, grad_layer_from_reduce};
+}
+
+std::tuple<torch::Tensor, torch::Tensor> jakal_net_apply_delta_to_layer_cuda(
+    const torch::Tensor& layer_state,
+    const torch::Tensor& layer_val,
+    const torch::Tensor& delta_state,
+    const torch::Tensor& delta_val,
+    const torch::Tensor& val_norm_weight,
+    const torch::Tensor& val_norm_bias,
+    const std::string& state_activation_name,
+    bool use_fused_forward) {
+  require_cuda_contiguous(layer_state, "layer_state");
+  require_cuda_contiguous(layer_val, "layer_val");
+  require_cuda_contiguous(delta_state, "delta_state");
+  require_cuda_contiguous(delta_val, "delta_val");
+  if (layer_state.sizes() != delta_state.sizes()) {
+    throw std::runtime_error("layer_state and delta_state must share shape.");
+  }
+  if (layer_val.sizes() != delta_val.sizes()) {
+    throw std::runtime_error("layer_val and delta_val must share shape.");
+  }
+  (void)use_fused_forward;
+
+  auto updated_state_input = layer_state + delta_state;
+  torch::Tensor updated_state;
+  if (state_activation_name == "signed_softmax") {
+    auto clean_state = torch::nan_to_num(updated_state_input);
+    clean_state = torch::layer_norm(
+        clean_state,
+        {clean_state.size(-1)},
+        c10::nullopt,
+        c10::nullopt,
+        1e-5,
+        false);
+    auto magnitude = torch::softmax(clean_state.abs(), -1);
+    const auto state_mass = static_cast<double>(updated_state_input.size(-1));
+    updated_state = torch::sign(clean_state) * magnitude * state_mass;
+  } else if (state_activation_name == "softsign") {
+    auto clean_state = torch::nan_to_num(updated_state_input);
+    updated_state = clean_state / (1.0 + clean_state.abs());
+  } else {
+    throw std::runtime_error("Unsupported state_activation_name: " + state_activation_name);
+  }
+
+  auto updated_val_input = layer_val + delta_val;
+  torch::Tensor updated_val;
+  if (!val_norm_weight.defined() || val_norm_weight.numel() == 0) {
+    updated_val = updated_val_input;
+  } else {
+    c10::optional<torch::Tensor> optional_bias = c10::nullopt;
+    if (val_norm_bias.defined() && val_norm_bias.numel() > 0) {
+      optional_bias = val_norm_bias.to(updated_val_input.scalar_type());
+    }
+    updated_val = torch::layer_norm(
+        updated_val_input,
+        {updated_val_input.size(-1)},
+        val_norm_weight.to(updated_val_input.scalar_type()),
+        optional_bias,
+        1e-5,
+        false);
+  }
+  return {updated_state, updated_val};
+}
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 jakal_net_diagonal_pairwise_topk_backward_cuda(
     const torch::Tensor& query_val,
@@ -1949,12 +3868,769 @@ jakal_net_low_rank_pairwise_topk_backward_cuda(
   return {grad_query, grad_source, grad_source_weight, grad_target_weight, grad_core_weight, grad_bias};
 }
 
+constexpr int kNomemorySeqTile = 64;
+constexpr int kNomemoryRankTile = 32;
+constexpr int kNomemoryDimTile = 64;
+
+__global__ void nomemory_low_rank_grad_projected_target_tiled_kernel(
+    const float* __restrict__ grad_scores,
+    const float* __restrict__ weighted_source,
+    float* __restrict__ grad_projected_target,
+    int64_t batch_flat,
+    int64_t nodes,
+    int64_t rank_dim) {
+  __shared__ float scores_tile[kNomemorySeqTile][kNomemorySeqTile];
+  __shared__ float source_tile[kNomemorySeqTile][kNomemoryRankTile];
+
+  const int64_t batch = blockIdx.z;
+  const int64_t target_tile = blockIdx.y * kNomemorySeqTile;
+  const int64_t rank_tile = blockIdx.x * kNomemoryRankTile;
+  const int64_t rank_local = threadIdx.x;
+  const int64_t row_group = threadIdx.y;
+  const int64_t rank = rank_tile + rank_local;
+  float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+  for (int64_t source_tile_start = 0; source_tile_start < nodes; source_tile_start += kNomemorySeqTile) {
+    for (int64_t local_target = row_group; local_target < kNomemorySeqTile; local_target += blockDim.y) {
+      const int64_t target = target_tile + local_target;
+      for (int64_t local_source = rank_local; local_source < kNomemorySeqTile; local_source += blockDim.x) {
+        const int64_t source = source_tile_start + local_source;
+        float value = 0.0f;
+        if (batch < batch_flat && target < nodes && source < nodes) {
+          value = grad_scores[(batch * nodes + target) * nodes + source];
+        }
+        scores_tile[local_target][local_source] = value;
+      }
+    }
+    for (int64_t local_source = row_group; local_source < kNomemorySeqTile; local_source += blockDim.y) {
+      const int64_t source = source_tile_start + local_source;
+      float value = 0.0f;
+      if (batch < batch_flat && source < nodes && rank < rank_dim) {
+        value = weighted_source[(batch * nodes + source) * rank_dim + rank];
+      }
+      source_tile[local_source][rank_local] = value;
+    }
+    __syncthreads();
+
+    for (int64_t k = 0; k < kNomemorySeqTile; ++k) {
+      const float source_value = source_tile[k][rank_local];
+      #pragma unroll
+      for (int64_t i = 0; i < 8; ++i) {
+        const int64_t local_target = row_group + i * blockDim.y;
+        acc[i] += scores_tile[local_target][k] * source_value;
+      }
+    }
+    __syncthreads();
+  }
+
+  if (batch >= batch_flat || rank >= rank_dim) {
+    return;
+  }
+  #pragma unroll
+  for (int64_t i = 0; i < 8; ++i) {
+    const int64_t local_target = row_group + i * blockDim.y;
+    const int64_t target = target_tile + local_target;
+    if (target < nodes) {
+      grad_projected_target[(batch * nodes + target) * rank_dim + rank] = acc[i];
+    }
+  }
+}
+
+__global__ void nomemory_low_rank_grad_weighted_source_tiled_kernel(
+    const float* __restrict__ grad_scores,
+    const float* __restrict__ projected_target,
+    float* __restrict__ grad_weighted_source,
+    int64_t batch_flat,
+    int64_t nodes,
+    int64_t rank_dim) {
+  __shared__ float scores_tile[kNomemorySeqTile][kNomemorySeqTile];
+  __shared__ float target_tile[kNomemorySeqTile][kNomemoryRankTile];
+
+  const int64_t batch = blockIdx.z;
+  const int64_t source_tile_start = blockIdx.y * kNomemorySeqTile;
+  const int64_t rank_tile = blockIdx.x * kNomemoryRankTile;
+  const int64_t rank_local = threadIdx.x;
+  const int64_t row_group = threadIdx.y;
+  const int64_t rank = rank_tile + rank_local;
+  float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+  for (int64_t target_tile_start = 0; target_tile_start < nodes; target_tile_start += kNomemorySeqTile) {
+    for (int64_t local_target = row_group; local_target < kNomemorySeqTile; local_target += blockDim.y) {
+      const int64_t target = target_tile_start + local_target;
+      for (int64_t local_source = rank_local; local_source < kNomemorySeqTile; local_source += blockDim.x) {
+        const int64_t source = source_tile_start + local_source;
+        float value = 0.0f;
+        if (batch < batch_flat && target < nodes && source < nodes) {
+          value = grad_scores[(batch * nodes + target) * nodes + source];
+        }
+        scores_tile[local_target][local_source] = value;
+      }
+    }
+    for (int64_t local_target = row_group; local_target < kNomemorySeqTile; local_target += blockDim.y) {
+      const int64_t target = target_tile_start + local_target;
+      float value = 0.0f;
+      if (batch < batch_flat && target < nodes && rank < rank_dim) {
+        value = projected_target[(batch * nodes + target) * rank_dim + rank];
+      }
+      target_tile[local_target][rank_local] = value;
+    }
+    __syncthreads();
+
+    for (int64_t k = 0; k < kNomemorySeqTile; ++k) {
+      const float target_value = target_tile[k][rank_local];
+      #pragma unroll
+      for (int64_t i = 0; i < 8; ++i) {
+        const int64_t local_source = row_group + i * blockDim.y;
+        acc[i] += scores_tile[k][local_source] * target_value;
+      }
+    }
+    __syncthreads();
+  }
+
+  if (batch >= batch_flat || rank >= rank_dim) {
+    return;
+  }
+  #pragma unroll
+  for (int64_t i = 0; i < 8; ++i) {
+    const int64_t local_source = row_group + i * blockDim.y;
+    const int64_t source = source_tile_start + local_source;
+    if (source < nodes) {
+      grad_weighted_source[(batch * nodes + source) * rank_dim + rank] = acc[i];
+    }
+  }
+}
+
+__global__ void nomemory_low_rank_grad_layer_tiled_kernel(
+    const float* __restrict__ grad_projected_target,
+    const float* __restrict__ grad_weighted_source,
+    const float* __restrict__ source_weight,
+    const float* __restrict__ target_weight,
+    const float* __restrict__ core_weight,
+    float* __restrict__ grad_layer,
+    int64_t batch_flat,
+    int64_t nodes,
+    int64_t dim,
+    int64_t rank_dim) {
+  __shared__ float grad_target_tile[kNomemorySeqTile][kNomemoryRankTile];
+  __shared__ float grad_source_tile[kNomemorySeqTile][kNomemoryRankTile];
+  __shared__ float target_weight_tile[kNomemoryRankTile][kNomemoryDimTile];
+  __shared__ float source_weight_tile[kNomemoryRankTile][kNomemoryDimTile];
+  __shared__ float core_tile[kNomemoryRankTile];
+
+  const int64_t batch = blockIdx.z;
+  const int64_t node_tile = blockIdx.y * kNomemorySeqTile;
+  const int64_t dim_tile = blockIdx.x * kNomemoryDimTile;
+  const int64_t dim_lane = threadIdx.x;
+  const int64_t row_group = threadIdx.y;
+  const int64_t dim_offsets[4] = {
+      dim_lane,
+      dim_lane + blockDim.x,
+      dim_lane + 2 * blockDim.x,
+      dim_lane + 3 * blockDim.x,
+  };
+  float acc[8][4];
+  for (int64_t i = 0; i < 8; ++i) {
+    for (int64_t j = 0; j < 4; ++j) {
+      acc[i][j] = 0.0f;
+    }
+  }
+
+  for (int64_t rank_tile = 0; rank_tile < rank_dim; rank_tile += kNomemoryRankTile) {
+    for (int64_t local_node = row_group; local_node < kNomemorySeqTile; local_node += blockDim.y) {
+      const int64_t node = node_tile + local_node;
+      for (int64_t local_rank = dim_lane; local_rank < kNomemoryRankTile; local_rank += blockDim.x) {
+        const int64_t rank = rank_tile + local_rank;
+        float target_value = 0.0f;
+        float source_value = 0.0f;
+        if (batch < batch_flat && node < nodes && rank < rank_dim) {
+          target_value = grad_projected_target[(batch * nodes + node) * rank_dim + rank];
+          source_value = grad_weighted_source[(batch * nodes + node) * rank_dim + rank];
+        }
+        grad_target_tile[local_node][local_rank] = target_value;
+        grad_source_tile[local_node][local_rank] = source_value;
+      }
+    }
+    for (int64_t local_rank = row_group; local_rank < kNomemoryRankTile; local_rank += blockDim.y) {
+      const int64_t rank = rank_tile + local_rank;
+      for (int64_t local_dim = dim_lane; local_dim < kNomemoryDimTile; local_dim += blockDim.x) {
+        const int64_t dim_index = dim_tile + local_dim;
+        float target_value = 0.0f;
+        float source_value = 0.0f;
+        if (rank < rank_dim && dim_index < dim) {
+          target_value = target_weight[rank * dim + dim_index];
+          source_value = source_weight[rank * dim + dim_index];
+        }
+        target_weight_tile[local_rank][local_dim] = target_value;
+        source_weight_tile[local_rank][local_dim] = source_value;
+      }
+      if (dim_lane == 0) {
+        core_tile[local_rank] = rank < rank_dim ? core_weight[rank] : 0.0f;
+      }
+    }
+    __syncthreads();
+
+    for (int64_t k = 0; k < kNomemoryRankTile; ++k) {
+      const float core_value = core_tile[k];
+      float target_values[8];
+      float source_values[8];
+      #pragma unroll
+      for (int64_t i = 0; i < 8; ++i) {
+        const int64_t local_node = row_group + i * blockDim.y;
+        target_values[i] = grad_target_tile[local_node][k];
+        source_values[i] = grad_source_tile[local_node][k] * core_value;
+      }
+      #pragma unroll
+      for (int64_t j = 0; j < 4; ++j) {
+        const int64_t local_dim = dim_offsets[j];
+        const float target_weight_value = target_weight_tile[k][local_dim];
+        const float source_weight_value = source_weight_tile[k][local_dim];
+        #pragma unroll
+        for (int64_t i = 0; i < 8; ++i) {
+          acc[i][j] += target_values[i] * target_weight_value +
+                       source_values[i] * source_weight_value;
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  if (batch >= batch_flat) {
+    return;
+  }
+  #pragma unroll
+  for (int64_t i = 0; i < 8; ++i) {
+    const int64_t local_node = row_group + i * blockDim.y;
+    const int64_t node = node_tile + local_node;
+    if (node >= nodes) {
+      continue;
+    }
+    #pragma unroll
+    for (int64_t j = 0; j < 4; ++j) {
+      const int64_t dim_index = dim_tile + threadIdx.x + j * blockDim.x;
+      if (dim_index < dim) {
+        grad_layer[(batch * nodes + node) * dim + dim_index] = acc[i][j];
+      }
+    }
+  }
+}
+
+__global__ void nomemory_low_rank_grad_weights_core_tiled_kernel(
+    const float* __restrict__ grad_projected_target,
+    const float* __restrict__ grad_weighted_source,
+    const float* __restrict__ projected_source,
+    const float* __restrict__ layer_val,
+    const float* __restrict__ core_weight,
+    float* __restrict__ grad_source_weight,
+    float* __restrict__ grad_target_weight,
+    float* __restrict__ grad_core_weight,
+    int64_t batch_flat,
+    int64_t nodes,
+    int64_t dim,
+    int64_t rank_dim) {
+  __shared__ float grad_target_tile[kNomemorySeqTile][kNomemoryRankTile];
+  __shared__ float grad_source_tile[kNomemorySeqTile][kNomemoryRankTile];
+  __shared__ float projected_source_tile[kNomemorySeqTile][kNomemoryRankTile];
+  __shared__ float value_tile[kNomemorySeqTile][kNomemoryDimTile];
+
+  const int64_t dim_tile = blockIdx.x * kNomemoryDimTile;
+  const int64_t rank_tile = blockIdx.y * kNomemoryRankTile;
+  const int64_t dim_lane = threadIdx.x;
+  const int64_t rank_lane = threadIdx.y;
+  const int64_t rank0_local = rank_lane;
+  const int64_t rank1_local = rank_lane + 16;
+  const int64_t dim_offsets[4] = {
+      dim_lane,
+      dim_lane + 16,
+      dim_lane + 32,
+      dim_lane + 48,
+  };
+  float target_acc[2][4];
+  float source_acc[2][4];
+  for (int64_t r = 0; r < 2; ++r) {
+    for (int64_t d = 0; d < 4; ++d) {
+      target_acc[r][d] = 0.0f;
+      source_acc[r][d] = 0.0f;
+    }
+  }
+  float core_acc[2] = {0.0f, 0.0f};
+  const bool accumulate_core = (blockIdx.x == 0 && dim_lane == 0);
+
+  const int64_t total_rows = batch_flat * nodes;
+  for (int64_t row_tile = 0; row_tile < total_rows; row_tile += kNomemorySeqTile) {
+    for (int64_t local_row = rank_lane; local_row < kNomemorySeqTile; local_row += blockDim.y) {
+      const int64_t flat = row_tile + local_row;
+      const int64_t batch = flat / nodes;
+      const int64_t node = flat % nodes;
+      for (int64_t local_dim = dim_lane; local_dim < kNomemoryDimTile; local_dim += blockDim.x) {
+        const int64_t dim_index = dim_tile + local_dim;
+        float value = 0.0f;
+        if (flat < total_rows && dim_index < dim) {
+          value = layer_val[(batch * nodes + node) * dim + dim_index];
+        }
+        value_tile[local_row][local_dim] = value;
+      }
+      for (int64_t local_rank = dim_lane; local_rank < kNomemoryRankTile; local_rank += blockDim.x) {
+        const int64_t rank = rank_tile + local_rank;
+        float grad_target_value = 0.0f;
+        float grad_source_value = 0.0f;
+        float projected_source_value = 0.0f;
+        if (flat < total_rows && rank < rank_dim) {
+          grad_target_value = grad_projected_target[(batch * nodes + node) * rank_dim + rank];
+          grad_source_value = grad_weighted_source[(batch * nodes + node) * rank_dim + rank];
+          projected_source_value = projected_source[(batch * nodes + node) * rank_dim + rank];
+        }
+        grad_target_tile[local_row][local_rank] = grad_target_value;
+        grad_source_tile[local_row][local_rank] = grad_source_value;
+        projected_source_tile[local_row][local_rank] = projected_source_value;
+      }
+    }
+    __syncthreads();
+
+    const int64_t rank_indices[2] = {rank0_local, rank1_local};
+    for (int64_t local_row = 0; local_row < kNomemorySeqTile; ++local_row) {
+      for (int64_t ridx = 0; ridx < 2; ++ridx) {
+        const int64_t local_rank = rank_indices[ridx];
+        if (local_rank >= kNomemoryRankTile) {
+          continue;
+        }
+        const float grad_target_value = grad_target_tile[local_row][local_rank];
+        const float grad_source_value = grad_source_tile[local_row][local_rank];
+        const int64_t rank = rank_tile + local_rank;
+        const float core_value = rank < rank_dim ? core_weight[rank] : 0.0f;
+        if (accumulate_core) {
+          core_acc[ridx] += grad_source_value * projected_source_tile[local_row][local_rank];
+        }
+        #pragma unroll
+        for (int64_t didx = 0; didx < 4; ++didx) {
+          const int64_t local_dim = dim_offsets[didx];
+          const float value = value_tile[local_row][local_dim];
+          target_acc[ridx][didx] += grad_target_value * value;
+          source_acc[ridx][didx] += grad_source_value * core_value * value;
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  const int64_t rank_indices[2] = {rank0_local, rank1_local};
+  for (int64_t ridx = 0; ridx < 2; ++ridx) {
+    const int64_t local_rank = rank_indices[ridx];
+    const int64_t rank = rank_tile + local_rank;
+    if (rank >= rank_dim) {
+      continue;
+    }
+    #pragma unroll
+    for (int64_t didx = 0; didx < 4; ++didx) {
+      const int64_t dim_index = dim_tile + dim_offsets[didx];
+      if (dim_index < dim) {
+        grad_target_weight[rank * dim + dim_index] = target_acc[ridx][didx];
+        grad_source_weight[rank * dim + dim_index] = source_acc[ridx][didx];
+      }
+    }
+    if (accumulate_core) {
+      grad_core_weight[rank] = core_acc[ridx];
+    }
+  }
+}
+
+__global__ void nomemory_low_rank_grad_core_kernel(
+    const float* __restrict__ grad_weighted_source,
+    const float* __restrict__ projected_source,
+    float* __restrict__ grad_core_weight,
+    int64_t batch_flat,
+    int64_t nodes,
+    int64_t rank_dim) {
+  const int64_t r = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= rank_dim) {
+    return;
+  }
+  float acc = 0.0f;
+  for (int64_t batch = 0; batch < batch_flat; ++batch) {
+    for (int64_t node = 0; node < nodes; ++node) {
+      acc += grad_weighted_source[(batch * nodes + node) * rank_dim + r] *
+             projected_source[(batch * nodes + node) * rank_dim + r];
+    }
+  }
+  grad_core_weight[r] = acc;
+}
+
+__global__ void nomemory_low_rank_grad_bias_kernel(
+    const float* __restrict__ grad_scores,
+    float* __restrict__ grad_bias,
+    int64_t total) {
+  float acc = 0.0f;
+  for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+       linear < total;
+       linear += blockDim.x * gridDim.x) {
+    acc += grad_scores[linear];
+  }
+  atomicAdd(grad_bias, acc);
+}
+
+__global__ void nomemory_add_three_kernel(
+    const float* __restrict__ left,
+    const float* __restrict__ middle,
+    const float* __restrict__ right,
+    float* __restrict__ out,
+    int64_t total) {
+  const int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+  if (linear >= total) {
+    return;
+  }
+  out[linear] = left[linear] + middle[linear] + right[linear];
+}
+
+__global__ void nomemory_exact_delta_pre_norm_kernel(
+    const float* __restrict__ edges,
+    const float* __restrict__ layer_val,
+    float* __restrict__ pre_norm,
+    int64_t batch_flat,
+    int64_t nodes,
+    int64_t dim) {
+  const int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+  const int64_t total = batch_flat * nodes * dim;
+  if (linear >= total) {
+    return;
+  }
+  const int64_t d = linear % dim;
+  const int64_t target_linear = linear / dim;
+  const int64_t target = target_linear % nodes;
+  const int64_t batch = target_linear / nodes;
+  float acc = layer_val[linear];
+  const int64_t edge_base = (batch * nodes + target) * nodes;
+  const int64_t value_base = batch * nodes * dim + d;
+  for (int64_t source = 0; source < nodes; ++source) {
+    acc += edges[edge_base + source] * layer_val[value_base + source * dim];
+  }
+  pre_norm[linear] = acc;
+}
+
+__global__ void nomemory_layer_norm_stats_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ mean,
+    float* __restrict__ rstd,
+    int64_t rows,
+    int64_t dim) {
+  const int64_t row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  __shared__ float sum_shared[256];
+  __shared__ float sq_shared[256];
+  float sum = 0.0f;
+  float sq = 0.0f;
+  const int64_t base = row * dim;
+  for (int64_t d = threadIdx.x; d < dim; d += blockDim.x) {
+    const float v = input[base + d];
+    sum += v;
+    sq += v * v;
+  }
+  sum_shared[threadIdx.x] = sum;
+  sq_shared[threadIdx.x] = sq;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      sum_shared[threadIdx.x] += sum_shared[threadIdx.x + stride];
+      sq_shared[threadIdx.x] += sq_shared[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    const float m = sum_shared[0] / static_cast<float>(dim);
+    const float var = sq_shared[0] / static_cast<float>(dim) - m * m;
+    mean[row] = m;
+    rstd[row] = rsqrtf(var + 1e-5f);
+  }
+}
+
+__global__ void nomemory_layer_norm_backward_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ grad_output,
+    const float* __restrict__ weight,
+    const float* __restrict__ mean,
+    const float* __restrict__ rstd,
+    float* __restrict__ grad_input,
+    float* __restrict__ grad_weight,
+    float* __restrict__ grad_bias,
+    int64_t rows,
+    int64_t dim) {
+  const int64_t row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  __shared__ float sum1[256];
+  __shared__ float sum2[256];
+  const int64_t base = row * dim;
+  const float row_mean = mean[row];
+  const float row_rstd = rstd[row];
+  float local_sum1 = 0.0f;
+  float local_sum2 = 0.0f;
+  for (int64_t d = threadIdx.x; d < dim; d += blockDim.x) {
+    const float normalized = (input[base + d] - row_mean) * row_rstd;
+    const float scaled_grad = grad_output[base + d] * weight[d];
+    local_sum1 += scaled_grad;
+    local_sum2 += scaled_grad * normalized;
+  }
+  sum1[threadIdx.x] = local_sum1;
+  sum2[threadIdx.x] = local_sum2;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      sum1[threadIdx.x] += sum1[threadIdx.x + stride];
+      sum2[threadIdx.x] += sum2[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  const float mean_scaled_grad = sum1[0] / static_cast<float>(dim);
+  const float mean_scaled_norm = sum2[0] / static_cast<float>(dim);
+  for (int64_t d = threadIdx.x; d < dim; d += blockDim.x) {
+    const float normalized = (input[base + d] - row_mean) * row_rstd;
+    const float grad_out = grad_output[base + d];
+    const float scaled_grad = grad_out * weight[d];
+    grad_input[base + d] =
+        (scaled_grad - mean_scaled_grad - normalized * mean_scaled_norm) * row_rstd;
+    atomicAdd(grad_weight + d, grad_out * normalized);
+    atomicAdd(grad_bias + d, grad_out);
+  }
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+jakal_net_nomemory_low_rank_pairwise_backward_cuda(
+    const torch::Tensor& layer_val,
+    const torch::Tensor& source_weight,
+    const torch::Tensor& target_weight,
+    const torch::Tensor& core_weight,
+    const torch::Tensor& projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& grad_scores) {
+  require_cuda_contiguous(layer_val, "layer_val");
+  require_cuda_contiguous(source_weight, "source_weight");
+  require_cuda_contiguous(target_weight, "target_weight");
+  require_cuda_contiguous(core_weight, "core_weight");
+  require_cuda_contiguous(projected_source, "projected_source");
+  require_cuda_contiguous(projected_target, "projected_target");
+  require_cuda_contiguous(grad_scores, "grad_scores");
+  if (layer_val.scalar_type() != torch::kFloat32 ||
+      source_weight.scalar_type() != torch::kFloat32 ||
+      target_weight.scalar_type() != torch::kFloat32 ||
+      core_weight.scalar_type() != torch::kFloat32 ||
+      projected_source.scalar_type() != torch::kFloat32 ||
+      projected_target.scalar_type() != torch::kFloat32 ||
+      grad_scores.scalar_type() != torch::kFloat32) {
+    throw std::runtime_error("nomemory low-rank exact backward CUDA currently requires float32 inputs.");
+  }
+  const auto batch_flat = layer_val.size(0);
+  const auto nodes = layer_val.size(1);
+  const auto dim = layer_val.size(2);
+  const auto rank_dim = core_weight.size(0);
+
+  auto grad_projected_target = torch::empty(projected_target.sizes(), projected_target.options());
+  auto grad_weighted_source = torch::empty(projected_source.sizes(), projected_source.options());
+  auto grad_layer = torch::empty(layer_val.sizes(), layer_val.options());
+  auto grad_source_weight = torch::empty(source_weight.sizes(), source_weight.options());
+  auto grad_target_weight = torch::empty(target_weight.sizes(), target_weight.options());
+  auto grad_core_weight = torch::empty(core_weight.sizes(), core_weight.options());
+  auto grad_bias = torch::zeros({}, layer_val.options());
+  auto weighted_source =
+      (projected_source * core_weight.view({1, 1, core_weight.size(0)})).contiguous();
+
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const int64_t score_total = batch_flat * nodes * nodes;
+
+  const dim3 stage1_threads(kNomemoryRankTile, 8);
+  const dim3 stage1_grid(
+      (rank_dim + kNomemoryRankTile - 1) / kNomemoryRankTile,
+      (nodes + kNomemorySeqTile - 1) / kNomemorySeqTile,
+      batch_flat);
+  const dim3 layer_threads(16, 8);
+  const dim3 layer_grid(
+      (dim + kNomemoryDimTile - 1) / kNomemoryDimTile,
+      (nodes + kNomemorySeqTile - 1) / kNomemorySeqTile,
+      batch_flat);
+  const dim3 weight_threads(16, 16);
+  const dim3 weight_grid(
+      (dim + kNomemoryDimTile - 1) / kNomemoryDimTile,
+      (rank_dim + kNomemoryRankTile - 1) / kNomemoryRankTile);
+
+  nomemory_low_rank_grad_projected_target_tiled_kernel<<<stage1_grid, stage1_threads, 0, stream>>>(
+      grad_scores.data_ptr<float>(),
+      weighted_source.data_ptr<float>(),
+      grad_projected_target.data_ptr<float>(),
+      batch_flat,
+      nodes,
+      rank_dim);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  nomemory_low_rank_grad_weighted_source_tiled_kernel<<<stage1_grid, stage1_threads, 0, stream>>>(
+      grad_scores.data_ptr<float>(),
+      projected_target.data_ptr<float>(),
+      grad_weighted_source.data_ptr<float>(),
+      batch_flat,
+      nodes,
+      rank_dim);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  nomemory_low_rank_grad_layer_tiled_kernel<<<layer_grid, layer_threads, 0, stream>>>(
+      grad_projected_target.data_ptr<float>(),
+      grad_weighted_source.data_ptr<float>(),
+      source_weight.data_ptr<float>(),
+      target_weight.data_ptr<float>(),
+      core_weight.data_ptr<float>(),
+      grad_layer.data_ptr<float>(),
+      batch_flat,
+      nodes,
+      dim,
+      rank_dim);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  nomemory_low_rank_grad_weights_core_tiled_kernel<<<weight_grid, weight_threads, 0, stream>>>(
+      grad_projected_target.data_ptr<float>(),
+      grad_weighted_source.data_ptr<float>(),
+      projected_source.data_ptr<float>(),
+      layer_val.data_ptr<float>(),
+      core_weight.data_ptr<float>(),
+      grad_source_weight.data_ptr<float>(),
+      grad_target_weight.data_ptr<float>(),
+      grad_core_weight.data_ptr<float>(),
+      batch_flat,
+      nodes,
+      dim,
+      rank_dim);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  nomemory_low_rank_grad_bias_kernel<<<256, 256, 0, stream>>>(
+      grad_scores.data_ptr<float>(),
+      grad_bias.data_ptr<float>(),
+      score_total);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  return {grad_layer, grad_source_weight, grad_target_weight, grad_core_weight, grad_bias};
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+jakal_net_nomemory_low_rank_exact_val_layer_backward_cuda(
+    const torch::Tensor& layer_val,
+    const torch::Tensor& source_weight,
+    const torch::Tensor& target_weight,
+    const torch::Tensor& core_weight,
+    const torch::Tensor& scores,
+    const torch::Tensor& edges,
+    const torch::Tensor& norm_weight,
+    const torch::Tensor& norm_bias,
+    const torch::Tensor& grad_output,
+    int64_t compress_kind) {
+  require_cuda_contiguous(layer_val, "layer_val");
+  require_cuda_contiguous(source_weight, "source_weight");
+  require_cuda_contiguous(target_weight, "target_weight");
+  require_cuda_contiguous(core_weight, "core_weight");
+  require_cuda_contiguous(scores, "scores");
+  require_cuda_contiguous(edges, "edges");
+  require_cuda_contiguous(norm_weight, "norm_weight");
+  require_cuda_contiguous(grad_output, "grad_output");
+  if (layer_val.scalar_type() != torch::kFloat32 ||
+      source_weight.scalar_type() != torch::kFloat32 ||
+      target_weight.scalar_type() != torch::kFloat32 ||
+      core_weight.scalar_type() != torch::kFloat32 ||
+      scores.scalar_type() != torch::kFloat32 ||
+      edges.scalar_type() != torch::kFloat32 ||
+      norm_weight.scalar_type() != torch::kFloat32 ||
+      grad_output.scalar_type() != torch::kFloat32) {
+    throw std::runtime_error("nomemory low-rank exact val-layer backward CUDA currently requires float32 inputs.");
+  }
+  const auto batch_flat = layer_val.size(0);
+  const auto nodes = layer_val.size(1);
+  const auto dim = layer_val.size(2);
+  const int64_t rows = batch_flat * nodes;
+
+  auto pre_norm = torch::empty_like(layer_val);
+  auto mean = torch::empty({rows}, layer_val.options());
+  auto rstd = torch::empty({rows}, layer_val.options());
+  auto grad_pre_norm = torch::empty_like(layer_val);
+  auto grad_norm_weight = torch::zeros_like(norm_weight);
+  torch::Tensor grad_norm_bias =
+      norm_bias.defined() && norm_bias.numel() != 0 ? torch::zeros_like(norm_weight) : torch::Tensor();
+  constexpr int threads = 256;
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const int64_t total = layer_val.numel();
+  nomemory_exact_delta_pre_norm_kernel<<<(total + threads - 1) / threads, threads, 0, stream>>>(
+      edges.data_ptr<float>(),
+      layer_val.data_ptr<float>(),
+      pre_norm.data_ptr<float>(),
+      batch_flat,
+      nodes,
+      dim);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  nomemory_layer_norm_stats_kernel<<<rows, threads, 0, stream>>>(
+      pre_norm.data_ptr<float>(),
+      mean.data_ptr<float>(),
+      rstd.data_ptr<float>(),
+      rows,
+      dim);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  nomemory_layer_norm_backward_kernel<<<rows, threads, 0, stream>>>(
+      pre_norm.data_ptr<float>(),
+      grad_output.data_ptr<float>(),
+      norm_weight.data_ptr<float>(),
+      mean.data_ptr<float>(),
+      rstd.data_ptr<float>(),
+      grad_pre_norm.data_ptr<float>(),
+      grad_norm_weight.data_ptr<float>(),
+      grad_norm_bias.defined() ? grad_norm_bias.data_ptr<float>() : grad_norm_weight.data_ptr<float>(),
+      rows,
+      dim);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  auto score_backward = jakal_net_nomemory_exact_scores_backward_cuda(
+      scores,
+      edges,
+      grad_pre_norm,
+      layer_val,
+      compress_kind);
+  auto grad_scores = std::get<0>(score_backward);
+  auto grad_layer_from_reduce = std::get<1>(score_backward);
+
+  auto projected_source = torch::matmul(layer_val, source_weight.transpose(0, 1)).contiguous();
+  auto projected_target = torch::matmul(layer_val, target_weight.transpose(0, 1)).contiguous();
+  auto pairwise_backward = jakal_net_nomemory_low_rank_pairwise_backward_cuda(
+      layer_val,
+      source_weight,
+      target_weight,
+      core_weight,
+      projected_source,
+      projected_target,
+      grad_scores);
+
+  auto grad_layer = torch::empty_like(layer_val);
+  nomemory_add_three_kernel<<<(total + threads - 1) / threads, threads, 0, stream>>>(
+      grad_pre_norm.data_ptr<float>(),
+      grad_layer_from_reduce.contiguous().data_ptr<float>(),
+      std::get<0>(pairwise_backward).contiguous().data_ptr<float>(),
+      grad_layer.data_ptr<float>(),
+      total);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  return {
+      grad_layer,
+      std::get<1>(pairwise_backward),
+      std::get<2>(pairwise_backward),
+      std::get<3>(pairwise_backward),
+      std::get<4>(pairwise_backward),
+      grad_norm_weight,
+      grad_norm_bias,
+  };
+}
+
 namespace {
 
 struct ScanCudaLayerState {
   torch::Tensor state;
   torch::Tensor val;
 };
+
+ScanCudaLayerState scan_cuda_apply_delta_to_layer(
+    const ScanCudaLayerState& layer,
+    const torch::Tensor& delta_state,
+    const torch::Tensor& delta_val,
+    const torch::Tensor& val_norm_weight,
+    const torch::Tensor& val_norm_bias,
+    bool use_fused_forward,
+    const std::string& state_activation_name);
 
 inline c10::optional<torch::Tensor> scan_cuda_optional_tensor(const torch::Tensor& tensor) {
   if (!tensor.defined() || tensor.numel() == 0) {
@@ -1967,7 +4643,7 @@ torch::Tensor scan_cuda_linear3d(
     const torch::Tensor& input,
     const torch::Tensor& weight,
     const torch::Tensor& bias) {
-  auto output = torch::matmul(input, weight.transpose(0, 1));
+  auto output = torch::matmul(input, weight.to(input.scalar_type()).transpose(0, 1));
   if (bias.defined() && bias.numel() != 0) {
     output = output + bias.to(output.scalar_type()).view({1, 1, -1});
   }
@@ -1988,7 +4664,7 @@ torch::Tensor scan_cuda_linear2d(
     const torch::Tensor& input,
     const torch::Tensor& weight,
     const torch::Tensor& bias) {
-  auto output = torch::matmul(input, weight.transpose(0, 1));
+  auto output = torch::matmul(input, weight.to(input.scalar_type()).transpose(0, 1));
   if (bias.defined() && bias.numel() != 0) {
     output = output + bias.to(output.scalar_type());
   }
@@ -2024,6 +4700,11 @@ torch::Tensor scan_cuda_signed_softmax_state(const torch::Tensor& state) {
   auto magnitude = torch::softmax(clean_state.abs(), -1);
   const auto state_mass = static_cast<double>(state.size(-1));
   return torch::sign(clean_state) * magnitude * state_mass;
+}
+
+torch::Tensor scan_cuda_softsign_state(const torch::Tensor& state) {
+  auto clean_state = torch::nan_to_num(state);
+  return clean_state / (1.0 + clean_state.abs());
 }
 
 torch::Tensor scan_cuda_signed_abs_softmax_scores(const torch::Tensor& scores) {
@@ -2131,8 +4812,100 @@ ScanCudaLayerState scan_cuda_apply_delta_to_layer(
     const torch::Tensor& delta_state,
     const torch::Tensor& delta_val,
     const torch::Tensor& val_norm_weight,
-    const torch::Tensor& val_norm_bias) {
-  auto updated_state = scan_cuda_signed_softmax_state(layer.state + delta_state);
+    const torch::Tensor& val_norm_bias,
+    bool use_fused_forward,
+    const std::string& state_activation_name = "signed_softmax") {
+  if (use_fused_forward &&
+      layer.state.is_cuda() &&
+      delta_state.is_cuda() &&
+      layer.val.is_cuda() &&
+      delta_val.is_cuda() &&
+      layer.state.is_contiguous() &&
+      delta_state.is_contiguous() &&
+      layer.val.is_contiguous() &&
+      delta_val.is_contiguous() &&
+      layer.state.dim() == 2 &&
+      layer.val.dim() == 3 &&
+      layer.state.scalar_type() == delta_state.scalar_type() &&
+       layer.val.scalar_type() == delta_val.scalar_type() &&
+       (!val_norm_weight.defined() || val_norm_weight.numel() == 0 ||
+       val_norm_weight.scalar_type() == layer.val.scalar_type()) &&
+       (!val_norm_bias.defined() || val_norm_bias.numel() == 0 ||
+       val_norm_bias.scalar_type() == layer.val.scalar_type()) &&
+      (state_activation_name == "signed_softmax" || state_activation_name == "softsign")) {
+    auto updated_state = torch::empty_like(layer.state);
+    auto updated_val = torch::empty_like(layer.val);
+    constexpr int threads = 256;
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    if (state_activation_name == "signed_softmax") {
+      const auto state_shmem = 2 * threads * sizeof(float);
+      AT_DISPATCH_FLOATING_TYPES_AND2(
+          torch::kHalf,
+          torch::kBFloat16,
+          layer.state.scalar_type(),
+          "scan_signed_softmax_state_kernel",
+          [&] {
+            scan_signed_softmax_state_kernel<scalar_t>
+                <<<layer.state.size(0), threads, state_shmem, stream>>>(
+                    layer.state.data_ptr<scalar_t>(),
+                    delta_state.data_ptr<scalar_t>(),
+                    updated_state.data_ptr<scalar_t>(),
+                    layer.state.size(0),
+                    layer.state.size(1));
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+          });
+    } else {
+      const auto state_total = layer.state.numel();
+      AT_DISPATCH_FLOATING_TYPES_AND2(
+          torch::kHalf,
+          torch::kBFloat16,
+          layer.state.scalar_type(),
+          "scan_softsign_state_kernel",
+          [&] {
+            scan_softsign_state_kernel<scalar_t>
+                <<<(state_total + threads - 1) / threads, threads, 0, stream>>>(
+                    layer.state.data_ptr<scalar_t>(),
+                    delta_state.data_ptr<scalar_t>(),
+                    updated_state.data_ptr<scalar_t>(),
+                    state_total);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+          });
+    }
+
+    const auto val_rows = layer.val.size(0) * layer.val.size(1);
+    const auto val_dim = layer.val.size(2);
+    const auto val_shmem = 2 * threads * sizeof(float);
+    const bool has_weight = val_norm_weight.defined() && val_norm_weight.numel() != 0;
+    const bool has_bias = val_norm_bias.defined() && val_norm_bias.numel() != 0;
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        torch::kHalf,
+        torch::kBFloat16,
+        layer.val.scalar_type(),
+        "scan_val_add_layer_norm_kernel",
+        [&] {
+          scan_val_add_layer_norm_kernel<scalar_t>
+              <<<val_rows, threads, val_shmem, stream>>>(
+                  layer.val.data_ptr<scalar_t>(),
+                  delta_val.data_ptr<scalar_t>(),
+                  has_weight ? val_norm_weight.data_ptr<scalar_t>() : nullptr,
+                  has_bias ? val_norm_bias.data_ptr<scalar_t>() : nullptr,
+                  updated_val.data_ptr<scalar_t>(),
+                  val_rows,
+                  val_dim,
+                  has_weight,
+                  has_bias);
+          C10_CUDA_KERNEL_LAUNCH_CHECK();
+        });
+    return {updated_state, updated_val};
+  }
+  torch::Tensor updated_state;
+  if (state_activation_name == "signed_softmax") {
+    updated_state = scan_cuda_signed_softmax_state(layer.state + delta_state);
+  } else if (state_activation_name == "softsign") {
+    updated_state = scan_cuda_softsign_state(layer.state + delta_state);
+  } else {
+    throw std::runtime_error("Unsupported state_activation_name: " + state_activation_name);
+  }
   auto updated_val = scan_cuda_layer_norm_last_dim(layer.val + delta_val, val_norm_weight, val_norm_bias);
   return {updated_state, updated_val};
 }
@@ -2631,11 +5404,67 @@ ScanCudaLayerState scan_cuda_apply_ffn_to_layer(
     const torch::Tensor& in_weight,
     const torch::Tensor& in_bias,
     const torch::Tensor& out_weight,
-    const torch::Tensor& out_bias) {
+    const torch::Tensor& out_bias,
+    bool use_fused_forward) {
   if (!in_weight.defined() || in_weight.numel() == 0) {
     return layer;
   }
   auto normalized = scan_cuda_layer_norm_last_dim(layer.val, norm_weight, norm_bias);
+  if (use_fused_forward &&
+      normalized.is_cuda() &&
+      normalized.is_contiguous() &&
+      layer.val.is_contiguous()) {
+    auto hidden = scan_cuda_linear3d(normalized, in_weight, torch::Tensor()).contiguous();
+    auto hidden_bias =
+        (in_bias.defined() && in_bias.numel() != 0 && in_bias.scalar_type() != hidden.scalar_type())
+            ? in_bias.to(hidden.scalar_type()).contiguous()
+            : in_bias;
+    constexpr int threads = 256;
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    const auto hidden_total = hidden.numel();
+    const bool has_hidden_bias = hidden_bias.defined() && hidden_bias.numel() != 0;
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        torch::kHalf,
+        torch::kBFloat16,
+        hidden.scalar_type(),
+        "scan_bias_gelu_kernel",
+        [&] {
+          scan_bias_gelu_kernel<scalar_t>
+              <<<(hidden_total + threads - 1) / threads, threads, 0, stream>>>(
+                  hidden.data_ptr<scalar_t>(),
+                  has_hidden_bias ? hidden_bias.data_ptr<scalar_t>() : nullptr,
+                  hidden_total,
+                  hidden.size(-1),
+                  has_hidden_bias);
+          C10_CUDA_KERNEL_LAUNCH_CHECK();
+        });
+    auto delta = scan_cuda_linear3d(hidden, out_weight, torch::Tensor())
+                     .to(layer.val.scalar_type())
+                     .contiguous();
+    auto output_bias =
+        (out_bias.defined() && out_bias.numel() != 0 && out_bias.scalar_type() != delta.scalar_type())
+            ? out_bias.to(delta.scalar_type()).contiguous()
+            : out_bias;
+    const auto delta_total = delta.numel();
+    const bool has_output_bias = output_bias.defined() && output_bias.numel() != 0;
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        torch::kHalf,
+        torch::kBFloat16,
+        delta.scalar_type(),
+        "scan_residual_bias_add_kernel",
+        [&] {
+          scan_residual_bias_add_kernel<scalar_t>
+              <<<(delta_total + threads - 1) / threads, threads, 0, stream>>>(
+                  layer.val.data_ptr<scalar_t>(),
+                  delta.data_ptr<scalar_t>(),
+                  has_output_bias ? output_bias.data_ptr<scalar_t>() : nullptr,
+                  delta_total,
+                  delta.size(-1),
+                  has_output_bias);
+          C10_CUDA_KERNEL_LAUNCH_CHECK();
+        });
+    return {layer.state, delta};
+  }
   auto hidden = scan_cuda_linear3d(normalized, in_weight, in_bias);
   auto activated = 0.5 * hidden * (1 + torch::erf(hidden * 0.70710678118654752440));
   auto delta = scan_cuda_linear3d(activated, out_weight, out_bias);
@@ -2798,31 +5627,8 @@ scan_cuda_forward_impl(
         std::get<0>(first_write_delta),
         std::get<1>(first_write_delta),
         val_norm_weights[0],
-        val_norm_biases[0]);
-    level = scan_cuda_apply_ffn_to_layer(
-        level,
-        level_ffn_norm_weights[0],
-        level_ffn_norm_biases[0],
-        level_ffn_in_weights[0],
-        level_ffn_in_biases[0],
-        level_ffn_out_weights[0],
-        level_ffn_out_biases[0]);
-    auto first_prop_delta = scan_cuda_low_rank_propagation_topk(
-        level.state,
-        level.val,
-        propagation_source_weights[0],
-        propagation_target_weights[0],
-        propagation_core_weights[0],
-        propagation_biases[0],
-        propagation_topks[0],
-        propagation_compress_name,
+        val_norm_biases[0],
         true);
-    level = scan_cuda_apply_delta_to_layer(
-        level,
-        std::get<0>(first_prop_delta),
-        std::get<1>(first_prop_delta),
-        val_norm_weights[0],
-        val_norm_biases[0]);
     level = scan_cuda_apply_ffn_to_layer(
         level,
         level_ffn_norm_weights[0],
@@ -2830,7 +5636,36 @@ scan_cuda_forward_impl(
         level_ffn_in_weights[0],
         level_ffn_in_biases[0],
         level_ffn_out_weights[0],
-        level_ffn_out_biases[0]);
+        level_ffn_out_biases[0],
+        true);
+    if (propagation_topks[0] >= 0) {
+      auto first_prop_delta = scan_cuda_low_rank_propagation_topk(
+          level.state,
+          level.val,
+          propagation_source_weights[0],
+          propagation_target_weights[0],
+          propagation_core_weights[0],
+          propagation_biases[0],
+          propagation_topks[0],
+          propagation_compress_name,
+          true);
+      level = scan_cuda_apply_delta_to_layer(
+          level,
+          std::get<0>(first_prop_delta),
+          std::get<1>(first_prop_delta),
+          val_norm_weights[0],
+          val_norm_biases[0],
+          true);
+      level = scan_cuda_apply_ffn_to_layer(
+          level,
+          level_ffn_norm_weights[0],
+          level_ffn_norm_biases[0],
+          level_ffn_in_weights[0],
+          level_ffn_in_biases[0],
+          level_ffn_out_weights[0],
+          level_ffn_out_biases[0],
+          true);
+    }
     next_memory.push_back(level);
 
     for (size_t level_index = 1; level_index < num_levels; ++level_index) {
@@ -2853,7 +5688,8 @@ scan_cuda_forward_impl(
           std::get<0>(parent_delta),
           std::get<1>(parent_delta),
           val_norm_weights[level_index],
-          val_norm_biases[level_index]);
+          val_norm_biases[level_index],
+          true);
       updated_level = scan_cuda_apply_ffn_to_layer(
           updated_level,
           level_ffn_norm_weights[level_index],
@@ -2861,7 +5697,8 @@ scan_cuda_forward_impl(
           level_ffn_in_weights[level_index],
           level_ffn_in_biases[level_index],
           level_ffn_out_weights[level_index],
-          level_ffn_out_biases[level_index]);
+          level_ffn_out_biases[level_index],
+          true);
 
       if (level_index == 1 && expected_skip_count > 0) {
         auto skip_gate = torch::sigmoid(skip_gates[0].to(token_val.scalar_type()));
@@ -2883,7 +5720,8 @@ scan_cuda_forward_impl(
             std::get<0>(skip_delta) * skip_gate,
             std::get<1>(skip_delta) * skip_gate,
             val_norm_weights[level_index],
-            val_norm_biases[level_index]);
+            val_norm_biases[level_index],
+            true);
         updated_level = scan_cuda_apply_ffn_to_layer(
             updated_level,
             level_ffn_norm_weights[level_index],
@@ -2891,7 +5729,8 @@ scan_cuda_forward_impl(
             level_ffn_in_weights[level_index],
             level_ffn_in_biases[level_index],
             level_ffn_out_weights[level_index],
-            level_ffn_out_biases[level_index]);
+            level_ffn_out_biases[level_index],
+            true);
       }
 
       if (level_index >= 2) {
@@ -2915,7 +5754,8 @@ scan_cuda_forward_impl(
             std::get<0>(skip_delta) * skip_gate,
             std::get<1>(skip_delta) * skip_gate,
             val_norm_weights[level_index],
-            val_norm_biases[level_index]);
+            val_norm_biases[level_index],
+            true);
         updated_level = scan_cuda_apply_ffn_to_layer(
             updated_level,
             level_ffn_norm_weights[level_index],
@@ -2923,33 +5763,38 @@ scan_cuda_forward_impl(
             level_ffn_in_weights[level_index],
             level_ffn_in_biases[level_index],
             level_ffn_out_weights[level_index],
-            level_ffn_out_biases[level_index]);
+            level_ffn_out_biases[level_index],
+            true);
       }
 
-      auto propagation_delta = scan_cuda_low_rank_propagation_topk(
-          updated_level.state,
-          updated_level.val,
-          propagation_source_weights[level_index],
-          propagation_target_weights[level_index],
-          propagation_core_weights[level_index],
-          propagation_biases[level_index],
-          propagation_topks[level_index],
-          propagation_compress_name,
-          true);
-      updated_level = scan_cuda_apply_delta_to_layer(
-          updated_level,
-          std::get<0>(propagation_delta),
-          std::get<1>(propagation_delta),
-          val_norm_weights[level_index],
-          val_norm_biases[level_index]);
-      updated_level = scan_cuda_apply_ffn_to_layer(
-          updated_level,
-          level_ffn_norm_weights[level_index],
-          level_ffn_norm_biases[level_index],
-          level_ffn_in_weights[level_index],
-          level_ffn_in_biases[level_index],
-          level_ffn_out_weights[level_index],
-          level_ffn_out_biases[level_index]);
+      if (propagation_topks[level_index] >= 0) {
+        auto propagation_delta = scan_cuda_low_rank_propagation_topk(
+            updated_level.state,
+            updated_level.val,
+            propagation_source_weights[level_index],
+            propagation_target_weights[level_index],
+            propagation_core_weights[level_index],
+            propagation_biases[level_index],
+            propagation_topks[level_index],
+            propagation_compress_name,
+            true);
+        updated_level = scan_cuda_apply_delta_to_layer(
+            updated_level,
+            std::get<0>(propagation_delta),
+            std::get<1>(propagation_delta),
+            val_norm_weights[level_index],
+            val_norm_biases[level_index],
+            true);
+        updated_level = scan_cuda_apply_ffn_to_layer(
+            updated_level,
+            level_ffn_norm_weights[level_index],
+            level_ffn_norm_biases[level_index],
+            level_ffn_in_weights[level_index],
+            level_ffn_in_biases[level_index],
+            level_ffn_out_weights[level_index],
+            level_ffn_out_biases[level_index],
+            true);
+      }
       next_memory.push_back(updated_level);
     }
 
@@ -3398,31 +6243,8 @@ std::vector<torch::Tensor> jakal_net_causal_memory_scan_fused_backward_cuda(
         std::get<0>(first_write_delta),
         std::get<1>(first_write_delta),
         val_norm_weights_leaves[0],
-        val_norm_biases_leaves[0]);
-    level = scan_cuda_apply_ffn_to_layer(
-        level,
-        level_ffn_norm_weights_leaves[0],
-        level_ffn_norm_biases_leaves[0],
-        level_ffn_in_weights_leaves[0],
-        level_ffn_in_biases_leaves[0],
-        level_ffn_out_weights_leaves[0],
-        level_ffn_out_biases_leaves[0]);
-    auto first_prop_delta = scan_cuda_low_rank_propagation_topk(
-        level.state,
-        level.val,
-        propagation_source_weights_leaves[0],
-        propagation_target_weights_leaves[0],
-        propagation_core_weights_leaves[0],
-        propagation_biases_leaves[0],
-        propagation_topks[0],
-        propagation_compress_name,
+        val_norm_biases_leaves[0],
         false);
-    level = scan_cuda_apply_delta_to_layer(
-        level,
-        std::get<0>(first_prop_delta),
-        std::get<1>(first_prop_delta),
-        val_norm_weights_leaves[0],
-        val_norm_biases_leaves[0]);
     level = scan_cuda_apply_ffn_to_layer(
         level,
         level_ffn_norm_weights_leaves[0],
@@ -3430,7 +6252,36 @@ std::vector<torch::Tensor> jakal_net_causal_memory_scan_fused_backward_cuda(
         level_ffn_in_weights_leaves[0],
         level_ffn_in_biases_leaves[0],
         level_ffn_out_weights_leaves[0],
-        level_ffn_out_biases_leaves[0]);
+        level_ffn_out_biases_leaves[0],
+        false);
+    if (propagation_topks[0] >= 0) {
+      auto first_prop_delta = scan_cuda_low_rank_propagation_topk(
+          level.state,
+          level.val,
+          propagation_source_weights_leaves[0],
+          propagation_target_weights_leaves[0],
+          propagation_core_weights_leaves[0],
+          propagation_biases_leaves[0],
+          propagation_topks[0],
+          propagation_compress_name,
+          false);
+      level = scan_cuda_apply_delta_to_layer(
+          level,
+          std::get<0>(first_prop_delta),
+          std::get<1>(first_prop_delta),
+          val_norm_weights_leaves[0],
+          val_norm_biases_leaves[0],
+          false);
+      level = scan_cuda_apply_ffn_to_layer(
+          level,
+          level_ffn_norm_weights_leaves[0],
+          level_ffn_norm_biases_leaves[0],
+          level_ffn_in_weights_leaves[0],
+          level_ffn_in_biases_leaves[0],
+          level_ffn_out_weights_leaves[0],
+          level_ffn_out_biases_leaves[0],
+          false);
+    }
     next_memory.push_back(level);
 
     for (size_t level_index = 1; level_index < current_memory.size(); ++level_index) {
@@ -3453,7 +6304,8 @@ std::vector<torch::Tensor> jakal_net_causal_memory_scan_fused_backward_cuda(
           std::get<0>(parent_delta),
           std::get<1>(parent_delta),
           val_norm_weights_leaves[level_index],
-          val_norm_biases_leaves[level_index]);
+          val_norm_biases_leaves[level_index],
+          false);
       updated_level = scan_cuda_apply_ffn_to_layer(
           updated_level,
           level_ffn_norm_weights_leaves[level_index],
@@ -3461,7 +6313,8 @@ std::vector<torch::Tensor> jakal_net_causal_memory_scan_fused_backward_cuda(
           level_ffn_in_weights_leaves[level_index],
           level_ffn_in_biases_leaves[level_index],
           level_ffn_out_weights_leaves[level_index],
-          level_ffn_out_biases_leaves[level_index]);
+          level_ffn_out_biases_leaves[level_index],
+          false);
 
       if (level_index == 1 && !skip_source_weights_leaves.empty()) {
         auto skip_gate = torch::sigmoid(skip_gates_leaves[0].to(token_val_leaf.scalar_type()));
@@ -3483,7 +6336,8 @@ std::vector<torch::Tensor> jakal_net_causal_memory_scan_fused_backward_cuda(
             std::get<0>(skip_delta) * skip_gate,
             std::get<1>(skip_delta) * skip_gate,
             val_norm_weights_leaves[level_index],
-            val_norm_biases_leaves[level_index]);
+            val_norm_biases_leaves[level_index],
+            false);
         updated_level = scan_cuda_apply_ffn_to_layer(
             updated_level,
             level_ffn_norm_weights_leaves[level_index],
@@ -3491,7 +6345,8 @@ std::vector<torch::Tensor> jakal_net_causal_memory_scan_fused_backward_cuda(
             level_ffn_in_weights_leaves[level_index],
             level_ffn_in_biases_leaves[level_index],
             level_ffn_out_weights_leaves[level_index],
-            level_ffn_out_biases_leaves[level_index]);
+            level_ffn_out_biases_leaves[level_index],
+            false);
       }
 
       if (level_index >= 2) {
@@ -3515,7 +6370,8 @@ std::vector<torch::Tensor> jakal_net_causal_memory_scan_fused_backward_cuda(
             std::get<0>(skip_delta) * skip_gate,
             std::get<1>(skip_delta) * skip_gate,
             val_norm_weights_leaves[level_index],
-            val_norm_biases_leaves[level_index]);
+            val_norm_biases_leaves[level_index],
+            false);
         updated_level = scan_cuda_apply_ffn_to_layer(
             updated_level,
             level_ffn_norm_weights_leaves[level_index],
@@ -3523,33 +6379,38 @@ std::vector<torch::Tensor> jakal_net_causal_memory_scan_fused_backward_cuda(
             level_ffn_in_weights_leaves[level_index],
             level_ffn_in_biases_leaves[level_index],
             level_ffn_out_weights_leaves[level_index],
-            level_ffn_out_biases_leaves[level_index]);
+            level_ffn_out_biases_leaves[level_index],
+            false);
       }
 
-      auto propagation_delta = scan_cuda_low_rank_propagation_topk(
-          updated_level.state,
-          updated_level.val,
-          propagation_source_weights_leaves[level_index],
-          propagation_target_weights_leaves[level_index],
-          propagation_core_weights_leaves[level_index],
-          propagation_biases_leaves[level_index],
-          propagation_topks[level_index],
-          propagation_compress_name,
-          false);
-      updated_level = scan_cuda_apply_delta_to_layer(
-          updated_level,
-          std::get<0>(propagation_delta),
-          std::get<1>(propagation_delta),
-          val_norm_weights_leaves[level_index],
-          val_norm_biases_leaves[level_index]);
-      updated_level = scan_cuda_apply_ffn_to_layer(
-          updated_level,
-          level_ffn_norm_weights_leaves[level_index],
-          level_ffn_norm_biases_leaves[level_index],
-          level_ffn_in_weights_leaves[level_index],
-          level_ffn_in_biases_leaves[level_index],
-          level_ffn_out_weights_leaves[level_index],
-          level_ffn_out_biases_leaves[level_index]);
+      if (propagation_topks[level_index] >= 0) {
+        auto propagation_delta = scan_cuda_low_rank_propagation_topk(
+            updated_level.state,
+            updated_level.val,
+            propagation_source_weights_leaves[level_index],
+            propagation_target_weights_leaves[level_index],
+            propagation_core_weights_leaves[level_index],
+            propagation_biases_leaves[level_index],
+            propagation_topks[level_index],
+            propagation_compress_name,
+            false);
+        updated_level = scan_cuda_apply_delta_to_layer(
+            updated_level,
+            std::get<0>(propagation_delta),
+            std::get<1>(propagation_delta),
+            val_norm_weights_leaves[level_index],
+            val_norm_biases_leaves[level_index],
+            false);
+        updated_level = scan_cuda_apply_ffn_to_layer(
+            updated_level,
+            level_ffn_norm_weights_leaves[level_index],
+            level_ffn_norm_biases_leaves[level_index],
+            level_ffn_in_weights_leaves[level_index],
+            level_ffn_in_biases_leaves[level_index],
+            level_ffn_out_weights_leaves[level_index],
+            level_ffn_out_biases_leaves[level_index],
+            false);
+      }
       next_memory.push_back(updated_level);
     }
 
