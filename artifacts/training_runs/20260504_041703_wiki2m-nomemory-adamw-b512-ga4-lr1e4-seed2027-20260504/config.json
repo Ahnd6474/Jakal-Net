@@ -1,0 +1,1452 @@
+{
+  "args": {
+    "text_file": null,
+    "text_source": [],
+    "jsonl_source": [],
+    "hf_dataset": null,
+    "hf_config": null,
+    "hf_split": "train",
+    "hf_text_key": "text",
+    "hf_streaming": false,
+    "max_samples": null,
+    "tokenizer": "byte_bpe",
+    "subword_vocab_size": 16384,
+    "subword_model_type": "bpe",
+    "tokenizer_prefix": null,
+    "hf_tokenizer_model": null,
+    "hf_embedding_model": null,
+    "hf_trust_remote_code": false,
+    "match_dim_to_hf_embedding": false,
+    "subword_character_coverage": 1.0,
+    "subword_input_sentence_size": 0,
+    "subword_num_threads": 0,
+    "pretokenize_workers": 8,
+    "pretokenized_path": null,
+    "pretokenized_dir": "artifacts/wiki2m_hf16k/pretokenized_shards_50k",
+    "pretokenized_load_workers": 8,
+    "flat_integrity_mode": "meta",
+    "flat_integrity_workers": 8,
+    "pretokenized_max_loaded_shards": 8,
+    "preload_flat_shards": false,
+    "pretokenized_active_shards_per_bucket": 2,
+    "pretokenized_shard_rotation_interval": 256,
+    "prefetch_batches": 100,
+    "prefetch_workers": 1,
+    "prefetch_pin_memory": true,
+    "rolling_prefetch_workers": 0,
+    "rolling_prefetch_worker_threads": 1,
+    "rolling_prefetch_block_size": 16,
+    "rolling_prefetch_blocks": 4,
+    "rolling_prefetch_cache_dir": null,
+    "prebuild_train_batches": true,
+    "prebuild_pin_memory": true,
+    "prebuild_workers": 8,
+    "prebuild_worker_threads": 2,
+    "prebuild_cache_dir": null,
+    "save_pretokenized": false,
+    "device": "cuda",
+    "precision": "bf16",
+    "seed": 2027,
+    "seq_len": 512,
+    "dim": 384,
+    "model_kind": "causal_memory",
+    "transformer_layers": 5,
+    "transformer_heads": 6,
+    "transformer_ff_mult": 4.0,
+    "transformer_dropout": 0.0,
+    "s_layers": 6,
+    "memory_slots": [
+      384,
+      96,
+      24
+    ],
+    "memory_update_intervals": [
+      1,
+      2,
+      4
+    ],
+    "prediction_layers": 3,
+    "s_window": 512,
+    "s_microbatch_size": 0,
+    "prediction_window": 512,
+    "checkpoint_sequence_layers": false,
+    "checkpoint_prediction_layers": false,
+    "disable_feed_forward_layers": true,
+    "disable_memory_feed_forward_layers": true,
+    "disable_memory": true,
+    "disable_memory_read": false,
+    "disable_memory_propagation": false,
+    "feed_forward_hidden_mult": 2.0,
+    "memory_topk": 16,
+    "memory_train_mode": "dense",
+    "memory_eval_mode": "dense",
+    "eval_topk": 0,
+    "scan_checkpoint_chunk_size": 0,
+    "scan_backend": "auto",
+    "enable_fused_training": true,
+    "fused_training_checkpoint_stride": 0,
+    "enable_scan_backward_cuda": false,
+    "enable_diagonal_dense_prop_cuda": false,
+    "compile_model": false,
+    "compile_mode": "reduce-overhead",
+    "dense_profile": false,
+    "step_breakdown_interval": 0,
+    "pairwise_kind": "low_rank_bilinear",
+    "route_kind": "low_rank_bilinear",
+    "pairwise_rank": 256,
+    "route_rank": 256,
+    "pairwise_heads": 4,
+    "pairwise_frozen_heads": 0,
+    "pairwise_anchor_heads": 0,
+    "pairwise_anchor_kind": "scaled_cosine",
+    "route_heads": 4,
+    "route_frozen_heads": 0,
+    "route_anchor_heads": 0,
+    "route_anchor_kind": "fixed_projection",
+    "direction_only_values": true,
+    "implementation": "native",
+    "knowledge_nodes": 0,
+    "knowledge_route_topk": 0,
+    "knowledge_propagation_topk": 0,
+    "knowledge_propagation_layers": 1,
+    "batch_size": 512,
+    "grad_accum_steps": 4,
+    "stage1_batch_size": 0,
+    "stage2_batch_size": 0,
+    "stage3_batch_size": 0,
+    "stage1_grad_accum_steps": 0,
+    "stage2_grad_accum_steps": 0,
+    "stage3_grad_accum_steps": 0,
+    "learning_rate": 0.0001,
+    "weight_decay": 0.01,
+    "optimizer": "adamw_fused",
+    "warmup_start_lr": 0.0001,
+    "warmup_steps": 0,
+    "lr_min_ratio": 1.0,
+    "lr_decay_start_step": 999999999,
+    "lr_decay_steps": 0,
+    "lr_decay_mode": "linear",
+    "noisy_adamw": false,
+    "noisy_adamw_update_ema_beta": 0.95,
+    "noisy_adamw_lag": 0.95,
+    "noisy_adamw_noise_mult": 1.0,
+    "noisy_adamw_noise_floor": 1e-05,
+    "noisy_adamw_abs_floor": 0.0,
+    "noisy_adamw_abs_floor_steps": 32,
+    "noisy_adamw_decay_steps": 128,
+    "noisy_adamw_clean_weight": 0.5,
+    "noisy_adamw_noisy_weight": 0.25,
+    "epochs": 1.0,
+    "train_fraction": 0.9,
+    "grad_clip": 1.0,
+    "diagnose_nonfinite_grad": false,
+    "diagnose_nonfinite_limit": 12,
+    "stop_on_nonfinite_grad": false,
+    "eval_interval": 500,
+    "checkpoint_interval": 100,
+    "eval_start_step": 200,
+    "eval_sample_interval": 1000,
+    "eval_documents": 8,
+    "curriculum_stage1_ratio": 0.1,
+    "curriculum_stage2_ratio": 0.4,
+    "curriculum_stage1_span": 1,
+    "curriculum_stage2_span": 1,
+    "curriculum_stage3_span": 1,
+    "output_root": "artifacts/training_runs",
+    "run_name": "wiki2m-nomemory-adamw-b512-ga4-lr1e4-seed2027-20260504",
+    "resume_checkpoint": null,
+    "resume_additional_epochs": 0.0,
+    "resume_additional_steps": 0,
+    "tensorboard": true,
+    "cuda_graph_stage1": false
+  },
+  "tokenizer_label": "hf_auto",
+  "tokenizer_model_path": "/tmp/jakal_net_tokenizers/progressive_b_hf_auto_hf_16384_268d868af4ef",
+  "parameter_count": 13678885,
+  "rnn_aux_parameter_count": 0,
+  "corpus_metadata": {
+    "shards": [
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_00.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 48393,
+            "code": 1607
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 155756,
+            "tokens": 66103894
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_01.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 48861,
+            "code": 1139
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 128080,
+            "tokens": 51870219
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_02.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "code": 1135,
+            "text": 48865
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 128703,
+            "tokens": 52308790
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_03.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 48861,
+            "code": 1139
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 125413,
+            "tokens": 50503219
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_04.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49096,
+            "code": 904
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 119443,
+            "tokens": 47320268
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_05.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 48970,
+            "code": 1030
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 119282,
+            "tokens": 47316978
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_06.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49156,
+            "code": 844
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 108859,
+            "tokens": 41474853
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_07.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49058,
+            "code": 942
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 116369,
+            "tokens": 45772221
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_08.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49103,
+            "code": 897
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 113630,
+            "tokens": 44450512
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_09.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49032,
+            "code": 968
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 114942,
+            "tokens": 44997518
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_10.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49034,
+            "code": 966
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 116815,
+            "tokens": 46076796
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_11.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49082,
+            "code": 918
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 116506,
+            "tokens": 45723700
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_12.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49247,
+            "code": 753
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 105840,
+            "tokens": 40195807
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_13.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49164,
+            "code": 836
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 111472,
+            "tokens": 43233326
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_14.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49158,
+            "code": 842
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 108979,
+            "tokens": 41682899
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_15.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49168,
+            "code": 832
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 107012,
+            "tokens": 40571865
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_16.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49370,
+            "code": 630
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 98068,
+            "tokens": 35523383
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_17.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49424,
+            "code": 576
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 94441,
+            "tokens": 33352332
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_18.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49441,
+            "code": 559
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 91501,
+            "tokens": 30998689
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_19.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49276,
+            "code": 724
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 102466,
+            "tokens": 38039220
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_20.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49209,
+            "code": 791
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 106032,
+            "tokens": 40050433
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_21.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49426,
+            "code": 574
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 93286,
+            "tokens": 33005283
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_22.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49408,
+            "code": 592
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 90954,
+            "tokens": 30966112
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_23.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49540,
+            "code": 460
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 85340,
+            "tokens": 26681499
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_24.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49377,
+            "code": 623
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 98719,
+            "tokens": 35919474
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_25.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49412,
+            "code": 588
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 97135,
+            "tokens": 34858803
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_26.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49356,
+            "code": 644
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 97336,
+            "tokens": 35231592
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_27.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49469,
+            "code": 531
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 91081,
+            "tokens": 31093380
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_28.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49453,
+            "code": 547
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 89050,
+            "tokens": 29534121
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_29.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49370,
+            "code": 630
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 94377,
+            "tokens": 32772247
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_30.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49429,
+            "code": 571
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 89745,
+            "tokens": 30144645
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_31.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49366,
+            "code": 634
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 96378,
+            "tokens": 34581493
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_32.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49401,
+            "code": 599
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 94367,
+            "tokens": 32961780
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_33.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49425,
+            "code": 575
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 90863,
+            "tokens": 30866193
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_34.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49563,
+            "code": 437
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 84918,
+            "tokens": 27621130
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_35.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49456,
+            "code": 544
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 91821,
+            "tokens": 31550464
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_36.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49421,
+            "code": 579
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 95093,
+            "tokens": 33994486
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_37.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49476,
+            "code": 524
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 91079,
+            "tokens": 30910785
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_38.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49435,
+            "code": 565
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 89360,
+            "tokens": 30136374
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      },
+      {
+        "path": "artifacts/wiki2m_hf16k/pretokenized_shards_50k/wiki_2m_39.pt",
+        "documents": 50000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 49354,
+            "code": 646
+          },
+          "tokenized_summary": {
+            "documents": 50000,
+            "chunks": 97486,
+            "tokens": 35263694
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "tokenizer_dir": "artifacts/wiki2m_hf16k/tokenizer"
+        }
+      }
+    ],
+    "directory": "artifacts/wiki2m_hf16k/pretokenized_shards_50k"
+  },
+  "fixed_eval_documents": [
+    {
+      "shard_index": 24,
+      "document_index": 36692
+    },
+    {
+      "shard_index": 21,
+      "document_index": 38954
+    },
+    {
+      "shard_index": 29,
+      "document_index": 45399
+    },
+    {
+      "shard_index": 35,
+      "document_index": 22762
+    },
+    {
+      "shard_index": 13,
+      "document_index": 8960
+    },
+    {
+      "shard_index": 19,
+      "document_index": 48205
+    },
+    {
+      "shard_index": 31,
+      "document_index": 33216
+    },
+    {
+      "shard_index": 9,
+      "document_index": 28267
+    }
+  ],
+  "fixed_eval_sample_documents": [
+    {
+      "shard_index": 24,
+      "document_index": 32688
+    }
+  ]
+}

@@ -1,0 +1,973 @@
+using device: cuda
+flat_metadata_index | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40 | workers=8
+flat_metadata_ok | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40
+loaded_pretokenized_dir | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | documents=2,000,000 | tokenizer=hf_auto
+startup | split_train_val_flat_done
+startup | summarize_flat_buckets_done
+startup | estimate_steps_flat_done
+startup | fixed_eval_documents_flat_done
+startup | fixed_eval_sample_documents_flat_done
+startup | batcher_done
+startup | prebuild_train_batches_start | pin_memory=True | workers=8 | worker_threads=2
+prebuild_process_start | workers=8 | worker_threads=2 | steps=4861 | tasks=128 | chunk_size=38 | batch_size=768 | pin_memory=True | cache_dir=<shared-ram-index>
+flat_metadata_index | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40 | workers=1
+flat_metadata_index | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40 | workers=1
+flat_metadata_index | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40 | workers=1
+flat_metadata_index | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40 | workers=1
+flat_metadata_index | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40 | workers=1
+flat_metadata_index | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40 | workers=1flat_metadata_index | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40 | workers=1
+
+flat_metadata_index | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40 | workers=1
+flat_metadata_ok | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40
+flat_metadata_ok | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40
+flat_metadata_ok | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40
+flat_metadata_ok | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40
+flat_metadata_ok | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40
+flat_metadata_ok | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40
+flat_metadata_ok | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40
+flat_metadata_ok | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40
+prebuild_worker_progress | task=1 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=1 | batches=8/38 | elapsed=0.1s
+prebuild_worker_progress | task=1 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=0 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=1 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=0 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=6 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=1 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=0 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=3 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=5 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=6 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=1 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=0 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=3 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=7 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=5 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=6 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=2 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=7 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=3 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=0 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=5 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=2 | batches=8/38 | elapsed=0.1s
+prebuild_worker_progress | task=6 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=4 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=8 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=0 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=7 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=3 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=5 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=2 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=6 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=4 | batches=8/38 | elapsed=0.1s
+prebuild_worker_progress | task=8 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=7 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=3 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=6 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=5 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=2 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=4 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=8 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=3 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=7 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=5 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=9 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=2 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=4 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=8 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=7 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=9 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=2 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=10 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=4 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=8 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=9 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=11 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=4 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=12 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=8 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=10 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=13 | batches=1/38 | elapsed=0.0s
+prebuild_process_progress | tasks_done=1/128 | task=1 | task_batches=38 | batches=38 | elapsed=37.0s
+prebuild_process_progress | tasks_done=2/128 | task=0 | task_batches=38 | batches=76 | elapsed=37.0s
+prebuild_process_progress | tasks_done=3/128 | task=6 | task_batches=38 | batches=114 | elapsed=37.0s
+prebuild_process_progress | tasks_done=4/128 | task=3 | task_batches=38 | batches=152 | elapsed=37.0s
+prebuild_process_progress | tasks_done=5/128 | task=5 | task_batches=38 | batches=190 | elapsed=37.0s
+prebuild_process_progress | tasks_done=6/128 | task=8 | task_batches=38 | batches=228 | elapsed=37.0s
+prebuild_worker_progress | task=9 | batches=24/38 | elapsed=0.1s
+prebuild_process_progress | tasks_done=7/128 | task=7 | task_batches=38 | batches=266 | elapsed=37.0s
+prebuild_worker_progress | task=11 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=14 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=12 | batches=8/38 | elapsed=0.0s
+prebuild_process_progress | tasks_done=8/128 | task=2 | task_batches=38 | batches=304 | elapsed=37.0s
+prebuild_worker_progress | task=13 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=10 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=15 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=9 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=14 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=11 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=12 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=15 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=13 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=10 | batches=24/38 | elapsed=0.1s
+prebuild_process_progress | tasks_done=9/128 | task=4 | task_batches=38 | batches=342 | elapsed=37.1s
+prebuild_worker_progress | task=16 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=9 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=10/128 | task=9 | task_batches=38 | batches=380 | elapsed=37.1s
+prebuild_worker_progress | task=17 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=14 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=11 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=12 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=15 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=13 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=10 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=16 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=17 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=14 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=10 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=11 | batches=32/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=11/128 | task=10 | task_batches=38 | batches=418 | elapsed=37.1s
+prebuild_worker_progress | task=18 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=12 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=15 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=13 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=16 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=17 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=11 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=14 | batches=32/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=12/128 | task=11 | task_batches=38 | batches=456 | elapsed=37.2s
+prebuild_worker_progress | task=12 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=13 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=19 | batches=1/38 | elapsed=0.0s
+prebuild_process_progress | tasks_done=13/128 | task=12 | task_batches=38 | batches=494 | elapsed=37.2s
+prebuild_worker_progress | task=18 | batches=8/38 | elapsed=0.0s
+prebuild_process_progress | tasks_done=14/128 | task=13 | task_batches=38 | batches=532 | elapsed=37.2s
+prebuild_worker_progress | task=20 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=21 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=15 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=16 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=14 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=17 | batches=24/38 | elapsed=0.1s
+prebuild_process_progress | tasks_done=15/128 | task=14 | task_batches=38 | batches=570 | elapsed=37.2s
+prebuild_worker_progress | task=22 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=19 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=15 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=21 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=20 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=18 | batches=16/38 | elapsed=0.1s
+prebuild_process_progress | tasks_done=16/128 | task=15 | task_batches=38 | batches=608 | elapsed=37.2s
+prebuild_worker_progress | task=23 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=16 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=22 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=17 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=19 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=21 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=16 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=23 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=20 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=18 | batches=24/38 | elapsed=0.1s
+prebuild_process_progress | tasks_done=17/128 | task=16 | task_batches=38 | batches=646 | elapsed=37.3s
+prebuild_worker_progress | task=24 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=17 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=25 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=22 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=19 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=21 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=23 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=18 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=20 | batches=24/38 | elapsed=0.1sprebuild_worker_progress | task=24 | batches=8/38 | elapsed=0.0s
+
+prebuild_worker_progress | task=25 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=22 | batches=24/38 | elapsed=0.1s
+prebuild_process_progress | tasks_done=18/128 | task=17 | task_batches=38 | batches=684 | elapsed=37.3s
+prebuild_worker_progress | task=18 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=19 | batches=32/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=19/128 | task=18 | task_batches=38 | batches=722 | elapsed=37.3s
+prebuild_worker_progress | task=26 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=21 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=23 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=24 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=20 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=25 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=19 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=22 | batches=32/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=20/128 | task=19 | task_batches=38 | batches=760 | elapsed=37.4s
+prebuild_worker_progress | task=27 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=21 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=21/128 | task=21 | task_batches=38 | batches=798 | elapsed=37.4s
+prebuild_worker_progress | task=26 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=20 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=28 | batches=1/38 | elapsed=0.0s
+prebuild_process_progress | tasks_done=22/128 | task=20 | task_batches=38 | batches=836 | elapsed=37.4s
+prebuild_worker_progress | task=29 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=23 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=24 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=22 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=23/128 | task=22 | task_batches=38 | batches=874 | elapsed=37.4s
+prebuild_worker_progress | task=25 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=30 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=27 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=28 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=23 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=26 | batches=16/38 | elapsed=0.1s
+prebuild_process_progress | tasks_done=24/128 | task=23 | task_batches=38 | batches=912 | elapsed=37.4s
+prebuild_worker_progress | task=29 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=31 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=24 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=30 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=25 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=27 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=28 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=31 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=26 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=24 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=29 | batches=16/38 | elapsed=0.1s
+prebuild_process_progress | tasks_done=25/128 | task=24 | task_batches=38 | batches=950 | elapsed=37.5s
+prebuild_worker_progress | task=32 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=25 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=26/128 | task=25 | task_batches=38 | batches=988 | elapsed=37.5s
+prebuild_worker_progress | task=30 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=33 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=27 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=28 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=31 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=26 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=32 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=29 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=33 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=30 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=27 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=26 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=27/128 | task=26 | task_batches=38 | batches=1026 | elapsed=37.5s
+prebuild_worker_progress | task=28 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=34 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=31 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=32 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=29 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=27 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=33 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=30 | batches=32/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=28/128 | task=27 | task_batches=38 | batches=1064 | elapsed=37.6s
+prebuild_worker_progress | task=35 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=28 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=29/128 | task=28 | task_batches=38 | batches=1102 | elapsed=37.6s
+prebuild_worker_progress | task=34 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=36 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=29 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=31 | batches=32/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=30/128 | task=29 | task_batches=38 | batches=1140 | elapsed=37.6s
+prebuild_worker_progress | task=37 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=32 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=30 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=31/128 | task=30 | task_batches=38 | batches=1178 | elapsed=37.6s
+prebuild_worker_progress | task=38 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=33 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=35 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=36 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=31 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=34 | batches=16/38 | elapsed=0.1s
+prebuild_process_progress | tasks_done=32/128 | task=31 | task_batches=38 | batches=1216 | elapsed=37.6s
+prebuild_worker_progress | task=39 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=37 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=32 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=38 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=35 | batches=16/38 | elapsed=0.1sprebuild_worker_progress | task=33 | batches=32/38 | elapsed=0.2s
+
+prebuild_worker_progress | task=36 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=39 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=34 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=32 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=33/128 | task=32 | task_batches=38 | batches=1254 | elapsed=37.7s
+prebuild_worker_progress | task=37 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=40 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=33 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=38 | batches=16/38 | elapsed=0.1s
+prebuild_process_progress | tasks_done=34/128 | task=33 | task_batches=38 | batches=1292 | elapsed=37.7s
+prebuild_worker_progress | task=41 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=35 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=36 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=39 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=34 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=40 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=37 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=38 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=41 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=35 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=34 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=36 | batches=32/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=35/128 | task=34 | task_batches=38 | batches=1330 | elapsed=37.7s
+prebuild_worker_progress | task=42 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=39 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=40 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=37 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=35 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=38 | batches=32/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=36/128 | task=35 | task_batches=38 | batches=1368 | elapsed=37.8s
+prebuild_worker_progress | task=41 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=43 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=36 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=37/128 | task=36 | task_batches=38 | batches=1406 | elapsed=37.8s
+prebuild_worker_progress | task=44 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=42 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=39 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=37 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=38/128 | task=37 | task_batches=38 | batches=1444 | elapsed=37.8s
+prebuild_worker_progress | task=40 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=38 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=45 | batches=1/38 | elapsed=0.0s
+prebuild_process_progress | tasks_done=39/128 | task=38 | task_batches=38 | batches=1482 | elapsed=37.8s
+prebuild_worker_progress | task=46 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=43 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=41 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=44 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=39 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=42 | batches=16/38 | elapsed=0.1s
+prebuild_process_progress | tasks_done=40/128 | task=39 | task_batches=38 | batches=1520 | elapsed=37.8s
+prebuild_worker_progress | task=47 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=45 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=40 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=46 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=43 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=41 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=44 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=42 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=47 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=40 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=41/128 | task=40 | task_batches=38 | batches=1558 | elapsed=37.9s
+prebuild_worker_progress | task=48 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=45 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=46 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=41 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=42/128 | task=41 | task_batches=38 | batches=1596 | elapsed=37.9s
+prebuild_worker_progress | task=43 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=49 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=44 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=42 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=47 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=48 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=45 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=46 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=49 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=43 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=42 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=44 | batches=32/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=43/128 | task=42 | task_batches=38 | batches=1634 | elapsed=37.9s
+prebuild_worker_progress | task=50 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=47 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=48 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=43 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=45 | batches=32/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=44/128 | task=43 | task_batches=38 | batches=1672 | elapsed=37.9s
+prebuild_worker_progress | task=46 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=51 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=49 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=44 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=45/128 | task=44 | task_batches=38 | batches=1710 | elapsed=38.0s
+prebuild_worker_progress | task=52 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=50 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=47 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=45 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=46 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=46/128 | task=45 | task_batches=38 | batches=1748 | elapsed=38.0s
+prebuild_worker_progress | task=48 | batches=24/38 | elapsed=0.1s
+prebuild_process_progress | tasks_done=47/128 | task=46 | task_batches=38 | batches=1786 | elapsed=38.0s
+prebuild_worker_progress | task=53 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=54 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=51 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=49 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=52 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=50 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=47 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=48/128 | task=47 | task_batches=38 | batches=1824 | elapsed=38.0s
+prebuild_worker_progress | task=55 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=53 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=48 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=54 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=51 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=49 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=52 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=50 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=55 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=48 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=49/128 | task=48 | task_batches=38 | batches=1862 | elapsed=38.1s
+prebuild_worker_progress | task=56 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=53 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=54 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=49 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=51 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=57 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=52 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=50 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=55 | batches=16/38 | elapsed=0.1s
+prebuild_process_progress | tasks_done=50/128 | task=49 | task_batches=38 | batches=1900 | elapsed=38.1s
+prebuild_worker_progress | task=56 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=53 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=54 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=51 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=57 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=50 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=52 | batches=32/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=51/128 | task=50 | task_batches=38 | batches=1938 | elapsed=38.1s
+prebuild_worker_progress | task=58 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=55 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=56 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=51 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=52/128 | task=51 | task_batches=38 | batches=1976 | elapsed=38.1s
+prebuild_worker_progress | task=59 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=53 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=52 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=54 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=57 | batches=16/38 | elapsed=0.1s
+prebuild_process_progress | tasks_done=53/128 | task=52 | task_batches=38 | batches=2014 | elapsed=38.1s
+prebuild_worker_progress | task=60 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=58 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=55 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=53 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=56 | batches=24/38 | elapsed=0.1s
+prebuild_process_progress | tasks_done=54/128 | task=53 | task_batches=38 | batches=2052 | elapsed=38.2s
+prebuild_worker_progress | task=59 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=54 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=61 | batches=1/38 | elapsed=0.0s
+prebuild_process_progress | tasks_done=55/128 | task=54 | task_batches=38 | batches=2090 | elapsed=38.2s
+prebuild_worker_progress | task=62 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=60 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=57 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=58 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=55 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=56/128 | task=55 | task_batches=38 | batches=2128 | elapsed=38.2s
+prebuild_worker_progress | task=63 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=56 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=61 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=59 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=62 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=60 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=57 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=58 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=63 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=56 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=57/128 | task=56 | task_batches=38 | batches=2166 | elapsed=38.2s
+prebuild_worker_progress | task=64 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=59 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=61 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=57 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=58/128 | task=57 | task_batches=38 | batches=2204 | elapsed=38.3s
+prebuild_worker_progress | task=62 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=65 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=60 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=58 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=63 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=64 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=59 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=61 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=65 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=62 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=58 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=60 | batches=32/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=59/128 | task=58 | task_batches=38 | batches=2242 | elapsed=38.3s
+prebuild_worker_progress | task=66 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=63 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=59 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=64 | batches=16/38 | elapsed=0.1s
+prebuild_process_progress | tasks_done=60/128 | task=59 | task_batches=38 | batches=2280 | elapsed=38.3s
+prebuild_worker_progress | task=67 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=60 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=61 | batches=32/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=61/128 | task=60 | task_batches=38 | batches=2318 | elapsed=38.3s
+prebuild_worker_progress | task=65 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=68 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=62 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=66 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=63 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=67 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=61 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=64 | batches=24/38 | elapsed=0.1s
+prebuild_process_progress | tasks_done=62/128 | task=61 | task_batches=38 | batches=2356 | elapsed=38.4s
+prebuild_worker_progress | task=69 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=62 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=68 | batches=8/38 | elapsed=0.0s
+prebuild_process_progress | tasks_done=63/128 | task=62 | task_batches=38 | batches=2394 | elapsed=38.4s
+prebuild_worker_progress | task=65 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=70 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=66 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=63 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=64/128 | task=63 | task_batches=38 | batches=2432 | elapsed=38.4s
+prebuild_worker_progress | task=71 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=67 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=64 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=69 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=68 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=70 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=65 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=66 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=71 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=64 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=65/128 | task=64 | task_batches=38 | batches=2470 | elapsed=38.4s
+prebuild_worker_progress | task=67 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=72 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=65 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=69 | batches=16/38 | elapsed=0.1s
+prebuild_process_progress | tasks_done=66/128 | task=65 | task_batches=38 | batches=2508 | elapsed=38.5s
+prebuild_worker_progress | task=68 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=73 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=70 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=66 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=71 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=72 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=67 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=73 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=69 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=68 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=66 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=67/128 | task=66 | task_batches=38 | batches=2546 | elapsed=38.5s
+prebuild_worker_progress | task=70 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=74 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=71 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=67 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=68/128 | task=67 | task_batches=38 | batches=2584 | elapsed=38.5s
+prebuild_worker_progress | task=75 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=72 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=68 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=69/128 | task=68 | task_batches=38 | batches=2622 | elapsed=38.5s
+prebuild_worker_progress | task=76 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=73 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=69 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=74 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=70 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=71 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=75 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=72 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=69 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=76 | batches=8/38 | elapsed=0.0s
+prebuild_process_progress | tasks_done=70/128 | task=69 | task_batches=38 | batches=2660 | elapsed=38.6s
+prebuild_worker_progress | task=77 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=73 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=70 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=71/128 | task=70 | task_batches=38 | batches=2698 | elapsed=38.6s
+prebuild_worker_progress | task=74 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=78 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=71 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=72/128 | task=71 | task_batches=38 | batches=2736 | elapsed=38.6s
+prebuild_worker_progress | task=79 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=75 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=72 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=76 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=77 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=73 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=78 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=74 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=79 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=72 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=75 | batches=24/38 | elapsed=0.1s
+prebuild_process_progress | tasks_done=73/128 | task=72 | task_batches=38 | batches=2774 | elapsed=38.6s
+prebuild_worker_progress | task=80 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=73 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=76 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=77 | batches=16/38 | elapsed=0.1s
+prebuild_process_progress | tasks_done=74/128 | task=73 | task_batches=38 | batches=2812 | elapsed=38.7s
+prebuild_worker_progress | task=81 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=74 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=78 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=79 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=75 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=80 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=81 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=76 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=74 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=77 | batches=24/38 | elapsed=0.1s
+prebuild_process_progress | tasks_done=75/128 | task=74 | task_batches=38 | batches=2850 | elapsed=38.7s
+prebuild_worker_progress | task=82 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=78 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=75 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=76/128 | task=75 | task_batches=38 | batches=2888 | elapsed=38.7s
+prebuild_worker_progress | task=79 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=83 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=80 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=76 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=77/128 | task=76 | task_batches=38 | batches=2926 | elapsed=38.7s
+prebuild_worker_progress | task=84 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=81 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=82 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=77 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=78 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=83 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=79 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=80 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=84 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=77 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=78/128 | task=77 | task_batches=38 | batches=2964 | elapsed=38.8s
+prebuild_worker_progress | task=81 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=85 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=82 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=78 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=79/128 | task=78 | task_batches=38 | batches=3002 | elapsed=38.8s
+prebuild_worker_progress | task=86 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=79 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=80/128 | task=79 | task_batches=38 | batches=3040 | elapsed=38.8s
+prebuild_worker_progress | task=87 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=83 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=80 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=84 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=85 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=81 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=82 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=86 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=87 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=80 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=81/128 | task=80 | task_batches=38 | batches=3078 | elapsed=38.8s
+prebuild_worker_progress | task=83 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=88 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=81 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=84 | batches=24/38 | elapsed=0.1s
+prebuild_process_progress | tasks_done=82/128 | task=81 | task_batches=38 | batches=3116 | elapsed=38.9s
+prebuild_worker_progress | task=89 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=85 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=82 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=86 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=87 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=88 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=83 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=84 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=82 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=89 | batches=8/38 | elapsed=0.0s
+prebuild_process_progress | tasks_done=83/128 | task=82 | task_batches=38 | batches=3154 | elapsed=38.9s
+prebuild_worker_progress | task=85 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=90 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=86 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=87 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=83 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=84/128 | task=83 | task_batches=38 | batches=3192 | elapsed=38.9s
+prebuild_worker_progress | task=84 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=88 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=91 | batches=1/38 | elapsed=0.0s
+prebuild_process_progress | tasks_done=85/128 | task=84 | task_batches=38 | batches=3230 | elapsed=38.9s
+prebuild_worker_progress | task=92 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=89 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=90 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=85 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=86 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=87 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=91 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=88 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=92 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=85 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=89 | batches=24/38 | elapsed=0.1s
+prebuild_process_progress | tasks_done=86/128 | task=85 | task_batches=38 | batches=3268 | elapsed=39.0s
+prebuild_worker_progress | task=90 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=86 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=93 | batches=1/38 | elapsed=0.0s
+prebuild_process_progress | tasks_done=87/128 | task=86 | task_batches=38 | batches=3306 | elapsed=39.0s
+prebuild_worker_progress | task=94 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=87 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=88/128 | task=87 | task_batches=38 | batches=3344 | elapsed=39.0s
+prebuild_worker_progress | task=95 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=91 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=88 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=92 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=93 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=90 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=89 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=94 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=95 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=88 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=91 | batches=24/38 | elapsed=0.1s
+prebuild_process_progress | tasks_done=89/128 | task=88 | task_batches=38 | batches=3382 | elapsed=39.0s
+prebuild_worker_progress | task=96 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=92 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=89 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=90/128 | task=89 | task_batches=38 | batches=3420 | elapsed=39.0s
+prebuild_worker_progress | task=97 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=90 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=93 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=94 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=95 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=96 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=91 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=92 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=90 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=97 | batches=8/38 | elapsed=0.0s
+prebuild_process_progress | tasks_done=91/128 | task=90 | task_batches=38 | batches=3458 | elapsed=39.1s
+prebuild_worker_progress | task=98 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=93 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=94 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=91 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=95 | batches=24/38 | elapsed=0.1s
+prebuild_process_progress | tasks_done=92/128 | task=91 | task_batches=38 | batches=3496 | elapsed=39.1s
+prebuild_worker_progress | task=92 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=99 | batches=1/38 | elapsed=0.0s
+prebuild_process_progress | tasks_done=93/128 | task=92 | task_batches=38 | batches=3534 | elapsed=39.1s
+prebuild_worker_progress | task=96 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=100 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=98 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=97 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=93 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=94 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=99 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=95 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=100 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=96 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=98 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=93 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=97 | batches=24/38 | elapsed=0.1s
+prebuild_process_progress | tasks_done=94/128 | task=93 | task_batches=38 | batches=3572 | elapsed=39.2s
+prebuild_worker_progress | task=101 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=94 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=95/128 | task=94 | task_batches=38 | batches=3610 | elapsed=39.2s
+prebuild_worker_progress | task=95 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=102 | batches=1/38 | elapsed=0.0s
+prebuild_process_progress | tasks_done=96/128 | task=95 | task_batches=38 | batches=3648 | elapsed=39.2s
+prebuild_worker_progress | task=103 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=99 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=100 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=96 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=98 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=97 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=101 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=102 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=103 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=96 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=99 | batches=24/38 | elapsed=0.1s
+prebuild_process_progress | tasks_done=97/128 | task=96 | task_batches=38 | batches=3686 | elapsed=39.2s
+prebuild_worker_progress | task=104 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=100 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=97 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=98/128 | task=97 | task_batches=38 | batches=3724 | elapsed=39.2s
+prebuild_worker_progress | task=105 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=98 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=101 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=102 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=103 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=99 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=104 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=100 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=98 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=105 | batches=8/38 | elapsed=0.0s
+prebuild_process_progress | tasks_done=99/128 | task=98 | task_batches=38 | batches=3762 | elapsed=39.3s
+prebuild_worker_progress | task=106 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=101 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=102 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=99 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=100/128 | task=99 | task_batches=38 | batches=3800 | elapsed=39.3s
+prebuild_worker_progress | task=103 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=100 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=107 | batches=1/38 | elapsed=0.0s
+prebuild_process_progress | tasks_done=101/128 | task=100 | task_batches=38 | batches=3838 | elapsed=39.3s
+prebuild_worker_progress | task=104 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=108 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=106 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=105 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=101 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=102 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=107 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=103 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=108 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=104 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=106 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=105 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=101 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=102 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=102/128 | task=101 | task_batches=38 | batches=3876 | elapsed=39.4s
+prebuild_process_progress | tasks_done=103/128 | task=102 | task_batches=38 | batches=3914 | elapsed=39.4s
+prebuild_worker_progress | task=109 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=110 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=103 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=104/128 | task=103 | task_batches=38 | batches=3952 | elapsed=39.4s
+prebuild_worker_progress | task=107 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=111 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=108 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=104 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=106 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=105 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=110 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=109 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=111 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=107 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=104 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=105/128 | task=104 | task_batches=38 | batches=3990 | elapsed=39.4s
+prebuild_worker_progress | task=112 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=108 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=105 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=106/128 | task=105 | task_batches=38 | batches=4028 | elapsed=39.4s
+prebuild_worker_progress | task=106 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=113 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=110 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=109 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=111 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=107 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=112 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=106 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=107/128 | task=106 | task_batches=38 | batches=4066 | elapsed=39.5s
+prebuild_worker_progress | task=108 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=113 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=114 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=110 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=109 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=107 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=108/128 | task=107 | task_batches=38 | batches=4104 | elapsed=39.5s
+prebuild_worker_progress | task=115 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=111 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=112 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=108 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=109/128 | task=108 | task_batches=38 | batches=4142 | elapsed=39.5s
+prebuild_worker_progress | task=116 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=114 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=113 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=110 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=109 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=115 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=111 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=112 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=116 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=114 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=110 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=113 | batches=24/38 | elapsed=0.1s
+prebuild_process_progress | tasks_done=110/128 | task=110 | task_batches=38 | batches=4180 | elapsed=39.6s
+prebuild_worker_progress | task=109 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=117 | batches=1/38 | elapsed=0.0s
+prebuild_process_progress | tasks_done=111/128 | task=109 | task_batches=38 | batches=4218 | elapsed=39.6s
+prebuild_worker_progress | task=111 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=118 | batches=1/38 | elapsed=0.0s
+prebuild_process_progress | tasks_done=112/128 | task=111 | task_batches=38 | batches=4256 | elapsed=39.6s
+prebuild_worker_progress | task=115 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=119 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=112 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=116 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=114 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=113 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=117 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=118 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=119 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=115 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=112 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=113/128 | task=112 | task_batches=38 | batches=4294 | elapsed=39.6s
+prebuild_worker_progress | task=120 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=116 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=113 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=114 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=121 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=117 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=118 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=119 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=115 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=120 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=114 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=116 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=122 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=121 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=117 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=115 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=118 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=123 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=119 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=116 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=120 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=124 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=122 | batches=8/38 | elapsed=0.0s
+prebuild_process_progress | tasks_done=114/128 | task=113 | task_batches=38 | batches=4332 | elapsed=39.7s
+prebuild_process_progress | tasks_done=115/128 | task=114 | task_batches=38 | batches=4370 | elapsed=39.7s
+prebuild_worker_progress | task=121 | batches=16/38 | elapsed=0.1s
+prebuild_process_progress | tasks_done=116/128 | task=115 | task_batches=38 | batches=4408 | elapsed=39.7s
+prebuild_process_progress | tasks_done=117/128 | task=116 | task_batches=38 | batches=4446 | elapsed=39.7s
+prebuild_worker_progress | task=117 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=123 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=118 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=119 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=124 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=120 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=122 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=117 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=118/128 | task=117 | task_batches=38 | batches=4484 | elapsed=39.8s
+prebuild_worker_progress | task=121 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=125 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=118 | batches=38/38 | elapsed=0.2s
+prebuild_worker_progress | task=119 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=119/128 | task=118 | task_batches=38 | batches=4522 | elapsed=39.8s
+prebuild_process_progress | tasks_done=120/128 | task=119 | task_batches=38 | batches=4560 | elapsed=39.8s
+prebuild_worker_progress | task=123 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=126 | batches=1/38 | elapsed=0.0s
+prebuild_worker_progress | task=127 | batches=1/35 | elapsed=0.0s
+prebuild_worker_progress | task=124 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=120 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=122 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=125 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=121 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=126 | batches=8/38 | elapsed=0.0s
+prebuild_worker_progress | task=127 | batches=8/35 | elapsed=0.0s
+prebuild_worker_progress | task=123 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=120 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=121/128 | task=120 | task_batches=38 | batches=4598 | elapsed=39.8s
+prebuild_worker_progress | task=124 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=121 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=122/128 | task=121 | task_batches=38 | batches=4636 | elapsed=39.8s
+prebuild_worker_progress | task=122 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=125 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=126 | batches=16/38 | elapsed=0.1s
+prebuild_worker_progress | task=123 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=127 | batches=16/35 | elapsed=0.1s
+prebuild_worker_progress | task=122 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=123/128 | task=122 | task_batches=38 | batches=4674 | elapsed=39.9s
+prebuild_worker_progress | task=124 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=125 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=123 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=124/128 | task=123 | task_batches=38 | batches=4712 | elapsed=39.9s
+prebuild_worker_progress | task=126 | batches=24/38 | elapsed=0.1s
+prebuild_worker_progress | task=127 | batches=24/35 | elapsed=0.1s
+prebuild_worker_progress | task=124 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=125/128 | task=124 | task_batches=38 | batches=4750 | elapsed=39.9s
+prebuild_worker_progress | task=125 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=126 | batches=32/38 | elapsed=0.2s
+prebuild_worker_progress | task=127 | batches=32/35 | elapsed=0.2s
+prebuild_worker_progress | task=125 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=126/128 | task=125 | task_batches=38 | batches=4788 | elapsed=40.0s
+prebuild_worker_progress | task=127 | batches=35/35 | elapsed=0.2s
+prebuild_process_progress | tasks_done=127/128 | task=127 | task_batches=35 | batches=4823 | elapsed=40.0s
+prebuild_worker_progress | task=126 | batches=38/38 | elapsed=0.2s
+prebuild_process_progress | tasks_done=128/128 | task=126 | task_batches=38 | batches=4861 | elapsed=40.0s
+startup | prebuild_train_batches_done | batches=4861 | seconds=44.5
+startup | model_init_done
+model=causal_memory_doc | params=13,678,885 | dim=384 | seq_len=512 | s_window=512 | s_microbatch_size=0 | scan_backend=auto | scan_checkpoint_chunk_size=0 | memory_slots=[384, 96, 24] | memory_update_intervals=[1, 2, 4] | knowledge_nodes=0 | memory_train_mode=dense | memory_eval_mode=dense | eval_topk=16 | direction_only_values=True | feed_forward_layers=False | memory_feed_forward_layers=False | disable_memory=True | disable_memory_read=False | disable_memory_propagation=False | feed_forward_hidden_mult=2 | optimizer=adamw_fused | checkpoint_sequence=False | checkpoint_prediction=False
+native_runtime | fused_training=True | fused_training_checkpoint_stride=0 | scan_backward_cuda=False | diagonal_dense_prop_cuda=False | compile_model=False | compile_mode=reduce-overhead | dense_profile=False
+curriculum_batches | stage1=batch768/ga4 | stage2=batch768/ga4 | stage3=batch768/ga4
+curriculum_spans | stage1=1 | stage2=1 | stage3=1
+bucket_summary | train={'wiki': 1773094, 'code': 26905} | val={'wiki': 197011, 'code': 2990}
+optimizer_groups | model:count=13,678,885,lr_scale=1.0000
+startup | main_optimizer_done
+startup | batcher_reused_prebuilt
+flat_preload_cache_override | max_loaded_shards=8 -> 0
+flat_preload_start | shards=40
+flat_preload_done | shards=40 | seconds=6.5
+startup | prebuilt_provider_done | batches=4861
+curriculum | step=1 | stage=stage1 | span=1 | batch_size=768 | grad_accum_steps=4 | freeze_memory=True | freeze_propagation=True | freeze_skip=True | bucket_weights={mixed_dialogue:1.000, arxiv:1.000, pubmed:1.000, dialogue:1.000, wiki:1.000, code:1.000, math:1.000, docs:1.000}
+progress | step=    1/4861 | stage=stage1 | span=1 | train_loss=9.7306 | lr=0.0001 | cpu_batch_ms=9.2 | prefetch_q=4860 | noisy_rate=0.0000 | noise_rms=0.000e+00 | elapsed=3.0s
+progress | step=   25/4861 | stage=stage1 | span=1 | train_loss=9.3543 | lr=0.000119238 | cpu_batch_ms=9.2 | prefetch_q=4836 | noisy_rate=0.0000 | noise_rms=0.000e+00 | elapsed=45.0s
+progress | step=   50/4861 | stage=stage1 | span=1 | train_loss=8.9470 | lr=0.000139279 | cpu_batch_ms=9.2 | prefetch_q=4811 | noisy_rate=0.0000 | noise_rms=0.000e+00 | elapsed=90.6s
+progress | step=   75/4861 | stage=stage1 | span=1 | train_loss=8.6491 | lr=0.000159319 | cpu_batch_ms=9.2 | prefetch_q=4786 | noisy_rate=0.0000 | noise_rms=0.000e+00 | elapsed=136.4s
+progress | step=  100/4861 | stage=stage1 | span=1 | train_loss=8.3545 | lr=0.000179359 | cpu_batch_ms=9.2 | prefetch_q=4761 | noisy_rate=0.0000 | noise_rms=0.000e+00 | elapsed=184.6s
+progress | step=  125/4861 | stage=stage1 | span=1 | train_loss=8.0229 | lr=0.000199399 | cpu_batch_ms=9.2 | prefetch_q=4736 | noisy_rate=0.0000 | noise_rms=0.000e+00 | elapsed=229.4s
+progress | step=  150/4861 | stage=stage1 | span=1 | train_loss=7.8080 | lr=0.000219439 | cpu_batch_ms=9.2 | prefetch_q=4711 | noisy_rate=0.0000 | noise_rms=0.000e+00 | elapsed=275.5s
+progress | step=  175/4861 | stage=stage1 | span=1 | train_loss=7.6363 | lr=0.000239479 | cpu_batch_ms=9.2 | prefetch_q=4686 | noisy_rate=0.0000 | noise_rms=0.000e+00 | elapsed=322.4s
+progress | step=  200/4861 | stage=stage1 | span=1 | train_loss=7.5851 | lr=0.000259519 | cpu_batch_ms=9.2 | prefetch_q=4661 | noisy_rate=0.0000 | noise_rms=0.000e+00 | elapsed=370.0s
+progress | step=  225/4861 | stage=stage1 | span=1 | train_loss=7.5713 | lr=0.000279559 | cpu_batch_ms=9.2 | prefetch_q=4636 | noisy_rate=0.0000 | noise_rms=0.000e+00 | elapsed=415.0s
+progress | step=  250/4861 | stage=stage1 | span=1 | train_loss=7.5549 | lr=0.000299599 | cpu_batch_ms=9.2 | prefetch_q=4611 | noisy_rate=0.0000 | noise_rms=0.000e+00 | elapsed=461.8s
+progress | step=  275/4861 | stage=stage1 | span=1 | train_loss=7.5548 | lr=0.000319639 | cpu_batch_ms=9.2 | prefetch_q=4586 | noisy_rate=0.0000 | noise_rms=0.000e+00 | elapsed=508.0s
+progress | step=  300/4861 | stage=stage1 | span=1 | train_loss=7.5555 | lr=0.000339679 | cpu_batch_ms=9.2 | prefetch_q=4561 | noisy_rate=0.0000 | noise_rms=0.000e+00 | elapsed=555.8s
+progress | step=  325/4861 | stage=stage1 | span=1 | train_loss=7.5494 | lr=0.000359719 | cpu_batch_ms=9.2 | prefetch_q=4536 | noisy_rate=0.0000 | noise_rms=0.000e+00 | elapsed=601.8s
+progress | step=  350/4861 | stage=stage1 | span=1 | train_loss=7.5616 | lr=0.00037976 | cpu_batch_ms=9.2 | prefetch_q=4511 | noisy_rate=0.0000 | noise_rms=0.000e+00 | elapsed=648.7s
+progress | step=  375/4861 | stage=stage1 | span=1 | train_loss=7.5640 | lr=0.0003998 | cpu_batch_ms=9.2 | prefetch_q=4486 | noisy_rate=0.0000 | noise_rms=0.000e+00 | elapsed=695.5s
+progress | step=  400/4861 | stage=stage1 | span=1 | train_loss=7.5481 | lr=0.00041984 | cpu_batch_ms=9.2 | prefetch_q=4461 | noisy_rate=0.0000 | noise_rms=0.000e+00 | elapsed=744.3s
+progress | step=  425/4861 | stage=stage1 | span=1 | train_loss=7.5432 | lr=0.00043988 | cpu_batch_ms=9.2 | prefetch_q=4436 | noisy_rate=0.0000 | noise_rms=0.000e+00 | elapsed=789.9s
+progress | step=  450/4861 | stage=stage1 | span=1 | train_loss=7.5495 | lr=0.00045992 | cpu_batch_ms=9.2 | prefetch_q=4411 | noisy_rate=0.0000 | noise_rms=0.000e+00 | elapsed=837.0s
+progress | step=  475/4861 | stage=stage1 | span=1 | train_loss=7.5610 | lr=0.00047996 | cpu_batch_ms=9.2 | prefetch_q=4386 | noisy_rate=0.0000 | noise_rms=0.000e+00 | elapsed=884.5s
+curriculum | step=487 | stage=stage2 | span=1 | batch_size=768 | grad_accum_steps=4 | freeze_memory=False | freeze_propagation=True | freeze_skip=True | bucket_weights={mixed_dialogue:1.000, arxiv:1.000, pubmed:1.000, dialogue:0.600, wiki:0.600, code:0.600, math:0.600, docs:0.600, math_qa:0.350, reasoning:0.350}
+progress | step=  500/4861 | stage=stage2 | span=1 | train_loss=9.5111 | lr=0.0005 | cpu_batch_ms=9.2 | prefetch_q=4361 | noisy_rate=0.0000 | noise_rms=0.000e+00 | elapsed=932.4s
+eval | step=500 | train_loss=9.5111 | val_loss=7.5679 | val_ppl=1935.13
+progress | step=  525/4861 | stage=stage2 | span=1 | train_loss=7.5555 | lr=0.0005 | cpu_batch_ms=9.2 | prefetch_q=4336 | noisy_rate=0.0000 | noise_rms=0.000e+00 | elapsed=977.7s
+progress | step=  550/4861 | stage=stage2 | span=1 | train_loss=7.5679 | lr=0.0005 | cpu_batch_ms=9.2 | prefetch_q=4311 | noisy_rate=0.0000 | noise_rms=0.000e+00 | elapsed=1024.9s
+progress | step=  575/4861 | stage=stage2 | span=1 | train_loss=7.5572 | lr=0.0005 | cpu_batch_ms=9.2 | prefetch_q=4286 | noisy_rate=0.0000 | noise_rms=0.000e+00 | elapsed=1071.9s
+progress | step=  600/4861 | stage=stage2 | span=1 | train_loss=7.5577 | lr=0.0005 | cpu_batch_ms=9.2 | prefetch_q=4261 | noisy_rate=0.0000 | noise_rms=0.000e+00 | elapsed=1120.1s
+progress | step=  625/4861 | stage=stage2 | span=1 | train_loss=7.5644 | lr=0.0005 | cpu_batch_ms=9.2 | prefetch_q=4236 | noisy_rate=0.0000 | noise_rms=0.000e+00 | elapsed=1166.1s
+progress | step=  650/4861 | stage=stage2 | span=1 | train_loss=7.5454 | lr=0.0005 | cpu_batch_ms=9.2 | prefetch_q=4211 | noisy_rate=0.0000 | noise_rms=0.000e+00 | elapsed=1212.6s
+progress | step=  675/4861 | stage=stage2 | span=1 | train_loss=7.5547 | lr=0.0005 | cpu_batch_ms=9.2 | prefetch_q=4186 | noisy_rate=0.0000 | noise_rms=0.000e+00 | elapsed=1259.5s
+progress | step=  700/4861 | stage=stage2 | span=1 | train_loss=7.5450 | lr=0.0005 | cpu_batch_ms=9.2 | prefetch_q=4161 | noisy_rate=0.0000 | noise_rms=0.000e+00 | elapsed=1308.8s
+progress | step=  725/4861 | stage=stage2 | span=1 | train_loss=7.5413 | lr=0.0005 | cpu_batch_ms=9.2 | prefetch_q=4136 | noisy_rate=0.0000 | noise_rms=0.000e+00 | elapsed=1354.3s
+progress | step=  750/4861 | stage=stage2 | span=1 | train_loss=7.5483 | lr=0.0005 | cpu_batch_ms=9.2 | prefetch_q=4111 | noisy_rate=0.0000 | noise_rms=0.000e+00 | elapsed=1400.7s
+progress | step=  775/4861 | stage=stage2 | span=1 | train_loss=7.5577 | lr=0.0005 | cpu_batch_ms=9.2 | prefetch_q=4086 | noisy_rate=0.0000 | noise_rms=0.000e+00 | elapsed=1447.6s

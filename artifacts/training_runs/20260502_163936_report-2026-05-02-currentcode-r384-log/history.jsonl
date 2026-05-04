@@ -1,0 +1,4 @@
+{"kind": "progress", "step": 1500, "total_steps": 9153, "stage": "stage2", "span": 1, "train_loss": 6.6421, "lr": 0.0005, "cpu_batch_ms": 6.2, "prefetch_q": 7653, "elapsed_s": 2127.8}
+{"kind": "eval", "step": 1500, "train_loss": 6.6421, "val_loss": 6.7827, "val_ppl": 882.48}
+{"kind": "progress", "step": 2000, "total_steps": 9153, "stage": "stage2", "span": 1, "train_loss": 6.2985, "lr": 0.0005, "cpu_batch_ms": 6.2, "prefetch_q": 7153, "elapsed_s": 2840.4}
+{"kind": "progress", "step": 2500, "total_steps": 9153, "stage": "stage2", "span": 1, "train_loss": 6.2293, "lr": 0.0005, "cpu_batch_ms": 6.2, "prefetch_q": 6653, "elapsed_s": 3553.0}

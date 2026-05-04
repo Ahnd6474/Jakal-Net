@@ -1,0 +1,17 @@
+{
+  "learning_rate": 0.0005,
+  "warmup_steps": 500,
+  "warmup_start_lr": 0.0001,
+  "lr_min_ratio": 0.2,
+  "lr_decay_start_step": 4000,
+  "lr_decay_steps": 0,
+  "direction_only_values": true,
+  "disable_feed_forward_layers": true,
+  "disable_memory_feed_forward_layers": true,
+  "pairwise_rank": 256,
+  "route_rank": 256,
+  "batch_size": 384,
+  "grad_accum_steps": 1,
+  "epochs": 1.0,
+  "run_name": "wiki2m-nomemory-b384-r256-h4-softsign-prebuild8x2-span1-1epoch-eval500-adamwfused-lr50e4-warmup500-hold4k-floor1e4-20260501"
+}
