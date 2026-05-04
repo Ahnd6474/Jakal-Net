@@ -11,7 +11,6 @@ import torch
 from torch import Tensor
 from torch.autograd import Function
 from torch.nn import functional as F
-from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from jakal_net.core import LayerDelta
 from jakal_net.kernel_common import (
@@ -23,28 +22,12 @@ from jakal_net.kernel_common import (
     supports_route_kernel,
 )
 from jakal_net.modules import (
-    BilinearPairwise,
     DiagonalBilinearPairwise,
     DiagonalBilinearRoute,
     HadamardMLPPairwise,
     LowRankBilinearPairwise,
     LowRankBilinearRoute,
-    MultiHeadPairwise,
     SourceTargetHadamardMLPRoute,
-)
-from jakal_net.triton_signed_smoothmax import (
-    diagonal_signed_smoothmax_backward_owner,
-    diagonal_signed_smoothmax_backward_tile_accumulate,
-    diagonal_signed_smoothmax_scores_and_head_grads_tile,
-    diagonal_signed_smoothmax_scores_tile,
-    lowrank_signed_smoothmax_backward_owner,
-    lowrank_signed_smoothmax_backward_tile_accumulate,
-    multihead_signed_smoothmax_head_grads,
-    multihead_signed_smoothmax_scores_and_head_grads_tile,
-    multihead_signed_smoothmax_scores,
-    multihead_signed_smoothmax_scores_tile,
-    signed_abs_softmax_edge_dot_tile,
-    triton_signed_smoothmax_available,
 )
 
 DEFAULT_NATIVE_MODULE = "jakal_net_native"
@@ -55,12 +38,8 @@ EXPERIMENTAL_FUSED_TRAINING_CHECKPOINT_STRIDE_ENV = "JAKAL_NET_FUSED_TRAINING_CH
 EXPERIMENTAL_SCAN_BACKWARD_CUDA_ENV = "JAKAL_NET_ENABLE_EXPERIMENTAL_SCAN_BACKWARD_CUDA"
 EXPERIMENTAL_CAUSAL_DENSE_PROP_FORWARD_CUDA_ENV = "JAKAL_NET_ENABLE_CAUSAL_DENSE_PROP_FORWARD_CUDA"
 EXPERIMENTAL_DIAGONAL_DENSE_PROP_CUDA_ENV = "JAKAL_NET_ENABLE_DIAGONAL_DENSE_PROP_CUDA"
-EXPERIMENTAL_BILINEAR_REDUCE_OVERHEAD_ENV = "JAKAL_NET_BILINEAR_REDUCE_OVERHEAD"
-EXPERIMENTAL_BILINEAR_NATIVE_BACKWARD_ENV = "JAKAL_NET_BILINEAR_NATIVE_BACKWARD"
 
 _FULL_TOPK_INDEX_CACHE: dict[tuple[str, tuple[int, ...]], Tensor] = {}
-_CAUSAL_TRIL_MASK_CACHE: dict[tuple[str, int, int], Tensor] = {}
-_BILINEAR_FORWARD_REDUCE_OVERHEAD: Any | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,6 +176,26 @@ def native_supports(op_name: str) -> bool:
 def native_supports_device(device_type: str) -> bool:
     status = native_status()
     return status.available and device_type in status.supported_devices
+
+
+def dense_apply_native_available(device_type: str) -> bool:
+    return native_supports("apply_delta_to_layer") and native_supports_device(device_type)
+
+
+def nomemory_causal_stack_fused_native_available(device_type: str) -> bool:
+    return (
+        native_supports("nomemory_causal_stack_fused")
+        and native_supports("nomemory_causal_stack_fused_backward_cuda")
+        and native_supports_device(device_type)
+    )
+
+
+def nomemory_causal_stack_ffn_fused_native_available(device_type: str) -> bool:
+    return (
+        native_supports("nomemory_causal_stack_ffn_fused")
+        and native_supports("nomemory_causal_stack_ffn_fused_backward_cuda")
+        and native_supports_device(device_type)
+    )
 
 
 def _native_scan_uses_legacy_low_rank_extension(
@@ -713,24 +712,6 @@ def _experimental_diagonal_dense_prop_cuda_enabled() -> bool:
     return _env_flag(EXPERIMENTAL_DIAGONAL_DENSE_PROP_CUDA_ENV)
 
 
-def _experimental_bilinear_reduce_overhead_enabled() -> bool:
-    return _env_flag(EXPERIMENTAL_BILINEAR_REDUCE_OVERHEAD_ENV)
-
-
-def _experimental_bilinear_native_backward_enabled() -> bool:
-    return _env_flag(EXPERIMENTAL_BILINEAR_NATIVE_BACKWARD_ENV)
-
-
-def _causal_tril_mask(nodes: int, device: torch.device) -> Tensor:
-    device_index = -1 if device.index is None else int(device.index)
-    key = (str(device.type), device_index, int(nodes))
-    mask = _CAUSAL_TRIL_MASK_CACHE.get(key)
-    if mask is None or mask.device != device:
-        mask = torch.ones((int(nodes), int(nodes)), dtype=torch.bool, device=device).tril()
-        _CAUSAL_TRIL_MASK_CACHE[key] = mask
-    return mask
-
-
 def _flatten_causal_memory_scan_args(
     *,
     aligned_s: Tensor,
@@ -916,6 +897,10 @@ def _native_scan_signed_softmax_state(state: Tensor) -> Tensor:
     return torch.sign(clean_state) * magnitude * float(state.shape[-1])
 
 
+def _native_scan_softsign_state(state: Tensor) -> Tensor:
+    return F.softsign(torch.nan_to_num(state))
+
+
 def _native_scan_signed_abs_softmax(scores: Tensor) -> Tensor:
     clean_scores = torch.nan_to_num(scores)
     return torch.nan_to_num(torch.sign(clean_scores) * torch.softmax(clean_scores.abs(), dim=-1))
@@ -960,8 +945,7 @@ def _native_scan_pairwise_scores(
             core_view_shape = [1] * projected_source.dim()
             core_view_shape[-3] = core_weight.shape[0]
             core_view_shape[-1] = core_weight.shape[1]
-            normalized_core = _normalized_lowrank_core(core_weight, dtype=src_val.dtype)
-            weighted_source = projected_source * normalized_core.view(*core_view_shape)
+            weighted_source = projected_source * core_weight.to(dtype=src_val.dtype).view(*core_view_shape)
             scores = torch.einsum("...hir,...hkr->...hik", weighted_source, projected_target)
             if packed_bias.numel() != 0:
                 scores = scores + packed_bias.to(dtype=scores.dtype).view(
@@ -984,9 +968,9 @@ def _native_scan_pairwise_scores(
         assert best_scores is not None
         return best_scores
     if pairwise_kind == "low_rank_bilinear":
-        projected_target = F.linear(dst_val, target_weight.to(dtype=dst_val.dtype), None)
         projected_source = F.linear(src_val, source_weight.to(dtype=src_val.dtype), None)
-        projected_source = projected_source * _normalized_lowrank_core(core_weight, dtype=src_val.dtype)
+        projected_source = projected_source * core_weight.to(dtype=src_val.dtype)
+        projected_target = F.linear(dst_val, target_weight.to(dtype=dst_val.dtype), None)
         scores = torch.einsum("...ir,...kr->...ik", projected_source, projected_target)
         if packed_bias.numel() != 0:
             scores = scores + packed_bias.to(dtype=scores.dtype)
@@ -1177,10 +1161,57 @@ def _native_scan_apply_delta(
     delta_val: Tensor,
     val_norm_weight: Tensor,
     val_norm_bias: Tensor,
+    *,
+    state_activation_name: str = "signed_softmax",
 ) -> tuple[Tensor, Tensor]:
-    next_state = _native_scan_signed_softmax_state(layer_state + delta_state)
+    if state_activation_name == "signed_softmax":
+        next_state = _native_scan_signed_softmax_state(layer_state + delta_state)
+    elif state_activation_name == "softsign":
+        next_state = _native_scan_softsign_state(layer_state + delta_state)
+    else:
+        raise ValueError(f"Unsupported state_activation_name: {state_activation_name!r}.")
     next_val = _native_scan_layer_norm(layer_val + delta_val, val_norm_weight, val_norm_bias)
     return next_state, next_val
+
+
+def dense_apply_native(
+    *,
+    layer_state: Tensor,
+    layer_val: Tensor,
+    delta_state: Tensor,
+    delta_val: Tensor,
+    val_norm_weight: Tensor,
+    val_norm_bias: Tensor,
+    state_activation_name: str = "signed_softmax",
+) -> tuple[Tensor, Tensor]:
+    if dense_apply_native_available(layer_state.device.type):
+        result = _native_module().apply_delta_to_layer(
+            layer_state,
+            layer_val,
+            delta_state,
+            delta_val,
+            val_norm_weight,
+            val_norm_bias,
+            state_activation_name,
+            True,
+        )
+        if (
+            isinstance(result, tuple)
+            and len(result) == 2
+            and isinstance(result[0], Tensor)
+            and isinstance(result[1], Tensor)
+        ):
+            return result
+        raise TypeError("apply_delta_to_layer must return (state, val).")
+    return _native_scan_apply_delta(
+        layer_state,
+        layer_val,
+        delta_state,
+        delta_val,
+        val_norm_weight,
+        val_norm_bias,
+        state_activation_name=state_activation_name,
+    )
 
 
 def _native_scan_read_memory(
@@ -2296,6 +2327,707 @@ def _save_optional_tensor(tensor: Tensor | None, reference: Tensor) -> Tensor:
 
 def _load_optional_tensor(tensor: Tensor) -> Tensor | None:
     return None if tensor.numel() == 0 else tensor
+
+
+def _split_nomemory_stack_layer_tensors(
+    layer_tensors: tuple[Tensor, ...],
+    num_layers: int,
+) -> tuple[tuple[Tensor, ...], tuple[Tensor, ...], tuple[Tensor, ...], tuple[Tensor, ...], tuple[Tensor, ...], tuple[Tensor, ...]]:
+    expected = num_layers * 6
+    if len(layer_tensors) != expected:
+        raise ValueError(f"Expected {expected} layer tensors, got {len(layer_tensors)}.")
+    source_weights: list[Tensor] = []
+    target_weights: list[Tensor] = []
+    core_weights: list[Tensor] = []
+    bias_tensors: list[Tensor] = []
+    norm_weights: list[Tensor] = []
+    norm_biases: list[Tensor] = []
+    for offset in range(0, expected, 6):
+        source_weights.append(layer_tensors[offset])
+        target_weights.append(layer_tensors[offset + 1])
+        core_weights.append(layer_tensors[offset + 2])
+        bias_tensors.append(layer_tensors[offset + 3])
+        norm_weights.append(layer_tensors[offset + 4])
+        norm_biases.append(layer_tensors[offset + 5])
+    return (
+        tuple(source_weights),
+        tuple(target_weights),
+        tuple(core_weights),
+        tuple(bias_tensors),
+        tuple(norm_weights),
+        tuple(norm_biases),
+    )
+
+
+def _split_nomemory_stack_ffn_layer_tensors(
+    layer_tensors: tuple[Tensor, ...],
+    num_layers: int,
+) -> tuple[
+    tuple[Tensor, ...],
+    tuple[Tensor, ...],
+    tuple[Tensor, ...],
+    tuple[Tensor, ...],
+    tuple[Tensor, ...],
+    tuple[Tensor, ...],
+]:
+    expected = num_layers * 6
+    if len(layer_tensors) != expected:
+        raise ValueError(f"Expected {expected} FFN layer tensors, got {len(layer_tensors)}.")
+    norm_weights: list[Tensor] = []
+    norm_biases: list[Tensor] = []
+    in_weights: list[Tensor] = []
+    in_biases: list[Tensor] = []
+    out_weights: list[Tensor] = []
+    out_biases: list[Tensor] = []
+    for offset in range(0, expected, 6):
+        norm_weights.append(layer_tensors[offset])
+        norm_biases.append(layer_tensors[offset + 1])
+        in_weights.append(layer_tensors[offset + 2])
+        in_biases.append(layer_tensors[offset + 3])
+        out_weights.append(layer_tensors[offset + 4])
+        out_biases.append(layer_tensors[offset + 5])
+    return (
+        tuple(norm_weights),
+        tuple(norm_biases),
+        tuple(in_weights),
+        tuple(in_biases),
+        tuple(out_weights),
+        tuple(out_biases),
+    )
+
+
+def _split_nomemory_stack_specs(
+    specs: tuple[tuple[int, int, int, int], ...],
+) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    compress_kinds: list[int] = []
+    windows: list[int] = []
+    target_block_sizes: list[int] = []
+    source_block_sizes: list[int] = []
+    for compress_kind, window, target_block_size, source_block_size in specs:
+        compress_kinds.append(int(compress_kind))
+        windows.append(int(window))
+        target_block_sizes.append(int(target_block_size))
+        source_block_sizes.append(int(source_block_size))
+    return (
+        tuple(compress_kinds),
+        tuple(windows),
+        tuple(target_block_sizes),
+        tuple(source_block_sizes),
+    )
+
+
+def nomemory_causal_stack_fused_native(
+    *,
+    token_val: Tensor,
+    anchor_state: Tensor,
+    anchor_val: Tensor,
+    s_prediction_weight: Tensor,
+    prediction_input_norm_weight: Tensor,
+    prediction_input_norm_bias: Tensor | None,
+    sequence_tensors: tuple[Tensor, ...],
+    prediction_tensors: tuple[Tensor, ...],
+    sequence_specs: tuple[tuple[int, int, int, int], ...],
+    prediction_specs: tuple[tuple[int, int, int, int], ...],
+    state_activation_name: str,
+) -> Tensor:
+    num_sequence_layers = len(sequence_specs)
+    num_prediction_layers = len(prediction_specs)
+    (
+        sequence_source_weights,
+        sequence_target_weights,
+        sequence_core_weights,
+        sequence_biases,
+        sequence_norm_weights,
+        sequence_norm_biases,
+    ) = _split_nomemory_stack_layer_tensors(sequence_tensors, num_sequence_layers)
+    (
+        prediction_source_weights,
+        prediction_target_weights,
+        prediction_core_weights,
+        prediction_biases,
+        prediction_norm_weights,
+        prediction_norm_biases,
+    ) = _split_nomemory_stack_layer_tensors(prediction_tensors, num_prediction_layers)
+    (
+        sequence_compress_kinds,
+        sequence_windows,
+        sequence_target_block_sizes,
+        sequence_source_block_sizes,
+    ) = _split_nomemory_stack_specs(sequence_specs)
+    (
+        prediction_compress_kinds,
+        prediction_windows,
+        prediction_target_block_sizes,
+        prediction_source_block_sizes,
+    ) = _split_nomemory_stack_specs(prediction_specs)
+    result = _native_module().nomemory_causal_stack_fused(
+        token_val,
+        anchor_state,
+        anchor_val,
+        s_prediction_weight,
+        prediction_input_norm_weight,
+        _save_optional_tensor(prediction_input_norm_bias, token_val),
+        list(sequence_source_weights),
+        list(sequence_target_weights),
+        list(sequence_core_weights),
+        list(sequence_biases),
+        list(sequence_norm_weights),
+        list(sequence_norm_biases),
+        list(sequence_compress_kinds),
+        list(sequence_windows),
+        list(sequence_target_block_sizes),
+        list(sequence_source_block_sizes),
+        list(prediction_source_weights),
+        list(prediction_target_weights),
+        list(prediction_core_weights),
+        list(prediction_biases),
+        list(prediction_norm_weights),
+        list(prediction_norm_biases),
+        list(prediction_compress_kinds),
+        list(prediction_windows),
+        list(prediction_target_block_sizes),
+        list(prediction_source_block_sizes),
+        state_activation_name,
+    )
+    if not isinstance(result, Tensor):
+        raise TypeError("nomemory_causal_stack_fused must return a Tensor.")
+    return result
+
+
+def nomemory_causal_stack_fused_trace_native(
+    *,
+    token_val: Tensor,
+    anchor_state: Tensor,
+    anchor_val: Tensor,
+    s_prediction_weight: Tensor,
+    prediction_input_norm_weight: Tensor,
+    prediction_input_norm_bias: Tensor | None,
+    sequence_tensors: tuple[Tensor, ...],
+    prediction_tensors: tuple[Tensor, ...],
+    sequence_specs: tuple[tuple[int, int, int, int], ...],
+    prediction_specs: tuple[tuple[int, int, int, int], ...],
+    state_activation_name: str,
+) -> tuple[Tensor, tuple[Tensor, ...]]:
+    num_sequence_layers = len(sequence_specs)
+    num_prediction_layers = len(prediction_specs)
+    (
+        sequence_source_weights,
+        sequence_target_weights,
+        sequence_core_weights,
+        sequence_biases,
+        sequence_norm_weights,
+        sequence_norm_biases,
+    ) = _split_nomemory_stack_layer_tensors(sequence_tensors, num_sequence_layers)
+    (
+        prediction_source_weights,
+        prediction_target_weights,
+        prediction_core_weights,
+        prediction_biases,
+        prediction_norm_weights,
+        prediction_norm_biases,
+    ) = _split_nomemory_stack_layer_tensors(prediction_tensors, num_prediction_layers)
+    (
+        sequence_compress_kinds,
+        sequence_windows,
+        sequence_target_block_sizes,
+        sequence_source_block_sizes,
+    ) = _split_nomemory_stack_specs(sequence_specs)
+    (
+        prediction_compress_kinds,
+        prediction_windows,
+        prediction_target_block_sizes,
+        prediction_source_block_sizes,
+    ) = _split_nomemory_stack_specs(prediction_specs)
+    result = _native_module().nomemory_causal_stack_fused_trace(
+        token_val,
+        anchor_state,
+        anchor_val,
+        s_prediction_weight,
+        prediction_input_norm_weight,
+        _save_optional_tensor(prediction_input_norm_bias, token_val),
+        list(sequence_source_weights),
+        list(sequence_target_weights),
+        list(sequence_core_weights),
+        list(sequence_biases),
+        list(sequence_norm_weights),
+        list(sequence_norm_biases),
+        list(sequence_compress_kinds),
+        list(sequence_windows),
+        list(sequence_target_block_sizes),
+        list(sequence_source_block_sizes),
+        list(prediction_source_weights),
+        list(prediction_target_weights),
+        list(prediction_core_weights),
+        list(prediction_biases),
+        list(prediction_norm_weights),
+        list(prediction_norm_biases),
+        list(prediction_compress_kinds),
+        list(prediction_windows),
+        list(prediction_target_block_sizes),
+        list(prediction_source_block_sizes),
+        state_activation_name,
+    )
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise TypeError("nomemory_causal_stack_fused_trace must return (query_val, trace_tensors).")
+    query_val, trace_tensors = result
+    if not isinstance(query_val, Tensor):
+        raise TypeError("nomemory_causal_stack_fused_trace query_val must be a Tensor.")
+    if not isinstance(trace_tensors, (list, tuple)):
+        raise TypeError("nomemory_causal_stack_fused_trace trace_tensors must be a sequence.")
+    return query_val, tuple(trace_tensors)
+
+
+def _nomemory_causal_stack_fused_backward_cuda(
+    *,
+    token_val: Tensor,
+    anchor_state: Tensor,
+    anchor_val: Tensor,
+    s_prediction_weight: Tensor,
+    prediction_input_norm_weight: Tensor,
+    prediction_input_norm_bias: Tensor | None,
+    sequence_tensors: tuple[Tensor, ...],
+    prediction_tensors: tuple[Tensor, ...],
+    sequence_specs: tuple[tuple[int, int, int, int], ...],
+    prediction_specs: tuple[tuple[int, int, int, int], ...],
+    state_activation_name: str,
+    trace_tensors: tuple[Tensor, ...],
+    grad_query_val: Tensor,
+) -> tuple[Tensor | None, ...]:
+    num_sequence_layers = len(sequence_specs)
+    num_prediction_layers = len(prediction_specs)
+    (
+        sequence_source_weights,
+        sequence_target_weights,
+        sequence_core_weights,
+        sequence_biases,
+        sequence_norm_weights,
+        sequence_norm_biases,
+    ) = _split_nomemory_stack_layer_tensors(sequence_tensors, num_sequence_layers)
+    (
+        prediction_source_weights,
+        prediction_target_weights,
+        prediction_core_weights,
+        prediction_biases,
+        prediction_norm_weights,
+        prediction_norm_biases,
+    ) = _split_nomemory_stack_layer_tensors(prediction_tensors, num_prediction_layers)
+    (
+        sequence_compress_kinds,
+        sequence_windows,
+        sequence_target_block_sizes,
+        sequence_source_block_sizes,
+    ) = _split_nomemory_stack_specs(sequence_specs)
+    (
+        prediction_compress_kinds,
+        prediction_windows,
+        prediction_target_block_sizes,
+        prediction_source_block_sizes,
+    ) = _split_nomemory_stack_specs(prediction_specs)
+    result = _native_module().nomemory_causal_stack_fused_backward_cuda(
+        token_val,
+        anchor_state,
+        anchor_val,
+        s_prediction_weight,
+        prediction_input_norm_weight,
+        _save_optional_tensor(prediction_input_norm_bias, token_val),
+        list(sequence_source_weights),
+        list(sequence_target_weights),
+        list(sequence_core_weights),
+        list(sequence_biases),
+        list(sequence_norm_weights),
+        list(sequence_norm_biases),
+        list(sequence_compress_kinds),
+        list(sequence_windows),
+        list(sequence_target_block_sizes),
+        list(sequence_source_block_sizes),
+        list(prediction_source_weights),
+        list(prediction_target_weights),
+        list(prediction_core_weights),
+        list(prediction_biases),
+        list(prediction_norm_weights),
+        list(prediction_norm_biases),
+        list(prediction_compress_kinds),
+        list(prediction_windows),
+        list(prediction_target_block_sizes),
+        list(prediction_source_block_sizes),
+        state_activation_name,
+        list(trace_tensors),
+        grad_query_val,
+    )
+    expected = 6 + len(sequence_tensors) + len(prediction_tensors)
+    if not isinstance(result, (list, tuple)) or len(result) != expected:
+        raise TypeError("nomemory_causal_stack_fused_backward_cuda must return one grad per saved tensor.")
+    result = tuple(None if grad is None else grad for grad in result)
+    base_grads = list(result[:6])
+    offset = 6
+    grouped_sequence_grads = [result[offset + (index * num_sequence_layers): offset + ((index + 1) * num_sequence_layers)] for index in range(6)]
+    offset += num_sequence_layers * 6
+    grouped_prediction_grads = [result[offset + (index * num_prediction_layers): offset + ((index + 1) * num_prediction_layers)] for index in range(6)]
+    flat_grads: list[Tensor | None] = base_grads
+    for layer_index in range(num_sequence_layers):
+        for group_index in range(6):
+            flat_grads.append(grouped_sequence_grads[group_index][layer_index])
+    for layer_index in range(num_prediction_layers):
+        for group_index in range(6):
+            flat_grads.append(grouped_prediction_grads[group_index][layer_index])
+    return tuple(flat_grads)
+
+
+def nomemory_causal_stack_ffn_fused_native(
+    *,
+    token_val: Tensor,
+    anchor_state: Tensor,
+    anchor_val: Tensor,
+    s_prediction_weight: Tensor,
+    prediction_input_norm_weight: Tensor,
+    prediction_input_norm_bias: Tensor | None,
+    sequence_tensors: tuple[Tensor, ...],
+    prediction_tensors: tuple[Tensor, ...],
+    sequence_ffn_tensors: tuple[Tensor, ...],
+    prediction_ffn_tensors: tuple[Tensor, ...],
+    sequence_specs: tuple[tuple[int, int, int, int], ...],
+    prediction_specs: tuple[tuple[int, int, int, int], ...],
+    state_activation_name: str,
+) -> Tensor:
+    num_sequence_layers = len(sequence_specs)
+    num_prediction_layers = len(prediction_specs)
+    (
+        sequence_source_weights,
+        sequence_target_weights,
+        sequence_core_weights,
+        sequence_biases,
+        sequence_norm_weights,
+        sequence_norm_biases,
+    ) = _split_nomemory_stack_layer_tensors(sequence_tensors, num_sequence_layers)
+    (
+        prediction_source_weights,
+        prediction_target_weights,
+        prediction_core_weights,
+        prediction_biases,
+        prediction_norm_weights,
+        prediction_norm_biases,
+    ) = _split_nomemory_stack_layer_tensors(prediction_tensors, num_prediction_layers)
+    (
+        sequence_ffn_norm_weights,
+        sequence_ffn_norm_biases,
+        sequence_ffn_in_weights,
+        sequence_ffn_in_biases,
+        sequence_ffn_out_weights,
+        sequence_ffn_out_biases,
+    ) = _split_nomemory_stack_ffn_layer_tensors(sequence_ffn_tensors, num_sequence_layers)
+    (
+        prediction_ffn_norm_weights,
+        prediction_ffn_norm_biases,
+        prediction_ffn_in_weights,
+        prediction_ffn_in_biases,
+        prediction_ffn_out_weights,
+        prediction_ffn_out_biases,
+    ) = _split_nomemory_stack_ffn_layer_tensors(prediction_ffn_tensors, num_prediction_layers)
+    (
+        sequence_compress_kinds,
+        sequence_windows,
+        sequence_target_block_sizes,
+        sequence_source_block_sizes,
+    ) = _split_nomemory_stack_specs(sequence_specs)
+    (
+        prediction_compress_kinds,
+        prediction_windows,
+        prediction_target_block_sizes,
+        prediction_source_block_sizes,
+    ) = _split_nomemory_stack_specs(prediction_specs)
+    result = _native_module().nomemory_causal_stack_ffn_fused(
+        token_val,
+        anchor_state,
+        anchor_val,
+        s_prediction_weight,
+        prediction_input_norm_weight,
+        _save_optional_tensor(prediction_input_norm_bias, token_val),
+        list(sequence_source_weights),
+        list(sequence_target_weights),
+        list(sequence_core_weights),
+        list(sequence_biases),
+        list(sequence_norm_weights),
+        list(sequence_norm_biases),
+        list(sequence_ffn_norm_weights),
+        list(sequence_ffn_norm_biases),
+        list(sequence_ffn_in_weights),
+        list(sequence_ffn_in_biases),
+        list(sequence_ffn_out_weights),
+        list(sequence_ffn_out_biases),
+        list(sequence_compress_kinds),
+        list(sequence_windows),
+        list(sequence_target_block_sizes),
+        list(sequence_source_block_sizes),
+        list(prediction_source_weights),
+        list(prediction_target_weights),
+        list(prediction_core_weights),
+        list(prediction_biases),
+        list(prediction_norm_weights),
+        list(prediction_norm_biases),
+        list(prediction_ffn_norm_weights),
+        list(prediction_ffn_norm_biases),
+        list(prediction_ffn_in_weights),
+        list(prediction_ffn_in_biases),
+        list(prediction_ffn_out_weights),
+        list(prediction_ffn_out_biases),
+        list(prediction_compress_kinds),
+        list(prediction_windows),
+        list(prediction_target_block_sizes),
+        list(prediction_source_block_sizes),
+        state_activation_name,
+    )
+    if not isinstance(result, Tensor):
+        raise TypeError("nomemory_causal_stack_ffn_fused must return a Tensor.")
+    return result
+
+
+def nomemory_causal_stack_ffn_fused_trace_native(
+    *,
+    token_val: Tensor,
+    anchor_state: Tensor,
+    anchor_val: Tensor,
+    s_prediction_weight: Tensor,
+    prediction_input_norm_weight: Tensor,
+    prediction_input_norm_bias: Tensor | None,
+    sequence_tensors: tuple[Tensor, ...],
+    prediction_tensors: tuple[Tensor, ...],
+    sequence_ffn_tensors: tuple[Tensor, ...],
+    prediction_ffn_tensors: tuple[Tensor, ...],
+    sequence_specs: tuple[tuple[int, int, int, int], ...],
+    prediction_specs: tuple[tuple[int, int, int, int], ...],
+    state_activation_name: str,
+) -> tuple[Tensor, tuple[Tensor, ...]]:
+    num_sequence_layers = len(sequence_specs)
+    num_prediction_layers = len(prediction_specs)
+    (
+        sequence_source_weights,
+        sequence_target_weights,
+        sequence_core_weights,
+        sequence_biases,
+        sequence_norm_weights,
+        sequence_norm_biases,
+    ) = _split_nomemory_stack_layer_tensors(sequence_tensors, num_sequence_layers)
+    (
+        prediction_source_weights,
+        prediction_target_weights,
+        prediction_core_weights,
+        prediction_biases,
+        prediction_norm_weights,
+        prediction_norm_biases,
+    ) = _split_nomemory_stack_layer_tensors(prediction_tensors, num_prediction_layers)
+    (
+        sequence_ffn_norm_weights,
+        sequence_ffn_norm_biases,
+        sequence_ffn_in_weights,
+        sequence_ffn_in_biases,
+        sequence_ffn_out_weights,
+        sequence_ffn_out_biases,
+    ) = _split_nomemory_stack_ffn_layer_tensors(sequence_ffn_tensors, num_sequence_layers)
+    (
+        prediction_ffn_norm_weights,
+        prediction_ffn_norm_biases,
+        prediction_ffn_in_weights,
+        prediction_ffn_in_biases,
+        prediction_ffn_out_weights,
+        prediction_ffn_out_biases,
+    ) = _split_nomemory_stack_ffn_layer_tensors(prediction_ffn_tensors, num_prediction_layers)
+    (
+        sequence_compress_kinds,
+        sequence_windows,
+        sequence_target_block_sizes,
+        sequence_source_block_sizes,
+    ) = _split_nomemory_stack_specs(sequence_specs)
+    (
+        prediction_compress_kinds,
+        prediction_windows,
+        prediction_target_block_sizes,
+        prediction_source_block_sizes,
+    ) = _split_nomemory_stack_specs(prediction_specs)
+    result = _native_module().nomemory_causal_stack_ffn_fused_trace(
+        token_val,
+        anchor_state,
+        anchor_val,
+        s_prediction_weight,
+        prediction_input_norm_weight,
+        _save_optional_tensor(prediction_input_norm_bias, token_val),
+        list(sequence_source_weights),
+        list(sequence_target_weights),
+        list(sequence_core_weights),
+        list(sequence_biases),
+        list(sequence_norm_weights),
+        list(sequence_norm_biases),
+        list(sequence_ffn_norm_weights),
+        list(sequence_ffn_norm_biases),
+        list(sequence_ffn_in_weights),
+        list(sequence_ffn_in_biases),
+        list(sequence_ffn_out_weights),
+        list(sequence_ffn_out_biases),
+        list(sequence_compress_kinds),
+        list(sequence_windows),
+        list(sequence_target_block_sizes),
+        list(sequence_source_block_sizes),
+        list(prediction_source_weights),
+        list(prediction_target_weights),
+        list(prediction_core_weights),
+        list(prediction_biases),
+        list(prediction_norm_weights),
+        list(prediction_norm_biases),
+        list(prediction_ffn_norm_weights),
+        list(prediction_ffn_norm_biases),
+        list(prediction_ffn_in_weights),
+        list(prediction_ffn_in_biases),
+        list(prediction_ffn_out_weights),
+        list(prediction_ffn_out_biases),
+        list(prediction_compress_kinds),
+        list(prediction_windows),
+        list(prediction_target_block_sizes),
+        list(prediction_source_block_sizes),
+        state_activation_name,
+    )
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise TypeError("nomemory_causal_stack_ffn_fused_trace must return (query_val, trace_tensors).")
+    query_val, trace_tensors = result
+    if not isinstance(query_val, Tensor):
+        raise TypeError("nomemory_causal_stack_ffn_fused_trace query_val must be a Tensor.")
+    if not isinstance(trace_tensors, (list, tuple)):
+        raise TypeError("nomemory_causal_stack_ffn_fused_trace trace_tensors must be a sequence.")
+    return query_val, tuple(trace_tensors)
+
+
+def _nomemory_causal_stack_ffn_fused_backward_cuda(
+    *,
+    token_val: Tensor,
+    anchor_state: Tensor,
+    anchor_val: Tensor,
+    s_prediction_weight: Tensor,
+    prediction_input_norm_weight: Tensor,
+    prediction_input_norm_bias: Tensor | None,
+    sequence_tensors: tuple[Tensor, ...],
+    prediction_tensors: tuple[Tensor, ...],
+    sequence_ffn_tensors: tuple[Tensor, ...],
+    prediction_ffn_tensors: tuple[Tensor, ...],
+    sequence_specs: tuple[tuple[int, int, int, int], ...],
+    prediction_specs: tuple[tuple[int, int, int, int], ...],
+    state_activation_name: str,
+    trace_tensors: tuple[Tensor, ...],
+    grad_query_val: Tensor,
+) -> tuple[Tensor | None, ...]:
+    num_sequence_layers = len(sequence_specs)
+    num_prediction_layers = len(prediction_specs)
+    (
+        sequence_source_weights,
+        sequence_target_weights,
+        sequence_core_weights,
+        sequence_biases,
+        sequence_norm_weights,
+        sequence_norm_biases,
+    ) = _split_nomemory_stack_layer_tensors(sequence_tensors, num_sequence_layers)
+    (
+        prediction_source_weights,
+        prediction_target_weights,
+        prediction_core_weights,
+        prediction_biases,
+        prediction_norm_weights,
+        prediction_norm_biases,
+    ) = _split_nomemory_stack_layer_tensors(prediction_tensors, num_prediction_layers)
+    (
+        sequence_ffn_norm_weights,
+        sequence_ffn_norm_biases,
+        sequence_ffn_in_weights,
+        sequence_ffn_in_biases,
+        sequence_ffn_out_weights,
+        sequence_ffn_out_biases,
+    ) = _split_nomemory_stack_ffn_layer_tensors(sequence_ffn_tensors, num_sequence_layers)
+    (
+        prediction_ffn_norm_weights,
+        prediction_ffn_norm_biases,
+        prediction_ffn_in_weights,
+        prediction_ffn_in_biases,
+        prediction_ffn_out_weights,
+        prediction_ffn_out_biases,
+    ) = _split_nomemory_stack_ffn_layer_tensors(prediction_ffn_tensors, num_prediction_layers)
+    (
+        sequence_compress_kinds,
+        sequence_windows,
+        sequence_target_block_sizes,
+        sequence_source_block_sizes,
+    ) = _split_nomemory_stack_specs(sequence_specs)
+    (
+        prediction_compress_kinds,
+        prediction_windows,
+        prediction_target_block_sizes,
+        prediction_source_block_sizes,
+    ) = _split_nomemory_stack_specs(prediction_specs)
+    result = _native_module().nomemory_causal_stack_ffn_fused_backward_cuda(
+        token_val,
+        anchor_state,
+        anchor_val,
+        s_prediction_weight,
+        prediction_input_norm_weight,
+        _save_optional_tensor(prediction_input_norm_bias, token_val),
+        list(sequence_source_weights),
+        list(sequence_target_weights),
+        list(sequence_core_weights),
+        list(sequence_biases),
+        list(sequence_norm_weights),
+        list(sequence_norm_biases),
+        list(sequence_ffn_norm_weights),
+        list(sequence_ffn_norm_biases),
+        list(sequence_ffn_in_weights),
+        list(sequence_ffn_in_biases),
+        list(sequence_ffn_out_weights),
+        list(sequence_ffn_out_biases),
+        list(sequence_compress_kinds),
+        list(sequence_windows),
+        list(sequence_target_block_sizes),
+        list(sequence_source_block_sizes),
+        list(prediction_source_weights),
+        list(prediction_target_weights),
+        list(prediction_core_weights),
+        list(prediction_biases),
+        list(prediction_norm_weights),
+        list(prediction_norm_biases),
+        list(prediction_ffn_norm_weights),
+        list(prediction_ffn_norm_biases),
+        list(prediction_ffn_in_weights),
+        list(prediction_ffn_in_biases),
+        list(prediction_ffn_out_weights),
+        list(prediction_ffn_out_biases),
+        list(prediction_compress_kinds),
+        list(prediction_windows),
+        list(prediction_target_block_sizes),
+        list(prediction_source_block_sizes),
+        state_activation_name,
+        list(trace_tensors),
+        grad_query_val,
+    )
+    expected = 6 + len(sequence_tensors) + len(prediction_tensors) + len(sequence_ffn_tensors) + len(prediction_ffn_tensors)
+    if not isinstance(result, (list, tuple)) or len(result) != expected:
+        raise TypeError("nomemory_causal_stack_ffn_fused_backward_cuda must return one grad per saved tensor.")
+    result = tuple(None if grad is None else grad for grad in result)
+    base_grads = list(result[:6])
+    offset = 6
+    grouped_sequence_grads = [result[offset + (index * num_sequence_layers): offset + ((index + 1) * num_sequence_layers)] for index in range(6)]
+    offset += num_sequence_layers * 6
+    grouped_prediction_grads = [result[offset + (index * num_prediction_layers): offset + ((index + 1) * num_prediction_layers)] for index in range(6)]
+    offset += num_prediction_layers * 6
+    grouped_sequence_ffn_grads = [result[offset + (index * num_sequence_layers): offset + ((index + 1) * num_sequence_layers)] for index in range(6)]
+    offset += num_sequence_layers * 6
+    grouped_prediction_ffn_grads = [result[offset + (index * num_prediction_layers): offset + ((index + 1) * num_prediction_layers)] for index in range(6)]
+    flat_grads: list[Tensor | None] = base_grads
+    for layer_index in range(num_sequence_layers):
+        for group_index in range(6):
+            flat_grads.append(grouped_sequence_grads[group_index][layer_index])
+    for layer_index in range(num_prediction_layers):
+        for group_index in range(6):
+            flat_grads.append(grouped_prediction_grads[group_index][layer_index])
+    for layer_index in range(num_sequence_layers):
+        for group_index in range(6):
+            flat_grads.append(grouped_sequence_ffn_grads[group_index][layer_index])
+    for layer_index in range(num_prediction_layers):
+        for group_index in range(6):
+            flat_grads.append(grouped_prediction_ffn_grads[group_index][layer_index])
+    return tuple(flat_grads)
 
 
 def _accumulator_dtype_for(tensor: Tensor) -> torch.dtype:
@@ -3887,9 +4619,9 @@ def _low_rank_dense_signed_abs_forward(
     ) = _flatten_dense_tensors(layer_val, projected_state, projected_val)
     target_step = nodes if target_block_size <= 0 else min(int(target_block_size), nodes)
     projected_target = torch.matmul(flat_val, target_weight.t()).contiguous()
-    projected_source = torch.matmul(flat_val, source_weight.t()).contiguous()
     weighted_source = (
-        projected_source * _normalized_lowrank_core(core_weight, dtype=flat_val.dtype).view(1, 1, -1)
+        torch.matmul(flat_val, source_weight.t())
+        * core_weight.to(dtype=flat_val.dtype).view(1, 1, -1)
     ).contiguous()
     state_blocks: list[Tensor] = []
     val_blocks: list[Tensor] = []
@@ -3936,9 +4668,9 @@ def _low_rank_dense_signed_abs_forward_native(
         out_dim,
     ) = _flatten_dense_tensors(layer_val, projected_state, projected_val)
     projected_target = torch.matmul(flat_val, target_weight.t()).contiguous()
-    projected_source = torch.matmul(flat_val, source_weight.t()).contiguous()
     weighted_source = (
-        projected_source * _normalized_lowrank_core(core_weight, dtype=flat_val.dtype).view(1, 1, -1)
+        torch.matmul(flat_val, source_weight.t())
+        * core_weight.to(dtype=flat_val.dtype).view(1, 1, -1)
     ).contiguous()
     if bias is not None:
         bias_column = bias.to(dtype=weighted_source.dtype).reshape(1, 1, 1).expand(
@@ -4105,12 +4837,9 @@ class _LowRankPropagationTopK(Function):
             out_dim,
         ) = _flatten_dense_tensors(layer_val, projected_state, projected_val)
         k = min(int(topk), nodes)
-        source_weight_cast = source_weight.to(dtype=flat_val.dtype)
-        target_weight_cast = target_weight.to(dtype=flat_val.dtype)
-        core_weight_cast = core_weight.to(dtype=flat_val.dtype)
-        projected_target = torch.matmul(flat_val, target_weight_cast.t()).contiguous()
-        projected_source = torch.matmul(flat_val, source_weight_cast.t()).contiguous()
-        weighted_projected_source = projected_source * core_weight_cast.view(1, 1, -1).to(
+        projected_target = torch.matmul(flat_val, target_weight.t()).contiguous()
+        projected_source = torch.matmul(flat_val, source_weight.t()).contiguous()
+        weighted_projected_source = projected_source * core_weight.view(1, 1, -1).to(
             projected_source.dtype
         )
         score_bias = float(bias.item()) if bias is not None else 0.0
@@ -4160,12 +4889,9 @@ class _LowRankPropagationTopK(Function):
             nodes,
             out_dim,
         ) = _flatten_dense_tensors(layer_val, projected_state, projected_val)
-        source_weight_cast = source_weight.to(dtype=flat_val.dtype)
-        target_weight_cast = target_weight.to(dtype=flat_val.dtype)
-        core_weight_cast = core_weight.to(dtype=flat_val.dtype)
-        projected_target = torch.matmul(flat_val, target_weight_cast.t()).contiguous()
-        projected_source = torch.matmul(flat_val, source_weight_cast.t()).contiguous()
-        weighted_projected_source = projected_source * core_weight_cast.view(1, 1, -1).to(
+        projected_target = torch.matmul(flat_val, target_weight.t()).contiguous()
+        projected_source = torch.matmul(flat_val, source_weight.t()).contiguous()
+        weighted_projected_source = projected_source * core_weight.view(1, 1, -1).to(
             projected_source.dtype
         )
         scores = torch.bmm(projected_target, weighted_projected_source.transpose(1, 2))
@@ -4234,172 +4960,6 @@ class _LowRankPropagationTopK(Function):
             None,
             None,
             None,
-            None,
-        )
-
-
-
-def _bilinear_causal_signed_abs_forward_impl(
-    flat_val: Tensor,
-    state_f32: Tensor,
-    val_f32: Tensor,
-    weight: Tensor,
-    bias: Tensor,
-    has_bias: bool,
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    nodes = int(flat_val.shape[-2])
-    projected_target = torch.matmul(flat_val, weight).contiguous()
-    scores = torch.bmm(projected_target, flat_val.transpose(1, 2)).to(dtype=torch.float32)
-    if has_bias:
-        scores = scores + bias.to(dtype=torch.float32)
-    mask_3d = _causal_tril_mask(nodes, flat_val.device).view(1, nodes, nodes)
-    stats = scores.abs().masked_fill(~mask_3d, float("-inf"))
-    probs = torch.softmax(stats, dim=-1)
-    edges = torch.sign(scores) * probs
-    delta_state = torch.bmm(edges, state_f32.unsqueeze(-1)).squeeze(-1)
-    delta_val = torch.bmm(edges, val_f32)
-    return delta_state, delta_val, projected_target, edges
-
-
-def _bilinear_causal_signed_abs_forward(
-    flat_val: Tensor,
-    state_f32: Tensor,
-    val_f32: Tensor,
-    weight: Tensor,
-    bias: Tensor,
-    has_bias: bool,
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    global _BILINEAR_FORWARD_REDUCE_OVERHEAD
-    if _experimental_bilinear_reduce_overhead_enabled():
-        compiler = getattr(torch, "compile", None)
-        if compiler is not None:
-            if _BILINEAR_FORWARD_REDUCE_OVERHEAD is None:
-                _BILINEAR_FORWARD_REDUCE_OVERHEAD = compiler(
-                    _bilinear_causal_signed_abs_forward_impl,
-                    mode="reduce-overhead",
-                    fullgraph=False,
-                )
-            return _BILINEAR_FORWARD_REDUCE_OVERHEAD(
-                flat_val,
-                state_f32,
-                val_f32,
-                weight,
-                bias,
-                has_bias,
-            )
-    return _bilinear_causal_signed_abs_forward_impl(
-        flat_val,
-        state_f32,
-        val_f32,
-        weight,
-        bias,
-        has_bias,
-    )
-
-
-class _BilinearPropagationCausalDenseSignedAbs(Function):
-    @staticmethod
-    def forward(
-        ctx: Any,
-        layer_val: Tensor,
-        projected_state: Tensor,
-        projected_val: Tensor,
-        weight: Tensor,
-        bias: Tensor,
-        has_bias: bool,
-    ) -> tuple[Tensor, Tensor]:
-        (
-            flat_val,
-            flat_projected_state,
-            flat_projected_val,
-            batch_shape,
-            nodes,
-            out_dim,
-        ) = _flatten_dense_tensors(layer_val, projected_state, projected_val)
-        if out_dim != flat_val.shape[-1]:
-            raise ValueError("bilinear causal dense propagation requires projected_val dim == layer dim.")
-        flat_val = flat_val.contiguous()
-        state_f32 = flat_projected_state.to(dtype=torch.float32).contiguous()
-        val_f32 = flat_projected_val.to(dtype=torch.float32).contiguous()
-        weight_cast = weight.to(dtype=flat_val.dtype).contiguous()
-        delta_state, delta_val, projected_target, edges = _bilinear_causal_signed_abs_forward(
-            flat_val,
-            state_f32,
-            val_f32,
-            weight_cast,
-            bias,
-            has_bias,
-        )
-        ctx.has_bias = bool(has_bias)
-        ctx.batch_shape = batch_shape
-        ctx.nodes = nodes
-        ctx.out_dim = out_dim
-        ctx.layer_dtype = layer_val.dtype
-        ctx.projected_state_dtype = projected_state.dtype
-        ctx.projected_val_dtype = projected_val.dtype
-        ctx.weight_dtype = weight.dtype
-        ctx.score_bias = float(bias.item()) if has_bias else 0.0
-        ctx.save_for_backward(flat_val, state_f32, val_f32, weight_cast, bias, projected_target, edges)
-        return (
-            delta_state.to(dtype=projected_state.dtype).reshape(*batch_shape, nodes),
-            delta_val.to(dtype=projected_val.dtype).reshape(*batch_shape, nodes, out_dim),
-        )
-
-    @staticmethod
-    def backward(ctx: Any, grad_delta_state: Tensor, grad_delta_val: Tensor) -> tuple[Any, ...]:
-        flat_val, state_f32, val_f32, weight, bias, projected_target, edges = ctx.saved_tensors
-        nodes = ctx.nodes
-        out_dim = ctx.out_dim
-        flat_grad_state = grad_delta_state.reshape(-1, nodes).to(dtype=torch.float32).contiguous()
-        flat_grad_val = grad_delta_val.reshape(-1, nodes, out_dim).to(dtype=torch.float32).contiguous()
-        if _experimental_bilinear_native_backward_enabled():
-            score_dtype = projected_target.dtype
-            flat_val_score = flat_val.to(dtype=score_dtype).contiguous()
-            projected_target = projected_target.to(dtype=score_dtype).contiguous()
-            (
-                grad_source_val,
-                grad_projected_target,
-                grad_projected_state,
-                grad_projected_val,
-                grad_bias_tensor,
-            ) = _native_module().bilinear_propagation_causal_dense_signed_abs_backward_cuda(
-                flat_val_score,
-                projected_target,
-                state_f32,
-                val_f32,
-                flat_grad_state,
-                flat_grad_val,
-                float(ctx.score_bias),
-            )
-            grad_bias = grad_bias_tensor.reshape(()) if ctx.has_bias else None
-        else:
-            edges = edges.to(dtype=torch.float32)
-            signs = torch.sign(edges)
-            probs = edges.abs()
-            grad_edges = flat_grad_state.unsqueeze(-1) * state_f32.unsqueeze(1)
-            grad_edges = grad_edges + torch.bmm(flat_grad_val, val_f32.transpose(1, 2))
-            dot = (grad_edges * edges).sum(dim=-1, keepdim=True)
-            grad_scores = signs * probs * (signs * grad_edges - dot)
-            flat_val_for_bmm = flat_val.to(dtype=projected_target.dtype)
-            grad_scores_for_bmm = grad_scores.to(dtype=projected_target.dtype)
-            grad_projected_target = torch.bmm(grad_scores_for_bmm, flat_val_for_bmm)
-            grad_source_val = torch.bmm(grad_scores_for_bmm.transpose(1, 2), projected_target)
-            grad_projected_state = torch.bmm(edges.transpose(1, 2), flat_grad_state.unsqueeze(-1)).squeeze(-1)
-            grad_projected_val = torch.bmm(edges.transpose(1, 2), flat_grad_val)
-            grad_bias = grad_scores.sum().reshape(()) if ctx.has_bias else None
-        weight_for_bmm = weight.to(dtype=grad_projected_target.dtype)
-        grad_target_val = torch.matmul(grad_projected_target, weight_for_bmm.transpose(0, 1))
-        grad_layer = grad_source_val.to(dtype=grad_target_val.dtype) + grad_target_val
-        grad_weight = torch.matmul(
-            flat_val.reshape(-1, flat_val.shape[-1]).to(dtype=torch.float32).t(),
-            grad_projected_target.reshape(-1, grad_projected_target.shape[-1]).to(dtype=torch.float32),
-        ).to(dtype=ctx.weight_dtype)
-        return (
-            grad_layer.reshape(*ctx.batch_shape, nodes, out_dim).to(dtype=ctx.layer_dtype),
-            grad_projected_state.reshape(*ctx.batch_shape, nodes).to(dtype=ctx.projected_state_dtype),
-            grad_projected_val.reshape(*ctx.batch_shape, nodes, out_dim).to(dtype=ctx.projected_val_dtype),
-            grad_weight,
-            grad_bias,
             None,
         )
 
@@ -4604,12 +5164,9 @@ class _LowRankPropagationWindow(Function):
             nodes,
             out_dim,
         ) = _flatten_dense_tensors(layer_val, projected_state, projected_val)
-        source_weight_cast = source_weight.to(dtype=flat_val.dtype)
-        target_weight_cast = target_weight.to(dtype=flat_val.dtype)
-        core_weight_cast = core_weight.to(dtype=flat_val.dtype)
-        projected_target = torch.matmul(flat_val, target_weight_cast.t()).contiguous()
-        projected_source = torch.matmul(flat_val, source_weight_cast.t()).contiguous()
-        weighted_projected_source = projected_source * core_weight_cast.view(1, 1, -1).to(
+        projected_target = torch.matmul(flat_val, target_weight.t()).contiguous()
+        projected_source = torch.matmul(flat_val, source_weight.t()).contiguous()
+        weighted_projected_source = projected_source * core_weight.view(1, 1, -1).to(
             projected_source.dtype
         )
         score_bias = float(bias.item()) if bias is not None else 0.0
@@ -4689,84 +5246,8 @@ class _LowRankPropagationWindow(Function):
             nodes,
             out_dim,
         ) = _flatten_dense_tensors(layer_val, projected_state, projected_val)
-        source_weight_cast = source_weight.to(dtype=flat_val.dtype)
-        target_weight_cast = target_weight.to(dtype=flat_val.dtype)
-        core_weight_cast = core_weight.to(dtype=flat_val.dtype)
-        projected_target = torch.matmul(flat_val, target_weight_cast.t()).contiguous()
-        projected_source = torch.matmul(flat_val, source_weight_cast.t()).contiguous()
-        raw_projected_target = projected_target
-        raw_projected_source = projected_source
-        if int(ctx.compress_kind) == 1 and int(ctx.window) + 1 >= int(nodes):
-            flat_grad_state = grad_delta_state.reshape(-1, nodes).to(dtype=torch.float32).contiguous()
-            flat_grad_val = grad_delta_val.reshape(-1, nodes, out_dim).to(dtype=torch.float32).contiguous()
-            state_f32 = flat_projected_state.to(dtype=torch.float32).contiguous()
-            val_f32 = flat_projected_val.to(dtype=torch.float32).contiguous()
-            normalized_core = _normalized_lowrank_core(core_weight, dtype=projected_source.dtype)
-            weighted_source = (projected_source * normalized_core.view(1, 1, -1)).contiguous()
-            scores = torch.bmm(projected_target, weighted_source.transpose(1, 2)).to(dtype=torch.float32)
-            if bias is not None:
-                scores = scores + bias.to(dtype=torch.float32)
-            mask = torch.ones((nodes, nodes), dtype=torch.bool, device=flat_val.device).tril()
-            mask_3d = mask.view(1, nodes, nodes)
-            scores = scores.masked_fill(~mask_3d, 0.0)
-            stats = scores.abs().masked_fill(~mask_3d, float("-inf"))
-            probs = torch.softmax(stats, dim=-1)
-            signs = torch.sign(scores)
-            edges = signs * probs * mask_3d.to(dtype=probs.dtype)
-
-            grad_edges = flat_grad_state.unsqueeze(-1) * state_f32.unsqueeze(1)
-            grad_edges = grad_edges + torch.bmm(flat_grad_val, val_f32.transpose(1, 2))
-            grad_edges = grad_edges * mask_3d.to(dtype=grad_edges.dtype)
-            dot = (grad_edges * edges).sum(dim=-1, keepdim=True)
-            grad_scores = signs * probs * (signs * grad_edges - dot)
-            grad_scores = grad_scores * mask_3d.to(dtype=grad_scores.dtype)
-
-            grad_projected_target = torch.bmm(
-                grad_scores.to(dtype=projected_target.dtype),
-                weighted_source,
-            )
-            grad_weighted_source = torch.bmm(
-                grad_scores.transpose(1, 2).to(dtype=projected_target.dtype),
-                projected_target,
-            )
-            grad_projected_source = grad_weighted_source * core_weight_cast.view(1, 1, -1).to(
-                grad_weighted_source.dtype
-            )
-            grad_projected_state = torch.bmm(edges.transpose(1, 2), flat_grad_state.unsqueeze(-1)).squeeze(-1)
-            grad_projected_val = torch.bmm(edges.transpose(1, 2), flat_grad_val)
-            grad_normalized_core = (grad_weighted_source * projected_source).sum(dim=(0, 1))
-            grad_core_weight = _grad_raw_lowrank_core_from_normalized(
-                grad_normalized_core,
-                core_weight,
-            )
-            grad_bias = grad_scores.sum().reshape(()) if ctx.has_bias else None
-            flat_val_2d = flat_val.reshape(-1, flat_val.shape[-1]).to(dtype=torch.float32)
-            grad_target_weight = torch.matmul(
-                grad_projected_target.reshape(-1, grad_projected_target.shape[-1]).to(dtype=torch.float32).t(),
-                flat_val_2d,
-            ).to(dtype=target_weight.dtype)
-            grad_source_weight = torch.matmul(
-                grad_projected_source.reshape(-1, grad_projected_source.shape[-1]).to(dtype=torch.float32).t(),
-                flat_val_2d,
-            ).to(dtype=source_weight.dtype)
-            grad_layer = torch.matmul(grad_projected_target, target_weight_cast.to(dtype=grad_projected_target.dtype))
-            grad_layer = grad_layer + torch.matmul(
-                grad_projected_source,
-                source_weight_cast.to(dtype=grad_projected_source.dtype),
-            )
-            return (
-                grad_layer.reshape_as(layer_val).to(dtype=layer_val.dtype),
-                grad_projected_state.reshape_as(projected_state).to(dtype=projected_state.dtype),
-                grad_projected_val.reshape_as(projected_val).to(dtype=projected_val.dtype),
-                grad_source_weight,
-                grad_target_weight,
-                grad_core_weight,
-                grad_bias,
-                None,
-                None,
-                None,
-                None,
-            )
+        projected_target = torch.matmul(flat_val, target_weight.t()).contiguous()
+        projected_source = torch.matmul(flat_val, source_weight.t()).contiguous()
         width = min(ctx.window + 1, nodes)
         index_2d, valid_2d = _window_source_indices(
             target_nodes=nodes,
@@ -4873,2058 +5354,6 @@ class _LowRankPropagationWindow(Function):
             None,
             None,
         )
-
-
-def _multihead_dense_tile_size() -> int:
-    raw = os.environ.get("JAKAL_NET_MULTIHEAD_DENSE_TILE", "64").strip()
-    try:
-        value = int(raw)
-    except ValueError:
-        value = 64
-    return max(16, min(1024, value))
-
-
-def _low_rank_signed_smoothmax_exact_checkpoint_enabled() -> bool:
-    value = os.environ.get("JAKAL_NET_LOWRANK_SIGNED_SMOOTHMAX_EXACT_CHECKPOINT", "1").strip().lower()
-    return value in {"1", "true", "yes", "on"}
-
-
-def _multihead_dense_cuda_kernel_enabled() -> bool:
-    value = os.environ.get("JAKAL_NET_MULTIHEAD_DENSE_CUDA_KERNEL", "1").strip().lower()
-    return value in {"1", "true", "yes", "on", "cuda"}
-
-
-def _multihead_signed_smoothmax_fused_cuda_enabled() -> bool:
-    value = os.environ.get("JAKAL_NET_MULTIHEAD_SIGNED_SMOOTHMAX_FUSED_CUDA", "0").strip().lower()
-    return value in {"1", "true", "yes", "on", "cuda"}
-
-
-def _multihead_signed_smoothmax_backward_cuda_enabled() -> bool:
-    value = os.environ.get("JAKAL_NET_MULTIHEAD_SIGNED_SMOOTHMAX_BACKWARD_CUDA", "0").strip().lower()
-    return value in {"1", "true", "yes", "on", "cuda"}
-
-
-def _multihead_signed_smoothmax_triton_enabled() -> bool:
-    value = os.environ.get("JAKAL_NET_MULTIHEAD_SIGNED_SMOOTHMAX_TRITON", "0").strip().lower()
-    return value in {"1", "true", "yes", "on", "triton"}
-
-
-def _multihead_signed_smoothmax_triton_forward_enabled(kind: str | None = None) -> bool:
-    default = "0"
-    if kind == "lowrank":
-        default = "1"
-        specific_name = "JAKAL_NET_MULTIHEAD_SIGNED_SMOOTHMAX_TRITON_FORWARD_LOWRANK"
-    elif kind == "diagonal":
-        default = "0"
-        specific_name = "JAKAL_NET_MULTIHEAD_SIGNED_SMOOTHMAX_TRITON_FORWARD_DIAGONAL"
-    else:
-        specific_name = "JAKAL_NET_MULTIHEAD_SIGNED_SMOOTHMAX_TRITON_FORWARD"
-    specific = os.environ.get(specific_name)
-    if specific is not None:
-        value = specific.strip().lower()
-        return value in {"1", "true", "yes", "on", "triton"}
-    value = os.environ.get("JAKAL_NET_MULTIHEAD_SIGNED_SMOOTHMAX_TRITON_FORWARD", default).strip().lower()
-    return value in {"1", "true", "yes", "on", "triton"}
-
-
-def _multihead_signed_smoothmax_triton_backward_enabled(kind: str | None = None) -> bool:
-    default = "0"
-    if kind == "lowrank":
-        default = "1"
-        specific_name = "JAKAL_NET_MULTIHEAD_SIGNED_SMOOTHMAX_TRITON_BACKWARD_LOWRANK"
-    elif kind == "diagonal":
-        default = "1"
-        specific_name = "JAKAL_NET_MULTIHEAD_SIGNED_SMOOTHMAX_TRITON_BACKWARD_DIAGONAL"
-    else:
-        specific_name = "JAKAL_NET_MULTIHEAD_SIGNED_SMOOTHMAX_TRITON_BACKWARD"
-    specific = os.environ.get(specific_name)
-    if specific is not None:
-        value = specific.strip().lower()
-        return value in {"1", "true", "yes", "on", "triton"}
-    value = os.environ.get("JAKAL_NET_MULTIHEAD_SIGNED_SMOOTHMAX_TRITON_BACKWARD", default).strip().lower()
-    return value in {"1", "true", "yes", "on", "triton"}
-
-
-def _multihead_signed_smoothmax_triton_edge_dot_enabled() -> bool:
-    value = os.environ.get("JAKAL_NET_MULTIHEAD_SIGNED_SMOOTHMAX_TRITON_EDGE_DOT", "1").strip().lower()
-    return value in {"1", "true", "yes", "on", "triton"}
-
-
-def _multihead_signed_smoothmax_triton_diagonal_tile_enabled() -> bool:
-    value = os.environ.get("JAKAL_NET_MULTIHEAD_SIGNED_SMOOTHMAX_TRITON_DIAGONAL_TILE", "1").strip().lower()
-    return value in {"1", "true", "yes", "on", "triton"}
-
-
-def _multihead_signed_smoothmax_owner_reduction_enabled(kind: str | None = None) -> bool:
-    default = "0"
-    if kind == "lowrank":
-        specific_name = "JAKAL_NET_MULTIHEAD_SIGNED_SMOOTHMAX_OWNER_REDUCTION_LOWRANK"
-    elif kind == "diagonal":
-        specific_name = "JAKAL_NET_MULTIHEAD_SIGNED_SMOOTHMAX_OWNER_REDUCTION_DIAGONAL"
-    else:
-        specific_name = "JAKAL_NET_MULTIHEAD_SIGNED_SMOOTHMAX_OWNER_REDUCTION"
-    specific = os.environ.get(specific_name)
-    if specific is not None:
-        value = specific.strip().lower()
-        return value in {"1", "true", "yes", "on"}
-    value = os.environ.get("JAKAL_NET_MULTIHEAD_SIGNED_SMOOTHMAX_OWNER_REDUCTION", default).strip().lower()
-    return value in {"1", "true", "yes", "on"}
-
-
-def _multihead_signed_smoothmax_lowrank_source_partial_enabled() -> bool:
-    value = os.environ.get("JAKAL_NET_MULTIHEAD_SIGNED_SMOOTHMAX_SOURCE_PARTIAL_LOWRANK", "1").strip().lower()
-    return value in {"1", "true", "yes", "on"}
-
-
-def _lowrank_smoothmax_bmm_cuda_enabled() -> bool:
-    value = os.environ.get("JAKAL_NET_LOWRANK_SMOOTHMAX_BMM_CUDA", "1").strip().lower()
-    return value in {"1", "true", "yes", "on"}
-
-def _normalized_lowrank_core(core: Tensor, *, dtype: torch.dtype | None = None) -> Tensor:
-    cast = core.to(dtype=dtype or core.dtype)
-    denom = torch.linalg.vector_norm(cast, ord=2, dim=-1, keepdim=True).clamp_min(1e-6)
-    return cast / denom
-
-
-def _grad_raw_lowrank_core_from_normalized(
-    grad_normalized_core: Tensor,
-    raw_core: Tensor,
-) -> Tensor:
-    core = raw_core.to(dtype=grad_normalized_core.dtype)
-    denom = torch.linalg.vector_norm(core, ord=2, dim=-1, keepdim=True).clamp_min(1e-6)
-    unit = core / denom
-    dot = (grad_normalized_core * unit).sum(dim=-1, keepdim=True)
-    grad_core = (grad_normalized_core - unit * dot) / denom
-    return grad_core.to(dtype=raw_core.dtype)
-
-
-def _multihead_signed_smoothmax_tile(
-    *,
-    projected_target: Tensor,
-    weighted_source: Tensor,
-    bias_arg: Tensor,
-    has_bias: bool,
-    source_start: int,
-    source_end: int,
-    allow_triton: bool = True,
-    return_head_grads: bool = False,
-) -> tuple[Tensor, Tensor | None, Tensor]:
-    heads = int(projected_target.shape[0])
-    batch = int(projected_target.shape[1])
-    nodes = int(projected_target.shape[2])
-    rank_dim = int(projected_target.shape[3])
-    tile_nodes = int(source_end - source_start)
-    use_triton = (
-        allow_triton
-        and projected_target.device.type == "cuda"
-        and triton_signed_smoothmax_available()
-        and heads <= 4
-    )
-    source_indices = torch.arange(source_start, source_end, device=projected_target.device)
-    target_indices = torch.arange(nodes, device=projected_target.device)
-    valid_mask = source_indices.view(1, 1, tile_nodes) <= target_indices.view(1, nodes, 1)
-    source_tile_bhnr = weighted_source[:, :, source_start:source_end, :].permute(1, 0, 2, 3).contiguous()
-    target_bhnr = projected_target.permute(1, 0, 2, 3).contiguous()
-    if use_triton:
-        if return_head_grads:
-            combined, head_grads = multihead_signed_smoothmax_scores_and_head_grads_tile(
-                target_bhnr,
-                source_tile_bhnr,
-                source_start,
-                bias_arg if has_bias else None,
-            )
-        else:
-            combined = multihead_signed_smoothmax_scores_tile(
-                target_bhnr,
-                source_tile_bhnr,
-                bias_arg if has_bias else None,
-            )
-            head_grads = None
-        combined = combined.masked_fill(~valid_mask, float("-inf"))
-        if not return_head_grads:
-            return combined, None, valid_mask
-        return combined, head_grads.masked_fill(~valid_mask.unsqueeze(0), 0.0), valid_mask
-    target_flat = projected_target.reshape(heads * batch, nodes, rank_dim)
-    source_flat = weighted_source[:, :, source_start:source_end, :].reshape(heads * batch, tile_nodes, rank_dim)
-    scores_raw = torch.bmm(target_flat, source_flat.transpose(1, 2)).reshape(
-        heads,
-        batch,
-        nodes,
-        tile_nodes,
-    )
-    if has_bias:
-        scores_raw = scores_raw + bias_arg.to(dtype=scores_raw.dtype).view(heads, 1, 1, 1)
-    stacked_scores = scores_raw.permute(1, 2, 3, 0).contiguous().float()
-    head_probs = torch.softmax(stacked_scores.abs(), dim=-1)
-    combined_raw = (stacked_scores * head_probs).sum(dim=-1)
-    combined = combined_raw.masked_fill(~valid_mask, float("-inf"))
-    if not return_head_grads:
-        return combined, None, valid_mask
-    head_grads = head_probs * (1.0 + torch.sign(stacked_scores) * (stacked_scores - combined_raw.unsqueeze(-1)))
-    head_grads = head_grads.masked_fill(~valid_mask.unsqueeze(-1), 0.0)
-    return combined, head_grads.permute(3, 0, 1, 2).contiguous(), valid_mask
-
-
-def _signed_smoothmax_row_stats_from_tiles(
-    *,
-    projected_target: Tensor,
-    weighted_source: Tensor,
-    bias_arg: Tensor,
-    has_bias: bool,
-    tile_size: int,
-) -> tuple[Tensor, Tensor]:
-    batch = int(projected_target.shape[1])
-    nodes = int(projected_target.shape[2])
-    row_max = torch.full((batch, nodes), float("-inf"), dtype=torch.float32, device=projected_target.device)
-    row_denom = torch.zeros((batch, nodes), dtype=torch.float32, device=projected_target.device)
-    for source_start in range(0, nodes, tile_size):
-        source_end = min(source_start + tile_size, nodes)
-        combined, _, valid_mask = _multihead_signed_smoothmax_tile(
-            projected_target=projected_target,
-            weighted_source=weighted_source,
-            bias_arg=bias_arg,
-            has_bias=has_bias,
-            source_start=source_start,
-            source_end=source_end,
-            return_head_grads=False,
-        )
-        stats = combined.abs().masked_fill(~valid_mask, float("-inf"))
-        tile_max = stats.amax(dim=-1)
-        new_max = torch.maximum(row_max, tile_max)
-        old_scale = torch.exp(
-            torch.where(
-                torch.isfinite(row_max),
-                row_max - new_max,
-                torch.full_like(new_max, float("-inf")),
-            )
-        )
-        tile_exp = torch.exp(stats - new_max.unsqueeze(-1)).masked_fill(~valid_mask, 0.0)
-        row_denom = row_denom * old_scale + tile_exp.sum(dim=-1)
-        row_max = new_max
-    return row_max, row_denom.clamp_min(1.0e-20)
-
-
-def _signed_smoothmax_backward_recompute_tiles(
-    *,
-    weighted_source: Tensor,
-    projected_source: Tensor,
-    projected_target: Tensor,
-    core_cast: Tensor,
-    bias_arg: Tensor,
-    has_bias: bool,
-    row_max: Tensor,
-    row_denom: Tensor,
-    flat_projected_state: Tensor,
-    flat_projected_val: Tensor,
-    flat_grad_state: Tensor,
-    flat_grad_val: Tensor,
-    tile_size: int,
-    use_raw_weighted_edges: bool,
-    allow_triton: bool = True,
-) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-    heads = int(projected_source.shape[0])
-    batch_flat = int(projected_target.shape[1])
-    nodes = int(projected_target.shape[2])
-    rank_dim = int(projected_target.shape[3])
-    grad_projected_source = torch.zeros_like(projected_source, dtype=torch.float32)
-    grad_projected_target = torch.zeros_like(projected_target, dtype=torch.float32)
-    grad_projected_state = torch.zeros_like(flat_projected_state)
-    grad_projected_val = torch.zeros_like(flat_projected_val)
-    grad_core_weights = torch.zeros_like(core_cast, dtype=torch.float32)
-    grad_biases = torch.zeros_like(bias_arg, dtype=torch.float32) if has_bias else torch.empty(0, device=projected_target.device)
-    num_tiles = (nodes + tile_size - 1) // tile_size
-    use_triton_backward = _multihead_signed_smoothmax_triton_backward_enabled("lowrank") and triton_signed_smoothmax_available()
-    grad_core_weight_partials = (
-        torch.zeros((num_tiles, heads, rank_dim), dtype=torch.float32, device=projected_target.device)
-        if use_triton_backward
-        else None
-    )
-    grad_bias_partials = (
-        torch.zeros((num_tiles, heads), dtype=torch.float32, device=projected_target.device)
-        if use_triton_backward and has_bias
-        else None
-    )
-    use_owner_reduction = (
-        use_triton_backward
-        and use_raw_weighted_edges
-        and _multihead_signed_smoothmax_owner_reduction_enabled("lowrank")
-    )
-    use_source_partial = use_triton_backward and _multihead_signed_smoothmax_lowrank_source_partial_enabled()
-    edge_dot = torch.zeros((batch_flat, nodes), dtype=torch.float32, device=projected_target.device)
-    grad_state_expanded = flat_grad_state.unsqueeze(-1)
-
-    for tile_index, source_start in enumerate(range(0, nodes, tile_size)):
-        source_end = min(source_start + tile_size, nodes)
-        scores, _, valid_mask = _multihead_signed_smoothmax_tile(
-            projected_target=projected_target,
-            weighted_source=weighted_source,
-            bias_arg=bias_arg,
-            has_bias=has_bias,
-            source_start=source_start,
-            source_end=source_end,
-            allow_triton=allow_triton,
-            return_head_grads=False,
-        )
-        probs = torch.exp(scores.abs() - row_max.unsqueeze(-1)).masked_fill(~valid_mask, 0.0) / row_denom.unsqueeze(-1)
-        edges = torch.sign(scores) * probs
-        if use_raw_weighted_edges:
-            source_strength = flat_projected_state[:, source_start:source_end]
-            weighted_val = flat_projected_val[:, source_start:source_end, :] * source_strength.unsqueeze(-1)
-            weighted_edges = edges * source_strength.unsqueeze(1)
-            grad_edges = grad_state_expanded * source_strength.unsqueeze(1)
-            grad_edges = grad_edges + torch.bmm(flat_grad_val, weighted_val.transpose(1, 2))
-            grad_projected_state[:, source_start:source_end] += torch.bmm(
-                edges.transpose(1, 2),
-                grad_state_expanded,
-            ).squeeze(-1)
-            grad_projected_state[:, source_start:source_end] += (
-                torch.bmm(edges.transpose(1, 2), flat_grad_val)
-                * flat_projected_val[:, source_start:source_end, :]
-            ).sum(dim=-1)
-            grad_projected_val[:, source_start:source_end, :] += torch.bmm(
-                weighted_edges.transpose(1, 2),
-                flat_grad_val,
-            )
-        else:
-            grad_edges = grad_state_expanded * flat_projected_state[:, source_start:source_end].unsqueeze(1)
-            grad_edges = grad_edges + torch.bmm(
-                flat_grad_val,
-                flat_projected_val[:, source_start:source_end, :].transpose(1, 2),
-            )
-            grad_projected_state[:, source_start:source_end] += torch.bmm(
-                edges.transpose(1, 2),
-                grad_state_expanded,
-            ).squeeze(-1)
-            grad_projected_val[:, source_start:source_end, :] += torch.bmm(
-                edges.transpose(1, 2),
-                flat_grad_val,
-            )
-        if (
-            projected_target.device.type == "cuda"
-            and triton_signed_smoothmax_available()
-            and _multihead_signed_smoothmax_triton_edge_dot_enabled()
-        ):
-            edge_dot = edge_dot + signed_abs_softmax_edge_dot_tile(
-                scores,
-                grad_edges,
-                row_max,
-                row_denom,
-                source_start,
-            )
-        else:
-            edge_dot = edge_dot + (grad_edges * edges).sum(dim=-1)
-
-    if use_owner_reduction:
-        (
-            grad_projected_target,
-            grad_projected_source,
-            grad_core_partials,
-            grad_bias_partials_owner,
-        ) = lowrank_signed_smoothmax_backward_owner(
-            projected_target,
-            projected_source,
-            weighted_source,
-            core_cast,
-            flat_projected_state,
-            flat_projected_val,
-            flat_grad_state,
-            flat_grad_val,
-            row_max,
-            row_denom,
-            edge_dot,
-            bias_arg if has_bias else None,
-        )
-        grad_core_weights += grad_core_partials.sum(dim=(0, 1))
-        if has_bias and grad_bias_partials_owner is not None:
-            grad_biases += grad_bias_partials_owner.sum(dim=(0, 1))
-    else:
-        for tile_index, source_start in enumerate(range(0, nodes, tile_size)):
-            source_end = min(source_start + tile_size, nodes)
-            if use_raw_weighted_edges:
-                source_strength = flat_projected_state[:, source_start:source_end]
-                weighted_val = flat_projected_val[:, source_start:source_end, :] * source_strength.unsqueeze(-1)
-                grad_edges = grad_state_expanded * source_strength.unsqueeze(1)
-                grad_edges = grad_edges + torch.bmm(flat_grad_val, weighted_val.transpose(1, 2))
-            else:
-                grad_edges = grad_state_expanded * flat_projected_state[:, source_start:source_end].unsqueeze(1)
-                grad_edges = grad_edges + torch.bmm(
-                    flat_grad_val,
-                    flat_projected_val[:, source_start:source_end, :].transpose(1, 2),
-                )
-            if use_triton_backward:
-                grad_source_arg = grad_projected_source
-                grad_source_row_offset: int | None = None
-                if use_source_partial:
-                    grad_source_arg = torch.zeros(
-                        (heads, batch_flat, int(source_end - source_start), rank_dim),
-                        dtype=torch.float32,
-                        device=projected_target.device,
-                    )
-                    grad_source_row_offset = 0
-                lowrank_signed_smoothmax_backward_tile_accumulate(
-                    projected_target,
-                    projected_source[:, :, source_start:source_end, :],
-                    weighted_source[:, :, source_start:source_end, :],
-                    core_cast,
-                    source_start,
-                    grad_edges,
-                    row_max,
-                    row_denom,
-                    edge_dot,
-                    grad_projected_target,
-                    grad_source_arg,
-                    grad_core_weight_partials[tile_index],
-                    grad_bias_partials[tile_index] if grad_bias_partials is not None else None,
-                    bias_arg if has_bias else None,
-                    grad_source_row_offset=grad_source_row_offset,
-                )
-                if use_source_partial:
-                    grad_projected_source[:, :, source_start:source_end, :] += grad_source_arg
-                continue
-            scores, head_grads, valid_mask = _multihead_signed_smoothmax_tile(
-                projected_target=projected_target,
-                weighted_source=weighted_source,
-                bias_arg=bias_arg,
-                has_bias=has_bias,
-                source_start=source_start,
-                source_end=source_end,
-                allow_triton=allow_triton,
-                return_head_grads=True,
-            )
-            assert head_grads is not None
-            probs = torch.exp(scores.abs() - row_max.unsqueeze(-1)).masked_fill(~valid_mask, 0.0) / row_denom.unsqueeze(-1)
-            signs = torch.sign(scores)
-            grad_scores = signs * probs * (signs * grad_edges - edge_dot.unsqueeze(-1))
-            grad_scores = grad_scores.masked_fill(~valid_mask, 0.0)
-            grad_scores_h = grad_scores.unsqueeze(0) * head_grads.to(dtype=grad_scores.dtype)
-            grad_scores_flat = grad_scores_h.reshape(heads * batch_flat, nodes, tile_nodes).to(dtype=projected_target.dtype)
-            weighted_source_tile = weighted_source[:, :, source_start:source_end, :].reshape(
-                heads * batch_flat,
-                tile_nodes,
-                rank_dim,
-            )
-            projected_target_flat = projected_target.reshape(heads * batch_flat, nodes, rank_dim)
-            grad_projected_target_tile = torch.bmm(
-                grad_scores_flat,
-                weighted_source_tile,
-            ).reshape(heads, batch_flat, nodes, rank_dim)
-            grad_weighted_source_tile = torch.bmm(
-                grad_scores_flat.transpose(1, 2),
-                projected_target_flat,
-            ).reshape(heads, batch_flat, tile_nodes, rank_dim)
-            source_slice = projected_source[:, :, source_start:source_end, :]
-            grad_projected_target += grad_projected_target_tile.float()
-            grad_projected_source[:, :, source_start:source_end, :] += (
-                grad_weighted_source_tile * core_cast.view(heads, 1, 1, rank_dim)
-            ).float()
-            grad_core_weights += (
-                grad_weighted_source_tile.float() * source_slice.float()
-            ).sum(dim=(1, 2))
-            if has_bias:
-                grad_biases += grad_scores_h.sum(dim=(1, 2, 3))
-    if grad_core_weight_partials is not None:
-        grad_core_weights += grad_core_weight_partials.sum(dim=0)
-    if grad_bias_partials is not None:
-        grad_biases += grad_bias_partials.sum(dim=0)
-    return (
-        grad_projected_source,
-        grad_projected_target,
-        grad_projected_state,
-        grad_projected_val,
-        grad_core_weights,
-        grad_biases,
-    )
-
-
-def _signed_smoothmax_backward_from_saved_scores(
-    *,
-    saved_scores: Tensor,
-    weighted_source: Tensor,
-    projected_source: Tensor,
-    projected_target: Tensor,
-    core_cast: Tensor,
-    bias_arg: Tensor,
-    has_bias: bool,
-    row_max: Tensor,
-    row_denom: Tensor,
-    flat_projected_state: Tensor,
-    flat_projected_val: Tensor,
-    flat_grad_state: Tensor,
-    flat_grad_val: Tensor,
-    tile_size: int,
-) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-    heads = int(projected_source.shape[0])
-    batch_flat = int(saved_scores.shape[0])
-    nodes = int(saved_scores.shape[1])
-    rank_dim = int(projected_target.shape[3])
-    grad_projected_source = torch.zeros_like(projected_source, dtype=torch.float32)
-    grad_projected_target = torch.zeros_like(projected_target, dtype=torch.float32)
-    grad_projected_state = torch.zeros_like(flat_projected_state)
-    grad_projected_val = torch.zeros_like(flat_projected_val)
-    grad_core_weights = torch.zeros_like(core_cast, dtype=torch.float32)
-    grad_biases = torch.zeros_like(bias_arg, dtype=torch.float32) if has_bias else torch.empty(0, device=saved_scores.device)
-    edge_dot = torch.zeros((batch_flat, nodes), dtype=torch.float32, device=saved_scores.device)
-    grad_state_expanded = flat_grad_state.unsqueeze(-1)
-    causal_mask_full = _causal_tril_mask(nodes, saved_scores.device).view(1, nodes, nodes)
-    grad_edges_tiles: list[Tensor] = []
-
-    for source_start in range(0, nodes, tile_size):
-        source_end = min(source_start + tile_size, nodes)
-        valid_mask = causal_mask_full[:, :, source_start:source_end]
-        scores = saved_scores[:, :, source_start:source_end]
-        probs = torch.exp(scores.abs() - row_max.unsqueeze(-1)).masked_fill(~valid_mask, 0.0) / row_denom.unsqueeze(-1)
-        edges = torch.sign(scores) * probs
-        grad_edges = grad_state_expanded * flat_projected_state[:, source_start:source_end].unsqueeze(1)
-        grad_edges = grad_edges + torch.bmm(flat_grad_val, flat_projected_val[:, source_start:source_end, :].transpose(1, 2))
-        grad_edges_tiles.append(grad_edges)
-        if (
-            saved_scores.device.type == "cuda"
-            and triton_signed_smoothmax_available()
-            and _multihead_signed_smoothmax_triton_edge_dot_enabled()
-        ):
-            edge_dot = edge_dot + signed_abs_softmax_edge_dot_tile(
-                scores,
-                grad_edges,
-                row_max,
-                row_denom,
-                source_start,
-            )
-        else:
-            edge_dot = edge_dot + (grad_edges * edges).sum(dim=-1)
-        grad_projected_state[:, source_start:source_end] += torch.bmm(edges.transpose(1, 2), grad_state_expanded).squeeze(-1)
-        grad_projected_val[:, source_start:source_end, :] += torch.bmm(edges.transpose(1, 2), flat_grad_val)
-
-    for tile_index, source_start in enumerate(range(0, nodes, tile_size)):
-        source_end = min(source_start + tile_size, nodes)
-        valid_mask = causal_mask_full[:, :, source_start:source_end]
-        scores = saved_scores[:, :, source_start:source_end]
-        if _multihead_signed_smoothmax_triton_backward_enabled("diagonal") and triton_signed_smoothmax_available():
-            bias_tile = bias_arg if has_bias else None
-            head_grads = multihead_signed_smoothmax_head_grads(
-                projected_target.permute(1, 0, 2, 3).contiguous(),
-                weighted_source[:, :, source_start:source_end, :].permute(1, 0, 2, 3).contiguous(),
-                source_start,
-                bias_tile,
-            )
-        else:
-            _, head_grads = _LowRankMultiHeadMaxPropagationCausalDenseSignedAbs._best_score_tile(
-                weighted_source,
-                projected_target,
-                bias_arg,
-                has_bias,
-                source_start,
-                source_end,
-                "signed_smoothmax",
-            )
-        probs = torch.exp(scores.abs() - row_max.unsqueeze(-1)).masked_fill(~valid_mask, 0.0) / row_denom.unsqueeze(-1)
-        signs = torch.sign(scores)
-        grad_edges = grad_edges_tiles[tile_index]
-        grad_scores = signs * probs * (signs * grad_edges - edge_dot.unsqueeze(-1))
-        grad_scores = grad_scores.masked_fill(~valid_mask, 0.0)
-        tile_nodes = int(source_end - source_start)
-        grad_scores_h = grad_scores.unsqueeze(0) * head_grads.to(dtype=grad_scores.dtype)
-        grad_scores_flat = grad_scores_h.reshape(heads * batch_flat, nodes, tile_nodes).to(dtype=projected_target.dtype)
-        weighted_source_tile = weighted_source[:, :, source_start:source_end, :].reshape(
-            heads * batch_flat,
-            tile_nodes,
-            rank_dim,
-        )
-        projected_target_flat = projected_target.reshape(heads * batch_flat, nodes, rank_dim)
-        grad_projected_target_tile = torch.bmm(
-            grad_scores_flat,
-            weighted_source_tile,
-        ).reshape(heads, batch_flat, nodes, rank_dim)
-        grad_weighted_source_tile = torch.bmm(
-            grad_scores_flat.transpose(1, 2),
-            projected_target_flat,
-        ).reshape(heads, batch_flat, tile_nodes, rank_dim)
-        source_slice = projected_source[:, :, source_start:source_end, :]
-        grad_projected_target += grad_projected_target_tile.float()
-        grad_projected_source[:, :, source_start:source_end, :] += (
-            grad_weighted_source_tile * core_cast.view(heads, 1, 1, rank_dim)
-        ).float()
-        grad_core_weights += (
-            grad_weighted_source_tile.float() * source_slice.float()
-        ).sum(dim=(1, 2))
-        if has_bias:
-            grad_biases += grad_scores_h.sum(dim=(1, 2, 3))
-    return (
-        grad_projected_source,
-        grad_projected_target,
-        grad_projected_state,
-        grad_projected_val,
-        grad_core_weights,
-        grad_biases,
-    )
-
-
-class _LowRankMultiHeadMaxPropagationCausalDenseSignedAbs(Function):
-    @staticmethod
-    def _project(
-        flat_val: Tensor,
-        source_weights: Tensor,
-        target_weights: Tensor,
-        core_weights: Tensor,
-        *,
-        exact_per_head: bool = False,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-        heads = int(source_weights.shape[0])
-        rank_dim = int(source_weights.shape[1])
-        source_cast = source_weights.to(dtype=flat_val.dtype)
-        target_cast = target_weights.to(dtype=flat_val.dtype)
-        core_cast = _normalized_lowrank_core(core_weights, dtype=flat_val.dtype).contiguous()
-        raw_projected_source = F.linear(
-            flat_val,
-            source_cast.reshape(heads * rank_dim, source_weights.shape[-1]),
-        ).reshape(
-            flat_val.shape[0],
-            flat_val.shape[1],
-            heads,
-            rank_dim,
-        ).permute(2, 0, 1, 3).contiguous()
-        raw_projected_target = F.linear(
-            flat_val,
-            target_cast.reshape(heads * rank_dim, target_weights.shape[-1]),
-        ).reshape(
-            flat_val.shape[0],
-            flat_val.shape[1],
-            heads,
-            rank_dim,
-        ).permute(2, 0, 1, 3).contiguous()
-        projected_source = raw_projected_source
-        projected_target = raw_projected_target
-        core_cast = core_cast.to(dtype=projected_target.dtype).contiguous()
-        projected_source = projected_source.to(dtype=projected_target.dtype).contiguous()
-        weighted_source = (projected_source * core_cast.view(heads, 1, 1, rank_dim)).contiguous()
-        return (
-            projected_source,
-            projected_target,
-            weighted_source,
-            core_cast,
-            raw_projected_source,
-            raw_projected_target,
-        )
-
-    @staticmethod
-    def _best_score_tile(
-        weighted_source: Tensor,
-        projected_target: Tensor,
-        biases: Tensor,
-        has_bias: bool,
-        source_start: int,
-        source_end: int,
-        aggregate: str = "max",
-        allow_triton: bool = True,
-    ) -> tuple[Tensor, Tensor]:
-        heads = int(weighted_source.shape[0])
-        batch = int(weighted_source.shape[1])
-        nodes = int(weighted_source.shape[2])
-        tile_nodes = int(source_end - source_start)
-        source_indices = torch.arange(source_start, source_end, device=projected_target.device)
-        target_indices = torch.arange(nodes, device=projected_target.device)
-        causal_mask = source_indices.view(1, 1, 1, tile_nodes) <= target_indices.view(1, 1, nodes, 1)
-        if aggregate == "signed_smoothmax":
-            combined, head_grads, _valid_mask = _multihead_signed_smoothmax_tile(
-                projected_target=projected_target,
-                weighted_source=weighted_source,
-                bias_arg=biases,
-                has_bias=has_bias,
-                source_start=source_start,
-                source_end=source_end,
-                allow_triton=allow_triton,
-                return_head_grads=True,
-            )
-            return combined, head_grads
-        target_flat = projected_target.reshape(heads * batch, nodes, projected_target.shape[-1])
-        source_flat = weighted_source[:, :, source_start:source_end, :].reshape(
-            heads * batch,
-            tile_nodes,
-            weighted_source.shape[-1],
-        )
-        scores_raw = torch.bmm(target_flat, source_flat.transpose(1, 2)).reshape(
-            heads,
-            batch,
-            nodes,
-            tile_nodes,
-        )
-        if has_bias:
-            scores_raw = scores_raw + biases.to(dtype=scores_raw.dtype).view(heads, 1, 1, 1)
-        scores = scores_raw.float()
-        if aggregate == "max":
-            scores = scores.masked_fill(~causal_mask, float("-inf"))
-            best_scores, best_heads = scores.max(dim=0)
-            return best_scores, best_heads.to(dtype=torch.int16)
-        if aggregate == "smoothmax":
-            masked_scores = scores.masked_fill(~causal_mask, float("-inf"))
-            combined = torch.logsumexp(masked_scores, dim=0) - torch.log(
-                torch.tensor(float(heads), dtype=torch.float32, device=projected_target.device)
-            )
-            head_probs = torch.softmax(masked_scores, dim=0).masked_fill(~causal_mask, 0.0)
-            valid_mask = causal_mask.squeeze(0).squeeze(0)
-            combined = combined.masked_fill(~valid_mask.unsqueeze(0), float("-inf"))
-            return combined, head_probs
-        valid_mask = causal_mask.squeeze(0).squeeze(0)
-        masked_scores = scores.masked_fill(~causal_mask, 0.0)
-        combined = masked_scores.sum(dim=0)
-        if aggregate == "mean":
-            combined = combined / float(heads)
-        elif aggregate != "sum":
-            raise ValueError(f"Unsupported multihead aggregate: {aggregate!r}.")
-        combined = combined.masked_fill(~valid_mask.unsqueeze(0), float("-inf"))
-        best_heads = torch.zeros((batch, nodes, tile_nodes), dtype=torch.int16, device=projected_target.device)
-        return combined, best_heads
-
-    @staticmethod
-    def _row_stats(
-        weighted_source: Tensor,
-        projected_target: Tensor,
-        biases: Tensor,
-        has_bias: bool,
-        tile_size: int,
-        aggregate: str = "max",
-        allow_triton: bool = True,
-    ) -> tuple[Tensor, Tensor]:
-        batch = int(weighted_source.shape[1])
-        nodes = int(weighted_source.shape[2])
-        row_max = torch.full((batch, nodes), float("-inf"), dtype=torch.float32, device=projected_target.device)
-        row_denom = torch.zeros((batch, nodes), dtype=torch.float32, device=projected_target.device)
-        for source_start in range(0, nodes, tile_size):
-            source_end = min(source_start + tile_size, nodes)
-            scores, _ = _LowRankMultiHeadMaxPropagationCausalDenseSignedAbs._best_score_tile(
-                weighted_source,
-                projected_target,
-                biases,
-                has_bias,
-                source_start,
-                source_end,
-                aggregate,
-                allow_triton,
-            )
-            valid_scores = torch.isfinite(scores)
-            stats = scores.abs().masked_fill(~valid_scores, float("-inf"))
-            tile_max = stats.amax(dim=-1)
-            new_max = torch.maximum(row_max, tile_max)
-            old_scale = torch.exp(torch.where(torch.isfinite(row_max), row_max - new_max, torch.full_like(new_max, float("-inf"))))
-            tile_exp = torch.exp(stats - new_max.unsqueeze(-1)).masked_fill(~valid_scores, 0.0)
-            row_denom = row_denom * old_scale + tile_exp.sum(dim=-1)
-            row_max = new_max
-        return row_max, row_denom.clamp_min(1.0e-20)
-
-    @staticmethod
-    def forward(
-        ctx: Any,
-        layer_val: Tensor,
-        projected_state: Tensor,
-        projected_val: Tensor,
-        source_weights: Tensor,
-        target_weights: Tensor,
-        core_weights: Tensor,
-        biases: Tensor,
-        has_bias: bool,
-        aggregate: str = "max",
-    ) -> tuple[Tensor, Tensor]:
-        (
-            flat_val,
-            flat_projected_state,
-            flat_projected_val,
-            batch_shape,
-            nodes,
-            out_dim,
-        ) = _flatten_dense_tensors(layer_val, projected_state, projected_val)
-        projected_source, projected_target, weighted_source, _core_cast, _raw_projected_source, _raw_projected_target = _LowRankMultiHeadMaxPropagationCausalDenseSignedAbs._project(
-            flat_val,
-            source_weights,
-            target_weights,
-            core_weights,
-            exact_per_head=str(aggregate) == "signed_smoothmax",
-        )
-        bias_arg = biases.to(dtype=projected_target.dtype).contiguous() if bool(has_bias) else biases
-        state_f32 = flat_projected_state.to(dtype=torch.float32).contiguous()
-        val_f32 = flat_projected_val.to(dtype=torch.float32).contiguous()
-        use_raw_weighted_edges = str(aggregate) == "signed_smoothmax"
-        allow_triton_lowrank_signed = (
-            str(aggregate) != "signed_smoothmax"
-            or _multihead_signed_smoothmax_triton_forward_enabled("lowrank")
-        )
-        tile_size = _multihead_dense_tile_size()
-        use_native_cuda = (
-            _multihead_dense_cuda_kernel_enabled()
-            and aggregate == "max"
-            and flat_val.is_cuda
-            and native_supports("low_rank_multihead_max_propagation_causal_dense_signed_abs_forward_cuda")
-            and native_supports("low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cuda")
-        )
-        use_smoothmax_bmm_cuda = (
-            str(aggregate) in {"smoothmax", "signed_smoothmax"}
-            and str(aggregate) != "signed_smoothmax"
-            and _lowrank_smoothmax_bmm_cuda_enabled()
-            and not use_native_cuda
-            and flat_val.is_cuda
-            and native_supports("low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_forward_bmm_cuda")
-        )
-        # Keep low-rank on the exact native/BMM path for now. The current
-        # Triton signed_smoothmax tiles still show a forward mismatch on
-        # low-rank full-model checks.
-        use_triton_signed_smoothmax = False
-        if use_native_cuda:
-            delta_state, delta_val = _native_module().low_rank_multihead_max_propagation_causal_dense_signed_abs_forward_cuda(
-                weighted_source,
-                projected_target,
-                state_f32,
-                val_f32,
-                bias_arg,
-                bool(has_bias),
-                str(aggregate),
-            )
-            row_max = flat_val.new_empty((0,), dtype=torch.float32)
-            row_denom = flat_val.new_empty((0,), dtype=torch.float32)
-        elif use_smoothmax_bmm_cuda:
-            delta_state, delta_val, row_max, row_denom = (
-                _native_module().low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_forward_bmm_cuda(
-                    weighted_source,
-                    projected_target,
-                    state_f32,
-                    val_f32,
-                    bias_arg,
-                    bool(has_bias),
-                    str(aggregate),
-                )
-            )
-        elif use_triton_signed_smoothmax:
-            scores = multihead_signed_smoothmax_scores(
-                projected_target.permute(1, 0, 2, 3).contiguous(),
-                weighted_source.permute(1, 0, 2, 3).contiguous(),
-                bias_arg if bool(has_bias) else None,
-            )
-            mask = _causal_tril_mask(nodes, flat_val.device).view(1, nodes, nodes)
-            valid_scores = scores.masked_fill(~mask, 0.0)
-            stats = valid_scores.abs().masked_fill(~mask, float("-inf"))
-            row_max = stats.amax(dim=-1)
-            probs = torch.softmax(stats, dim=-1)
-            edges = torch.sign(valid_scores) * probs * mask.to(dtype=probs.dtype)
-            row_denom = torch.exp(stats - row_max.unsqueeze(-1)).masked_fill(~mask, 0.0).sum(dim=-1).clamp_min(1.0e-20)
-            delta_state = torch.bmm(edges, state_f32.unsqueeze(-1)).squeeze(-1)
-            delta_val = torch.bmm(edges, val_f32)
-            saved_scores = valid_scores.contiguous()
-        else:
-            row_max, row_denom = _LowRankMultiHeadMaxPropagationCausalDenseSignedAbs._row_stats(
-                weighted_source,
-                projected_target,
-                bias_arg,
-                bool(has_bias),
-                tile_size,
-                str(aggregate),
-                allow_triton_lowrank_signed,
-            )
-            delta_state = torch.zeros((flat_val.shape[0], nodes), dtype=torch.float32, device=flat_val.device)
-            delta_val = torch.zeros((flat_val.shape[0], nodes, out_dim), dtype=torch.float32, device=flat_val.device)
-            for source_start in range(0, nodes, tile_size):
-                source_end = min(source_start + tile_size, nodes)
-                scores, _ = _LowRankMultiHeadMaxPropagationCausalDenseSignedAbs._best_score_tile(
-                    weighted_source,
-                    projected_target,
-                    bias_arg,
-                    bool(has_bias),
-                    source_start,
-                    source_end,
-                    str(aggregate),
-                    allow_triton_lowrank_signed,
-                )
-                probs = torch.exp(scores.abs() - row_max.unsqueeze(-1)).masked_fill(~torch.isfinite(scores), 0.0)
-                edges = torch.sign(scores) * (probs / row_denom.unsqueeze(-1))
-                if use_raw_weighted_edges:
-                    weighted_edges = edges * state_f32[:, source_start:source_end].unsqueeze(1)
-                    delta_state = delta_state + weighted_edges.sum(dim=-1)
-                    delta_val = delta_val + torch.bmm(weighted_edges, val_f32[:, source_start:source_end, :])
-                else:
-                    delta_state = delta_state + torch.bmm(edges, state_f32[:, source_start:source_end].unsqueeze(-1)).squeeze(-1)
-                    delta_val = delta_val + torch.bmm(edges, val_f32[:, source_start:source_end, :])
-            saved_scores = flat_val.new_empty((0,), dtype=torch.float32)
-        if use_native_cuda or use_smoothmax_bmm_cuda:
-            saved_scores = flat_val.new_empty((0,), dtype=torch.float32)
-        ctx.has_bias = bool(has_bias)
-        ctx.aggregate = str(aggregate)
-        ctx.batch_shape = batch_shape
-        ctx.nodes = nodes
-        ctx.out_dim = out_dim
-        ctx.layer_dtype = layer_val.dtype
-        ctx.projected_state_dtype = projected_state.dtype
-        ctx.projected_val_dtype = projected_val.dtype
-        ctx.tile_size = int(tile_size)
-        ctx.used_native_cuda = bool(use_native_cuda)
-        ctx.used_smoothmax_bmm_cuda = bool(use_smoothmax_bmm_cuda)
-        ctx.projected_val_is_raw = bool(use_raw_weighted_edges)
-        ctx.save_for_backward(
-            flat_val,
-            projected_state,
-            projected_val,
-            source_weights,
-            target_weights,
-            core_weights,
-            biases,
-            row_max,
-            row_denom,
-            saved_scores,
-        )
-        return (
-            delta_state.to(dtype=projected_state.dtype).reshape(*batch_shape, nodes),
-            delta_val.to(dtype=projected_val.dtype).reshape(*batch_shape, nodes, out_dim),
-        )
-
-    @staticmethod
-    def backward(ctx: Any, grad_delta_state: Tensor, grad_delta_val: Tensor) -> tuple[Any, ...]:
-        (
-            flat_val,
-            projected_state,
-            projected_val,
-            source_weights,
-            target_weights,
-            core_weights,
-            biases,
-            row_max,
-            row_denom,
-            saved_scores,
-        ) = ctx.saved_tensors
-        nodes = int(ctx.nodes)
-        out_dim = int(ctx.out_dim)
-        flat_projected_state = projected_state.reshape(-1, nodes).to(dtype=torch.float32).contiguous()
-        flat_projected_val = projected_val.reshape(-1, nodes, out_dim).to(dtype=torch.float32).contiguous()
-        flat_grad_state = grad_delta_state.reshape(-1, nodes).to(dtype=torch.float32).contiguous()
-        flat_grad_val = grad_delta_val.reshape(-1, nodes, out_dim).to(dtype=torch.float32).contiguous()
-        projected_source, projected_target, weighted_source, core_cast, raw_projected_source, raw_projected_target = _LowRankMultiHeadMaxPropagationCausalDenseSignedAbs._project(
-            flat_val,
-            source_weights,
-            target_weights,
-            core_weights,
-            exact_per_head=str(ctx.aggregate) == "signed_smoothmax",
-        )
-        bias_arg = biases.to(dtype=projected_target.dtype).contiguous() if ctx.has_bias else biases
-        tile_size = int(ctx.tile_size)
-        if str(ctx.aggregate) == "signed_smoothmax":
-            (
-                grad_projected_source,
-                grad_projected_target,
-                grad_projected_state,
-                grad_projected_val,
-                grad_core_weights,
-                grad_biases,
-            ) = _signed_smoothmax_backward_recompute_tiles(
-                weighted_source=weighted_source,
-                projected_source=projected_source,
-                projected_target=projected_target,
-                core_cast=core_cast,
-                bias_arg=bias_arg,
-                has_bias=bool(ctx.has_bias),
-                row_max=row_max.float(),
-                row_denom=row_denom.float(),
-                flat_projected_state=flat_projected_state,
-                flat_projected_val=flat_projected_val,
-                flat_grad_state=flat_grad_state,
-                flat_grad_val=flat_grad_val,
-                tile_size=tile_size,
-                use_raw_weighted_edges=bool(getattr(ctx, "projected_val_is_raw", False)),
-                allow_triton=False,
-            )
-        elif (
-            str(ctx.aggregate) == "smoothmax"
-            and bool(getattr(ctx, "used_smoothmax_bmm_cuda", False))
-            and native_supports("low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_backward_bmm_cuda")
-        ):
-            (
-                grad_projected_source,
-                grad_projected_target,
-                grad_projected_state,
-                grad_projected_val,
-                grad_core_weights,
-                grad_biases,
-            ) = _native_module().low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_backward_bmm_cuda(
-                weighted_source,
-                projected_source,
-                projected_target,
-                flat_projected_state,
-                flat_projected_val,
-                core_cast,
-                bias_arg,
-                row_max,
-                row_denom,
-                flat_grad_state,
-                flat_grad_val,
-                bool(ctx.has_bias),
-                str(ctx.aggregate),
-            )
-        elif bool(getattr(ctx, "used_native_cuda", False)):
-            (
-                grad_projected_source,
-                grad_projected_target,
-                grad_projected_state,
-                grad_projected_val,
-                grad_core_weights,
-                grad_biases,
-            ) = _native_module().low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cuda(
-                weighted_source,
-                projected_source,
-                projected_target,
-                flat_projected_state,
-                flat_projected_val,
-                core_cast,
-                bias_arg,
-                flat_grad_state,
-                flat_grad_val,
-                bool(ctx.has_bias),
-                str(ctx.aggregate),
-            )
-        else:
-            if row_max.numel() == 0 or row_denom.numel() == 0:
-                row_max, row_denom = _LowRankMultiHeadMaxPropagationCausalDenseSignedAbs._row_stats(
-                    weighted_source,
-                    projected_target,
-                    bias_arg,
-                    bool(ctx.has_bias),
-                    tile_size,
-                    str(ctx.aggregate),
-                    False,
-                )
-            row_max = row_max.float()
-            row_denom = row_denom.float()
-            use_raw_weighted_edges = bool(getattr(ctx, "projected_val_is_raw", False))
-            edge_dot = torch.zeros((flat_val.shape[0], nodes), dtype=torch.float32, device=flat_val.device)
-            for source_start in range(0, nodes, tile_size):
-                source_end = min(source_start + tile_size, nodes)
-                scores, _ = _LowRankMultiHeadMaxPropagationCausalDenseSignedAbs._best_score_tile(
-                    weighted_source,
-                    projected_target,
-                    bias_arg,
-                    bool(ctx.has_bias),
-                    source_start,
-                    source_end,
-                    str(ctx.aggregate),
-                    False,
-                )
-                probs = torch.exp(scores.abs() - row_max.unsqueeze(-1)).masked_fill(~torch.isfinite(scores), 0.0) / row_denom.unsqueeze(-1)
-                edges = torch.sign(scores) * probs
-                if use_raw_weighted_edges:
-                    source_strength = flat_projected_state[:, source_start:source_end]
-                    weighted_val = flat_projected_val[:, source_start:source_end, :] * source_strength.unsqueeze(-1)
-                    grad_edges = flat_grad_state.unsqueeze(-1) * source_strength.unsqueeze(1)
-                    grad_edges = grad_edges + torch.bmm(flat_grad_val, weighted_val.transpose(1, 2))
-                else:
-                    grad_edges = flat_grad_state.unsqueeze(-1) * flat_projected_state[:, source_start:source_end].unsqueeze(1)
-                    grad_edges = grad_edges + torch.bmm(flat_grad_val, flat_projected_val[:, source_start:source_end, :].transpose(1, 2))
-                if (
-                    flat_val.device.type == "cuda"
-                    and triton_signed_smoothmax_available()
-                    and _multihead_signed_smoothmax_triton_edge_dot_enabled()
-                ):
-                    edge_dot = edge_dot + signed_abs_softmax_edge_dot_tile(
-                        scores,
-                        grad_edges,
-                        row_max,
-                        row_denom,
-                        source_start,
-                    )
-                else:
-                    edge_dot = edge_dot + (grad_edges * edges).sum(dim=-1)
-            grad_projected_source = torch.zeros_like(projected_source, dtype=torch.float32)
-            grad_projected_target = torch.zeros_like(projected_target, dtype=torch.float32)
-            grad_projected_state = torch.zeros_like(flat_projected_state)
-            grad_projected_val = torch.zeros_like(flat_projected_val)
-            grad_core_weights = torch.zeros_like(core_weights, dtype=torch.float32)
-            grad_biases = torch.zeros_like(biases, dtype=torch.float32) if ctx.has_bias else torch.empty(0, device=flat_val.device)
-            heads = int(source_weights.shape[0])
-            rank_dim = int(projected_target.shape[-1])
-            batch_flat = int(projected_target.shape[1])
-            for source_start in range(0, nodes, tile_size):
-                source_end = min(source_start + tile_size, nodes)
-                scores, best_heads = _LowRankMultiHeadMaxPropagationCausalDenseSignedAbs._best_score_tile(
-                    weighted_source,
-                    projected_target,
-                    bias_arg,
-                    bool(ctx.has_bias),
-                    source_start,
-                    source_end,
-                    str(ctx.aggregate),
-                    False,
-                )
-                probs = torch.exp(scores.abs() - row_max.unsqueeze(-1)).masked_fill(~torch.isfinite(scores), 0.0) / row_denom.unsqueeze(-1)
-                signs = torch.sign(scores)
-                edges = signs * probs
-                if use_raw_weighted_edges:
-                    source_strength = flat_projected_state[:, source_start:source_end]
-                    weighted_val = flat_projected_val[:, source_start:source_end, :] * source_strength.unsqueeze(-1)
-                    weighted_edges = edges * source_strength.unsqueeze(1)
-                    grad_edges = flat_grad_state.unsqueeze(-1) * source_strength.unsqueeze(1)
-                    grad_edges = grad_edges + torch.bmm(flat_grad_val, weighted_val.transpose(1, 2))
-                else:
-                    weighted_edges = edges
-                    grad_edges = flat_grad_state.unsqueeze(-1) * flat_projected_state[:, source_start:source_end].unsqueeze(1)
-                    grad_edges = grad_edges + torch.bmm(flat_grad_val, flat_projected_val[:, source_start:source_end, :].transpose(1, 2))
-                grad_scores = signs * probs * (signs * grad_edges - edge_dot.unsqueeze(-1))
-                grad_scores = grad_scores.masked_fill(~torch.isfinite(scores), 0.0)
-                if use_raw_weighted_edges:
-                    grad_projected_state[:, source_start:source_end] += torch.bmm(edges.transpose(1, 2), flat_grad_state.unsqueeze(-1)).squeeze(-1)
-                    grad_projected_state[:, source_start:source_end] += (
-                        torch.bmm(edges.transpose(1, 2), flat_grad_val) * flat_projected_val[:, source_start:source_end, :]
-                    ).sum(dim=-1)
-                    grad_projected_val[:, source_start:source_end, :] += torch.bmm(weighted_edges.transpose(1, 2), flat_grad_val)
-                else:
-                    grad_projected_state[:, source_start:source_end] += torch.bmm(edges.transpose(1, 2), flat_grad_state.unsqueeze(-1)).squeeze(-1)
-                    grad_projected_val[:, source_start:source_end, :] += torch.bmm(edges.transpose(1, 2), flat_grad_val)
-                score_scale = 1.0 / float(heads) if str(ctx.aggregate) == "mean" else 1.0
-                tile_nodes = int(source_end - source_start)
-                if str(ctx.aggregate) == "max":
-                    head_weights = (
-                        F.one_hot(best_heads.to(dtype=torch.int64), num_classes=heads)
-                        .permute(3, 0, 1, 2)
-                        .to(dtype=grad_scores.dtype)
-                    )
-                elif str(ctx.aggregate) in {"smoothmax", "signed_smoothmax"}:
-                    head_weights = best_heads.to(dtype=grad_scores.dtype)
-                else:
-                    head_weights = torch.full(
-                        (heads, batch_flat, nodes, tile_nodes),
-                        score_scale,
-                        dtype=grad_scores.dtype,
-                        device=grad_scores.device,
-                    )
-                grad_scores_h = grad_scores.unsqueeze(0) * head_weights
-                grad_scores_flat = grad_scores_h.reshape(heads * batch_flat, nodes, tile_nodes).to(dtype=torch.float32)
-                weighted_source_tile = weighted_source[:, :, source_start:source_end, :].reshape(
-                    heads * batch_flat,
-                    tile_nodes,
-                    rank_dim,
-                ).to(dtype=torch.float32)
-                projected_target_flat = projected_target.reshape(heads * batch_flat, nodes, rank_dim).to(dtype=torch.float32)
-                grad_projected_target_tile = torch.bmm(
-                    grad_scores_flat,
-                    weighted_source_tile,
-                ).reshape(heads, batch_flat, nodes, rank_dim)
-                grad_weighted_source_tile = torch.bmm(
-                    grad_scores_flat.transpose(1, 2),
-                    projected_target_flat,
-                ).reshape(heads, batch_flat, tile_nodes, rank_dim)
-                source_slice = projected_source[:, :, source_start:source_end, :]
-                grad_projected_target += grad_projected_target_tile.float()
-                grad_projected_source[:, :, source_start:source_end, :] += (
-                    grad_weighted_source_tile * core_cast.view(heads, 1, 1, rank_dim).to(dtype=torch.float32)
-                ).float()
-                grad_core_weights += (
-                    grad_weighted_source_tile.float() * source_slice.float()
-                ).sum(dim=(1, 2))
-                if ctx.has_bias:
-                    grad_biases += grad_scores_h.sum(dim=(1, 2, 3))
-        heads = int(source_weights.shape[0])
-        source_cast = source_weights.to(dtype=flat_val.dtype)
-        target_cast = target_weights.to(dtype=flat_val.dtype)
-        grad_projected_source_cast = grad_projected_source.to(dtype=flat_val.dtype)
-        grad_projected_target_cast = grad_projected_target.to(dtype=flat_val.dtype)
-        grad_layer = torch.zeros_like(flat_val, dtype=torch.float32)
-        flat_val_2d = flat_val.reshape(-1, flat_val.shape[-1]).to(dtype=torch.float32)
-        rank_dim = int(source_weights.shape[1])
-        batch_flat = int(flat_val.shape[0])
-        flat_val_heads = flat_val_2d.unsqueeze(0).expand(heads, -1, -1)
-        grad_source_weights = torch.bmm(
-            grad_projected_source.reshape(heads, -1, rank_dim).float().transpose(1, 2),
-            flat_val_heads,
-        )
-        grad_target_weights = torch.bmm(
-            grad_projected_target.reshape(heads, -1, rank_dim).float().transpose(1, 2),
-            flat_val_heads,
-        )
-        source_cast_flat = source_cast.unsqueeze(1).expand(-1, batch_flat, -1, -1).reshape(
-            heads * batch_flat,
-            rank_dim,
-            out_dim,
-        )
-        target_cast_flat = target_cast.unsqueeze(1).expand(-1, batch_flat, -1, -1).reshape(
-            heads * batch_flat,
-            rank_dim,
-            out_dim,
-        )
-        grad_layer = grad_layer + torch.bmm(
-            grad_projected_source_cast.reshape(heads * batch_flat, nodes, rank_dim),
-            source_cast_flat,
-        ).reshape(heads, batch_flat, nodes, out_dim).sum(dim=0).float()
-        grad_layer = grad_layer + torch.bmm(
-            grad_projected_target_cast.reshape(heads * batch_flat, nodes, rank_dim),
-            target_cast_flat,
-        ).reshape(heads, batch_flat, nodes, out_dim).sum(dim=0).float()
-        grad_core_weights = _grad_raw_lowrank_core_from_normalized(
-            grad_core_weights,
-            core_weights,
-        )
-        return (
-            grad_layer.reshape_as(flat_val).reshape(*ctx.batch_shape, nodes, out_dim).to(dtype=ctx.layer_dtype),
-            grad_projected_state.reshape(*ctx.batch_shape, nodes).to(dtype=ctx.projected_state_dtype),
-            grad_projected_val.reshape(*ctx.batch_shape, nodes, out_dim).to(dtype=ctx.projected_val_dtype),
-            grad_source_weights.to(dtype=source_weights.dtype),
-            grad_target_weights.to(dtype=target_weights.dtype),
-            grad_core_weights.to(dtype=core_weights.dtype),
-            grad_biases.to(dtype=biases.dtype) if ctx.has_bias else None,
-            None,
-            None,
-        )
-
-
-def _low_rank_multihead_signed_smoothmax_causal_dense_exact(
-    *,
-    layer_val: Tensor,
-    source_strength: Tensor,
-    projected_val: Tensor,
-    source_weights: Tensor,
-    target_weights: Tensor,
-    core_weights: Tensor,
-    biases: Tensor,
-    has_bias: bool,
-) -> LayerDelta:
-    delta_state, delta_val = _low_rank_multihead_signed_smoothmax_causal_dense_exact_tensors(
-        layer_val=layer_val,
-        source_strength=source_strength,
-        projected_val=projected_val,
-        source_weights=source_weights,
-        target_weights=target_weights,
-        core_weights=core_weights,
-        biases=biases,
-        has_bias=has_bias,
-    )
-    return LayerDelta(delta_state=delta_state, delta_val=delta_val)
-
-
-def _low_rank_multihead_signed_smoothmax_causal_dense_exact_tensors(
-    *,
-    layer_val: Tensor,
-    source_strength: Tensor,
-    projected_val: Tensor,
-    source_weights: Tensor,
-    target_weights: Tensor,
-    core_weights: Tensor,
-    biases: Tensor,
-    has_bias: bool,
-) -> tuple[Tensor, Tensor]:
-    flat_val, flat_source_strength, flat_projected_val, batch_shape, nodes, out_dim = _flatten_dense_tensors(
-        layer_val,
-        source_strength,
-        projected_val,
-    )
-    heads = int(source_weights.shape[0])
-    rank_dim = int(source_weights.shape[1])
-    tile_size = min(_multihead_dense_tile_size(), nodes)
-    source_cast = source_weights.to(dtype=flat_val.dtype)
-    target_cast = target_weights.to(dtype=flat_val.dtype)
-    core_cast = _normalized_lowrank_core(core_weights, dtype=flat_val.dtype)
-    projected_target = torch.stack(
-        [F.linear(flat_val, target_cast[head]) for head in range(heads)],
-        dim=0,
-    ).contiguous()
-    projected_source = torch.stack(
-        [F.linear(flat_val, source_cast[head]) for head in range(heads)],
-        dim=0,
-    ).contiguous()
-    weighted_source = (projected_source * core_cast.view(heads, 1, 1, rank_dim)).contiguous()
-    delta_state = torch.zeros((flat_val.shape[0], nodes), dtype=torch.float32, device=flat_val.device)
-    delta_val = torch.zeros((flat_val.shape[0], nodes, out_dim), dtype=torch.float32, device=flat_val.device)
-    val_f32 = flat_projected_val.to(dtype=torch.float32)
-    strength_f32 = flat_source_strength.to(dtype=torch.float32)
-    bias_view = biases.to(dtype=projected_target.dtype).view(1, 1, 1, heads) if has_bias else None
-
-    def _combined_score_tile(source_start: int, source_end: int) -> tuple[Tensor, Tensor]:
-        source_nodes = source_end - source_start
-        source_slice = weighted_source[:, :, source_start:source_end, :]
-        scores_by_head = torch.stack(
-            [
-                torch.einsum("bir,bjr->bij", projected_target[head], source_slice[head])
-                for head in range(heads)
-            ],
-            dim=-1,
-        )
-        if bias_view is not None:
-            scores_by_head = scores_by_head + bias_view
-        target_indices = torch.arange(nodes, device=flat_val.device)
-        source_indices = torch.arange(source_start, source_end, device=flat_val.device)
-        valid_mask = source_indices.view(1, 1, source_nodes) <= target_indices.view(1, nodes, 1)
-        combined_scores = (scores_by_head * torch.softmax(scores_by_head.abs(), dim=-1)).sum(dim=-1)
-        combined_scores = combined_scores.masked_fill(~valid_mask, float("-inf"))
-        return combined_scores, valid_mask
-
-    row_max = torch.full((flat_val.shape[0], nodes), float("-inf"), dtype=torch.float32, device=flat_val.device)
-    row_denom = torch.zeros((flat_val.shape[0], nodes), dtype=torch.float32, device=flat_val.device)
-    for source_start in range(0, nodes, tile_size):
-        source_end = min(source_start + tile_size, nodes)
-        combined_scores, valid_mask = _combined_score_tile(source_start, source_end)
-        stats = combined_scores.abs().masked_fill(~valid_mask, float("-inf"))
-        tile_max = stats.amax(dim=-1)
-        new_max = torch.maximum(row_max, tile_max)
-        old_scale = torch.exp(
-            torch.where(
-                torch.isfinite(row_max),
-                row_max - new_max,
-                torch.full_like(new_max, float("-inf")),
-            )
-        )
-        tile_exp = torch.exp(stats - new_max.unsqueeze(-1)).masked_fill(~valid_mask, 0.0)
-        row_denom = row_denom * old_scale + tile_exp.sum(dim=-1)
-        row_max = new_max
-    row_denom = row_denom.clamp_min(1.0e-20)
-
-    for source_start in range(0, nodes, tile_size):
-        source_end = min(source_start + tile_size, nodes)
-        combined_scores, valid_mask = _combined_score_tile(source_start, source_end)
-        probs = torch.exp(combined_scores.abs() - row_max.unsqueeze(-1)).masked_fill(~valid_mask, 0.0) / row_denom.unsqueeze(-1)
-        edges = torch.sign(combined_scores) * probs
-        weighted_edges = edges * strength_f32[:, source_start:source_end].unsqueeze(-2)
-        delta_state = delta_state + weighted_edges.sum(dim=-1)
-        delta_val = delta_val + torch.einsum(
-            "bij,bjd->bid",
-            weighted_edges,
-            val_f32[:, source_start:source_end, :],
-        )
-    return (
-        delta_state.to(dtype=source_strength.dtype).reshape(*batch_shape, nodes),
-        delta_val.to(dtype=projected_val.dtype).reshape(*batch_shape, nodes, out_dim),
-    )
-
-
-def _diagonal_multihead_parts(pairwise_fn: object) -> tuple[Tensor, Tensor, bool, str] | None:
-    if not isinstance(pairwise_fn, MultiHeadPairwise):
-        return None
-    if pairwise_fn.aggregate not in {"max", "mean", "sum", "head_mean", "smoothmax", "signed_smoothmax"} or len(pairwise_fn.heads) == 0:
-        return None
-    if not all(isinstance(head, DiagonalBilinearPairwise) for head in pairwise_fn.heads):
-        return None
-    weights = torch.stack([head.normalized_weight() for head in pairwise_fn.heads])
-    has_bias = all(getattr(head, "bias", None) is not None for head in pairwise_fn.heads)
-    if has_bias:
-        biases = torch.stack([head.bias for head in pairwise_fn.heads])
-    elif any(getattr(head, "bias", None) is not None for head in pairwise_fn.heads):
-        return None
-    else:
-        biases = torch.empty(0, dtype=weights.dtype, device=weights.device)
-    return weights, biases, has_bias, str(pairwise_fn.aggregate)
-
-
-def _diagonal_signed_smoothmax_tile_from_flat(
-    *,
-    flat_val: Tensor,
-    core: Tensor,
-    bias_arg: Tensor,
-    has_bias: bool,
-    source_start: int,
-    source_end: int,
-    query_bhnr: Tensor | None = None,
-    return_head_grads: bool = False,
-) -> tuple[Tensor, Tensor | None, Tensor]:
-    batch, nodes, dim = flat_val.shape
-    heads = int(core.shape[0])
-    tile_nodes = int(source_end - source_start)
-    score_flat_val = flat_val if flat_val.dtype == torch.float32 else flat_val.float()
-    score_core = core if core.dtype == torch.float32 else core.float()
-    score_bias = bias_arg if bias_arg.dtype == torch.float32 else bias_arg.float()
-    source_indices = torch.arange(source_start, source_end, device=flat_val.device)
-    target_indices = torch.arange(nodes, device=flat_val.device)
-    valid_mask = source_indices.view(1, 1, tile_nodes) <= target_indices.view(1, nodes, 1)
-    if (
-        flat_val.device.type == "cuda"
-        and triton_signed_smoothmax_available()
-        and heads <= 4
-        and _multihead_signed_smoothmax_triton_diagonal_tile_enabled()
-    ):
-        if return_head_grads:
-            combined, head_grads = diagonal_signed_smoothmax_scores_and_head_grads_tile(
-                score_flat_val,
-                score_core,
-                source_start,
-                tile_nodes,
-                score_bias if has_bias else None,
-            )
-        else:
-            combined = diagonal_signed_smoothmax_scores_tile(
-                score_flat_val,
-                score_core,
-                source_start,
-                tile_nodes,
-                score_bias if has_bias else None,
-            )
-            head_grads = None
-        combined = combined.masked_fill(~valid_mask, float("-inf"))
-        if not return_head_grads:
-            return combined, None, valid_mask
-        return combined, head_grads.masked_fill(~valid_mask.unsqueeze(0), 0.0), valid_mask
-    source_slice = score_flat_val[:, source_start:source_end, :]
-    if query_bhnr is None:
-        query_bhnr = (score_flat_val.unsqueeze(1) * score_core.view(1, heads, 1, dim)).contiguous()
-    source_tile_bhnr = source_slice.unsqueeze(1).expand(batch, heads, tile_nodes, dim).contiguous()
-    query_flat = query_bhnr.reshape(batch * heads, nodes, dim)
-    source_flat = source_tile_bhnr.reshape(batch * heads, tile_nodes, dim)
-    scores_raw = torch.bmm(query_flat, source_flat.transpose(1, 2)).reshape(
-        batch,
-        heads,
-        nodes,
-        tile_nodes,
-    ).permute(1, 0, 2, 3).contiguous()
-    if has_bias:
-        scores_raw = scores_raw + score_bias.to(dtype=scores_raw.dtype).view(heads, 1, 1, 1)
-    stacked_scores = scores_raw.permute(1, 2, 3, 0).contiguous()
-    head_probs = torch.softmax(stacked_scores.abs(), dim=-1)
-    combined_raw = (stacked_scores * head_probs).sum(dim=-1)
-    combined = combined_raw.masked_fill(~valid_mask, float("-inf"))
-    if not return_head_grads:
-        return combined, None, valid_mask
-    head_grads = head_probs * (1.0 + torch.sign(stacked_scores) * (stacked_scores - combined_raw.unsqueeze(-1)))
-    head_grads = head_grads.masked_fill(~valid_mask.unsqueeze(-1), 0.0)
-    return combined, head_grads.permute(3, 0, 1, 2).contiguous(), valid_mask
-
-
-def _diagonal_signed_smoothmax_row_stats_from_flat(
-    *,
-    flat_val: Tensor,
-    core: Tensor,
-    bias_arg: Tensor,
-    has_bias: bool,
-    tile_size: int,
-) -> tuple[Tensor, Tensor]:
-    batch, nodes, _dim = flat_val.shape
-    use_triton = (
-        flat_val.device.type == "cuda"
-        and triton_signed_smoothmax_available()
-        and int(core.shape[0]) <= 4
-        and _multihead_signed_smoothmax_triton_diagonal_tile_enabled()
-    )
-    query_bhnr = None
-    if not use_triton:
-        heads = int(core.shape[0])
-        query_bhnr = (
-            flat_val.float().unsqueeze(1)
-            * core.float().view(1, heads, 1, flat_val.shape[-1])
-        ).contiguous()
-    row_max = torch.full((batch, nodes), float("-inf"), dtype=torch.float32, device=flat_val.device)
-    row_denom = torch.zeros((batch, nodes), dtype=torch.float32, device=flat_val.device)
-    for source_start in range(0, nodes, tile_size):
-        source_end = min(source_start + tile_size, nodes)
-        combined, _, valid_mask = _diagonal_signed_smoothmax_tile_from_flat(
-            flat_val=flat_val,
-            core=core,
-            bias_arg=bias_arg,
-            has_bias=has_bias,
-            source_start=source_start,
-            source_end=source_end,
-            query_bhnr=query_bhnr,
-            return_head_grads=False,
-        )
-        stats = combined.abs().masked_fill(~valid_mask, float("-inf"))
-        tile_max = stats.amax(dim=-1)
-        new_max = torch.maximum(row_max, tile_max)
-        old_scale = torch.exp(
-            torch.where(
-                torch.isfinite(row_max),
-                row_max - new_max,
-                torch.full_like(new_max, float("-inf")),
-            )
-        )
-        tile_exp = torch.exp(stats - new_max.unsqueeze(-1)).masked_fill(~valid_mask, 0.0)
-        row_denom = row_denom * old_scale + tile_exp.sum(dim=-1)
-        row_max = new_max
-    return row_max, row_denom.clamp_min(1.0e-20)
-
-
-def _diagonal_signed_smoothmax_backward_recompute_from_flat(
-    *,
-    flat_val: Tensor,
-    core: Tensor,
-    bias_arg: Tensor,
-    has_bias: bool,
-    row_max: Tensor,
-    row_denom: Tensor,
-    flat_projected_state: Tensor,
-    flat_projected_val: Tensor,
-    flat_grad_state: Tensor,
-    flat_grad_val: Tensor,
-    tile_size: int,
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    batch, nodes, dim = flat_val.shape
-    heads = int(core.shape[0])
-    use_triton = (
-        flat_val.device.type == "cuda"
-        and triton_signed_smoothmax_available()
-        and heads <= 4
-        and _multihead_signed_smoothmax_triton_diagonal_tile_enabled()
-    )
-    query_bhnr = None
-    if not use_triton:
-        query_bhnr = (
-            flat_val.float().unsqueeze(1)
-            * core.float().view(1, heads, 1, dim)
-        ).contiguous()
-    grad_layer = torch.zeros_like(flat_val, dtype=torch.float32)
-    grad_projected_state = torch.zeros_like(flat_projected_state)
-    grad_projected_val = torch.zeros_like(flat_projected_val)
-    grad_weights = torch.zeros_like(core, dtype=torch.float32)
-    grad_biases = torch.zeros_like(bias_arg, dtype=torch.float32) if has_bias else torch.empty(0, device=flat_val.device)
-    num_tiles = (nodes + tile_size - 1) // tile_size
-    use_triton_backward = _multihead_signed_smoothmax_triton_backward_enabled("diagonal") and triton_signed_smoothmax_available()
-    grad_weight_partials = (
-        torch.zeros((num_tiles, heads, dim), dtype=torch.float32, device=flat_val.device)
-        if use_triton_backward
-        else None
-    )
-    grad_bias_partials = (
-        torch.zeros((num_tiles, heads), dtype=torch.float32, device=flat_val.device)
-        if use_triton_backward and has_bias
-        else None
-    )
-    use_owner_reduction = use_triton_backward and _multihead_signed_smoothmax_owner_reduction_enabled("diagonal")
-    edge_dot = torch.zeros((batch, nodes), dtype=torch.float32, device=flat_val.device)
-    grad_state_expanded = flat_grad_state.unsqueeze(-1)
-    flat_val_by_head = flat_val.unsqueeze(0).expand(heads, -1, -1, -1)
-    flat_val_flat = flat_val_by_head.reshape(heads * batch, nodes, dim)
-
-    for tile_index, source_start in enumerate(range(0, nodes, tile_size)):
-        source_end = min(source_start + tile_size, nodes)
-        scores, _, valid_mask = _diagonal_signed_smoothmax_tile_from_flat(
-            flat_val=flat_val,
-            core=core,
-            bias_arg=bias_arg,
-            has_bias=has_bias,
-            source_start=source_start,
-            source_end=source_end,
-            query_bhnr=query_bhnr,
-            return_head_grads=False,
-        )
-        probs = torch.exp(scores.abs() - row_max.unsqueeze(-1)).masked_fill(~valid_mask, 0.0) / row_denom.unsqueeze(-1)
-        edges = torch.sign(scores) * probs
-        grad_edges = grad_state_expanded * flat_projected_state[:, source_start:source_end].unsqueeze(1)
-        grad_edges = grad_edges + torch.bmm(
-            flat_grad_val,
-            flat_projected_val[:, source_start:source_end, :].transpose(1, 2),
-        )
-        if (
-            flat_val.device.type == "cuda"
-            and triton_signed_smoothmax_available()
-            and _multihead_signed_smoothmax_triton_edge_dot_enabled()
-        ):
-            edge_dot = edge_dot + signed_abs_softmax_edge_dot_tile(
-                scores,
-                grad_edges,
-                row_max,
-                row_denom,
-                source_start,
-            )
-        else:
-            edge_dot = edge_dot + (grad_edges * edges).sum(dim=-1)
-        grad_projected_state[:, source_start:source_end] += torch.bmm(
-            edges.transpose(1, 2),
-            grad_state_expanded,
-        ).squeeze(-1)
-        grad_projected_val[:, source_start:source_end, :] += torch.bmm(
-            edges.transpose(1, 2),
-            flat_grad_val,
-        )
-
-    if use_owner_reduction:
-        (
-            grad_layer_target,
-            grad_layer_source,
-            grad_weight_partials_owner,
-            grad_bias_partials_owner,
-        ) = diagonal_signed_smoothmax_backward_owner(
-            flat_val,
-            core,
-            flat_projected_state,
-            flat_projected_val,
-            flat_grad_state,
-            flat_grad_val,
-            row_max,
-            row_denom,
-            edge_dot,
-            bias_arg if has_bias else None,
-        )
-        grad_layer = grad_layer_target + grad_layer_source
-        grad_weights += grad_weight_partials_owner.sum(dim=(0, 1, 2))
-        if has_bias and grad_bias_partials_owner is not None:
-            grad_biases += grad_bias_partials_owner.sum(dim=(0, 1))
-    else:
-        for tile_index, source_start in enumerate(range(0, nodes, tile_size)):
-            source_end = min(source_start + tile_size, nodes)
-            grad_edges = grad_state_expanded * flat_projected_state[:, source_start:source_end].unsqueeze(1)
-            grad_edges = grad_edges + torch.bmm(
-                flat_grad_val,
-                flat_projected_val[:, source_start:source_end, :].transpose(1, 2),
-            )
-            tile_nodes = int(source_end - source_start)
-            if use_triton_backward:
-                diagonal_signed_smoothmax_backward_tile_accumulate(
-                    flat_val,
-                    core,
-                    source_start,
-                    grad_edges,
-                    row_max,
-                    row_denom,
-                    edge_dot,
-                    grad_layer,
-                    grad_weight_partials[tile_index],
-                    grad_bias_partials[tile_index] if grad_bias_partials is not None else None,
-                    bias_arg if has_bias else None,
-                )
-                continue
-            scores, head_grads, valid_mask = _diagonal_signed_smoothmax_tile_from_flat(
-                flat_val=flat_val,
-                core=core,
-                bias_arg=bias_arg,
-                has_bias=has_bias,
-                source_start=source_start,
-                source_end=source_end,
-                query_bhnr=query_bhnr,
-                return_head_grads=True,
-            )
-            probs = torch.exp(scores.abs() - row_max.unsqueeze(-1)).masked_fill(~valid_mask, 0.0) / row_denom.unsqueeze(-1)
-            signs = torch.sign(scores)
-            grad_scores = signs * probs * (signs * grad_edges - edge_dot.unsqueeze(-1))
-            grad_scores = grad_scores.masked_fill(~valid_mask, 0.0)
-            source_slice = flat_val[:, source_start:source_end, :]
-            grad_scores_h = grad_scores.unsqueeze(0) * head_grads.to(dtype=grad_scores.dtype)
-            grad_scores_flat = grad_scores_h.reshape(heads * batch, nodes, tile_nodes).to(dtype=flat_val.dtype)
-            weighted_source_tile = (source_slice.unsqueeze(0) * core.view(heads, 1, 1, dim)).reshape(
-                heads * batch,
-                tile_nodes,
-                dim,
-            )
-            grad_target_layer = torch.bmm(
-                grad_scores_flat,
-                weighted_source_tile,
-            ).reshape(heads, batch, nodes, dim)
-            grad_weighted_source = torch.bmm(
-                grad_scores_flat.transpose(1, 2),
-                flat_val_flat,
-            ).reshape(heads, batch, tile_nodes, dim)
-            grad_layer += grad_target_layer.sum(dim=0).float()
-            grad_layer[:, source_start:source_end, :] += (
-                grad_weighted_source * core.view(heads, 1, 1, dim)
-            ).sum(dim=0).float()
-            grad_weights += (
-                grad_weighted_source.float() * source_slice.unsqueeze(0).float()
-            ).sum(dim=(1, 2))
-            if has_bias:
-                grad_biases += grad_scores_h.sum(dim=(1, 2, 3))
-    if grad_weight_partials is not None:
-        grad_weights += grad_weight_partials.sum(dim=0)
-    if grad_bias_partials is not None:
-        grad_biases += grad_bias_partials.sum(dim=0)
-    return grad_layer, grad_projected_state, grad_projected_val, grad_weights, grad_biases
-
-
-def _diagonal_multihead_causal_dense_signed_abs_bmm(
-    *,
-    layer_val: Tensor,
-    projected_state: Tensor,
-    projected_val: Tensor,
-    weights: Tensor,
-    biases: Tensor,
-    has_bias: bool,
-    aggregate: str,
-) -> LayerDelta:
-    if aggregate == "signed_smoothmax":
-        delta_state, delta_val = _DiagonalMultiHeadPropagationCausalDenseSignedAbs.apply(
-            layer_val,
-            projected_state,
-            projected_val,
-            weights,
-            biases,
-            has_bias,
-            aggregate,
-        )
-        return LayerDelta(delta_state=delta_state, delta_val=delta_val)
-    (
-        flat_val,
-        flat_projected_state,
-        flat_projected_val,
-        batch_shape,
-        nodes,
-        out_dim,
-    ) = _flatten_dense_tensors(layer_val, projected_state, projected_val)
-    if out_dim != flat_val.shape[-1]:
-        raise ValueError("diagonal multi-head causal dense propagation requires projected_val dim == layer dim.")
-
-    flat_val = flat_val.contiguous()
-    state_f32 = flat_projected_state.to(dtype=torch.float32).contiguous()
-    val_f32 = flat_projected_val.to(dtype=torch.float32).contiguous()
-    batch_flat = int(flat_val.shape[0])
-    heads = int(weights.shape[0])
-    dim = int(flat_val.shape[-1])
-    weight = weights.to(dtype=flat_val.dtype, device=flat_val.device).contiguous()
-    if weight.shape != (heads, dim):
-        raise ValueError("diagonal multi-head weights must have shape [heads, dim].")
-
-    query = flat_val.unsqueeze(1) * weight.view(1, heads, 1, dim)
-    keys = flat_val.unsqueeze(1).expand(batch_flat, heads, nodes, dim)
-    scores_by_head = torch.bmm(
-        query.reshape(batch_flat * heads, nodes, dim),
-        keys.reshape(batch_flat * heads, nodes, dim).transpose(1, 2),
-    ).reshape(batch_flat, heads, nodes, nodes).to(dtype=torch.float32)
-    if has_bias:
-        scores_by_head = scores_by_head + biases.to(dtype=torch.float32, device=flat_val.device).view(1, heads, 1, 1)
-
-    if aggregate == "max":
-        scores = scores_by_head.max(dim=1).values
-    elif aggregate == "smoothmax":
-        scores = torch.logsumexp(scores_by_head, dim=1) - torch.log(
-            torch.tensor(float(heads), dtype=torch.float32, device=flat_val.device)
-        )
-    elif aggregate == "signed_smoothmax":
-        scores = (
-            scores_by_head
-            * torch.softmax(scores_by_head.abs(), dim=1)
-        ).sum(dim=1)
-    else:
-        scores = scores_by_head.sum(dim=1)
-        if aggregate == "mean":
-            scores = scores / float(heads)
-
-    mask = _causal_tril_mask(nodes, flat_val.device)
-    mask_3d = mask.view(1, nodes, nodes)
-    scores = scores.masked_fill(~mask_3d, 0.0)
-    stats = scores.abs().masked_fill(~mask_3d, float("-inf"))
-    probs = torch.softmax(stats, dim=-1)
-    edges = torch.sign(scores) * probs * mask_3d.to(dtype=probs.dtype)
-    delta_state = torch.bmm(edges, state_f32.unsqueeze(-1)).squeeze(-1)
-    delta_val = torch.bmm(edges, val_f32)
-    return LayerDelta(
-        delta_state=delta_state.to(dtype=projected_state.dtype).reshape(*batch_shape, nodes),
-        delta_val=delta_val.to(dtype=projected_val.dtype).reshape(*batch_shape, nodes, out_dim),
-    )
-
-
-class _DiagonalMultiHeadPropagationCausalDenseSignedAbs(Function):
-    @staticmethod
-    def forward(
-        ctx: Any,
-        layer_val: Tensor,
-        projected_state: Tensor,
-        projected_val: Tensor,
-        weights: Tensor,
-        biases: Tensor,
-        has_bias: bool,
-        aggregate: str,
-    ) -> tuple[Tensor, Tensor]:
-        (
-            flat_val,
-            flat_projected_state,
-            flat_projected_val,
-            batch_shape,
-            nodes,
-            out_dim,
-        ) = _flatten_dense_tensors(layer_val, projected_state, projected_val)
-        if out_dim != flat_val.shape[-1]:
-            raise ValueError("diagonal multi-head CUDA path requires projected_val dim == layer dim.")
-        heads = int(weights.shape[0])
-        dim = int(flat_val.shape[-1])
-        if weights.shape != (heads, dim):
-            raise ValueError("diagonal multi-head weights must have shape [heads, dim].")
-        score_dtype = flat_val.dtype
-        core = weights.to(dtype=score_dtype, device=flat_val.device).contiguous()
-        bias_arg = biases.to(dtype=score_dtype, device=flat_val.device).contiguous() if bool(has_bias) else biases
-        state_f32 = flat_projected_state.to(dtype=torch.float32).contiguous()
-        val_f32 = flat_projected_val.to(dtype=torch.float32).contiguous()
-        ctx.has_bias = bool(has_bias)
-        ctx.aggregate = str(aggregate)
-        ctx.batch_shape = batch_shape
-        ctx.nodes = nodes
-        ctx.out_dim = out_dim
-        ctx.layer_dtype = layer_val.dtype
-        ctx.projected_state_dtype = projected_state.dtype
-        ctx.projected_val_dtype = projected_val.dtype
-        ctx.tile_size = int(_multihead_dense_tile_size())
-        use_smoothmax_bmm_cuda = (
-            str(aggregate) in {"smoothmax", "signed_smoothmax"}
-            and not (
-                str(aggregate) == "signed_smoothmax"
-                and flat_val.is_cuda
-                and triton_signed_smoothmax_available()
-                and _multihead_signed_smoothmax_triton_enabled()
-            )
-            and flat_val.is_cuda
-            and native_supports("diagonal_multihead_smoothmax_propagation_causal_dense_signed_abs_forward_bmm_cuda")
-        )
-        use_triton_signed_smoothmax = (
-            str(aggregate) == "signed_smoothmax"
-            and flat_val.is_cuda
-            and triton_signed_smoothmax_available()
-            and _multihead_signed_smoothmax_triton_enabled()
-        )
-        use_recompute_signed_smoothmax = str(aggregate) == "signed_smoothmax"
-        if use_recompute_signed_smoothmax:
-            row_max, row_denom = _diagonal_signed_smoothmax_row_stats_from_flat(
-                flat_val=flat_val,
-                core=core,
-                bias_arg=bias_arg,
-                has_bias=bool(has_bias),
-                tile_size=int(ctx.tile_size),
-            )
-            use_triton_diag = (
-                flat_val.device.type == "cuda"
-                and triton_signed_smoothmax_available()
-                and heads <= 4
-                and _multihead_signed_smoothmax_triton_diagonal_tile_enabled()
-            )
-            query_bhnr = None
-            if not use_triton_diag:
-                query_bhnr = (
-                    flat_val.float().unsqueeze(1)
-                    * core.float().view(1, heads, 1, dim)
-                ).contiguous()
-            delta_state = torch.zeros((flat_val.shape[0], nodes), dtype=torch.float32, device=flat_val.device)
-            delta_val = torch.zeros((flat_val.shape[0], nodes, out_dim), dtype=torch.float32, device=flat_val.device)
-            for source_start in range(0, nodes, int(ctx.tile_size)):
-                source_end = min(source_start + int(ctx.tile_size), nodes)
-                scores, _, valid_mask = _diagonal_signed_smoothmax_tile_from_flat(
-                    flat_val=flat_val,
-                    core=core,
-                    bias_arg=bias_arg,
-                    has_bias=bool(has_bias),
-                    source_start=source_start,
-                    source_end=source_end,
-                    query_bhnr=query_bhnr,
-                    return_head_grads=False,
-                )
-                probs = torch.exp(scores.abs() - row_max.unsqueeze(-1)).masked_fill(~valid_mask, 0.0) / row_denom.unsqueeze(-1)
-                edges = torch.sign(scores) * probs
-                delta_state = delta_state + torch.bmm(edges, state_f32[:, source_start:source_end].unsqueeze(-1)).squeeze(-1)
-                delta_val = delta_val + torch.bmm(edges, val_f32[:, source_start:source_end, :])
-            saved_scores = flat_val.new_empty((0,), dtype=torch.float32)
-            used_native_cuda = False
-        elif use_smoothmax_bmm_cuda:
-            delta_state, delta_val, row_max, row_denom = (
-                _native_module().diagonal_multihead_smoothmax_propagation_causal_dense_signed_abs_forward_bmm_cuda(
-                    flat_val,
-                    state_f32,
-                    val_f32,
-                    core,
-                    bias_arg,
-                    bool(has_bias),
-                    str(aggregate),
-                )
-            )
-            used_native_cuda = False
-        elif use_triton_signed_smoothmax:
-            projected_source = flat_val.unsqueeze(0).expand(heads, -1, -1, -1).contiguous()
-            projected_target = projected_source
-            weighted_source = (projected_source * core.view(heads, 1, 1, dim)).contiguous()
-            query = (flat_val.unsqueeze(1) * core.view(1, heads, 1, dim)).contiguous()
-            source = flat_val.unsqueeze(1).expand(flat_val.shape[0], heads, nodes, dim).contiguous()
-            scores = multihead_signed_smoothmax_scores(
-                query,
-                source,
-                bias_arg if bool(has_bias) else None,
-            )
-            mask = _causal_tril_mask(nodes, flat_val.device).view(1, nodes, nodes)
-            valid_scores = scores.masked_fill(~mask, 0.0)
-            stats = valid_scores.abs().masked_fill(~mask, float("-inf"))
-            row_max = stats.amax(dim=-1)
-            probs = torch.softmax(stats, dim=-1)
-            edges = torch.sign(valid_scores) * probs * mask.to(dtype=probs.dtype)
-            row_denom = torch.exp(stats - row_max.unsqueeze(-1)).masked_fill(~mask, 0.0).sum(dim=-1).clamp_min(1.0e-20)
-            delta_state = torch.bmm(edges, state_f32.unsqueeze(-1)).squeeze(-1)
-            delta_val = torch.bmm(edges, val_f32)
-            saved_scores = valid_scores.contiguous()
-            used_native_cuda = False
-        else:
-            projected_source = flat_val.unsqueeze(0).expand(heads, -1, -1, -1).contiguous()
-            projected_target = projected_source
-            weighted_source = (projected_source * core.view(heads, 1, 1, dim)).contiguous()
-            delta_state, delta_val = _native_module().low_rank_multihead_max_propagation_causal_dense_signed_abs_forward_cuda(
-                weighted_source,
-                projected_target,
-                state_f32,
-                val_f32,
-                bias_arg,
-                bool(has_bias),
-                str(aggregate),
-            )
-            row_max = flat_val.new_empty((0,), dtype=torch.float32)
-            row_denom = flat_val.new_empty((0,), dtype=torch.float32)
-            saved_scores = flat_val.new_empty((0,), dtype=torch.float32)
-            used_native_cuda = True
-        if use_smoothmax_bmm_cuda:
-            saved_scores = flat_val.new_empty((0,), dtype=torch.float32)
-        ctx.used_native_cuda = bool(used_native_cuda)
-        ctx.used_recompute_signed_smoothmax = bool(use_recompute_signed_smoothmax)
-        ctx.save_for_backward(flat_val, projected_state, projected_val, weights, biases, row_max, row_denom, saved_scores)
-        return (
-            delta_state.to(dtype=projected_state.dtype).reshape(*batch_shape, nodes),
-            delta_val.to(dtype=projected_val.dtype).reshape(*batch_shape, nodes, out_dim),
-        )
-
-    @staticmethod
-    def backward(ctx: Any, grad_delta_state: Tensor, grad_delta_val: Tensor) -> tuple[Any, ...]:
-        flat_val, projected_state, projected_val, weights, biases, row_max, row_denom, saved_scores = ctx.saved_tensors
-        nodes = int(ctx.nodes)
-        out_dim = int(ctx.out_dim)
-        heads = int(weights.shape[0])
-        dim = int(flat_val.shape[-1])
-        core = weights.to(dtype=flat_val.dtype, device=flat_val.device).contiguous()
-        bias_arg = biases.to(dtype=flat_val.dtype, device=flat_val.device).contiguous() if ctx.has_bias else biases
-        flat_projected_state = projected_state.reshape(-1, nodes).to(dtype=torch.float32).contiguous()
-        flat_projected_val = projected_val.reshape(-1, nodes, out_dim).to(dtype=torch.float32).contiguous()
-        flat_grad_state = grad_delta_state.reshape(-1, nodes).to(dtype=torch.float32).contiguous()
-        flat_grad_val = grad_delta_val.reshape(-1, nodes, out_dim).to(dtype=torch.float32).contiguous()
-        if str(ctx.aggregate) == "signed_smoothmax" and bool(getattr(ctx, "used_recompute_signed_smoothmax", False)):
-            (
-                grad_layer,
-                grad_projected_state,
-                grad_projected_val,
-                grad_weights,
-                grad_biases,
-            ) = _diagonal_signed_smoothmax_backward_recompute_from_flat(
-                flat_val=flat_val,
-                core=core,
-                bias_arg=bias_arg,
-                has_bias=bool(ctx.has_bias),
-                row_max=row_max.float(),
-                row_denom=row_denom.float(),
-                flat_projected_state=flat_projected_state,
-                flat_projected_val=flat_projected_val,
-                flat_grad_state=flat_grad_state,
-                flat_grad_val=flat_grad_val,
-                tile_size=int(ctx.tile_size),
-            )
-        elif (
-            str(ctx.aggregate) == "signed_smoothmax"
-            and saved_scores.numel() != 0
-            and _multihead_signed_smoothmax_triton_backward_enabled("diagonal")
-        ):
-            projected_source = flat_val.unsqueeze(0).expand(heads, -1, -1, -1).contiguous()
-            projected_target = projected_source
-            weighted_source = (projected_source * core.view(heads, 1, 1, dim)).contiguous()
-            (
-                grad_projected_source,
-                grad_projected_target,
-                grad_projected_state,
-                grad_projected_val,
-                grad_weights,
-                grad_biases,
-            ) = _signed_smoothmax_backward_from_saved_scores(
-                saved_scores=saved_scores,
-                weighted_source=weighted_source,
-                projected_source=projected_source,
-                projected_target=projected_target,
-                core_cast=core,
-                bias_arg=bias_arg,
-                has_bias=bool(ctx.has_bias),
-                row_max=row_max.float(),
-                row_denom=row_denom.float(),
-                flat_projected_state=flat_projected_state,
-                flat_projected_val=flat_projected_val,
-                flat_grad_state=flat_grad_state,
-                flat_grad_val=flat_grad_val,
-                tile_size=_multihead_dense_tile_size(),
-            )
-            grad_layer = (grad_projected_source + grad_projected_target).sum(dim=0)
-        elif (
-            str(ctx.aggregate) == "smoothmax"
-            and native_supports("low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_backward_bmm_cuda")
-        ):
-            projected_source = flat_val.unsqueeze(0).expand(heads, -1, -1, -1).contiguous()
-            projected_target = projected_source
-            weighted_source = (projected_source * core.view(heads, 1, 1, dim)).contiguous()
-            (
-                grad_projected_source,
-                grad_projected_target,
-                grad_projected_state,
-                grad_projected_val,
-                grad_weights,
-                grad_biases,
-            ) = _native_module().low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_backward_bmm_cuda(
-                weighted_source,
-                projected_source,
-                projected_target,
-                flat_projected_state,
-                flat_projected_val,
-                core,
-                bias_arg,
-                row_max,
-                row_denom,
-                flat_grad_state,
-                flat_grad_val,
-                bool(ctx.has_bias),
-                str(ctx.aggregate),
-            )
-            grad_layer = (grad_projected_source + grad_projected_target).sum(dim=0)
-        elif bool(getattr(ctx, "used_native_cuda", False)):
-            projected_source = flat_val.unsqueeze(0).expand(heads, -1, -1, -1).contiguous()
-            projected_target = projected_source
-            weighted_source = (projected_source * core.view(heads, 1, 1, dim)).contiguous()
-            (
-                grad_projected_source,
-                grad_projected_target,
-                grad_projected_state,
-                grad_projected_val,
-                grad_weights,
-                grad_biases,
-            ) = _native_module().low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cuda(
-                weighted_source,
-                projected_source,
-                projected_target,
-                flat_projected_state,
-                flat_projected_val,
-                core,
-                bias_arg,
-                flat_grad_state,
-                flat_grad_val,
-                bool(ctx.has_bias),
-                str(ctx.aggregate),
-            )
-            grad_layer = (grad_projected_source + grad_projected_target).sum(dim=0)
-        else:
-            projected_source = flat_val.unsqueeze(0).expand(heads, -1, -1, -1).contiguous()
-            projected_target = projected_source
-            weighted_source = (projected_source * core.view(heads, 1, 1, dim)).contiguous()
-            (
-                grad_projected_source,
-                grad_projected_target,
-                grad_projected_state,
-                grad_projected_val,
-                grad_weights,
-                grad_biases,
-            ) = _native_module().low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cuda(
-                weighted_source,
-                projected_source,
-                projected_target,
-                flat_projected_state,
-                flat_projected_val,
-                core,
-                bias_arg,
-                flat_grad_state,
-                flat_grad_val,
-                bool(ctx.has_bias),
-                str(ctx.aggregate),
-            )
-            grad_layer = (grad_projected_source + grad_projected_target).sum(dim=0)
-        return (
-            grad_layer.reshape_as(flat_val).reshape(*ctx.batch_shape, nodes, out_dim).to(dtype=ctx.layer_dtype),
-            grad_projected_state.reshape(*ctx.batch_shape, nodes).to(dtype=ctx.projected_state_dtype),
-            grad_projected_val.reshape(*ctx.batch_shape, nodes, out_dim).to(dtype=ctx.projected_val_dtype),
-            grad_weights.to(dtype=weights.dtype),
-            grad_biases.to(dtype=biases.dtype) if ctx.has_bias else None,
-            None,
-            None,
-        )
-
-
-def _low_rank_multihead_max_parts(pairwise_fn: object) -> tuple[Tensor, Tensor, Tensor, Tensor, bool, str] | None:
-    if not isinstance(pairwise_fn, MultiHeadPairwise):
-        return None
-    if pairwise_fn.aggregate not in {"max", "mean", "sum", "head_mean", "smoothmax", "signed_smoothmax"} or len(pairwise_fn.heads) == 0:
-        return None
-    if not all(isinstance(head, LowRankBilinearPairwise) for head in pairwise_fn.heads):
-        return None
-    source_weights = torch.stack([head.source_proj.weight for head in pairwise_fn.heads])
-    target_weights = torch.stack([head.target_proj.weight for head in pairwise_fn.heads])
-    core_weights = torch.stack([head.weight for head in pairwise_fn.heads])
-    has_bias = all(getattr(head, "bias", None) is not None for head in pairwise_fn.heads)
-    if has_bias:
-        biases = torch.stack([head.bias for head in pairwise_fn.heads])
-    elif any(getattr(head, "bias", None) is not None for head in pairwise_fn.heads):
-        return None
-    else:
-        biases = torch.empty(0, dtype=core_weights.dtype, device=core_weights.device)
-    return source_weights, target_weights, core_weights, biases, has_bias, str(pairwise_fn.aggregate)
 
 
 def propagation_dense_native(
@@ -7051,41 +5480,8 @@ def propagation_window_native(
     target_block_size: int,
     source_block_size: int,
 ) -> Any:
-    low_rank_multihead_parts = _low_rank_multihead_max_parts(pairwise_fn)
-    diagonal_multihead_parts = _diagonal_multihead_parts(pairwise_fn)
-    if (
-        not supports_pairwise_kernel(pairwise_fn)
-        and low_rank_multihead_parts is None
-        and diagonal_multihead_parts is None
-    ):
+    if not supports_pairwise_kernel(pairwise_fn):
         raise TypeError("Unsupported pairwise_fn for native propagation.")
-    use_bilinear_causal_dense_recompute = (
-        _experimental_fused_training_enabled()
-        and _experimental_causal_dense_prop_forward_cuda_enabled()
-        and edge_compress_name == "signed_abs_softmax"
-        and isinstance(pairwise_fn, BilinearPairwise)
-        and native_supports("low_rank_propagation_causal_dense_signed_abs_forward_cuda")
-        and _cuda_float_tensor(layer_val)
-        and _cuda_float_tensor(projected_state)
-        and _cuda_float_tensor(projected_val)
-        and int(window) + 1 >= int(layer_val.shape[-2])
-        and int(projected_val.shape[-1]) == int(layer_val.shape[-1])
-    )
-    if use_bilinear_causal_dense_recompute:
-        bias = (
-            pairwise_fn.bias
-            if getattr(pairwise_fn, "bias", None) is not None
-            else torch.empty(0, dtype=layer_val.dtype, device=layer_val.device)
-        )
-        delta_state, delta_val = _BilinearPropagationCausalDenseSignedAbs.apply(
-            layer_val,
-            projected_state,
-            projected_val,
-            pairwise_fn.normalized_weight(),
-            bias,
-            getattr(pairwise_fn, "bias", None) is not None,
-        )
-        return LayerDelta(delta_state=delta_state, delta_val=delta_val)
     use_diagonal_causal_dense_cuda = (
         _experimental_diagonal_dense_prop_cuda_enabled()
         and edge_compress_name == "signed_abs_softmax"
@@ -7113,164 +5509,6 @@ def propagation_window_native(
             getattr(pairwise_fn, "bias", None) is not None,
         )
         return LayerDelta(delta_state=delta_state, delta_val=delta_val)
-    use_diagonal_multihead_causal_dense_bmm = (
-        _experimental_fused_training_enabled()
-        and _experimental_causal_dense_prop_forward_cuda_enabled()
-        and edge_compress_name == "signed_abs_softmax"
-        and diagonal_multihead_parts is not None
-        and _cuda_float_tensor(layer_val)
-        and _cuda_float_tensor(projected_state)
-        and _cuda_float_tensor(projected_val)
-        and int(window) + 1 >= int(layer_val.shape[-2])
-        and int(projected_val.shape[-1]) == int(layer_val.shape[-1])
-    )
-    use_diagonal_multihead_signed_smoothmax_exact = (
-        edge_compress_name == "signed_abs_softmax"
-        and diagonal_multihead_parts is not None
-        and str(diagonal_multihead_parts[-1]) == "signed_smoothmax"
-        and _cuda_float_tensor(layer_val)
-        and _cuda_float_tensor(projected_state)
-        and _cuda_float_tensor(projected_val)
-        and int(window) + 1 >= int(layer_val.shape[-2])
-        and int(projected_val.shape[-1]) == int(layer_val.shape[-1])
-    )
-    if use_diagonal_multihead_signed_smoothmax_exact and diagonal_multihead_parts is not None:
-        weights, biases, has_bias, _aggregate = diagonal_multihead_parts
-        delta_state, delta_val = _DiagonalMultiHeadPropagationCausalDenseSignedAbs.apply(
-            layer_val,
-            projected_state,
-            projected_val,
-            weights,
-            biases,
-            has_bias,
-            "signed_smoothmax",
-        )
-        return LayerDelta(delta_state=delta_state, delta_val=delta_val)
-    if use_diagonal_multihead_causal_dense_bmm and diagonal_multihead_parts is not None:
-        weights, biases, has_bias, aggregate = diagonal_multihead_parts
-        if aggregate in {"smoothmax", "signed_smoothmax"}:
-            delta_state, delta_val = _DiagonalMultiHeadPropagationCausalDenseSignedAbs.apply(
-                layer_val,
-                projected_state,
-                projected_val,
-                weights,
-                biases,
-                has_bias,
-                aggregate,
-            )
-            return LayerDelta(delta_state=delta_state, delta_val=delta_val)
-        if (
-            aggregate == "max"
-            and _multihead_dense_cuda_kernel_enabled()
-            and native_supports("low_rank_multihead_max_propagation_causal_dense_signed_abs_forward_cuda")
-            and native_supports("low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cuda")
-        ):
-            delta_state, delta_val = _DiagonalMultiHeadPropagationCausalDenseSignedAbs.apply(
-                layer_val,
-                projected_state,
-                projected_val,
-                weights,
-                biases,
-                has_bias,
-                aggregate,
-            )
-            return LayerDelta(delta_state=delta_state, delta_val=delta_val)
-        return _diagonal_multihead_causal_dense_signed_abs_bmm(
-            layer_val=layer_val,
-            projected_state=projected_state,
-            projected_val=projected_val,
-            weights=weights,
-            biases=biases,
-            has_bias=has_bias,
-            aggregate=aggregate,
-        )
-    use_low_rank_multihead_signed_smoothmax_exact = (
-        edge_compress_name == "signed_abs_softmax"
-        and low_rank_multihead_parts is not None
-        and str(low_rank_multihead_parts[-1]) == "signed_smoothmax"
-        and _cuda_float_tensor(layer_val)
-        and _cuda_float_tensor(projected_state)
-        and _cuda_float_tensor(projected_val)
-        and int(window) + 1 >= int(layer_val.shape[-2])
-    )
-    if use_low_rank_multihead_signed_smoothmax_exact and low_rank_multihead_parts is not None:
-        source_weights, target_weights, core_weights, biases, has_bias, _aggregate = low_rank_multihead_parts
-        delta_state, delta_val = _LowRankMultiHeadMaxPropagationCausalDenseSignedAbs.apply(
-            layer_val,
-            projected_state,
-            projected_val,
-            source_weights,
-            target_weights,
-            core_weights,
-            biases,
-            has_bias,
-            "signed_smoothmax",
-        )
-        return LayerDelta(delta_state=delta_state, delta_val=delta_val)
-    use_low_rank_multihead_smoothmax_exact = (
-        edge_compress_name == "signed_abs_softmax"
-        and low_rank_multihead_parts is not None
-        and str(low_rank_multihead_parts[-1]) == "smoothmax"
-        and _cuda_float_tensor(layer_val)
-        and _cuda_float_tensor(projected_state)
-        and _cuda_float_tensor(projected_val)
-        and int(window) + 1 >= int(layer_val.shape[-2])
-    )
-    if use_low_rank_multihead_smoothmax_exact and low_rank_multihead_parts is not None:
-        source_weights, target_weights, core_weights, biases, has_bias, _aggregate = low_rank_multihead_parts
-        delta_state, delta_val = _LowRankMultiHeadMaxPropagationCausalDenseSignedAbs.apply(
-            layer_val,
-            projected_state,
-            projected_val,
-            source_weights,
-            target_weights,
-            core_weights,
-            biases,
-            has_bias,
-            "smoothmax",
-        )
-        return LayerDelta(delta_state=delta_state, delta_val=delta_val)
-    use_low_rank_multihead_causal_dense = (
-        _experimental_fused_training_enabled()
-        and _experimental_causal_dense_prop_forward_cuda_enabled()
-        and edge_compress_name == "signed_abs_softmax"
-        and low_rank_multihead_parts is not None
-        and native_supports("low_rank_multihead_max_propagation_causal_dense_signed_abs_forward_cuda")
-        and native_supports("low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cuda")
-        and _cuda_float_tensor(layer_val)
-        and _cuda_float_tensor(projected_state)
-        and _cuda_float_tensor(projected_val)
-        and int(window) + 1 >= int(layer_val.shape[-2])
-    )
-    if use_low_rank_multihead_causal_dense and low_rank_multihead_parts is not None:
-        source_weights, target_weights, core_weights, biases, has_bias, aggregate = low_rank_multihead_parts
-        if str(aggregate) == "signed_smoothmax":
-            delta_state, delta_val = _LowRankMultiHeadMaxPropagationCausalDenseSignedAbs.apply(
-                layer_val,
-                projected_state,
-                projected_val,
-                source_weights,
-                target_weights,
-                core_weights,
-                biases,
-                has_bias,
-                "signed_smoothmax",
-            )
-            return LayerDelta(delta_state=delta_state, delta_val=delta_val)
-        # For smoothmax, the autograd wrapper uses the tiled ATen/BMM forward path
-        # and reuses saved row stats in the BMM backward path.
-        delta_state, delta_val = _LowRankMultiHeadMaxPropagationCausalDenseSignedAbs.apply(
-            layer_val,
-            projected_state,
-            projected_val,
-            source_weights,
-            target_weights,
-            core_weights,
-            biases,
-            has_bias,
-            aggregate,
-        )
-        return LayerDelta(delta_state=delta_state, delta_val=delta_val)
     use_entmax15_cuda_autograd = (
         _experimental_fused_training_enabled()
         and edge_compress_name == "signed_entmax15"
@@ -7289,7 +5527,6 @@ def propagation_window_native(
         and edge_compress_name == "signed_abs_softmax"
         and _query_backward_ops_available()
         and native_supports("low_rank_propagation_causal_dense_signed_abs_forward_cuda")
-        and native_supports("low_rank_propagation_causal_dense_signed_abs_backward_cuda")
         and native_supports("low_rank_pairwise_topk_backward_cuda")
         and isinstance(pairwise_fn, LowRankBilinearPairwise)
         and _cuda_float_tensor(layer_val)

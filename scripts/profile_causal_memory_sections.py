@@ -7,7 +7,7 @@ import time
 import torch
 import torch.nn.functional as F
 
-from jakal_net._architectural_common import apply_delta, unit_normalize_values
+from jakal_net._architectural_common import apply_delta, softsign_state
 from jakal_net.causal_memory_lm import CausalHierarchicalMemoryLM
 from jakal_net.core import Layer
 
@@ -39,6 +39,7 @@ def build_model(args: argparse.Namespace, device: torch.device) -> CausalHierarc
         else tuple(args.memory_update_intervals),
         prediction_layers=args.prediction_layers,
         s_window=args.s_window,
+        prediction_window=args.prediction_window,
         memory_topk=args.memory_topk,
         memory_train_mode=args.memory_train_mode,
         memory_eval_mode="topk",
@@ -53,6 +54,7 @@ def build_model(args: argparse.Namespace, device: torch.device) -> CausalHierarc
         pairwise_anchor_heads=args.pairwise_anchor_heads,
         route_anchor_heads=args.route_anchor_heads,
         implementation="native",
+        direction_only_values=args.direction_only_values,
         feed_forward_layers=not args.disable_feed_forward_layers,
         memory_feed_forward_layers=not (
             args.disable_feed_forward_layers or args.disable_memory_feed_forward_layers
@@ -79,24 +81,21 @@ def profile_s_encode_sections(
         ).unsqueeze(0)
         token_val = s_module.sequence_input_norm(token_val)
         token_state_source = token_val
-        if s_module.unit_norm_values:
-            token_val = unit_normalize_values(token_val)
     with timed("s_anchor_state"):
         anchor_val = s_module.anchor_val.expand(batch_size, 1, -1).to(
             device=token_val.device,
             dtype=token_val.dtype,
         )
-        if s_module.unit_norm_values:
-            anchor_val = unit_normalize_values(anchor_val)
         anchor_state = s_module.anchor_state.expand(batch_size, 1).to(
             device=token_val.device,
             dtype=token_val.dtype,
         )
+        token_state = model.value_to_state(token_state_source).squeeze(-1)
+        if s_module.direction_only_values:
+            anchor_state = softsign_state(anchor_state)
+            token_state = softsign_state(token_state)
         seq_val = torch.cat((anchor_val, token_val), dim=1)
-        seq_state = torch.cat(
-            (anchor_state, model.value_to_state(token_state_source).squeeze(-1)),
-            dim=1,
-        )
+        seq_state = torch.cat((anchor_state, token_state), dim=1)
         layer = Layer(dim=s_module.dim, num_nodes=seq_len + 1, state=seq_state, val=seq_val)
     for layer_index, (propagation, norm) in enumerate(
         zip(s_module.sequence_layers, s_module.sequence_norms)
@@ -104,13 +103,22 @@ def profile_s_encode_sections(
         with timed(f"s_layer_{layer_index}_compute_delta"):
             delta = propagation.compute_delta(layer)
         with timed(f"s_layer_{layer_index}_apply_delta_norm"):
-            layer = apply_delta(
-                layer,
-                delta,
-                residual=True,
-                val_norm=norm,
-                unit_norm_values=s_module.unit_norm_values,
-            )
+            if s_module._can_use_dense_apply_fastpath(layer, propagation):
+                layer = s_module._apply_dense_delta_fastpath(
+                    layer,
+                    delta.delta_state,
+                    delta.delta_val,
+                    norm,
+                    propagation,
+                )
+            else:
+                layer = apply_delta(
+                    layer,
+                    delta,
+                    residual=True,
+                    val_norm=norm,
+                    direction_only_values=s_module.direction_only_values,
+                )
         with timed(f"s_layer_{layer_index}_ffn"):
             layer = s_module._apply_ffn(layer, s_module.sequence_ffns[layer_index])
     return layer
@@ -167,32 +175,36 @@ def profile_forward_sections(
             zip(model.prediction_layers, model.prediction_norms)
         ):
             with timed(f"prediction_propagation_{layer_index}"):
-                query_layer = apply_delta(
-                    query_layer,
-                    propagation.compute_delta(query_layer),
-                    residual=True,
-                    val_norm=norm,
-                    unit_norm_values=model.unit_norm_values,
-                )
+                delta = propagation.compute_delta(query_layer)
+                if model._can_use_dense_apply_fastpath(query_layer, propagation):
+                    query_layer = model._apply_dense_delta_fastpath(
+                        query_layer,
+                        delta.delta_state,
+                        delta.delta_val,
+                        norm,
+                        propagation,
+                    )
+                else:
+                    query_layer = apply_delta(
+                        query_layer,
+                        delta,
+                        residual=True,
+                        val_norm=norm,
+                        direction_only_values=model.direction_only_values,
+                    )
             with timed(f"prediction_ffn_{layer_index}"):
                 ffn_val = model.prediction_ffns[layer_index](query_layer.val)
-                if model.unit_norm_values:
-                    ffn_val = unit_normalize_values(ffn_val)
                 query_layer = query_layer.with_tensors(val=ffn_val)
         with timed("output_norm_head"):
             output_state_source = model.output_norm(query_layer.val)
             output_val = output_state_source
-            if model.unit_norm_values:
-                output_val = unit_normalize_values(output_val)
-                query_layer = query_layer.with_tensors(
-                    state=model.value_to_state(output_state_source).squeeze(-1),
-                    val=output_val,
-                )
-            else:
-                query_layer = query_layer.with_tensors(
-                    state=model.value_to_state(output_state_source).squeeze(-1),
-                    val=output_val,
-                )
+            output_state = model.value_to_state(output_state_source).squeeze(-1)
+            if model.direction_only_values:
+                output_state = softsign_state(output_state)
+            query_layer = query_layer.with_tensors(
+                state=output_state,
+                val=output_val,
+            )
             _ = Layer(dim=model.dim, num_nodes=query_layer.num_nodes, state=query_layer.state, val=output_val)
             logits = model.lm_head(output_val)
     return logits
@@ -210,6 +222,7 @@ def main() -> None:
     parser.add_argument("--memory-update-intervals", type=int, nargs="+", default=None)
     parser.add_argument("--prediction-layers", type=int, default=3)
     parser.add_argument("--s-window", type=int, default=128)
+    parser.add_argument("--prediction-window", type=int, default=128)
     parser.add_argument("--memory-topk", type=int, default=16)
     parser.add_argument("--memory-train-mode", choices=("dense", "topk"), default="dense")
     parser.add_argument("--eval-topk", type=int, default=16)
@@ -235,6 +248,7 @@ def main() -> None:
     parser.add_argument("--disable-memory", action="store_true")
     parser.add_argument("--disable-memory-read", action="store_true")
     parser.add_argument("--disable-memory-propagation", action="store_true")
+    parser.add_argument("--direction-only-values", action="store_true")
     parser.add_argument("--scan-backend", choices=("auto", "python", "native"), default="native")
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--backward", action="store_true")
@@ -251,14 +265,17 @@ def main() -> None:
         "profile_config | "
         f"batch={args.batch_size} | seq={args.seq_len} | dim={args.dim} | "
         f"s_layers={args.s_layers} | prediction_layers={args.prediction_layers} | "
-        f"memory_slots={tuple(args.memory_slots)} | pairwise_kind={args.pairwise_kind} | "
+        f"memory_slots={tuple(args.memory_slots)} | s_window={args.s_window} | "
+        f"prediction_window={args.prediction_window} | pairwise_kind={args.pairwise_kind} | "
         f"route_kind={args.route_kind} | memory_ffn={model.memory_feed_forward_layers} | "
         f"disable_memory={model.disable_memory} | disable_memory_read={model.disable_memory_read} | "
         f"disable_memory_propagation={model.disable_memory_propagation} | "
+        f"direction_only_values={model.direction_only_values} | "
         f"memory_train_mode={args.memory_train_mode} | scan_backend={args.scan_backend} | "
         f"bf16={args.bf16} | backward={args.backward}",
         flush=True,
     )
+    model.reset_dense_apply_stats()
     with timed("forward_total"):
         logits = profile_forward_sections(
             model,
@@ -272,6 +289,7 @@ def main() -> None:
     if args.backward:
         with timed("backward_total"):
             loss.backward()
+    print(f"profile_dense_apply | {model.dense_apply_stats()}", flush=True)
     if device.type == "cuda":
         peak_gb = torch.cuda.max_memory_allocated(device) / (1024.0**3)
         print(f"profile_cuda | peak_allocated_gb={peak_gb:.3f}", flush=True)

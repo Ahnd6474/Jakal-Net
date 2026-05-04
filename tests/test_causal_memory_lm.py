@@ -1,9 +1,12 @@
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
+import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
@@ -21,9 +24,19 @@ from jakal_net.causal_memory_lm import (  # noqa: E402
     MemoryScanOutput,
     ModelRecurrentState,
     ValueNormStateProjection,
+    _nomemory_exact_stack_fused,
 )
+from jakal_net._architectural_common import apply_delta, softsign_state  # noqa: E402
+from jakal_net.core import Layer, LayerDelta  # noqa: E402
+from jakal_net.kernel_common import pairwise_kernel_spec  # noqa: E402
 from jakal_net.latent_graph import KModule  # noqa: E402
-from jakal_net.native_backend import _native_scan_uses_legacy_low_rank_extension  # noqa: E402
+from jakal_net.modules import MultiHeadPairwise  # noqa: E402
+from jakal_net.native_backend import (  # noqa: E402
+    _native_scan_uses_legacy_low_rank_extension,
+    native_supports,
+    nomemory_causal_stack_ffn_fused_native_available,
+    nomemory_causal_stack_fused_native_available,
+)
 
 
 class CausalMemoryLMTests(unittest.TestCase):
@@ -102,7 +115,11 @@ class CausalMemoryLMTests(unittest.TestCase):
 
             self.assertIsInstance(output, MemoryScanOutput)
             self.assertEqual(output.logits.shape, (2, 5, 32))
-            self.assertEqual(len(output.memory_state), 2)
+            if kwargs.get("disable_memory"):
+                self.assertEqual(len(output.memory_state), 0)
+                self.assertEqual(model.initialize_memory_state(2, device=token_ids.device, dtype=torch.float32), ())
+            else:
+                self.assertEqual(len(output.memory_state), 2)
             if kwargs.get("disable_memory_propagation"):
                 self.assertFalse(model.b_module.memory_propagation_layers)
 
@@ -233,6 +250,675 @@ class CausalMemoryLMTests(unittest.TestCase):
         )
 
         self.assertTrue(model._native_scan_supported_config())
+
+    def test_direction_only_values_use_softsign_state_without_value_l2_normalization(self) -> None:
+        layer = Layer(
+            dim=4,
+            num_nodes=3,
+            state=torch.tensor([[0.5, -1.0, 2.0]], dtype=torch.float32),
+            val=torch.tensor(
+                [[[3.0, 4.0, 0.0, 0.0], [1.0, 2.0, 2.0, 1.0], [0.5, 0.5, 0.5, 0.5]]],
+                dtype=torch.float32,
+            ),
+        )
+        delta = LayerDelta(
+            delta_state=torch.tensor([[1.5, 0.5, -0.5]], dtype=torch.float32),
+            delta_val=torch.tensor(
+                [[[0.0, 1.0, 0.0, 0.0], [2.0, 0.0, -1.0, 0.0], [0.0, 0.0, 0.0, 3.0]]],
+                dtype=torch.float32,
+            ),
+        )
+
+        updated = apply_delta(layer, delta, residual=True, direction_only_values=True)
+
+        self.assertTrue(torch.allclose(updated.state, softsign_state(layer.state + delta.delta_state)))
+        self.assertTrue(torch.equal(updated.val, layer.val + delta.delta_val))
+
+    def test_direction_only_values_keep_sequence_dense_fastpath(self) -> None:
+        model = CausalHierarchicalMemoryLM(
+            vocab_size=64,
+            dim=16,
+            max_seq_len=16,
+            s_layers=1,
+            memory_slots=(8, 4),
+            prediction_layers=1,
+            memory_topk=2,
+            pairwise_rank=8,
+            route_rank=8,
+            scan_backend="native",
+            direction_only_values=True,
+            feed_forward_layers=False,
+        )
+        layer = Layer(
+            dim=16,
+            num_nodes=17,
+            state=torch.randn(2, 17),
+            val=torch.randn(2, 17, 16),
+        )
+        delta = LayerDelta(
+            delta_state=torch.randn_like(layer.state),
+            delta_val=torch.randn_like(layer.val),
+        )
+
+        self.assertTrue(model.s_module._can_use_dense_apply_fastpath(layer, model.s_module.sequence_layers[0]))
+        expected = layer.with_tensors(
+            state=softsign_state(layer.state + delta.delta_state),
+            val=model.s_module.sequence_norms[0](layer.val + delta.delta_val),
+        )
+        actual = model.s_module._apply_dense_delta_fastpath(
+            layer,
+            delta.delta_state,
+            delta.delta_val,
+            model.s_module.sequence_norms[0],
+            model.s_module.sequence_layers[0],
+        )
+        self.assertTrue(torch.allclose(actual.state, expected.state))
+        self.assertTrue(torch.allclose(actual.val, expected.val))
+
+    def test_direction_only_values_keep_prediction_dense_fastpath(self) -> None:
+        model = CausalHierarchicalMemoryLM(
+            vocab_size=64,
+            dim=16,
+            max_seq_len=16,
+            s_layers=1,
+            memory_slots=(8, 4),
+            prediction_layers=1,
+            memory_topk=2,
+            pairwise_rank=8,
+            route_rank=8,
+            scan_backend="native",
+            direction_only_values=True,
+            feed_forward_layers=False,
+        )
+        layer = Layer(
+            dim=16,
+            num_nodes=16,
+            state=torch.randn(2, 16),
+            val=torch.randn(2, 16, 16),
+        )
+        delta = LayerDelta(
+            delta_state=torch.randn_like(layer.state),
+            delta_val=torch.randn_like(layer.val),
+        )
+
+        self.assertTrue(model._can_use_dense_apply_fastpath(layer, model.prediction_layers[0]))
+        expected = layer.with_tensors(
+            state=softsign_state(layer.state + delta.delta_state),
+            val=model.prediction_norms[0](layer.val + delta.delta_val),
+        )
+        actual = model._apply_dense_delta_fastpath(
+            layer,
+            delta.delta_state,
+            delta.delta_val,
+            model.prediction_norms[0],
+            model.prediction_layers[0],
+        )
+        self.assertTrue(torch.allclose(actual.state, expected.state))
+        self.assertTrue(torch.allclose(actual.val, expected.val))
+
+    def test_nomemory_exact_stack_fastpath_requires_explicit_env_gate(self) -> None:
+        model = CausalHierarchicalMemoryLM(
+            vocab_size=64,
+            dim=16,
+            max_seq_len=16,
+            s_layers=1,
+            memory_slots=(8, 4),
+            prediction_layers=1,
+            memory_topk=2,
+            pairwise_rank=8,
+            route_rank=8,
+            disable_memory=True,
+            feed_forward_layers=False,
+        )
+        token_ids = torch.randint(0, 64, (2, 16))
+
+        self.assertFalse(
+            model._supports_nomemory_exact_stack_fastpath(
+                token_ids,
+                return_layers=False,
+            )
+        )
+
+    def test_forward_can_dispatch_to_nomemory_exact_stack_fastpath(self) -> None:
+        model = CausalHierarchicalMemoryLM(
+            vocab_size=32,
+            dim=8,
+            max_seq_len=12,
+            s_layers=1,
+            memory_slots=(6, 4),
+            prediction_layers=1,
+            memory_topk=2,
+            pairwise_rank=4,
+            route_rank=4,
+            disable_memory=True,
+            feed_forward_layers=False,
+        )
+        token_ids = torch.randint(0, 32, (2, 5))
+        fast_query_val = torch.zeros(2, 5, 8)
+
+        with patch.object(
+            model,
+            "_supports_nomemory_exact_stack_fastpath",
+            return_value=True,
+        ) as supports_mock, patch.object(
+            model,
+            "_run_nomemory_exact_stack_fastpath",
+            return_value=fast_query_val,
+        ) as run_mock:
+            logits = model(token_ids)
+
+        supports_mock.assert_called_once()
+        run_mock.assert_called_once()
+        self.assertEqual(logits.shape, (2, 5, 32))
+
+    def test_nomemory_exact_stack_ffn_fastpath_requires_explicit_env_gate(self) -> None:
+        model = CausalHierarchicalMemoryLM(
+            vocab_size=64,
+            dim=16,
+            max_seq_len=16,
+            s_layers=1,
+            memory_slots=(8, 4),
+            prediction_layers=1,
+            memory_topk=2,
+            pairwise_rank=8,
+            route_rank=8,
+            disable_memory=True,
+            feed_forward_layers=True,
+        )
+        token_ids = torch.randint(0, 64, (2, 16))
+
+        self.assertFalse(
+            model._supports_nomemory_exact_stack_ffn_fastpath(
+                token_ids,
+                return_layers=False,
+            )
+        )
+
+    def test_forward_can_dispatch_to_nomemory_exact_stack_ffn_fastpath(self) -> None:
+        model = CausalHierarchicalMemoryLM(
+            vocab_size=32,
+            dim=8,
+            max_seq_len=12,
+            s_layers=1,
+            memory_slots=(6, 4),
+            prediction_layers=1,
+            memory_topk=2,
+            pairwise_rank=4,
+            route_rank=4,
+            disable_memory=True,
+            feed_forward_layers=True,
+        )
+        token_ids = torch.randint(0, 32, (2, 5))
+        fast_query_val = torch.zeros(2, 5, 8)
+
+        with patch.object(
+            model,
+            "_supports_nomemory_exact_stack_fastpath",
+            return_value=False,
+        ) as supports_noffn_mock, patch.object(
+            model,
+            "_supports_nomemory_exact_stack_ffn_fastpath",
+            return_value=True,
+        ) as supports_ffn_mock, patch.object(
+            model,
+            "_run_nomemory_exact_stack_ffn_fastpath",
+            return_value=fast_query_val,
+        ) as run_mock:
+            logits = model(token_ids)
+
+        supports_noffn_mock.assert_called_once()
+        supports_ffn_mock.assert_called_once()
+        run_mock.assert_called_once()
+        self.assertEqual(logits.shape, (2, 5, 32))
+
+    def test_nomemory_exact_stack_native_fastpath_matches_reference_and_gradients(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for native nomemory exact stack parity coverage.")
+        if not nomemory_causal_stack_fused_native_available("cuda"):
+            self.skipTest("Native nomemory exact stack fused op is unavailable on CUDA.")
+        if not native_supports("nomemory_causal_stack_fused_trace"):
+            self.skipTest("Native nomemory exact stack trace op is unavailable.")
+        if not native_supports("nomemory_causal_stack_fused_backward_cuda"):
+            self.skipTest("Native nomemory exact stack backward op is unavailable.")
+
+        device = torch.device("cuda")
+        torch.manual_seed(23)
+        input_ids = torch.randint(0, 64, (2, 8), device=device)
+        target = torch.randint(0, 64, (2, 8), device=device)
+
+        def _run_step(model: CausalHierarchicalMemoryLM, *, fastpath_enabled: bool) -> tuple[torch.Tensor, float, dict[str, int], dict[str, torch.Tensor]]:
+            env = {
+                "JAKAL_NET_ENABLE_EXPERIMENTAL_FUSED_TRAINING": "1" if fastpath_enabled else "0",
+                "JAKAL_NET_ENABLE_EXPERIMENTAL_NOMEMORY_EXACT_STACK_FASTPATH": "1" if fastpath_enabled else "0",
+            }
+            model.zero_grad(set_to_none=True)
+            model.reset_dense_apply_stats()
+            with patch.dict(os.environ, env, clear=False):
+                logits = model(input_ids)
+                loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), target.reshape(-1))
+                loss.backward()
+            sequence_pairwise = model.s_module.sequence_layers[0].pairwise_fn
+            prediction_pairwise = model.prediction_layers[0].pairwise_fn
+            if isinstance(sequence_pairwise, MultiHeadPairwise):
+                sequence_pairwise = sequence_pairwise.heads[0]
+            if isinstance(prediction_pairwise, MultiHeadPairwise):
+                prediction_pairwise = prediction_pairwise.heads[0]
+            grads = {
+                "s_prediction": model.s_prediction_proj.weight.grad.detach().cpu(),
+                "prediction_input_norm": model.prediction_input_norm.weight.grad.detach().cpu(),
+                "sequence_core": sequence_pairwise.weight.grad.detach().cpu(),
+                "prediction_core": prediction_pairwise.weight.grad.detach().cpu(),
+            }
+            return logits.detach().cpu(), float(loss.detach()), model.dense_apply_stats(), grads
+
+        def _run_token_val_grad_parity(model: CausalHierarchicalMemoryLM) -> torch.Tensor:
+            token_val = model.s_module.token_embedding(input_ids)
+            token_val = token_val + model.s_module.position_encoding(
+                input_ids.shape[1],
+                device=token_val.device,
+                dtype=token_val.dtype,
+            ).unsqueeze(0)
+            token_val = model.s_module.sequence_input_norm(token_val)
+
+            sequence_specs = tuple(
+                (
+                    int(model._nomemory_exact_edge_compress_kind(propagation) or 0),
+                    int(propagation.window or 0),
+                    int(propagation.target_block_size or (input_ids.shape[1] + 1)),
+                    int(propagation.source_block_size or (input_ids.shape[1] + 1)),
+                )
+                for propagation in model.s_module.sequence_layers
+            )
+            prediction_specs = tuple(
+                (
+                    int(model._nomemory_exact_edge_compress_kind(propagation) or 0),
+                    int(propagation.window or 0),
+                    int(propagation.target_block_size or input_ids.shape[1]),
+                    int(propagation.source_block_size or input_ids.shape[1]),
+                )
+                for propagation in model.prediction_layers
+            )
+            sequence_tensors = tuple(
+                tensor
+                for propagation, norm in zip(model.s_module.sequence_layers, model.s_module.sequence_norms)
+                for spec in (pairwise_kernel_spec(propagation.pairwise_fn),)
+                for tensor in (
+                    model._tensor_or_empty(spec.in_weight, token_val),
+                    model._tensor_or_empty(spec.out_weight, token_val),
+                    spec.weight.to(device=token_val.device, dtype=token_val.dtype),
+                    model._tensor_or_empty(spec.bias, token_val),
+                    model.s_module._norm_param_or_empty(norm, "weight", token_val),
+                    model.s_module._norm_param_or_empty(norm, "bias", token_val),
+                )
+            )
+            prediction_tensors = tuple(
+                tensor
+                for propagation, norm in zip(model.prediction_layers, model.prediction_norms)
+                for spec in (pairwise_kernel_spec(propagation.pairwise_fn),)
+                for tensor in (
+                    model._tensor_or_empty(spec.in_weight, token_val),
+                    model._tensor_or_empty(spec.out_weight, token_val),
+                    spec.weight.to(device=token_val.device, dtype=token_val.dtype),
+                    model._tensor_or_empty(spec.bias, token_val),
+                    model._norm_param_or_empty(norm, "weight", token_val),
+                    model._norm_param_or_empty(norm, "bias", token_val),
+                )
+            )
+
+            token_val_fast = token_val.detach().clone().requires_grad_(True)
+            query_fast = _nomemory_exact_stack_fused(
+                token_val_fast,
+                anchor_state=model.s_module.anchor_state.expand(input_ids.shape[0], 1).to(
+                    device=token_val_fast.device,
+                    dtype=token_val_fast.dtype,
+                ),
+                anchor_val=model.s_module.anchor_val.expand(input_ids.shape[0], 1, -1).to(
+                    device=token_val_fast.device,
+                    dtype=token_val_fast.dtype,
+                ),
+                s_prediction_weight=model.s_prediction_proj.weight.to(
+                    device=token_val_fast.device,
+                    dtype=token_val_fast.dtype,
+                ),
+                prediction_input_norm_weight=model._norm_param_or_empty(
+                    model.prediction_input_norm,
+                    "weight",
+                    token_val_fast,
+                ),
+                prediction_input_norm_bias=model._norm_param_or_empty(
+                    model.prediction_input_norm,
+                    "bias",
+                    token_val_fast,
+                ),
+                sequence_tensors=sequence_tensors,
+                prediction_tensors=prediction_tensors,
+                sequence_specs=sequence_specs,
+                prediction_specs=prediction_specs,
+                state_activation_name="softsign" if model.direction_only_values else "signed_softmax",
+            )
+            loss_fast = query_fast.square().mean()
+            loss_fast.backward()
+            return token_val_fast.grad.detach().cpu()
+
+        for direction_only_values in (False, True):
+            with self.subTest(direction_only_values=direction_only_values):
+                base_model = CausalHierarchicalMemoryLM(
+                    vocab_size=64,
+                    dim=32,
+                    max_seq_len=16,
+                    s_layers=6,
+                    memory_slots=(8, 4),
+                    prediction_layers=3,
+                    memory_topk=2,
+                    pairwise_rank=16,
+                    route_rank=16,
+                    pairwise_heads=4,
+                    route_heads=4,
+                    disable_memory=True,
+                    feed_forward_layers=False,
+                    scan_backend="native",
+                    implementation="native",
+                    direction_only_values=direction_only_values,
+                ).to(device)
+                reference_model = CausalHierarchicalMemoryLM(
+                    vocab_size=64,
+                    dim=32,
+                    max_seq_len=16,
+                    s_layers=6,
+                    memory_slots=(8, 4),
+                    prediction_layers=3,
+                    memory_topk=2,
+                    pairwise_rank=16,
+                    route_rank=16,
+                    pairwise_heads=4,
+                    route_heads=4,
+                    disable_memory=True,
+                    feed_forward_layers=False,
+                    scan_backend="native",
+                    implementation="native",
+                    direction_only_values=direction_only_values,
+                ).to(device)
+                reference_model.load_state_dict(base_model.state_dict())
+                base_model.train()
+                reference_model.train()
+
+                with patch.dict(
+                    os.environ,
+                    {
+                        "JAKAL_NET_ENABLE_EXPERIMENTAL_FUSED_TRAINING": "1",
+                        "JAKAL_NET_ENABLE_EXPERIMENTAL_NOMEMORY_EXACT_STACK_FASTPATH": "1",
+                    },
+                    clear=False,
+                ):
+                    self.assertTrue(
+                        base_model._supports_nomemory_exact_stack_fastpath(
+                            input_ids,
+                            return_layers=False,
+                        )
+                    )
+
+                fast_logits, fast_loss, fast_stats, fast_grads = _run_step(base_model, fastpath_enabled=True)
+                reference_logits, reference_loss, reference_stats, reference_grads = _run_step(
+                    reference_model,
+                    fastpath_enabled=False,
+                )
+                token_val_grad = _run_token_val_grad_parity(base_model)
+                reference_token_val = token_val_grad.new_zeros(token_val_grad.shape)
+                token_val = reference_model.s_module.token_embedding(input_ids)
+                token_val = token_val + reference_model.s_module.position_encoding(
+                    input_ids.shape[1],
+                    device=token_val.device,
+                    dtype=token_val.dtype,
+                ).unsqueeze(0)
+                token_val = reference_model.s_module.sequence_input_norm(token_val)
+                token_val_ref = token_val.detach().clone().requires_grad_(True)
+                anchor_val = reference_model.s_module.anchor_val.expand(input_ids.shape[0], 1, -1).to(
+                    device=token_val_ref.device,
+                    dtype=token_val_ref.dtype,
+                )
+                anchor_state = reference_model.s_module.anchor_state.expand(input_ids.shape[0], 1).to(
+                    device=token_val_ref.device,
+                    dtype=token_val_ref.dtype,
+                )
+                token_state = reference_model.value_to_state(token_val_ref).squeeze(-1)
+                if direction_only_values:
+                    anchor_state = softsign_state(anchor_state)
+                    token_state = softsign_state(token_state)
+                sequence_layer = Layer(
+                    dim=reference_model.dim,
+                    num_nodes=input_ids.shape[1] + 1,
+                    state=torch.cat((anchor_state, token_state), dim=1),
+                    val=torch.cat((anchor_val, token_val_ref), dim=1),
+                )
+                for propagation, norm, ffn in zip(
+                    reference_model.s_module.sequence_layers,
+                    reference_model.s_module.sequence_norms,
+                    reference_model.s_module.sequence_ffns,
+                ):
+                    delta = propagation.compute_delta(sequence_layer)
+                    if reference_model.s_module._can_use_dense_apply_fastpath(sequence_layer, propagation):
+                        sequence_layer = reference_model.s_module._apply_dense_delta_fastpath(
+                            sequence_layer,
+                            delta.delta_state,
+                            delta.delta_val,
+                            norm,
+                            propagation,
+                        )
+                    else:
+                        sequence_layer = apply_delta(
+                            sequence_layer,
+                            delta,
+                            residual=True,
+                            val_norm=norm,
+                            direction_only_values=direction_only_values,
+                        )
+                    sequence_layer = sequence_layer.with_tensors(val=ffn(sequence_layer.val))
+                aligned_s = sequence_layer.val[:, 1:, :]
+                query_layer = reference_model._memoryless_query_layer(aligned_s)
+                for propagation, norm, ffn in zip(
+                    reference_model.prediction_layers,
+                    reference_model.prediction_norms,
+                    reference_model.prediction_ffns,
+                ):
+                    delta = propagation.compute_delta(query_layer)
+                    if reference_model._can_use_dense_apply_fastpath(query_layer, propagation):
+                        query_layer = reference_model._apply_dense_delta_fastpath(
+                            query_layer,
+                            delta.delta_state,
+                            delta.delta_val,
+                            norm,
+                            propagation,
+                        )
+                    else:
+                        query_layer = apply_delta(
+                            query_layer,
+                            delta,
+                            residual=True,
+                            val_norm=norm,
+                            direction_only_values=direction_only_values,
+                        )
+                    query_layer = query_layer.with_tensors(val=ffn(query_layer.val))
+                query_layer.val.square().mean().backward()
+                reference_token_val = token_val_ref.grad.detach().cpu()
+
+                self.assertTrue(torch.allclose(fast_logits, reference_logits, atol=1e-4, rtol=1e-4))
+                self.assertAlmostEqual(fast_loss, reference_loss, places=5)
+                for name in fast_grads:
+                    self.assertTrue(
+                        torch.allclose(fast_grads[name], reference_grads[name], atol=1e-4, rtol=1e-4),
+                        msg=f"Gradient mismatch for {name} with direction_only_values={direction_only_values}.",
+                    )
+                self.assertTrue(
+                    torch.allclose(token_val_grad, reference_token_val, atol=1e-4, rtol=1e-4),
+                    msg=f"token_val gradient mismatch with direction_only_values={direction_only_values}.",
+                )
+                self.assertEqual(fast_stats["nomemory_exact_stack_fastpath_calls"], 1)
+                self.assertEqual(fast_stats["sequence_native_calls"], 6)
+                self.assertEqual(fast_stats["prediction_native_calls"], 3)
+                self.assertEqual(reference_stats["nomemory_exact_stack_fastpath_calls"], 0)
+
+    def test_nomemory_exact_stack_ffn_native_fastpath_matches_reference_and_gradients(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for native nomemory exact stack FFN parity coverage.")
+        if not nomemory_causal_stack_ffn_fused_native_available("cuda"):
+            self.skipTest("Native nomemory exact stack FFN fused op is unavailable on CUDA.")
+        if not native_supports("nomemory_causal_stack_ffn_fused_trace"):
+            self.skipTest("Native nomemory exact stack FFN trace op is unavailable.")
+        if not native_supports("nomemory_causal_stack_ffn_fused_backward_cuda"):
+            self.skipTest("Native nomemory exact stack FFN backward op is unavailable.")
+
+        device = torch.device("cuda")
+        torch.manual_seed(23)
+        input_ids = torch.randint(0, 64, (2, 8), device=device)
+        target = torch.randint(0, 64, (2, 8), device=device)
+
+        def _run_step(
+            model: CausalHierarchicalMemoryLM,
+            *,
+            fastpath_enabled: bool,
+        ) -> tuple[torch.Tensor, float, dict[str, int], dict[str, torch.Tensor]]:
+            env = {
+                "JAKAL_NET_ENABLE_EXPERIMENTAL_FUSED_TRAINING": "1" if fastpath_enabled else "0",
+                "JAKAL_NET_ENABLE_EXPERIMENTAL_NOMEMORY_EXACT_STACK_FASTPATH": "1" if fastpath_enabled else "0",
+                "JAKAL_NET_ENABLE_EXPERIMENTAL_NOMEMORY_EXACT_STACK_FFN_FASTPATH": "1" if fastpath_enabled else "0",
+            }
+            model.zero_grad(set_to_none=True)
+            model.reset_dense_apply_stats()
+            with patch.dict(os.environ, env, clear=False):
+                logits = model(input_ids)
+                loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), target.reshape(-1))
+                loss.backward()
+            grads = {
+                "s_prediction": model.s_prediction_proj.weight.grad.detach().cpu(),
+                "prediction_input_norm": model.prediction_input_norm.weight.grad.detach().cpu(),
+                "sequence_ffn_norm": model.s_module.sequence_ffns[0].input_norm.weight.grad.detach().cpu(),
+                "sequence_ffn_in": model.s_module.sequence_ffns[0].net[0].weight.grad.detach().cpu(),
+                "sequence_ffn_out": model.s_module.sequence_ffns[0].net[3].weight.grad.detach().cpu(),
+                "prediction_ffn_norm": model.prediction_ffns[0].input_norm.weight.grad.detach().cpu(),
+                "prediction_ffn_in": model.prediction_ffns[0].net[0].weight.grad.detach().cpu(),
+                "prediction_ffn_out": model.prediction_ffns[0].net[3].weight.grad.detach().cpu(),
+            }
+            return logits.detach().cpu(), float(loss.detach()), model.dense_apply_stats(), grads
+
+        base_model = CausalHierarchicalMemoryLM(
+            vocab_size=64,
+            dim=32,
+            max_seq_len=16,
+            s_layers=6,
+            memory_slots=(8, 4),
+            prediction_layers=3,
+            memory_topk=2,
+            pairwise_rank=16,
+            route_rank=16,
+            pairwise_heads=4,
+            route_heads=4,
+            disable_memory=True,
+            feed_forward_layers=True,
+            scan_backend="native",
+            implementation="native",
+            direction_only_values=True,
+        ).to(device)
+        reference_model = CausalHierarchicalMemoryLM(
+            vocab_size=64,
+            dim=32,
+            max_seq_len=16,
+            s_layers=6,
+            memory_slots=(8, 4),
+            prediction_layers=3,
+            memory_topk=2,
+            pairwise_rank=16,
+            route_rank=16,
+            pairwise_heads=4,
+            route_heads=4,
+            disable_memory=True,
+            feed_forward_layers=True,
+            scan_backend="native",
+            implementation="native",
+            direction_only_values=True,
+        ).to(device)
+        reference_model.load_state_dict(base_model.state_dict())
+        base_model.train()
+        reference_model.train()
+
+        with patch.dict(
+            os.environ,
+            {
+                "JAKAL_NET_ENABLE_EXPERIMENTAL_FUSED_TRAINING": "1",
+                "JAKAL_NET_ENABLE_EXPERIMENTAL_NOMEMORY_EXACT_STACK_FASTPATH": "1",
+                "JAKAL_NET_ENABLE_EXPERIMENTAL_NOMEMORY_EXACT_STACK_FFN_FASTPATH": "1",
+            },
+            clear=False,
+        ):
+            self.assertTrue(
+                base_model._supports_nomemory_exact_stack_ffn_fastpath(
+                    input_ids,
+                    return_layers=False,
+                )
+            )
+
+        fast_logits, fast_loss, fast_stats, fast_grads = _run_step(base_model, fastpath_enabled=True)
+        reference_logits, reference_loss, reference_stats, reference_grads = _run_step(
+            reference_model,
+            fastpath_enabled=False,
+        )
+
+        self.assertTrue(torch.allclose(fast_logits, reference_logits, atol=1e-5, rtol=1e-5))
+        self.assertAlmostEqual(fast_loss, reference_loss, places=6)
+        for name in fast_grads:
+            self.assertTrue(
+                torch.allclose(fast_grads[name], reference_grads[name], atol=1e-5, rtol=1e-5),
+                msg=f"Gradient mismatch for {name}.",
+            )
+        self.assertEqual(fast_stats["nomemory_exact_stack_ffn_fastpath_calls"], 1)
+        self.assertEqual(fast_stats["sequence_native_calls"], 6)
+        self.assertEqual(fast_stats["prediction_native_calls"], 3)
+        self.assertEqual(reference_stats["nomemory_exact_stack_ffn_fastpath_calls"], 0)
+
+    def test_direction_only_values_memoryless_query_uses_softsign_state(self) -> None:
+        model = CausalHierarchicalMemoryLM(
+            vocab_size=64,
+            dim=16,
+            max_seq_len=16,
+            s_layers=1,
+            memory_slots=(8, 4),
+            prediction_layers=1,
+            memory_topk=2,
+            pairwise_rank=8,
+            route_rank=8,
+            direction_only_values=True,
+            feed_forward_layers=False,
+        )
+        aligned_s = torch.randn(2, 5, 16)
+
+        query_layer = model._memoryless_query_layer(aligned_s)
+        query_state_source = model.prediction_input_norm(model.s_prediction_proj(aligned_s))
+        expected_state = softsign_state(model.value_to_state(query_state_source).squeeze(-1))
+
+        self.assertTrue(torch.allclose(query_layer.state, expected_state))
+        self.assertTrue(torch.equal(query_layer.val, query_state_source))
+
+    def test_dense_apply_stats_track_sequence_and_prediction_calls(self) -> None:
+        model = CausalHierarchicalMemoryLM(
+            vocab_size=64,
+            dim=16,
+            max_seq_len=16,
+            s_layers=1,
+            memory_slots=(8, 4),
+            prediction_layers=1,
+            memory_topk=2,
+            pairwise_rank=8,
+            route_rank=8,
+            direction_only_values=True,
+            feed_forward_layers=False,
+        )
+        model.reset_dense_apply_stats()
+        input_ids = torch.randint(0, 64, (2, 8))
+
+        _ = model(input_ids)
+
+        stats = model.dense_apply_stats()
+        self.assertEqual(stats["sequence_native_calls"] + stats["sequence_python_calls"], 1)
+        self.assertEqual(stats["prediction_native_calls"] + stats["prediction_python_calls"], 1)
 
     def test_memory_train_eval_modes_select_dense_or_topk(self) -> None:
         model = CausalHierarchicalMemoryLM(
