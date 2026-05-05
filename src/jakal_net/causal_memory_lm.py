@@ -100,6 +100,7 @@ class CausalMemoryLM(nn.Module):
         feed_forward_hidden_mult: float = 2.0,
         feed_forward_kind: str = "value",
         feed_forward_residual_scale: float = 1.0,
+        feed_forward_learnable_residual_scale: bool = False,
         feed_forward_zero_init_output: bool = True,
         feed_forward_activation: str = "gelu",
         tie_embedding_head: bool = True,
@@ -137,10 +138,14 @@ class CausalMemoryLM(nn.Module):
         self.dim = int(dim)
         self.max_seq_len = int(max_seq_len)
         self.propagation_layers_count = total_layers
-        self.legacy_sequence_layers_count = max(0, min(int(s_layers), total_layers))
-        self.legacy_prediction_layers_count = max(0, total_layers - self.legacy_sequence_layers_count)
         if propagation_layers is None:
+            self.legacy_sequence_layers_count = max(0, min(int(s_layers), total_layers))
+            self.legacy_prediction_layers_count = max(0, total_layers - self.legacy_sequence_layers_count)
             self.legacy_prediction_layers_count = int(prediction_layers)
+        else:
+            # The current no-memory path is a single propagation stack.
+            self.legacy_sequence_layers_count = total_layers
+            self.legacy_prediction_layers_count = 0
         self.prediction_window = int(prediction_window)
         self.scan_backend = scan_backend
         self.scan_checkpoint_chunk_size = scan_checkpoint_chunk_size
@@ -157,6 +162,7 @@ class CausalMemoryLM(nn.Module):
         self.feed_forward_hidden_mult = float(feed_forward_hidden_mult)
         self.feed_forward_kind = feed_forward_kind
         self.feed_forward_residual_scale = float(feed_forward_residual_scale)
+        self.feed_forward_learnable_residual_scale = bool(feed_forward_learnable_residual_scale)
         self.feed_forward_zero_init_output = bool(feed_forward_zero_init_output)
         self.feed_forward_activation = feed_forward_activation
         self.sequence_anchor = bool(sequence_anchor)
@@ -207,6 +213,7 @@ class CausalMemoryLM(nn.Module):
             feed_forward_hidden_mult=self.feed_forward_hidden_mult,
             feed_forward_kind=self.feed_forward_kind,
             feed_forward_residual_scale=self.feed_forward_residual_scale,
+            feed_forward_learnable_residual_scale=self.feed_forward_learnable_residual_scale,
             feed_forward_zero_init_output=self.feed_forward_zero_init_output,
             feed_forward_activation=self.feed_forward_activation,
         )

@@ -19,6 +19,7 @@ def make_propagation_ffn(
     kind: str,
     hidden_mult: float,
     residual_scale: float,
+    learnable_residual_scale: bool,
     zero_init_output: bool,
     activation: str,
 ) -> nn.Module:
@@ -29,12 +30,15 @@ def make_propagation_ffn(
             dim,
             hidden_mult=hidden_mult,
             residual_scale=residual_scale,
+            learnable_residual_scale=learnable_residual_scale,
             zero_init_output=zero_init_output,
             activation=activation,
         )
     return ResidualFeedForward(
         dim,
         hidden_mult=hidden_mult,
+        residual_scale=residual_scale,
+        learnable_residual_scale=learnable_residual_scale,
         activation=activation,
     )
 

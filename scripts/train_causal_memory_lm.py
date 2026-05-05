@@ -428,6 +428,7 @@ class FlatPretokenizedShard:
         target_out: torch.Tensor,
         loss_mask_out: torch.Tensor,
         loss_mode: str = "default",
+        clear_outputs: bool = True,
     ) -> bool:
         if self.context_flat is None or self.loss_mask_flat is None or self.is_continuation is None:
             self.ensure_loaded()
@@ -437,9 +438,10 @@ class FlatPretokenizedShard:
         token_end = int(self.chunk_token_offsets[chunk_index + 1].item())
         active_context = self.context_flat[token_start:token_end]
         active_length = int(active_context.shape[0])
-        context_out.fill_(self.pad_token_id)
-        target_out.fill_(self.pad_token_id)
-        loss_mask_out.zero_()
+        if clear_outputs:
+            context_out.fill_(self.pad_token_id)
+            target_out.fill_(self.pad_token_id)
+            loss_mask_out.zero_()
         if active_length > 0:
             context_out[:active_length].copy_(active_context.to(dtype=torch.long))
             target_out[active_length - 1] = self.eos_token_id if is_last_chunk else self.cont_token_id
@@ -1267,6 +1269,273 @@ class SynchronousDocumentBatchProvider:
     def close(self) -> None:
         if self._previous_pin_memory is not None and hasattr(self.batcher, "pin_memory"):
             self.batcher.pin_memory = bool(self._previous_pin_memory)
+
+
+def _materialize_flat_plan_block(
+    batcher: FlatDocumentChunkBatcher,
+    plan_block: PrebuiltFlatBatchPlanBlock,
+    *,
+    pin_memory: bool,
+) -> PrebuiltBatchBlock:
+    if not plan_block.plans:
+        raise ValueError("flat plan block must contain at least one plan.")
+    batch_count = len(plan_block.plans)
+    batch_size = int(plan_block.plans[0].plan.batch_size)
+    seq_len = int(batcher.seq_len)
+    pad_token_id = int(batcher.pad_token_id)
+    context = torch.full((batch_count, batch_size, seq_len), pad_token_id, dtype=torch.long)
+    target = torch.full((batch_count, batch_size, seq_len), pad_token_id, dtype=torch.long)
+    loss_mask = torch.zeros((batch_count, batch_size, seq_len), dtype=torch.float32)
+    reset_mask = torch.zeros((batch_count, batch_size), dtype=torch.bool)
+    started_at = time.perf_counter()
+    for local_index, plan_entry in enumerate(plan_block.plans):
+        plan = plan_entry.plan
+        if int(plan.batch_size) != batch_size:
+            raise ValueError("flat plan block must use a consistent batch_size.")
+        reset_mask[local_index].copy_(torch.as_tensor(plan.reset_mask, dtype=torch.bool))
+        shard_cache = {
+            int(shard_index): batcher.collection.get_shard(int(shard_index))
+            for shard_index in set(plan.shard_indices)
+        }
+        for item_index in range(batch_size):
+            shard = shard_cache[int(plan.shard_indices[item_index])]
+            shard.copy_chunk_tensors_into(
+                plan.chunk_indices[item_index],
+                document_index=plan.document_indices[item_index],
+                is_last_chunk=plan.is_last_chunk[item_index],
+                context_out=context[local_index, item_index],
+                target_out=target[local_index, item_index],
+                loss_mask_out=loss_mask[local_index, item_index],
+                clear_outputs=False,
+            )
+        if plan_entry.reset_all:
+            reset_mask[local_index].fill_(True)
+    if pin_memory:
+        context = context.pin_memory()
+        target = target.pin_memory()
+        loss_mask = loss_mask.pin_memory()
+        reset_mask = reset_mask.pin_memory()
+    return PrebuiltBatchBlock(
+        context=context,
+        target=target,
+        loss_mask=loss_mask,
+        reset_mask=reset_mask,
+        build_seconds=time.perf_counter() - started_at,
+    )
+
+
+class RollingFlatPlanPrefetchProvider:
+    def __init__(
+        self,
+        batcher: FlatDocumentChunkBatcher,
+        *,
+        device: torch.device,
+        total_steps: int,
+        start_step: int,
+        stage1_ratio: float,
+        stage2_ratio: float,
+        stage1_span: int,
+        stage2_span: int,
+        stage3_span: int,
+        stage1_batch_size: int,
+        stage2_batch_size: int,
+        stage3_batch_size: int,
+        stage1_grad_accum_steps: int,
+        stage2_grad_accum_steps: int,
+        stage3_grad_accum_steps: int,
+        queued_blocks: int,
+        block_size: int,
+        materializer_threads: int,
+    ) -> None:
+        self.batcher = batcher
+        self.device = device
+        self.total_steps = int(total_steps)
+        self.start_step = int(start_step)
+        self.block_size = max(1, int(block_size))
+        self.queued_blocks = max(1, int(queued_blocks))
+        self.materializer_threads = max(1, int(materializer_threads))
+        self._plan_queue: queue.Queue[tuple[int, PrebuiltFlatBatchPlanBlock] | _PrefetchFailure | None] = queue.Queue(
+            maxsize=self.queued_blocks
+        )
+        self._result_queue: queue.Queue[
+            tuple[str, int, PrebuiltBatchBlock] | tuple[str, int, BaseException]
+        ] = queue.Queue(
+            maxsize=self.queued_blocks
+        )
+        self._stop = threading.Event()
+        self._current_block: PrebuiltBatchBlock | None = None
+        self._current_block_index = 0
+        self._consumed_batches = 0
+        self._next_chunk_index = 0
+        self._pending_blocks: dict[int, PrebuiltBatchBlock] = {}
+        self._produced_batches = 0
+        self._total_batch_build_seconds = 0.0
+        # Threaded materialization shares a single shard cache inside one process.
+        # Disable eviction here to avoid unloading a shard while another thread is
+        # still copying from it.
+        self.batcher.collection.max_loaded_shards = 0
+        with self.batcher.collection._cache_lock:
+            self.batcher.collection._loaded_shard_lru.clear()
+        stages = [
+            resolve_curriculum_stage(
+                step=step,
+                total_steps=total_steps,
+                stage1_ratio=stage1_ratio,
+                stage2_ratio=stage2_ratio,
+                stage1_span=stage1_span,
+                stage2_span=stage2_span,
+                stage3_span=stage3_span,
+                stage1_batch_size=stage1_batch_size,
+                stage2_batch_size=stage2_batch_size,
+                stage3_batch_size=stage3_batch_size,
+                stage1_grad_accum_steps=stage1_grad_accum_steps,
+                stage2_grad_accum_steps=stage2_grad_accum_steps,
+                stage3_grad_accum_steps=stage3_grad_accum_steps,
+            )
+            for step in range(self.start_step + 1, self.total_steps + 1)
+        ]
+        self.stage_chunks = [
+            stages[index : index + self.block_size]
+            for index in range(0, len(stages), self.block_size)
+        ]
+        if not self.stage_chunks:
+            raise ValueError("rolling flat plan prefetch has no stages to build.")
+        self.total_batches = sum(len(chunk) for chunk in self.stage_chunks)
+        self._planner_thread = threading.Thread(
+            target=self._planner_worker,
+            name="cmem_flat_plan_prefetch",
+            daemon=True,
+        )
+        self._materializer_threads = [
+            threading.Thread(
+                target=self._materializer_worker,
+                name=f"cmem_flat_materialize_{index}",
+                daemon=True,
+            )
+            for index in range(self.materializer_threads)
+        ]
+        self._planner_thread.start()
+        for thread in self._materializer_threads:
+            thread.start()
+
+    def _planner_worker(self) -> None:
+        try:
+            for chunk_index, stage_chunk in enumerate(self.stage_chunks):
+                if self._stop.is_set():
+                    break
+                started_at = time.perf_counter()
+                plans: list[PrebuiltFlatBatchPlan] = []
+                for stage in stage_chunk:
+                    self.batcher.set_batch_size(stage.batch_size)
+                    self.batcher.set_bucket_weights(stage.bucket_weights)
+                    plans.append(
+                        PrebuiltFlatBatchPlan(
+                            plan=self.batcher.next_batch_plan(),
+                            reset_all=bool(stage.freeze_memory),
+                        )
+                    )
+                block = PrebuiltFlatBatchPlanBlock(
+                    plans=tuple(plans),
+                    build_seconds=time.perf_counter() - started_at,
+                )
+                placed = False
+                while not placed and not self._stop.is_set():
+                    try:
+                        self._plan_queue.put((chunk_index, block), timeout=0.1)
+                        placed = True
+                    except queue.Full:
+                        continue
+            for _ in range(self.materializer_threads):
+                while not self._stop.is_set():
+                    try:
+                        self._plan_queue.put(None, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+        except BaseException as exc:  # pragma: no cover - defensive background thread path
+            while not self._stop.is_set():
+                try:
+                    self._plan_queue.put(_PrefetchFailure(exc), timeout=0.1)
+                    return
+                except queue.Full:
+                    continue
+
+    def _materializer_worker(self) -> None:
+        while not self._stop.is_set():
+            item = self._plan_queue.get()
+            if isinstance(item, _PrefetchFailure):
+                while not self._stop.is_set():
+                    try:
+                        self._result_queue.put(("error", -1, item.error), timeout=0.1)
+                        return
+                    except queue.Full:
+                        continue
+            if item is None:
+                return
+            chunk_index, plan_block = item
+            try:
+                block = _materialize_flat_plan_block(
+                    self.batcher,
+                    plan_block,
+                    pin_memory=bool(getattr(self.batcher, "pin_memory", False)),
+                )
+                while not self._stop.is_set():
+                    try:
+                        self._result_queue.put(("block", int(chunk_index), block), timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+            except BaseException as exc:  # pragma: no cover - defensive background thread path
+                while not self._stop.is_set():
+                    try:
+                        self._result_queue.put(("error", int(chunk_index), exc), timeout=0.1)
+                        return
+                    except queue.Full:
+                        continue
+
+    def _next_ordered_block(self) -> PrebuiltBatchBlock:
+        if self._next_chunk_index >= len(self.stage_chunks):
+            raise StopIteration("rolling flat plan prefetch is exhausted.")
+        while self._next_chunk_index not in self._pending_blocks:
+            kind, chunk_index, payload = self._result_queue.get()
+            if kind == "error":
+                raise RuntimeError("Rolling flat plan prefetcher failed.") from payload
+            if kind != "block":
+                raise RuntimeError(f"Unexpected rolling flat plan message: {kind}")
+            self._pending_blocks[int(chunk_index)] = payload
+        block = self._pending_blocks.pop(self._next_chunk_index)
+        self._next_chunk_index += 1
+        self._produced_batches += block.batch_count
+        self._total_batch_build_seconds += block.build_seconds
+        return block
+
+    def next_batch(self) -> DocumentBatch:
+        if self._current_block is None or self._current_block_index >= self._current_block.batch_count:
+            self._current_block = self._next_ordered_block()
+            self._current_block_index = 0
+        local_index = self._current_block_index
+        self._current_block_index += 1
+        self._consumed_batches += 1
+        batch = DocumentBatch(
+            context=self._current_block.context[local_index],
+            target=self._current_block.target[local_index],
+            loss_mask=self._current_block.loss_mask[local_index],
+            reset_mask=self._current_block.reset_mask[local_index],
+        )
+        return move_batch_to_device(batch, device=self.device, non_blocking=True)
+
+    def stats(self) -> tuple[float, int]:
+        average = self._total_batch_build_seconds / max(1, self._produced_batches)
+        buffered = sum(block.batch_count for block in self._pending_blocks.values())
+        if self._current_block is not None:
+            buffered += max(0, self._current_block.batch_count - self._current_block_index)
+        return average, buffered
+
+    def close(self) -> None:
+        self._stop.set()
+        self._planner_thread.join(timeout=1.0)
+        for thread in self._materializer_threads:
+            thread.join(timeout=1.0)
 
 
 class RollingProcessDocumentBatchProvider:
@@ -2379,6 +2648,14 @@ class FlatDocumentChunkBatcher:
         )
         clone.pin_memory = self.pin_memory
         clone.set_bucket_weights(dict(zip(self.active_buckets, self.active_bucket_weights)))
+        # Each forked prefetch worker gets its own shard cache; keep it close to the
+        # active working set instead of inheriting the large parent-process default.
+        worker_max_loaded_shards = max(1, int(self.active_shards_per_bucket) + 1)
+        current_max_loaded_shards = int(clone.collection.max_loaded_shards)
+        if current_max_loaded_shards <= 0 or current_max_loaded_shards > worker_max_loaded_shards:
+            clone.collection.max_loaded_shards = worker_max_loaded_shards
+        with clone.collection._cache_lock:
+            clone.collection._loaded_shard_lru.clear()
         return clone
 
     def set_batch_size(self, batch_size: int) -> None:
@@ -2493,7 +2770,8 @@ class FlatDocumentChunkBatcher:
             else:
                 reset_mask.append(False)
             reference = self.documents[self.current_doc[item_index]]
-            shard = self.collection.get_shard(reference.shard_index)
+            # Planning only needs metadata; avoid faulting in the whole shard payload here.
+            shard = self.collection.shards[reference.shard_index]
             chunk_start, chunk_end = shard.document_chunk_range(reference.document_index)
             chunk_index = chunk_start + self.current_chunk[item_index]
             last_chunk = chunk_index == chunk_end - 1
@@ -5404,7 +5682,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--memory-slots", type=int, nargs="+", default=[256, 64, 16])
     parser.add_argument("--memory-update-intervals", type=int, nargs="+")
     parser.add_argument("--prediction-layers", type=int, default=2)
-    parser.add_argument("--s-window", type=int, default=256)
+    parser.add_argument(
+        "--s-window",
+        type=int,
+        default=0,
+        help="Sequence propagation window. Use 0 for full causal dense propagation across the whole sequence.",
+    )
     parser.add_argument("--s-microbatch-size", type=int, default=0)
     parser.add_argument("--prediction-window", type=int, default=64)
     parser.add_argument("--checkpoint-sequence-layers", action="store_true")
@@ -5451,6 +5734,11 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help="Residual scale for state_val FFN outputs.",
+    )
+    parser.add_argument(
+        "--feed-forward-learnable-residual-scale",
+        action="store_true",
+        help="Learn a positive FFN residual scale instead of using a fixed constant.",
     )
     parser.add_argument(
         "--feed-forward-random-output-init",
@@ -6052,6 +6340,7 @@ def build_rnn_aux_optimizer(
 def main() -> None:
     args = parse_args()
     forced_unit_norm_policy = "none"
+    requested_legacy_layer_split = (int(args.s_layers), int(args.prediction_layers))
     requested_stage_spans = (
         int(args.curriculum_stage1_span),
         int(args.curriculum_stage2_span),
@@ -6151,6 +6440,13 @@ def main() -> None:
         print(
             "warning | overriding requested curriculum document spans to 1 | "
             f"requested={requested_stage_spans}",
+            flush=True,
+        )
+    if args.model_kind == "causal_memory" and int(args.propagation_layers) > 0:
+        print(
+            "warning | using propagation_layers as the single causal stack depth; "
+            f"ignoring legacy layer split s_layers={requested_legacy_layer_split[0]} "
+            f"prediction_layers={requested_legacy_layer_split[1]}",
             flush=True,
         )
 
@@ -6503,8 +6799,32 @@ def main() -> None:
         source_batcher: DocumentChunkBatcher | FlatDocumentChunkBatcher,
         *,
         start_step_value: int,
-    ) -> RollingFileDocumentBatchProvider:
-        return RollingFileDocumentBatchProvider(
+    ) -> RollingProcessDocumentBatchProvider | RollingFlatPlanPrefetchProvider:
+        if isinstance(source_batcher, FlatDocumentChunkBatcher):
+            return RollingFlatPlanPrefetchProvider(
+                source_batcher,
+                device=device,
+                total_steps=total_steps,
+                start_step=start_step_value,
+                stage1_ratio=args.curriculum_stage1_ratio,
+                stage2_ratio=args.curriculum_stage2_ratio,
+                stage1_span=args.curriculum_stage1_span,
+                stage2_span=args.curriculum_stage2_span,
+                stage3_span=args.curriculum_stage3_span,
+                stage1_batch_size=stage1_batch_size,
+                stage2_batch_size=stage2_batch_size,
+                stage3_batch_size=stage3_batch_size,
+                stage1_grad_accum_steps=stage1_grad_accum_steps,
+                stage2_grad_accum_steps=stage2_grad_accum_steps,
+                stage3_grad_accum_steps=stage3_grad_accum_steps,
+                queued_blocks=max(1, int(args.rolling_prefetch_blocks)),
+                block_size=max(1, int(args.rolling_prefetch_block_size)),
+                materializer_threads=max(
+                    1,
+                    int(args.rolling_prefetch_workers) * max(1, int(args.rolling_prefetch_worker_threads)),
+                ),
+            )
+        return RollingProcessDocumentBatchProvider(
             source_batcher,
             device=device,
             total_steps=total_steps,
@@ -6520,12 +6840,11 @@ def main() -> None:
             stage1_grad_accum_steps=stage1_grad_accum_steps,
             stage2_grad_accum_steps=stage2_grad_accum_steps,
             stage3_grad_accum_steps=stage3_grad_accum_steps,
-            pin_memory=bool(args.prefetch_pin_memory),
+            pin_memory=False,
             workers=max(1, int(args.rolling_prefetch_workers)),
             worker_threads=max(1, int(args.rolling_prefetch_worker_threads)),
             block_size=max(1, int(args.rolling_prefetch_block_size)),
             queued_blocks=max(1, int(args.rolling_prefetch_blocks)),
-            cache_dir=None if args.rolling_prefetch_cache_dir is None else Path(args.rolling_prefetch_cache_dir),
         )
 
     batcher: DocumentChunkBatcher | FlatDocumentChunkBatcher | None = None
@@ -6533,6 +6852,7 @@ def main() -> None:
         AsyncDocumentBatchPrefetcher
         | SynchronousDocumentBatchProvider
         | RollingProcessDocumentBatchProvider
+        | RollingFlatPlanPrefetchProvider
         | RollingFileDocumentBatchProvider
         | PrebuiltDocumentBatchProvider
         | None
@@ -6573,16 +6893,16 @@ def main() -> None:
             dropout=args.transformer_dropout,
         ).to(device)
     else:
-        total_propagation_layers = int(args.s_layers) + int(args.prediction_layers)
+        total_propagation_layers = resolve_total_propagation_layers(args)
         model = CausalMemoryLM(
             vocab_size=vocab_size,
             dim=args.dim,
             max_seq_len=args.seq_len,
             propagation_layers=total_propagation_layers,
-            s_layers=args.s_layers,
+            s_layers=total_propagation_layers,
             memory_slots=tuple(args.memory_slots),
             memory_update_intervals=None if args.memory_update_intervals is None else tuple(args.memory_update_intervals),
-            prediction_layers=args.prediction_layers,
+            prediction_layers=0,
             s_window=args.s_window,
             s_microbatch_size=None if args.s_microbatch_size <= 0 else args.s_microbatch_size,
             prediction_window=args.prediction_window,
@@ -6598,6 +6918,7 @@ def main() -> None:
             feed_forward_hidden_mult=args.feed_forward_hidden_mult,
             feed_forward_kind=args.feed_forward_kind,
             feed_forward_residual_scale=args.feed_forward_residual_scale,
+            feed_forward_learnable_residual_scale=args.feed_forward_learnable_residual_scale,
             feed_forward_zero_init_output=not args.feed_forward_random_output_init,
             feed_forward_activation=args.feed_forward_activation,
             memory_topk=args.memory_topk,
@@ -6656,9 +6977,11 @@ def main() -> None:
     else:
         print(
             f"model=causal_memory_doc | params={parameter_count:,} | dim={args.dim} | seq_len={args.seq_len} | "
-            f"propagation_layers={total_propagation_layers} | legacy_s_layers={args.s_layers} | "
-            f"legacy_prediction_layers={args.prediction_layers} | "
-            f"s_window={args.s_window} | s_microbatch_size={args.s_microbatch_size} | "
+            f"propagation_layers={total_propagation_layers} | "
+            f"legacy_s_layers={requested_legacy_layer_split[0]} | "
+            f"legacy_prediction_layers={requested_legacy_layer_split[1]} | "
+            f"full_dense_causal={args.s_window <= 0} | s_window={args.s_window} | "
+            f"s_microbatch_size={args.s_microbatch_size} | "
             f"scan_backend={args.scan_backend} | scan_checkpoint_chunk_size={args.scan_checkpoint_chunk_size} | "
             f"memory_slots={args.memory_slots} | memory_update_intervals={args.memory_update_intervals} | knowledge_nodes={args.knowledge_nodes} | "
             f"memory_train_mode={args.memory_train_mode} | memory_eval_mode={args.memory_eval_mode} | eval_topk={args.eval_topk or args.memory_topk} | "
@@ -6671,6 +6994,7 @@ def main() -> None:
             f"feed_forward_hidden_mult={args.feed_forward_hidden_mult:g} | "
             f"feed_forward_kind={args.feed_forward_kind} | "
             f"feed_forward_residual_scale={args.feed_forward_residual_scale:g} | "
+            f"feed_forward_learnable_residual_scale={args.feed_forward_learnable_residual_scale} | "
             f"feed_forward_zero_init_output={not args.feed_forward_random_output_init} | "
             f"feed_forward_activation={args.feed_forward_activation} | "
             f"optimizer={args.optimizer} | checkpoint_sequence={args.checkpoint_sequence_layers} | "

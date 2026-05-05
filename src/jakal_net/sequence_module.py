@@ -51,6 +51,7 @@ class SModule(nn.Module):
         feed_forward_hidden_mult: float = 2.0,
         feed_forward_kind: str = "value",
         feed_forward_residual_scale: float = 1.0,
+        feed_forward_learnable_residual_scale: bool = False,
         feed_forward_zero_init_output: bool = True,
         feed_forward_activation: str = "gelu",
     ) -> None:
@@ -86,6 +87,7 @@ class SModule(nn.Module):
         self.feed_forward_hidden_mult = float(feed_forward_hidden_mult)
         self.feed_forward_kind = feed_forward_kind
         self.feed_forward_residual_scale = float(feed_forward_residual_scale)
+        self.feed_forward_learnable_residual_scale = bool(feed_forward_learnable_residual_scale)
         self.feed_forward_zero_init_output = bool(feed_forward_zero_init_output)
         self.feed_forward_activation = feed_forward_activation
         self.sequence_anchor = bool(sequence_anchor)
@@ -105,7 +107,8 @@ class SModule(nn.Module):
         else:
             self.sequence_input_norm = nn.LayerNorm(dim)
         sequence_norm_factory = nn.Identity if unit_norm_values else lambda: nn.LayerNorm(dim)
-        sequence_window = max_seq_len if s_window is None else max(1, s_window)
+        full_dense_causal = s_window is None or int(s_window) <= 0
+        sequence_window = max_seq_len if full_dense_causal else max(1, int(s_window))
         sequence_nodes = max_seq_len + (1 if self.sequence_anchor else 0)
         full_window_block_size = sequence_nodes if sequence_window + 1 >= sequence_nodes else None
         self.sequence_stack = PropagationStack(
@@ -138,12 +141,14 @@ class SModule(nn.Module):
                 kind=self.feed_forward_kind,
                 hidden_mult=self.feed_forward_hidden_mult,
                 residual_scale=self.feed_forward_residual_scale,
+                learnable_residual_scale=self.feed_forward_learnable_residual_scale,
                 zero_init_output=self.feed_forward_zero_init_output,
                 activation=self.feed_forward_activation,
             ),
             unit_norm_values=self.unit_norm_values,
             residual_gate_init=self.propagation_residual_gate_init,
         )
+        self.full_dense_causal = bool(full_dense_causal)
 
     def _can_use_dense_apply_fastpath(self, layer: Layer, propagation: SparsePropagation) -> bool:
         return can_use_dense_apply_fastpath(layer, propagation)
