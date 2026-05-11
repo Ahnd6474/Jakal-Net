@@ -126,6 +126,23 @@ def make_feed_forward_activation(name: str) -> nn.Module:
     raise ValueError(f"Unsupported feed-forward activation: {name!r}.")
 
 
+def _inverse_softplus(value: float) -> float:
+    if value <= 0.0:
+        return -20.0
+    return float(torch.log(torch.expm1(torch.tensor(value))).item())
+
+
+def make_norm(dim: int, kind: str = "layernorm") -> nn.Module:
+    if kind == "layernorm":
+        return nn.LayerNorm(dim)
+    if kind == "rmsnorm":
+        rms_norm = getattr(nn, "RMSNorm", None)
+        if rms_norm is not None:
+            return rms_norm(dim)
+        return nn.LayerNorm(dim)
+    raise ValueError(f"Unsupported norm kind: {kind!r}.")
+
+
 class ResidualFeedForward(nn.Module):
     def __init__(
         self,
@@ -133,7 +150,11 @@ class ResidualFeedForward(nn.Module):
         *,
         hidden_mult: float = 2.0,
         dropout: float = 0.0,
+        residual_scale: float = 1.0,
+        learnable_residual_scale: bool = False,
         activation: str = "gelu",
+        norm_kind: str = "layernorm",
+        use_input_norm: bool = True,
     ) -> None:
         super().__init__()
         if dim <= 0:
@@ -142,8 +163,17 @@ class ResidualFeedForward(nn.Module):
             raise ValueError("hidden_mult must be positive.")
         if not 0.0 <= dropout < 1.0:
             raise ValueError("dropout must be in [0, 1).")
+        if residual_scale < 0.0:
+            raise ValueError("residual_scale must be non-negative.")
         hidden_dim = max(dim, int(round(float(dim) * float(hidden_mult))))
-        self.input_norm = nn.LayerNorm(dim)
+        self.input_norm = make_norm(dim, norm_kind) if use_input_norm else nn.Identity()
+        self.learnable_residual_scale = bool(learnable_residual_scale)
+        if self.learnable_residual_scale:
+            self.residual_scale_param = nn.Parameter(torch.tensor(_inverse_softplus(float(residual_scale))))
+            self.register_buffer("fixed_residual_scale", None, persistent=False)
+        else:
+            self.register_parameter("residual_scale_param", None)
+            self.register_buffer("fixed_residual_scale", torch.tensor(float(residual_scale)), persistent=False)
         self.net = nn.Sequential(
             nn.Linear(dim, hidden_dim),
             make_feed_forward_activation(activation),
@@ -164,7 +194,12 @@ class ResidualFeedForward(nn.Module):
         nn.init.zeros_(second.bias)
 
     def forward(self, val: Tensor) -> Tensor:
-        return val + self.net(self.input_norm(val))
+        if self.residual_scale_param is not None:
+            scale = F.softplus(self.residual_scale_param).to(device=val.device, dtype=val.dtype)
+        else:
+            assert self.fixed_residual_scale is not None
+            scale = self.fixed_residual_scale.to(device=val.device, dtype=val.dtype)
+        return val + scale * self.net(self.input_norm(val))
 
 
 class StateValueFeedForward(nn.Module):
@@ -175,8 +210,11 @@ class StateValueFeedForward(nn.Module):
         hidden_mult: float = 2.0,
         dropout: float = 0.0,
         residual_scale: float = 1.0,
+        learnable_residual_scale: bool = False,
         zero_init_output: bool = True,
         activation: str = "gelu",
+        norm_kind: str = "layernorm",
+        use_input_norm: bool = True,
     ) -> None:
         super().__init__()
         if dim <= 0:
@@ -188,8 +226,14 @@ class StateValueFeedForward(nn.Module):
         if residual_scale < 0.0:
             raise ValueError("residual_scale must be non-negative.")
         hidden_dim = max(dim, int(round(float(dim) * float(hidden_mult))))
-        self.residual_scale = float(residual_scale)
-        self.input_norm = nn.LayerNorm(dim)
+        self.learnable_residual_scale = bool(learnable_residual_scale)
+        self.input_norm = make_norm(dim, norm_kind) if use_input_norm else nn.Identity()
+        if self.learnable_residual_scale:
+            self.residual_scale_param = nn.Parameter(torch.tensor(_inverse_softplus(float(residual_scale))))
+            self.register_buffer("fixed_residual_scale", None, persistent=False)
+        else:
+            self.register_parameter("residual_scale_param", None)
+            self.register_buffer("fixed_residual_scale", torch.tensor(float(residual_scale)), persistent=False)
         self.net = nn.Sequential(
             nn.Linear(dim, hidden_dim),
             make_feed_forward_activation(activation),
@@ -217,7 +261,11 @@ class StateValueFeedForward(nn.Module):
         delta = self.net(self.input_norm(mixed))
         delta_state = delta[..., 0]
         delta_val = delta[..., 1:]
-        scale = self.residual_scale
+        if self.residual_scale_param is not None:
+            scale = F.softplus(self.residual_scale_param).to(device=val.device, dtype=val.dtype)
+        else:
+            assert self.fixed_residual_scale is not None
+            scale = self.fixed_residual_scale.to(device=val.device, dtype=val.dtype)
         return state + scale * delta_state, val + scale * delta_val
 
 

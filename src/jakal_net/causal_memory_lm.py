@@ -19,6 +19,7 @@ from jakal_net.propagation_stack import (
     can_use_dense_apply_fastpath,
 )
 from jakal_net.sequence_module import SModule
+from jakal_net.modules import make_norm
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,7 +92,10 @@ class CausalMemoryLM(nn.Module):
         scan_checkpoint_chunk_size: int | None = None,
         implementation: str = "streaming",
         unit_norm_values: bool = False,
-        propagation_residual_gate_init: float = 0.1,
+        state_activation_kind: str = "signed_softmax",
+        norm_kind: str = "layernorm",
+        propagation_residual_gate_init: float = 1.0,
+        propagation_residual_gate_init_max: float | None = None,
         feed_forward_layers: bool = True,
         memory_feed_forward_layers: bool | None = None,
         disable_memory: bool = False,
@@ -100,8 +104,10 @@ class CausalMemoryLM(nn.Module):
         feed_forward_hidden_mult: float = 2.0,
         feed_forward_kind: str = "value",
         feed_forward_residual_scale: float = 1.0,
+        feed_forward_learnable_residual_scale: bool = False,
         feed_forward_zero_init_output: bool = True,
         feed_forward_activation: str = "gelu",
+        feed_forward_input_norm: bool = True,
         tie_embedding_head: bool = True,
         knowledge_nodes: int = 0,
         knowledge_route_topk: int | None = None,
@@ -137,16 +143,25 @@ class CausalMemoryLM(nn.Module):
         self.dim = int(dim)
         self.max_seq_len = int(max_seq_len)
         self.propagation_layers_count = total_layers
-        self.legacy_sequence_layers_count = max(0, min(int(s_layers), total_layers))
-        self.legacy_prediction_layers_count = max(0, total_layers - self.legacy_sequence_layers_count)
         if propagation_layers is None:
+            self.legacy_sequence_layers_count = max(0, min(int(s_layers), total_layers))
+            self.legacy_prediction_layers_count = max(0, total_layers - self.legacy_sequence_layers_count)
             self.legacy_prediction_layers_count = int(prediction_layers)
+        else:
+            # The current no-memory path is a single propagation stack.
+            self.legacy_sequence_layers_count = total_layers
+            self.legacy_prediction_layers_count = 0
         self.prediction_window = int(prediction_window)
         self.scan_backend = scan_backend
         self.scan_checkpoint_chunk_size = scan_checkpoint_chunk_size
         self.checkpoint_prediction_layers = bool(checkpoint_prediction_layers)
         self.unit_norm_values = bool(unit_norm_values)
+        self.state_activation_kind = str(state_activation_kind)
+        self.norm_kind = norm_kind
         self.propagation_residual_gate_init = float(propagation_residual_gate_init)
+        self.propagation_residual_gate_init_max = (
+            None if propagation_residual_gate_init_max is None else float(propagation_residual_gate_init_max)
+        )
         self.feed_forward_layers = bool(feed_forward_layers)
         self.memory_feed_forward_layers = (
             self.feed_forward_layers if memory_feed_forward_layers is None else bool(memory_feed_forward_layers)
@@ -157,8 +172,10 @@ class CausalMemoryLM(nn.Module):
         self.feed_forward_hidden_mult = float(feed_forward_hidden_mult)
         self.feed_forward_kind = feed_forward_kind
         self.feed_forward_residual_scale = float(feed_forward_residual_scale)
+        self.feed_forward_learnable_residual_scale = bool(feed_forward_learnable_residual_scale)
         self.feed_forward_zero_init_output = bool(feed_forward_zero_init_output)
         self.feed_forward_activation = feed_forward_activation
+        self.feed_forward_input_norm = bool(feed_forward_input_norm)
         self.sequence_anchor = bool(sequence_anchor)
         self.memory_slots = ()
         self.num_memory_levels = 0
@@ -202,15 +219,20 @@ class CausalMemoryLM(nn.Module):
             s_microbatch_size=s_microbatch_size,
             checkpoint_sequence_layers=checkpoint_sequence_layers or checkpoint_prediction_layers,
             unit_norm_values=unit_norm_values,
+            state_activation_kind=self.state_activation_kind,
+            norm_kind=self.norm_kind,
             propagation_residual_gate_init=self.propagation_residual_gate_init,
+            propagation_residual_gate_init_max=self.propagation_residual_gate_init_max,
             feed_forward_layers=self.feed_forward_layers,
             feed_forward_hidden_mult=self.feed_forward_hidden_mult,
             feed_forward_kind=self.feed_forward_kind,
             feed_forward_residual_scale=self.feed_forward_residual_scale,
+            feed_forward_learnable_residual_scale=self.feed_forward_learnable_residual_scale,
             feed_forward_zero_init_output=self.feed_forward_zero_init_output,
             feed_forward_activation=self.feed_forward_activation,
+            feed_forward_input_norm=self.feed_forward_input_norm,
         )
-        self.output_norm = nn.LayerNorm(dim)
+        self.output_norm = make_norm(dim, self.norm_kind)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
         if tie_embedding_head:
             self.lm_head.weight = self.s_module.token_embedding.weight
@@ -307,14 +329,15 @@ class CausalMemoryLM(nn.Module):
         layer: Layer,
         delta_state: Tensor,
         delta_val: Tensor,
-        norm: nn.Module,
+        norm: nn.Module | None = None,
     ) -> Layer:
         return apply_dense_delta_fastpath(
             layer,
             delta_state,
             delta_val,
-            norm,
+            norm=norm,
             unit_norm_values=self.unit_norm_values,
+            state_activation_kind=self.state_activation_kind,
         )
 
     def _native_scan_supported_config(self) -> bool:
@@ -329,6 +352,34 @@ class CausalMemoryLM(nn.Module):
     ) -> tuple[Layer, ...]:
         del batch_size, device, dtype
         return ()
+
+    def export_runtime_state(self) -> dict[str, Any]:
+        return {}
+
+    def load_runtime_state(self, state: dict[str, Any] | None) -> None:
+        del state
+
+    def _finalize_sequence_output(
+        self,
+        sequence_layer: Layer,
+        *,
+        return_layers: bool = False,
+        return_logits: bool = True,
+    ) -> tuple[Tensor, Layer, Layer | None, Layer | None]:
+        query_layer = self._strip_sequence_anchor(sequence_layer)
+        output_state_source = self.output_norm(query_layer.val)
+        output_val = output_state_source
+        output_state = self.value_to_state(output_state_source).squeeze(-1)
+        if self.unit_norm_values:
+            output_state = softsign_state(output_state)
+        query_layer = query_layer.with_tensors(state=output_state, val=output_val)
+        logits = self.lm_head(output_val) if return_logits else output_val.new_empty((0,))
+        return (
+            logits,
+            query_layer,
+            clone_layer(sequence_layer) if return_layers else None,
+            clone_layer(query_layer) if return_layers else None,
+        )
 
     def forward(
         self,
@@ -347,23 +398,27 @@ class CausalMemoryLM(nn.Module):
         if memory_state not in (None, (), tuple()):
             raise ValueError("This model does not support legacy hierarchical memory_state inputs.")
 
-        sequence_layer = self.s_module.encode(input_ids, state_projection=self.value_to_state)
-        query_layer = self._strip_sequence_anchor(sequence_layer)
-        output_state_source = self.output_norm(query_layer.val)
-        output_val = output_state_source
-        output_state = self.value_to_state(output_state_source).squeeze(-1)
-        if self.unit_norm_values:
-            output_state = softsign_state(output_state)
-        query_layer = query_layer.with_tensors(state=output_state, val=output_val)
-        logits = self.lm_head(output_val) if return_logits else output_val.new_empty((0,))
+        initial_layer = self.s_module.build_input_layer(
+            input_ids,
+            state_projection=self.value_to_state,
+        )
+        sequence_layer = self.s_module.run_propagation(
+            initial_layer,
+            checkpoint_layers=self.s_module.checkpoint_sequence_layers,
+        )
+        logits, _query_layer, sequence_layer_out, query_layer_out = self._finalize_sequence_output(
+            sequence_layer,
+            return_layers=return_layers,
+            return_logits=return_logits,
+        )
         if not (return_memory_state or return_layers):
             return logits
         return MemoryScanOutput(
             logits=logits,
             memory_state=(),
             knowledge_state=None,
-            sequence_layer=clone_layer(sequence_layer) if return_layers else None,
-            query_layer=clone_layer(query_layer) if return_layers else None,
+            sequence_layer=sequence_layer_out,
+            query_layer=query_layer_out,
         )
 
 

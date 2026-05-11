@@ -428,6 +428,7 @@ class FlatPretokenizedShard:
         target_out: torch.Tensor,
         loss_mask_out: torch.Tensor,
         loss_mode: str = "default",
+        clear_outputs: bool = True,
     ) -> bool:
         if self.context_flat is None or self.loss_mask_flat is None or self.is_continuation is None:
             self.ensure_loaded()
@@ -437,9 +438,10 @@ class FlatPretokenizedShard:
         token_end = int(self.chunk_token_offsets[chunk_index + 1].item())
         active_context = self.context_flat[token_start:token_end]
         active_length = int(active_context.shape[0])
-        context_out.fill_(self.pad_token_id)
-        target_out.fill_(self.pad_token_id)
-        loss_mask_out.zero_()
+        if clear_outputs:
+            context_out.fill_(self.pad_token_id)
+            target_out.fill_(self.pad_token_id)
+            loss_mask_out.zero_()
         if active_length > 0:
             context_out[:active_length].copy_(active_context.to(dtype=torch.long))
             target_out[active_length - 1] = self.eos_token_id if is_last_chunk else self.cont_token_id
@@ -1267,6 +1269,273 @@ class SynchronousDocumentBatchProvider:
     def close(self) -> None:
         if self._previous_pin_memory is not None and hasattr(self.batcher, "pin_memory"):
             self.batcher.pin_memory = bool(self._previous_pin_memory)
+
+
+def _materialize_flat_plan_block(
+    batcher: FlatDocumentChunkBatcher,
+    plan_block: PrebuiltFlatBatchPlanBlock,
+    *,
+    pin_memory: bool,
+) -> PrebuiltBatchBlock:
+    if not plan_block.plans:
+        raise ValueError("flat plan block must contain at least one plan.")
+    batch_count = len(plan_block.plans)
+    batch_size = int(plan_block.plans[0].plan.batch_size)
+    seq_len = int(batcher.seq_len)
+    pad_token_id = int(batcher.pad_token_id)
+    context = torch.full((batch_count, batch_size, seq_len), pad_token_id, dtype=torch.long)
+    target = torch.full((batch_count, batch_size, seq_len), pad_token_id, dtype=torch.long)
+    loss_mask = torch.zeros((batch_count, batch_size, seq_len), dtype=torch.float32)
+    reset_mask = torch.zeros((batch_count, batch_size), dtype=torch.bool)
+    started_at = time.perf_counter()
+    for local_index, plan_entry in enumerate(plan_block.plans):
+        plan = plan_entry.plan
+        if int(plan.batch_size) != batch_size:
+            raise ValueError("flat plan block must use a consistent batch_size.")
+        reset_mask[local_index].copy_(torch.as_tensor(plan.reset_mask, dtype=torch.bool))
+        shard_cache = {
+            int(shard_index): batcher.collection.get_shard(int(shard_index))
+            for shard_index in set(plan.shard_indices)
+        }
+        for item_index in range(batch_size):
+            shard = shard_cache[int(plan.shard_indices[item_index])]
+            shard.copy_chunk_tensors_into(
+                plan.chunk_indices[item_index],
+                document_index=plan.document_indices[item_index],
+                is_last_chunk=plan.is_last_chunk[item_index],
+                context_out=context[local_index, item_index],
+                target_out=target[local_index, item_index],
+                loss_mask_out=loss_mask[local_index, item_index],
+                clear_outputs=False,
+            )
+        if plan_entry.reset_all:
+            reset_mask[local_index].fill_(True)
+    if pin_memory:
+        context = context.pin_memory()
+        target = target.pin_memory()
+        loss_mask = loss_mask.pin_memory()
+        reset_mask = reset_mask.pin_memory()
+    return PrebuiltBatchBlock(
+        context=context,
+        target=target,
+        loss_mask=loss_mask,
+        reset_mask=reset_mask,
+        build_seconds=time.perf_counter() - started_at,
+    )
+
+
+class RollingFlatPlanPrefetchProvider:
+    def __init__(
+        self,
+        batcher: FlatDocumentChunkBatcher,
+        *,
+        device: torch.device,
+        total_steps: int,
+        start_step: int,
+        stage1_ratio: float,
+        stage2_ratio: float,
+        stage1_span: int,
+        stage2_span: int,
+        stage3_span: int,
+        stage1_batch_size: int,
+        stage2_batch_size: int,
+        stage3_batch_size: int,
+        stage1_grad_accum_steps: int,
+        stage2_grad_accum_steps: int,
+        stage3_grad_accum_steps: int,
+        queued_blocks: int,
+        block_size: int,
+        materializer_threads: int,
+    ) -> None:
+        self.batcher = batcher
+        self.device = device
+        self.total_steps = int(total_steps)
+        self.start_step = int(start_step)
+        self.block_size = max(1, int(block_size))
+        self.queued_blocks = max(1, int(queued_blocks))
+        self.materializer_threads = max(1, int(materializer_threads))
+        self._plan_queue: queue.Queue[tuple[int, PrebuiltFlatBatchPlanBlock] | _PrefetchFailure | None] = queue.Queue(
+            maxsize=self.queued_blocks
+        )
+        self._result_queue: queue.Queue[
+            tuple[str, int, PrebuiltBatchBlock] | tuple[str, int, BaseException]
+        ] = queue.Queue(
+            maxsize=self.queued_blocks
+        )
+        self._stop = threading.Event()
+        self._current_block: PrebuiltBatchBlock | None = None
+        self._current_block_index = 0
+        self._consumed_batches = 0
+        self._next_chunk_index = 0
+        self._pending_blocks: dict[int, PrebuiltBatchBlock] = {}
+        self._produced_batches = 0
+        self._total_batch_build_seconds = 0.0
+        # Threaded materialization shares a single shard cache inside one process.
+        # Disable eviction here to avoid unloading a shard while another thread is
+        # still copying from it.
+        self.batcher.collection.max_loaded_shards = 0
+        with self.batcher.collection._cache_lock:
+            self.batcher.collection._loaded_shard_lru.clear()
+        stages = [
+            resolve_curriculum_stage(
+                step=step,
+                total_steps=total_steps,
+                stage1_ratio=stage1_ratio,
+                stage2_ratio=stage2_ratio,
+                stage1_span=stage1_span,
+                stage2_span=stage2_span,
+                stage3_span=stage3_span,
+                stage1_batch_size=stage1_batch_size,
+                stage2_batch_size=stage2_batch_size,
+                stage3_batch_size=stage3_batch_size,
+                stage1_grad_accum_steps=stage1_grad_accum_steps,
+                stage2_grad_accum_steps=stage2_grad_accum_steps,
+                stage3_grad_accum_steps=stage3_grad_accum_steps,
+            )
+            for step in range(self.start_step + 1, self.total_steps + 1)
+        ]
+        self.stage_chunks = [
+            stages[index : index + self.block_size]
+            for index in range(0, len(stages), self.block_size)
+        ]
+        if not self.stage_chunks:
+            raise ValueError("rolling flat plan prefetch has no stages to build.")
+        self.total_batches = sum(len(chunk) for chunk in self.stage_chunks)
+        self._planner_thread = threading.Thread(
+            target=self._planner_worker,
+            name="cmem_flat_plan_prefetch",
+            daemon=True,
+        )
+        self._materializer_threads = [
+            threading.Thread(
+                target=self._materializer_worker,
+                name=f"cmem_flat_materialize_{index}",
+                daemon=True,
+            )
+            for index in range(self.materializer_threads)
+        ]
+        self._planner_thread.start()
+        for thread in self._materializer_threads:
+            thread.start()
+
+    def _planner_worker(self) -> None:
+        try:
+            for chunk_index, stage_chunk in enumerate(self.stage_chunks):
+                if self._stop.is_set():
+                    break
+                started_at = time.perf_counter()
+                plans: list[PrebuiltFlatBatchPlan] = []
+                for stage in stage_chunk:
+                    self.batcher.set_batch_size(stage.batch_size)
+                    self.batcher.set_bucket_weights(stage.bucket_weights)
+                    plans.append(
+                        PrebuiltFlatBatchPlan(
+                            plan=self.batcher.next_batch_plan(),
+                            reset_all=bool(stage.freeze_memory),
+                        )
+                    )
+                block = PrebuiltFlatBatchPlanBlock(
+                    plans=tuple(plans),
+                    build_seconds=time.perf_counter() - started_at,
+                )
+                placed = False
+                while not placed and not self._stop.is_set():
+                    try:
+                        self._plan_queue.put((chunk_index, block), timeout=0.1)
+                        placed = True
+                    except queue.Full:
+                        continue
+            for _ in range(self.materializer_threads):
+                while not self._stop.is_set():
+                    try:
+                        self._plan_queue.put(None, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+        except BaseException as exc:  # pragma: no cover - defensive background thread path
+            while not self._stop.is_set():
+                try:
+                    self._plan_queue.put(_PrefetchFailure(exc), timeout=0.1)
+                    return
+                except queue.Full:
+                    continue
+
+    def _materializer_worker(self) -> None:
+        while not self._stop.is_set():
+            item = self._plan_queue.get()
+            if isinstance(item, _PrefetchFailure):
+                while not self._stop.is_set():
+                    try:
+                        self._result_queue.put(("error", -1, item.error), timeout=0.1)
+                        return
+                    except queue.Full:
+                        continue
+            if item is None:
+                return
+            chunk_index, plan_block = item
+            try:
+                block = _materialize_flat_plan_block(
+                    self.batcher,
+                    plan_block,
+                    pin_memory=bool(getattr(self.batcher, "pin_memory", False)),
+                )
+                while not self._stop.is_set():
+                    try:
+                        self._result_queue.put(("block", int(chunk_index), block), timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+            except BaseException as exc:  # pragma: no cover - defensive background thread path
+                while not self._stop.is_set():
+                    try:
+                        self._result_queue.put(("error", int(chunk_index), exc), timeout=0.1)
+                        return
+                    except queue.Full:
+                        continue
+
+    def _next_ordered_block(self) -> PrebuiltBatchBlock:
+        if self._next_chunk_index >= len(self.stage_chunks):
+            raise StopIteration("rolling flat plan prefetch is exhausted.")
+        while self._next_chunk_index not in self._pending_blocks:
+            kind, chunk_index, payload = self._result_queue.get()
+            if kind == "error":
+                raise RuntimeError("Rolling flat plan prefetcher failed.") from payload
+            if kind != "block":
+                raise RuntimeError(f"Unexpected rolling flat plan message: {kind}")
+            self._pending_blocks[int(chunk_index)] = payload
+        block = self._pending_blocks.pop(self._next_chunk_index)
+        self._next_chunk_index += 1
+        self._produced_batches += block.batch_count
+        self._total_batch_build_seconds += block.build_seconds
+        return block
+
+    def next_batch(self) -> DocumentBatch:
+        if self._current_block is None or self._current_block_index >= self._current_block.batch_count:
+            self._current_block = self._next_ordered_block()
+            self._current_block_index = 0
+        local_index = self._current_block_index
+        self._current_block_index += 1
+        self._consumed_batches += 1
+        batch = DocumentBatch(
+            context=self._current_block.context[local_index],
+            target=self._current_block.target[local_index],
+            loss_mask=self._current_block.loss_mask[local_index],
+            reset_mask=self._current_block.reset_mask[local_index],
+        )
+        return move_batch_to_device(batch, device=self.device, non_blocking=True)
+
+    def stats(self) -> tuple[float, int]:
+        average = self._total_batch_build_seconds / max(1, self._produced_batches)
+        buffered = sum(block.batch_count for block in self._pending_blocks.values())
+        if self._current_block is not None:
+            buffered += max(0, self._current_block.batch_count - self._current_block_index)
+        return average, buffered
+
+    def close(self) -> None:
+        self._stop.set()
+        self._planner_thread.join(timeout=1.0)
+        for thread in self._materializer_threads:
+            thread.join(timeout=1.0)
 
 
 class RollingProcessDocumentBatchProvider:
@@ -2379,6 +2648,14 @@ class FlatDocumentChunkBatcher:
         )
         clone.pin_memory = self.pin_memory
         clone.set_bucket_weights(dict(zip(self.active_buckets, self.active_bucket_weights)))
+        # Each forked prefetch worker gets its own shard cache; keep it close to the
+        # active working set instead of inheriting the large parent-process default.
+        worker_max_loaded_shards = max(1, int(self.active_shards_per_bucket) + 1)
+        current_max_loaded_shards = int(clone.collection.max_loaded_shards)
+        if current_max_loaded_shards <= 0 or current_max_loaded_shards > worker_max_loaded_shards:
+            clone.collection.max_loaded_shards = worker_max_loaded_shards
+        with clone.collection._cache_lock:
+            clone.collection._loaded_shard_lru.clear()
         return clone
 
     def set_batch_size(self, batch_size: int) -> None:
@@ -2493,7 +2770,8 @@ class FlatDocumentChunkBatcher:
             else:
                 reset_mask.append(False)
             reference = self.documents[self.current_doc[item_index]]
-            shard = self.collection.get_shard(reference.shard_index)
+            # Planning only needs metadata; avoid faulting in the whole shard payload here.
+            shard = self.collection.shards[reference.shard_index]
             chunk_start, chunk_end = shard.document_chunk_range(reference.document_index)
             chunk_index = chunk_start + self.current_chunk[item_index]
             last_chunk = chunk_index == chunk_end - 1
@@ -3986,6 +4264,43 @@ def resolve_curriculum_stage(
     )
 
 
+def estimate_total_optimizer_steps(
+    *,
+    total_micro_steps: int,
+    stage1_ratio: float,
+    stage2_ratio: float,
+    stage1_span: int = 1,
+    stage2_span: int = 1,
+    stage3_span: int = 1,
+    stage1_batch_size: int = 1,
+    stage2_batch_size: int = 1,
+    stage3_batch_size: int = 1,
+    stage1_grad_accum_steps: int = 1,
+    stage2_grad_accum_steps: int = 1,
+    stage3_grad_accum_steps: int = 1,
+) -> int:
+    optimizer_steps = 0
+    for micro_step in range(1, max(1, int(total_micro_steps)) + 1):
+        stage = resolve_curriculum_stage(
+            step=micro_step,
+            total_steps=total_micro_steps,
+            stage1_ratio=stage1_ratio,
+            stage2_ratio=stage2_ratio,
+            stage1_span=stage1_span,
+            stage2_span=stage2_span,
+            stage3_span=stage3_span,
+            stage1_batch_size=stage1_batch_size,
+            stage2_batch_size=stage2_batch_size,
+            stage3_batch_size=stage3_batch_size,
+            stage1_grad_accum_steps=stage1_grad_accum_steps,
+            stage2_grad_accum_steps=stage2_grad_accum_steps,
+            stage3_grad_accum_steps=stage3_grad_accum_steps,
+        )
+        if micro_step % stage.grad_accum_steps == 0 or micro_step == total_micro_steps:
+            optimizer_steps += 1
+    return max(1, optimizer_steps)
+
+
 def apply_training_curriculum(model: torch.nn.Module, stage: TrainingCurriculumStage) -> None:
     base_model = unwrap_model(model)
     if not hasattr(base_model, "b_module"):
@@ -4038,10 +4353,11 @@ def build_run_name(args: argparse.Namespace) -> str:
             f"transformer-doc-l{args.transformer_layers}-h{args.transformer_heads}"
             f"-ff{args.transformer_ff_mult:g}-dim{args.dim}-seq{args.seq_len}"
         )
-    return (
+    base = (
         f"causal-memory-doc-pl{propagation_layers}-b{memory_slug}"
         f"-dim{args.dim}-seq{args.seq_len}"
     )
+    return base
 
 
 def estimate_steps_per_epoch(*, documents: Sequence[TokenizedDocument], batch_size: int) -> int:
@@ -4993,6 +5309,41 @@ def collect_model_internal_stats(model: torch.nn.Module) -> dict[str, float]:
     return {}
 
 
+IMPORTANT_LAYERWISE_SUMMARY_METRICS: dict[str, tuple[str, ...]] = {
+    "residual_gate": ("mean", "var"),
+    "edge_entropy": ("mean", "var"),
+    "edge_source_load_variance": ("mean", "var"),
+}
+
+
+def summarize_layerwise_model_stats(model_stats: dict[str, float]) -> dict[str, float]:
+    grouped: dict[str, list[float]] = {}
+    for stat_name, stat_value in model_stats.items():
+        match = re.match(r"^layer_\d+/(.+)$", stat_name)
+        if match is None:
+            continue
+        value = float(stat_value)
+        if not math.isfinite(value):
+            continue
+        metric_name = match.group(1)
+        if metric_name not in IMPORTANT_LAYERWISE_SUMMARY_METRICS:
+            continue
+        grouped.setdefault(metric_name, []).append(value)
+
+    summary: dict[str, float] = {}
+    for metric_name, values in grouped.items():
+        if not values:
+            continue
+        mean_value = float(sum(values) / len(values))
+        var_value = float(sum((value - mean_value) ** 2 for value in values) / len(values))
+        for aggregate_name in IMPORTANT_LAYERWISE_SUMMARY_METRICS[metric_name]:
+            if aggregate_name == "mean":
+                summary[f"{metric_name}/mean"] = mean_value
+            elif aggregate_name == "var":
+                summary[f"{metric_name}/var"] = var_value
+    return summary
+
+
 class Stage1CudaGraphRunner:
     def __init__(
         self,
@@ -5280,7 +5631,8 @@ def save_checkpoint(
     rnn_aux_head: SharedEmbeddingRnnAuxHead | None,
     optimizer: torch.optim.Optimizer,
     rnn_aux_optimizer: torch.optim.Optimizer | None,
-    step: int,
+    micro_step: int,
+    optimizer_step: int,
     args: argparse.Namespace,
     train_loss: float,
     val_loss: float | None,
@@ -5295,13 +5647,20 @@ def save_checkpoint(
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_model = unwrap_model(model)
+    runtime_state = None
+    export_runtime_state = getattr(checkpoint_model, "export_runtime_state", None)
+    if callable(export_runtime_state):
+        runtime_state = export_runtime_state()
     torch.save(
         {
             "model_state_dict": checkpoint_model.state_dict(),
+            "runtime_state": runtime_state,
             "optimizer_state_dict": optimizer.state_dict(),
             "rnn_aux_optimizer_state_dict": None if rnn_aux_optimizer is None else rnn_aux_optimizer.state_dict(),
             "rnn_aux_state_dict": None if rnn_aux_head is None else rnn_aux_head.state_dict(),
-            "step": step,
+            "step": optimizer_step,
+            "micro_step": micro_step,
+            "optimizer_step": optimizer_step,
             "args": vars(args),
             "train_loss": train_loss,
             "val_loss": val_loss,
@@ -5404,7 +5763,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--memory-slots", type=int, nargs="+", default=[256, 64, 16])
     parser.add_argument("--memory-update-intervals", type=int, nargs="+")
     parser.add_argument("--prediction-layers", type=int, default=2)
-    parser.add_argument("--s-window", type=int, default=256)
+    parser.add_argument(
+        "--s-window",
+        type=int,
+        default=0,
+        help="Sequence propagation window. Use 0 for full causal dense propagation across the whole sequence.",
+    )
     parser.add_argument("--s-microbatch-size", type=int, default=0)
     parser.add_argument("--prediction-window", type=int, default=64)
     parser.add_argument("--checkpoint-sequence-layers", action="store_true")
@@ -5453,6 +5817,11 @@ def parse_args() -> argparse.Namespace:
         help="Residual scale for state_val FFN outputs.",
     )
     parser.add_argument(
+        "--feed-forward-learnable-residual-scale",
+        action="store_true",
+        help="Learn a positive FFN residual scale instead of using a fixed constant.",
+    )
+    parser.add_argument(
         "--feed-forward-random-output-init",
         action="store_true",
         help="Use Xavier output init for state_val FFNs instead of zero-init identity output.",
@@ -5462,6 +5831,11 @@ def parse_args() -> argparse.Namespace:
         choices=("gelu", "silu", "relu"),
         default="gelu",
         help="Activation used inside sequence/prediction FFN blocks.",
+    )
+    parser.add_argument(
+        "--disable-feed-forward-input-norm",
+        action="store_true",
+        help="Disable FFN input normalization while keeping propagation normalization unchanged.",
     )
     parser.add_argument("--memory-topk", type=int, default=16)
     parser.add_argument("--memory-train-mode", choices=("dense", "topk"), default="dense")
@@ -5518,13 +5892,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--route-anchor-kind", choices=("fixed_projection", "query_norm_dot", "diagonal_bilinear", "constant_one"), default="fixed_projection")
     parser.add_argument("--unit-norm-values", action="store_true")
     parser.add_argument("--disable-forced-unit-norm-values", action="store_true")
-    parser.add_argument("--propagation-residual-gate-init", type=float, default=0.1)
+    parser.add_argument("--state-activation-kind", choices=("signed_softmax", "softsign"), default="signed_softmax")
+    parser.add_argument("--norm-kind", choices=("layernorm", "rmsnorm"), default="layernorm")
+    parser.add_argument("--propagation-residual-gate-init", type=float, default=1.0)
+    parser.add_argument("--propagation-residual-gate-init-max", type=float, default=0.0)
+    parser.add_argument(
+        "--freeze-propagation-residual-gate",
+        action="store_true",
+        help="Keep per-layer propagation residual gates fixed at their initialized values.",
+    )
     parser.add_argument("--implementation", choices=("reference", "streaming", "kernel", "native"), default="streaming")
     parser.add_argument("--knowledge-nodes", type=int, default=0)
     parser.add_argument("--knowledge-route-topk", type=int, default=0)
     parser.add_argument("--knowledge-propagation-topk", type=int, default=0)
     parser.add_argument("--knowledge-propagation-layers", type=int, default=1)
-
     parser.add_argument("--batch-size", type=int, default=384)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument(
@@ -5731,6 +6112,15 @@ def build_parameter_groups(
         ),
     )
     return param_groups, group_configs
+
+
+def freeze_propagation_residual_gates(model: nn.Module) -> int:
+    frozen = 0
+    for name, parameter in model.named_parameters():
+        if name.endswith("residual_gate"):
+            parameter.requires_grad_(False)
+            frozen += 1
+    return frozen
 
 
 class Lion(torch.optim.Optimizer):
@@ -6052,6 +6442,7 @@ def build_rnn_aux_optimizer(
 def main() -> None:
     args = parse_args()
     forced_unit_norm_policy = "none"
+    requested_legacy_layer_split = (int(args.s_layers), int(args.prediction_layers))
     requested_stage_spans = (
         int(args.curriculum_stage1_span),
         int(args.curriculum_stage2_span),
@@ -6151,6 +6542,13 @@ def main() -> None:
         print(
             "warning | overriding requested curriculum document spans to 1 | "
             f"requested={requested_stage_spans}",
+            flush=True,
+        )
+    if args.model_kind == "causal_memory" and int(args.propagation_layers) > 0:
+        print(
+            "warning | using propagation_layers as the single causal stack depth; "
+            f"ignoring legacy layer split s_layers={requested_legacy_layer_split[0]} "
+            f"prediction_layers={requested_legacy_layer_split[1]}",
             flush=True,
         )
 
@@ -6389,6 +6787,20 @@ def main() -> None:
         )
         print(f"hf_embedding_dim | source={hf_dim_source} | dim={args.dim}", flush=True)
     total_steps = max(1, int(math.ceil(steps_per_epoch * args.epochs)))
+    total_optimizer_steps = estimate_total_optimizer_steps(
+        total_micro_steps=total_steps,
+        stage1_ratio=args.curriculum_stage1_ratio,
+        stage2_ratio=args.curriculum_stage2_ratio,
+        stage1_span=args.curriculum_stage1_span,
+        stage2_span=args.curriculum_stage2_span,
+        stage3_span=args.curriculum_stage3_span,
+        stage1_batch_size=stage1_batch_size,
+        stage2_batch_size=stage2_batch_size,
+        stage3_batch_size=stage3_batch_size,
+        stage1_grad_accum_steps=stage1_grad_accum_steps,
+        stage2_grad_accum_steps=stage2_grad_accum_steps,
+        stage3_grad_accum_steps=stage3_grad_accum_steps,
+    )
     lowrank_lion_default_schedule_applied = False
     if (
         args.model_kind == "causal_memory"
@@ -6403,14 +6815,23 @@ def main() -> None:
         args.lr_min_ratio = 0.25
         lowrank_lion_default_schedule_applied = True
     run_name = args.run_name or build_run_name(args)
+    resume_run_dir = None
+    if args.resume_checkpoint:
+        resume_run_dir = Path(args.resume_checkpoint).resolve().parent.parent
     if distributed:
         run_dir_payload = [""]
         if is_main_process:
-            run_dir_payload[0] = str(create_run_directory(args.output_root, run_name))
+            if resume_run_dir is not None:
+                run_dir_payload[0] = str(resume_run_dir)
+            else:
+                run_dir_payload[0] = str(create_run_directory(args.output_root, run_name))
         dist.broadcast_object_list(run_dir_payload, src=0)
         run_dir = Path(run_dir_payload[0])
     else:
-        run_dir = create_run_directory(args.output_root, run_name)
+        if resume_run_dir is not None:
+            run_dir = resume_run_dir
+        else:
+            run_dir = create_run_directory(args.output_root, run_name)
     checkpoints_dir = ensure_directory(run_dir / "checkpoints")
 
     def create_training_batcher() -> DocumentChunkBatcher | FlatDocumentChunkBatcher:
@@ -6503,8 +6924,32 @@ def main() -> None:
         source_batcher: DocumentChunkBatcher | FlatDocumentChunkBatcher,
         *,
         start_step_value: int,
-    ) -> RollingFileDocumentBatchProvider:
-        return RollingFileDocumentBatchProvider(
+    ) -> RollingProcessDocumentBatchProvider | RollingFlatPlanPrefetchProvider:
+        if isinstance(source_batcher, FlatDocumentChunkBatcher):
+            return RollingFlatPlanPrefetchProvider(
+                source_batcher,
+                device=device,
+                total_steps=total_steps,
+                start_step=start_step_value,
+                stage1_ratio=args.curriculum_stage1_ratio,
+                stage2_ratio=args.curriculum_stage2_ratio,
+                stage1_span=args.curriculum_stage1_span,
+                stage2_span=args.curriculum_stage2_span,
+                stage3_span=args.curriculum_stage3_span,
+                stage1_batch_size=stage1_batch_size,
+                stage2_batch_size=stage2_batch_size,
+                stage3_batch_size=stage3_batch_size,
+                stage1_grad_accum_steps=stage1_grad_accum_steps,
+                stage2_grad_accum_steps=stage2_grad_accum_steps,
+                stage3_grad_accum_steps=stage3_grad_accum_steps,
+                queued_blocks=max(1, int(args.rolling_prefetch_blocks)),
+                block_size=max(1, int(args.rolling_prefetch_block_size)),
+                materializer_threads=max(
+                    1,
+                    int(args.rolling_prefetch_workers) * max(1, int(args.rolling_prefetch_worker_threads)),
+                ),
+            )
+        return RollingProcessDocumentBatchProvider(
             source_batcher,
             device=device,
             total_steps=total_steps,
@@ -6520,12 +6965,11 @@ def main() -> None:
             stage1_grad_accum_steps=stage1_grad_accum_steps,
             stage2_grad_accum_steps=stage2_grad_accum_steps,
             stage3_grad_accum_steps=stage3_grad_accum_steps,
-            pin_memory=bool(args.prefetch_pin_memory),
+            pin_memory=False,
             workers=max(1, int(args.rolling_prefetch_workers)),
             worker_threads=max(1, int(args.rolling_prefetch_worker_threads)),
             block_size=max(1, int(args.rolling_prefetch_block_size)),
             queued_blocks=max(1, int(args.rolling_prefetch_blocks)),
-            cache_dir=None if args.rolling_prefetch_cache_dir is None else Path(args.rolling_prefetch_cache_dir),
         )
 
     batcher: DocumentChunkBatcher | FlatDocumentChunkBatcher | None = None
@@ -6533,6 +6977,7 @@ def main() -> None:
         AsyncDocumentBatchPrefetcher
         | SynchronousDocumentBatchProvider
         | RollingProcessDocumentBatchProvider
+        | RollingFlatPlanPrefetchProvider
         | RollingFileDocumentBatchProvider
         | PrebuiltDocumentBatchProvider
         | None
@@ -6573,16 +7018,16 @@ def main() -> None:
             dropout=args.transformer_dropout,
         ).to(device)
     else:
-        total_propagation_layers = int(args.s_layers) + int(args.prediction_layers)
+        total_propagation_layers = resolve_total_propagation_layers(args)
         model = CausalMemoryLM(
             vocab_size=vocab_size,
             dim=args.dim,
             max_seq_len=args.seq_len,
             propagation_layers=total_propagation_layers,
-            s_layers=args.s_layers,
+            s_layers=total_propagation_layers,
             memory_slots=tuple(args.memory_slots),
             memory_update_intervals=None if args.memory_update_intervals is None else tuple(args.memory_update_intervals),
-            prediction_layers=args.prediction_layers,
+            prediction_layers=0,
             s_window=args.s_window,
             s_microbatch_size=None if args.s_microbatch_size <= 0 else args.s_microbatch_size,
             prediction_window=args.prediction_window,
@@ -6598,8 +7043,10 @@ def main() -> None:
             feed_forward_hidden_mult=args.feed_forward_hidden_mult,
             feed_forward_kind=args.feed_forward_kind,
             feed_forward_residual_scale=args.feed_forward_residual_scale,
+            feed_forward_learnable_residual_scale=args.feed_forward_learnable_residual_scale,
             feed_forward_zero_init_output=not args.feed_forward_random_output_init,
             feed_forward_activation=args.feed_forward_activation,
+            feed_forward_input_norm=not args.disable_feed_forward_input_norm,
             memory_topk=args.memory_topk,
             memory_train_mode=args.memory_train_mode,
             memory_eval_mode=args.memory_eval_mode,
@@ -6622,12 +7069,25 @@ def main() -> None:
             route_anchor_kind=args.route_anchor_kind,
             implementation=args.implementation,
             unit_norm_values=args.unit_norm_values,
+            state_activation_kind=args.state_activation_kind,
+            norm_kind=args.norm_kind,
             propagation_residual_gate_init=args.propagation_residual_gate_init,
+            propagation_residual_gate_init_max=(
+                None
+                if args.propagation_residual_gate_init_max <= 0.0
+                else args.propagation_residual_gate_init_max
+            ),
             knowledge_nodes=args.knowledge_nodes,
             knowledge_route_topk=None if args.knowledge_route_topk <= 0 else args.knowledge_route_topk,
             knowledge_propagation_topk=None if args.knowledge_propagation_topk <= 0 else args.knowledge_propagation_topk,
             knowledge_propagation_layers=args.knowledge_propagation_layers,
         ).to(device)
+        if args.freeze_propagation_residual_gate:
+            frozen_gate_count = freeze_propagation_residual_gates(model)
+            print(
+                f"freeze_propagation_residual_gate | enabled=True | frozen={frozen_gate_count}",
+                flush=True,
+            )
     if args.hf_embedding_model:
         if not isinstance(decode_vocab, HFTokenizerVocab):
             raise ValueError("--hf-embedding-model requires --tokenizer hf_auto.")
@@ -6656,23 +7116,30 @@ def main() -> None:
     else:
         print(
             f"model=causal_memory_doc | params={parameter_count:,} | dim={args.dim} | seq_len={args.seq_len} | "
-            f"propagation_layers={total_propagation_layers} | legacy_s_layers={args.s_layers} | "
-            f"legacy_prediction_layers={args.prediction_layers} | "
-            f"s_window={args.s_window} | s_microbatch_size={args.s_microbatch_size} | "
+            f"propagation_layers={total_propagation_layers} | "
+            f"legacy_s_layers={requested_legacy_layer_split[0]} | "
+            f"legacy_prediction_layers={requested_legacy_layer_split[1]} | "
+            f"full_dense_causal={args.s_window <= 0} | s_window={args.s_window} | "
+            f"s_microbatch_size={args.s_microbatch_size} | "
             f"scan_backend={args.scan_backend} | scan_checkpoint_chunk_size={args.scan_checkpoint_chunk_size} | "
             f"memory_slots={args.memory_slots} | memory_update_intervals={args.memory_update_intervals} | knowledge_nodes={args.knowledge_nodes} | "
             f"memory_train_mode={args.memory_train_mode} | memory_eval_mode={args.memory_eval_mode} | eval_topk={args.eval_topk or args.memory_topk} | "
             f"unit_norm_values={args.unit_norm_values} | feed_forward_layers={not args.disable_feed_forward_layers} | "
+            f"state_activation_kind={args.state_activation_kind} | "
             f"pairwise_head_aggregate={args.pairwise_head_aggregate} | "
+            f"norm_kind={args.norm_kind} | "
             f"propagation_residual_gate_init={args.propagation_residual_gate_init:g} | "
+            f"propagation_residual_gate_init_max={args.propagation_residual_gate_init_max:g} | "
             f"memory_feed_forward_layers={not (args.disable_feed_forward_layers or args.disable_memory_feed_forward_layers)} | "
             f"disable_memory={args.disable_memory} | disable_memory_read={args.disable_memory_read} | "
             f"disable_memory_propagation={args.disable_memory_propagation} | "
             f"feed_forward_hidden_mult={args.feed_forward_hidden_mult:g} | "
             f"feed_forward_kind={args.feed_forward_kind} | "
             f"feed_forward_residual_scale={args.feed_forward_residual_scale:g} | "
+            f"feed_forward_learnable_residual_scale={args.feed_forward_learnable_residual_scale} | "
             f"feed_forward_zero_init_output={not args.feed_forward_random_output_init} | "
             f"feed_forward_activation={args.feed_forward_activation} | "
+            f"feed_forward_input_norm={not args.disable_feed_forward_input_norm} | "
             f"optimizer={args.optimizer} | checkpoint_sequence={args.checkpoint_sequence_layers} | "
             f"checkpoint_prediction={args.checkpoint_prediction_layers}",
             flush=True,
@@ -6777,7 +7244,11 @@ def main() -> None:
             raise ValueError("--init-model-checkpoint cannot be combined with --resume-checkpoint.")
         init_checkpoint_path = Path(args.init_model_checkpoint)
         init_checkpoint = load_checkpoint(init_checkpoint_path, device=device)
-        unwrap_model(model).load_state_dict(init_checkpoint["model_state_dict"])
+        checkpoint_model = unwrap_model(model)
+        checkpoint_model.load_state_dict(init_checkpoint["model_state_dict"])
+        load_runtime_state = getattr(checkpoint_model, "load_runtime_state", None)
+        if callable(load_runtime_state):
+            load_runtime_state(init_checkpoint.get("runtime_state"))
         print(
             f"initialized_model_checkpoint | path={init_checkpoint_path} | "
             f"source_step={init_checkpoint.get('step')} | "
@@ -6823,21 +7294,37 @@ def main() -> None:
     train_memory_state: tuple[Any, ...] | None = None
     active_stage_name: str | None = None
     start_step = 0
+    optimizer_step = 0
+    optimizer_window_losses: list[float] = []
     best_val_loss = float("inf")
     if args.resume_checkpoint:
         checkpoint_path = Path(args.resume_checkpoint)
         checkpoint = load_checkpoint(checkpoint_path, device=device)
-        unwrap_model(model).load_state_dict(checkpoint["model_state_dict"])
+        checkpoint_model = unwrap_model(model)
+        checkpoint_model.load_state_dict(checkpoint["model_state_dict"])
+        load_runtime_state = getattr(checkpoint_model, "load_runtime_state", None)
+        if callable(load_runtime_state):
+            load_runtime_state(checkpoint.get("runtime_state"))
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        start_step = int(checkpoint.get("step", 0))
+        start_step = int(checkpoint.get("micro_step", checkpoint.get("step", 0)))
+        optimizer_step = int(checkpoint.get("optimizer_step", checkpoint.get("step", 0)))
         checkpoint_val_loss = checkpoint.get("val_loss")
         if checkpoint_val_loss is not None:
             best_val_loss = float(checkpoint_val_loss)
         if not distributed and checkpoint.get("train_memory_state") is not None:
             train_memory_state = move_memory_state(checkpoint["train_memory_state"], device=device)
         batcher_state = checkpoint.get("batcher_state")
-        if not distributed and isinstance(batcher_state, dict):
+        if (
+            not distributed
+            and isinstance(batcher_state, dict)
+            and int(args.rolling_prefetch_workers) <= 0
+        ):
             batcher.load_state_dict(batcher_state)
+        elif isinstance(batcher_state, dict) and int(args.rolling_prefetch_workers) > 0:
+            print(
+                "resume_info | ignoring checkpoint batcher_state because rolling prefetch is enabled",
+                flush=True,
+            )
         active_stage_name = checkpoint.get("active_stage_name")
         if not distributed:
             python_rng_state = checkpoint.get("python_rng_state")
@@ -6854,7 +7341,7 @@ def main() -> None:
                     if isinstance(state, torch.Tensor)
                 ])
         print(
-            f"resumed_checkpoint | path={checkpoint_path} | step={start_step} | "
+            f"resumed_checkpoint | path={checkpoint_path} | step={optimizer_step} | micro_step={start_step} | "
             f"train_loss={checkpoint.get('train_loss')} | val_loss={checkpoint.get('val_loss')}",
             flush=True,
         )
@@ -6878,11 +7365,34 @@ def main() -> None:
         model = compiler(model, **compile_kwargs)
         print("startup | compile_model_done", flush=True)
     if distributed:
+        ddp_static_graph = os.environ.get("JAKAL_NET_DDP_STATIC_GRAPH", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        ddp_gradient_as_bucket_view = os.environ.get(
+            "JAKAL_NET_DDP_GRADIENT_AS_BUCKET_VIEW",
+            "",
+        ).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         model = DistributedDataParallel(
             model,
             device_ids=[local_rank],
             output_device=local_rank,
             broadcast_buffers=False,
+            gradient_as_bucket_view=ddp_gradient_as_bucket_view,
+            static_graph=ddp_static_graph,
+        )
+        print(
+            "startup | ddp_config | "
+            f"broadcast_buffers=False | gradient_as_bucket_view={ddp_gradient_as_bucket_view} | "
+            f"static_graph={ddp_static_graph}",
+            flush=True,
         )
         print("startup | ddp_wrap_done", flush=True)
 
@@ -6954,20 +7464,68 @@ def main() -> None:
         for parameter_name, parameter in model.named_parameters()
         if parameter.requires_grad
     ]
+    fp32_grad_accum_enabled = scaler is None
+    fp32_grad_accum_buffers: dict[torch.nn.Parameter, torch.Tensor] = {}
     stage1_cuda_graph_runner: Stage1CudaGraphRunner | Stage1ForwardCudaGraphRunner | None = None
+
+    def clear_fp32_grad_accum_buffers() -> None:
+        fp32_grad_accum_buffers.clear()
+
+    def stash_current_grads_into_fp32_buffers() -> None:
+        if not fp32_grad_accum_enabled:
+            return
+        with torch.no_grad():
+            for parameter in grad_clip_parameters:
+                grad = parameter.grad
+                if grad is None:
+                    continue
+                buffer = fp32_grad_accum_buffers.get(parameter)
+                if (
+                    buffer is None
+                    or buffer.shape != grad.shape
+                    or buffer.device != grad.device
+                ):
+                    buffer = torch.zeros_like(
+                        grad,
+                        dtype=torch.float32,
+                        device=grad.device,
+                    )
+                    fp32_grad_accum_buffers[parameter] = buffer
+                buffer.add_(grad.detach().to(dtype=torch.float32))
+                parameter.grad = None
+
+    def restore_fp32_grad_accum_buffers() -> None:
+        if not fp32_grad_accum_enabled:
+            return
+        with torch.no_grad():
+            for parameter in grad_clip_parameters:
+                buffer = fp32_grad_accum_buffers.get(parameter)
+                if buffer is None:
+                    parameter.grad = None
+                    continue
+                parameter.grad = buffer.to(dtype=parameter.dtype)
 
     def save_training_checkpoint(
         path: Path,
         *,
-        step: int,
+        micro_step: int,
+        optimizer_step_value: int,
         train_loss: float,
         val_loss: float | None,
     ) -> None:
         nonlocal prefetcher
         if not is_main_process:
             return
-        batcher_state = batcher.state_dict()
-        if not args.prebuild_train_batches:
+        rolling_prefetch_active = isinstance(
+            prefetcher,
+            (
+                RollingProcessDocumentBatchProvider,
+                RollingFlatPlanPrefetchProvider,
+                RollingFileDocumentBatchProvider,
+            ),
+        )
+        batcher_state = None if rolling_prefetch_active else batcher.state_dict()
+        if not args.prebuild_train_batches and not rolling_prefetch_active:
             prefetcher.close()
         save_checkpoint(
             path,
@@ -6975,7 +7533,8 @@ def main() -> None:
             rnn_aux_head=None,
             optimizer=optimizer,
             rnn_aux_optimizer=None,
-            step=step,
+            micro_step=micro_step,
+            optimizer_step=optimizer_step_value,
             args=args,
             train_loss=train_loss,
             val_loss=val_loss,
@@ -6988,8 +7547,8 @@ def main() -> None:
             torch_rng_state=torch.get_rng_state(),
             cuda_rng_state=(torch.cuda.get_rng_state_all() if device.type == "cuda" else None),
         )
-        if not args.prebuild_train_batches:
-            prefetcher = create_live_batch_provider(start_step_value=step)
+        if not args.prebuild_train_batches and not rolling_prefetch_active and micro_step < total_steps:
+            prefetcher = create_live_batch_provider(start_step_value=micro_step)
 
     for step in range(start_step + 1, total_steps + 1):
         stage = resolve_curriculum_stage(
@@ -7026,9 +7585,10 @@ def main() -> None:
                 flush=True,
             )
 
+        pending_optimizer_step = optimizer_step + 1
         lr = compute_learning_rate(
-            step=step,
-            total_steps=total_steps,
+            step=pending_optimizer_step,
+            total_steps=total_optimizer_steps,
             base_lr=args.learning_rate,
             warmup_start_lr=args.warmup_start_lr,
             warmup_steps=args.warmup_steps,
@@ -7039,6 +7599,8 @@ def main() -> None:
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
+        should_step_optimizer = step % stage.grad_accum_steps == 0 or step == total_steps
+        next_optimizer_step = optimizer_step + 1 if should_step_optimizer else optimizer_step
         current_memory_state = None if stage.freeze_memory else train_memory_state
         span_losses: list[float] = []
         last_span_loss_tensor: torch.Tensor | None = None
@@ -7047,108 +7609,119 @@ def main() -> None:
         should_collect_model_stats = (
             writer is not None
             and args.model_kind == "causal_memory"
-            and (step == 1 or step % 25 == 0)
+            and should_step_optimizer
+            and (next_optimizer_step == 1 or next_optimizer_step % 25 == 0)
             and not args.cuda_graph_stage1
         )
         set_model_track_stats(model, should_collect_model_stats)
-        for span_index in range(stage.document_span):
-            batch = override_batch_reset(
-                prefetcher.next_batch(),
-                reset_all=stage.freeze_memory,
-            )
-            use_stage1_cuda_graph = (
-                args.cuda_graph_stage1
-                and device.type == "cuda"
-                and scaler is None
-                and stage.name == "stage1"
-                and stage.document_span == 1
-                and stage.grad_accum_steps == 1
-                and not stage.freeze_memory
-                and span_index == 0
-            )
-            if use_stage1_cuda_graph:
-                if (
-                    stage1_cuda_graph_runner is None
-                    or tuple(stage1_cuda_graph_runner.static_batch.context.shape) != tuple(batch.context.shape)
-                ):
-                    stage1_cuda_graph_runner = Stage1ForwardCudaGraphRunner(
-                        model=model,
-                        batch=batch,
+        sync_context = (
+            model.no_sync()
+            if distributed and not should_step_optimizer
+            else nullcontext()
+        )
+        with sync_context:
+            for span_index in range(stage.document_span):
+                batch = override_batch_reset(
+                    prefetcher.next_batch(),
+                    reset_all=stage.freeze_memory,
+                )
+                use_stage1_cuda_graph = (
+                    args.cuda_graph_stage1
+                    and device.type == "cuda"
+                    and scaler is None
+                    and stage.name == "stage1"
+                    and stage.document_span == 1
+                    and stage.grad_accum_steps == 1
+                    and not stage.freeze_memory
+                    and span_index == 0
+                )
+                if use_stage1_cuda_graph:
+                    if (
+                        stage1_cuda_graph_runner is None
+                        or tuple(stage1_cuda_graph_runner.static_batch.context.shape) != tuple(batch.context.shape)
+                    ):
+                        stage1_cuda_graph_runner = Stage1ForwardCudaGraphRunner(
+                            model=model,
+                            batch=batch,
+                            precision=args.precision,
+                        )
+                        print("cuda_graph | mode=forward_only", flush=True)
+                    loss, main_loss_value, next_memory_state = stage1_cuda_graph_runner.replay(
+                        batch,
+                        memory_state=current_memory_state,
+                    )
+                    used_cuda_graph = isinstance(stage1_cuda_graph_runner, Stage1CudaGraphRunner)
+                else:
+                    loss, main_loss_value, next_memory_state = run_model(
+                        model,
+                        batch,
+                        memory_state=current_memory_state,
                         precision=args.precision,
-                    )
-                    print("cuda_graph | mode=forward_only", flush=True)
-                loss, main_loss_value, next_memory_state = stage1_cuda_graph_runner.replay(
-                    batch,
-                    memory_state=current_memory_state,
+                        grad_enabled=True,
                 )
-                used_cuda_graph = isinstance(stage1_cuda_graph_runner, Stage1CudaGraphRunner)
-            else:
-                loss, main_loss_value, next_memory_state = run_model(
-                    model,
-                    batch,
-                    memory_state=current_memory_state,
-                    precision=args.precision,
-                    grad_enabled=True,
-            )
-            loss_is_finite = bool(torch.isfinite(loss.detach()).item())
-            if not loss_is_finite:
-                print(
-                    f"warning | step={step} | span_index={span_index} | non-finite loss; skipping optimizer step",
-                    flush=True,
-                )
-                parameter_diagnostics = summarize_nonfinite_parameters(
-                    grad_clip_named_parameters,
-                    limit=args.diagnose_nonfinite_limit,
-                )
-                if parameter_diagnostics:
+                loss_is_finite = bool(torch.isfinite(loss.detach()).item())
+                if not loss_is_finite:
                     print(
-                        "diagnose_nonfinite_param | "
-                        + " | ".join(parameter_diagnostics),
+                        f"warning | step={step} | span_index={span_index} | non-finite loss; skipping optimizer step",
                         flush=True,
                     )
-                else:
-                    print("diagnose_nonfinite_param | all_finite", flush=True)
-                memory_diagnostics = summarize_nonfinite_memory_state(next_memory_state)
-                if memory_diagnostics:
-                    print(
-                        "diagnose_nonfinite_memory | "
-                        + " | ".join(memory_diagnostics),
-                        flush=True,
+                    parameter_diagnostics = summarize_nonfinite_parameters(
+                        grad_clip_named_parameters,
+                        limit=args.diagnose_nonfinite_limit,
                     )
-                else:
-                    print("diagnose_nonfinite_memory | all_finite", flush=True)
-                break
-            span_losses.append(main_loss_value)
-            last_span_loss_tensor = loss
-            current_memory_state = None if stage.freeze_memory else next_memory_state
+                    if parameter_diagnostics:
+                        print(
+                            "diagnose_nonfinite_param | "
+                            + " | ".join(parameter_diagnostics),
+                            flush=True,
+                        )
+                    else:
+                        print("diagnose_nonfinite_param | all_finite", flush=True)
+                    memory_diagnostics = summarize_nonfinite_memory_state(next_memory_state)
+                    if memory_diagnostics:
+                        print(
+                            "diagnose_nonfinite_memory | "
+                            + " | ".join(memory_diagnostics),
+                            flush=True,
+                        )
+                    else:
+                        print("diagnose_nonfinite_memory | all_finite", flush=True)
+                    break
+                span_losses.append(main_loss_value)
+                last_span_loss_tensor = loss
+                current_memory_state = None if stage.freeze_memory else next_memory_state
 
-        if loss_is_finite and last_span_loss_tensor is not None and not used_cuda_graph:
-            total_span_loss = last_span_loss_tensor / stage.grad_accum_steps
-            if scaler is not None:
-                scaler.scale(total_span_loss).backward()
+            if loss_is_finite and last_span_loss_tensor is not None and not used_cuda_graph:
+                total_span_loss = last_span_loss_tensor / stage.grad_accum_steps
+                if scaler is not None:
+                    scaler.scale(total_span_loss).backward()
+                else:
+                    total_span_loss.backward()
+                del total_span_loss
+                train_memory_state = None if stage.freeze_memory else detach_memory_state(current_memory_state)
+                if not memory_state_is_finite(train_memory_state):
+                    print(f"warning | step={step} | non-finite memory state; resetting memory", flush=True)
+                    train_memory_state = None
+            elif loss_is_finite and used_cuda_graph:
+                train_memory_state = detach_memory_state(current_memory_state)
+                if not memory_state_is_finite(train_memory_state):
+                    print(f"warning | step={step} | non-finite memory state; resetting memory", flush=True)
+                    train_memory_state = None
             else:
-                total_span_loss.backward()
-            del total_span_loss
-            train_memory_state = None if stage.freeze_memory else detach_memory_state(current_memory_state)
-            if not memory_state_is_finite(train_memory_state):
-                print(f"warning | step={step} | non-finite memory state; resetting memory", flush=True)
+                optimizer.zero_grad(set_to_none=True)
+                clear_fp32_grad_accum_buffers()
                 train_memory_state = None
-        elif loss_is_finite and used_cuda_graph:
-            train_memory_state = detach_memory_state(current_memory_state)
-            if not memory_state_is_finite(train_memory_state):
-                print(f"warning | step={step} | non-finite memory state; resetting memory", flush=True)
-                train_memory_state = None
-        else:
-            optimizer.zero_grad(set_to_none=True)
-            train_memory_state = None
+
+        if loss_is_finite and fp32_grad_accum_enabled and (last_span_loss_tensor is not None or used_cuda_graph):
+            stash_current_grads_into_fp32_buffers()
 
         model_stats = collect_model_internal_stats(model) if should_collect_model_stats else {}
         if should_collect_model_stats:
             set_model_track_stats(model, False)
 
-        should_step_optimizer = step % stage.grad_accum_steps == 0 or step == total_steps
         grad_group_diagnostics: dict[str, dict[str, float | int]] = {}
         if loss_is_finite and should_step_optimizer:
+            restore_fp32_grad_accum_buffers()
             if scaler is not None:
                 scaler.unscale_(optimizer)
             if should_apply_nomemory_lowrank_grad_scale(args):
@@ -7157,7 +7730,7 @@ def main() -> None:
                     scale=float(args.nomemory_lowrank_grad_scale),
                 )
             should_capture_grad_groups = args.grad_diagnose_groups and should_log_grad_diagnostics(
-                step=step,
+                step=next_optimizer_step,
                 interval=args.grad_diagnose_interval,
                 first_steps=args.grad_diagnose_first_steps,
             )
@@ -7217,9 +7790,9 @@ def main() -> None:
                         if gradient_extremes:
                             print(
                                 "diagnose_grad_extremes | "
-                                + " | ".join(gradient_extremes),
-                                flush=True,
-                            )
+                            + " | ".join(gradient_extremes),
+                            flush=True,
+                        )
                     memory_diagnostics = summarize_nonfinite_memory_state(current_memory_state)
                     if memory_diagnostics:
                         print(
@@ -7230,6 +7803,7 @@ def main() -> None:
                     else:
                         print("diagnose_nonfinite_memory | all_finite", flush=True)
                 optimizer.zero_grad(set_to_none=True)
+                clear_fp32_grad_accum_buffers()
                 train_memory_state = None
                 if args.stop_on_nonfinite_grad:
                     raise
@@ -7240,10 +7814,13 @@ def main() -> None:
                 else:
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+                clear_fp32_grad_accum_buffers()
         else:
             grad_norm = float("nan")
 
-        train_loss = float(span_losses[-1] if span_losses else float("nan"))
+        micro_train_loss = float(span_losses[-1] if span_losses else float("nan"))
+        if not math.isnan(micro_train_loss):
+            optimizer_window_losses.append(micro_train_loss)
         train_aux_loss = 0.0
         avg_rnn_batch_seconds = 0.0
         rnn_prefetch_queue_size = 0
@@ -7265,29 +7842,40 @@ def main() -> None:
                 if isinstance(stat_value, torch.Tensor):
                     vi_lion_stats[history_key] = float(stat_value.detach().float().cpu().item())
             break
-        if writer is not None:
-            writer.add_scalar("train/loss", train_loss, step)
-            writer.add_scalar("train/lr", lr, step)
-            writer.add_scalar("train/document_span", stage.document_span, step)
-            writer.add_scalar("train/cpu_batch_ms", avg_cpu_batch_seconds * 1000.0, step)
-            writer.add_scalar("train/prefetch_queue_size", prefetch_queue_size, step)
+        did_optimizer_step = loss_is_finite and should_step_optimizer and not math.isnan(grad_norm)
+        if did_optimizer_step:
+            optimizer_step = next_optimizer_step
+        train_loss = (
+            float(sum(optimizer_window_losses) / len(optimizer_window_losses))
+            if optimizer_window_losses
+            else float("nan")
+        )
+        model_stat_summary = summarize_layerwise_model_stats(model_stats) if model_stats else {}
+        if writer is not None and did_optimizer_step:
+            writer.add_scalar("train/loss", train_loss, optimizer_step)
+            writer.add_scalar("train/lr", lr, optimizer_step)
+            writer.add_scalar("train/document_span", stage.document_span, optimizer_step)
+            writer.add_scalar("train/cpu_batch_ms", avg_cpu_batch_seconds * 1000.0, optimizer_step)
+            writer.add_scalar("train/prefetch_queue_size", prefetch_queue_size, optimizer_step)
             if not math.isnan(grad_norm):
-                writer.add_scalar("train/grad_norm", grad_norm, step)
+                writer.add_scalar("train/grad_norm", grad_norm, optimizer_step)
             for group_name, group_stats in grad_group_diagnostics.items():
                 for stat_name, stat_value in group_stats.items():
                     writer.add_scalar(
                         f"train_grad_group/{group_name}/{stat_name}",
                         float(stat_value),
-                        step,
+                        optimizer_step,
                     )
             for stat_name, stat_value in vi_lion_stats.items():
-                writer.add_scalar(f"train/{stat_name}", stat_value, step)
+                writer.add_scalar(f"train/{stat_name}", stat_value, optimizer_step)
             for bucket_name, bucket_weight in bucket_weights.items():
-                writer.add_scalar(f"train_bucket_weight/{bucket_name}", bucket_weight, step)
+                writer.add_scalar(f"train_bucket_weight/{bucket_name}", bucket_weight, optimizer_step)
             for stat_name, stat_value in model_stats.items():
-                writer.add_scalar(f"train_model/{stat_name}", stat_value, step)
+                writer.add_scalar(f"train_model/{stat_name}", stat_value, optimizer_step)
+            for stat_name, stat_value in model_stat_summary.items():
+                writer.add_scalar(f"train_model_summary/{stat_name}", stat_value, optimizer_step)
 
-        should_print_progress = step == 1 or step % 25 == 0
+        should_print_progress = did_optimizer_step and (optimizer_step == 1 or optimizer_step % 25 == 0)
         if should_print_progress and is_main_process:
             elapsed = time.time() - start_time
             vi_lion_progress = ""
@@ -7300,7 +7888,8 @@ def main() -> None:
                     f" | vi_ratio={vi_lion_stats.get('vi_grad_rms_ratio', float('nan')):.3g}"
                 )
             print(
-                f"progress | step={step:5d}/{total_steps} | stage={stage.name} | span={stage.document_span} | "
+                f"progress | step={optimizer_step:5d}/{total_optimizer_steps} | micro_step={step:5d}/{total_steps} | "
+                f"stage={stage.name} | span={stage.document_span} | "
                 f"train_loss={train_loss:.4f} | lr={lr:.6g} | "
                 f"cpu_batch_ms={avg_cpu_batch_seconds * 1000.0:.1f} | prefetch_q={prefetch_queue_size} | "
                 f"elapsed={elapsed:.1f}s{vi_lion_progress}",
@@ -7322,11 +7911,11 @@ def main() -> None:
             print("grad_diagnose | " + " | ".join(group_messages), flush=True)
 
         val_loss = None
-        should_eval = is_main_process and (
-            step == total_steps
+        should_eval = is_main_process and did_optimizer_step and (
+            optimizer_step == total_optimizer_steps
             or (
-                step >= max(1, int(args.eval_start_step))
-                and step % args.eval_interval == 0
+                optimizer_step >= max(1, int(args.eval_start_step))
+                and optimizer_step % args.eval_interval == 0
             )
         )
         if should_eval:
@@ -7349,19 +7938,19 @@ def main() -> None:
                 )
             val_ppl = perplexity_from_loss(val_loss)
             print(
-                f"eval | step={step} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
+                f"eval | step={optimizer_step} | micro_step={step} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
                 f"val_ppl={val_ppl:.2f}",
                 flush=True,
             )
             if writer is not None:
-                writer.add_scalar("eval/val_loss", val_loss, step)
-                writer.add_scalar("eval/val_ppl", val_ppl, step)
+                writer.add_scalar("eval/val_loss", val_loss, optimizer_step)
+                writer.add_scalar("eval/val_ppl", val_ppl, optimizer_step)
                 should_log_eval_samples = (
-                    step == total_steps
+                    optimizer_step == total_optimizer_steps
                     or (
                         args.eval_sample_interval > 0
-                        and step >= max(1, int(args.eval_start_step))
-                        and step % args.eval_sample_interval == 0
+                        and optimizer_step >= max(1, int(args.eval_start_step))
+                        and optimizer_step % args.eval_sample_interval == 0
                     )
                 )
                 if should_log_eval_samples:
@@ -7374,7 +7963,7 @@ def main() -> None:
                             vocab=decode_vocab,
                             device=device,
                             precision=args.precision,
-                            step=step,
+                            step=optimizer_step,
                             max_samples=1,
                         )
                     else:
@@ -7385,51 +7974,58 @@ def main() -> None:
                             vocab=decode_vocab,
                             device=device,
                             precision=args.precision,
-                            step=step,
+                            step=optimizer_step,
                             max_samples=1,
                         )
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 save_training_checkpoint(
                     checkpoints_dir / "best.pt",
-                    step=step,
+                    micro_step=step,
+                    optimizer_step_value=optimizer_step,
                     train_loss=train_loss,
                     val_loss=val_loss,
                 )
                 if is_main_process:
                     write_json(
                         checkpoints_dir / "best.json",
-                        {"step": step, "train_loss": train_loss, "val_loss": val_loss},
+                        {"step": optimizer_step, "micro_step": step, "train_loss": train_loss, "val_loss": val_loss},
                     )
 
-        if is_main_process and (step == total_steps or step % args.checkpoint_interval == 0):
+        if is_main_process and did_optimizer_step and (
+            optimizer_step == total_optimizer_steps or optimizer_step % args.checkpoint_interval == 0
+        ):
             save_training_checkpoint(
                 checkpoints_dir / "last.pt",
-                step=step,
+                micro_step=step,
+                optimizer_step_value=optimizer_step,
                 train_loss=train_loss,
                 val_loss=val_loss,
             )
             write_json(
                 checkpoints_dir / "last.json",
-                {"step": step, "train_loss": train_loss, "val_loss": val_loss},
+                {"step": optimizer_step, "micro_step": step, "train_loss": train_loss, "val_loss": val_loss},
             )
 
-        row = {
-            "step": step,
-            "stage": stage.name,
-            "document_span": stage.document_span,
-            "train_loss": train_loss,
-            "grad_norm": grad_norm,
-            "lr": lr,
-            "val_loss": val_loss,
-            "val_ppl": None if val_loss is None else perplexity_from_loss(val_loss),
-        }
-        if grad_group_diagnostics:
-            row["grad_group_diagnostics"] = grad_group_diagnostics
-        row.update(vi_lion_stats)
-        if is_main_process:
+        if is_main_process and did_optimizer_step:
+            row = {
+                "step": optimizer_step,
+                "micro_step": step,
+                "stage": stage.name,
+                "document_span": stage.document_span,
+                "train_loss": train_loss,
+                "grad_norm": grad_norm,
+                "lr": lr,
+                "val_loss": val_loss,
+                "val_ppl": None if val_loss is None else perplexity_from_loss(val_loss),
+            }
+            if grad_group_diagnostics:
+                row["grad_group_diagnostics"] = grad_group_diagnostics
+            row.update(vi_lion_stats)
             history_rows.append(row)
             append_jsonl(run_dir / "history.jsonl", row)
+        if did_optimizer_step:
+            optimizer_window_losses.clear()
 
     if is_main_process:
         write_csv_rows(run_dir / "history.csv", history_rows)

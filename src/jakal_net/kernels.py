@@ -13,6 +13,7 @@ from jakal_net.kernel_common import (
     flatten_val,
     gather_state_by_indices,
     gather_val_by_indices,
+    nonself_block_mask,
     normalize_with_online_softmax,
     online_softmax_stats_step,
     pairwise_scores_dense,
@@ -353,8 +354,16 @@ def propagation_dense_kernel(
                 else pairwise_scores_dense(pairwise_fn, target_val, source_val)
             )
             with profiler.record("softmax"):
+                mask_2d = nonself_block_mask(
+                    target_start,
+                    target_end,
+                    source_start,
+                    source_end,
+                    device=layer_val.device,
+                )
+                mask = mask_2d.view(1, target_end - target_start, source_end - source_start)
                 edges = _weight_edges(
-                    _compress_edges(scores, edge_compress_fn),
+                    _compress_edges(scores, edge_compress_fn, mask=mask),
                     flat_source_state,
                     source_start,
                     source_end,
@@ -597,6 +606,15 @@ def propagation_topk_kernel(
                 source_start, source_end, device=layer_val.device, dtype=torch.long
             ).view(1, 1, source_end - source_start)
             source_indices = source_indices.expand(flat_val.shape[0], target_nodes, -1)
+            nonself_2d = nonself_block_mask(
+                target_start,
+                target_end,
+                source_start,
+                source_end,
+                device=layer_val.device,
+            )
+            nonself_mask = nonself_2d.view(1, target_nodes, source_end - source_start)
+            scores = scores.masked_fill(~nonself_mask, torch.finfo(scores.dtype).min)
 
             candidate_scores = torch.cat((best_scores, scores), dim=-1)
             candidate_indices = torch.cat((best_indices, source_indices), dim=-1)
@@ -610,8 +628,15 @@ def propagation_topk_kernel(
         if best_scores is None or best_indices is None:
             continue
 
+        target_indices = torch.arange(
+            target_start,
+            target_end,
+            device=best_indices.device,
+            dtype=best_indices.dtype,
+        ).view(1, target_nodes, 1)
+        edge_mask = best_indices != target_indices
         with profiler.record("softmax"):
-            edges = _compress_edges(best_scores, edge_compress_fn)
+            edges = _compress_edges(best_scores, edge_compress_fn, mask=edge_mask)
         if source_state is not None:
             selected_source_state = gather_state_by_indices(
                 flatten_state(source_state),
