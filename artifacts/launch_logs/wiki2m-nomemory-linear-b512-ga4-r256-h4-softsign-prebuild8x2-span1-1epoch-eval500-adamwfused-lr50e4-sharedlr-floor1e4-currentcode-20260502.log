@@ -1,0 +1,111 @@
+using device: cuda
+flat_metadata_index | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40 | workers=8
+flat_metadata_ok | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40
+loaded_pretokenized_dir | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | documents=2,000,000 | tokenizer=hf_auto
+startup | split_train_val_flat_done
+startup | summarize_flat_buckets_done
+startup | estimate_steps_flat_done
+startup | fixed_eval_documents_flat_done
+startup | fixed_eval_sample_documents_flat_done
+startup | batcher_done
+startup | prebuild_train_batches_start | pin_memory=True | workers=8 | worker_threads=2
+prebuild_process_start | workers=8 | worker_threads=2 | steps=7292 | tasks=128 | chunk_size=57 | batch_size=512 | pin_memory=True | cache_dir=<shared-ram-index>
+flat_metadata_index | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40 | workers=1
+flat_metadata_index | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40 | workers=1
+flat_metadata_index | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40 | workers=1
+flat_metadata_index | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40 | workers=1
+flat_metadata_index | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40 | workers=1
+flat_metadata_index | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40 | workers=1
+flat_metadata_index | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40 | workers=1
+flat_metadata_index | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40 | workers=1
+flat_metadata_ok | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40
+flat_metadata_ok | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40
+flat_metadata_ok | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40
+flat_metadata_ok | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40
+flat_metadata_ok | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40
+flat_metadata_ok | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40
+flat_metadata_ok | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40
+flat_metadata_ok | path=artifacts/wiki2m_hf16k/pretokenized_shards_50k | shards=40
+prebuild_worker_progress | task=0 | batches=1/57 | elapsed=0.0s
+prebuild_worker_progress | task=2 | batches=1/57 | elapsed=0.0s
+prebuild_worker_progress | task=1 | batches=1/57 | elapsed=0.0s
+prebuild_worker_progress | task=3 | batches=1/57 | elapsed=0.0s
+prebuild_worker_progress | task=6 | batches=1/57 | elapsed=0.0s
+prebuild_worker_progress | task=2 | batches=8/57 | elapsed=0.0s
+prebuild_worker_progress | task=0 | batches=8/57 | elapsed=0.0s
+prebuild_worker_progress | task=1 | batches=8/57 | elapsed=0.0s
+prebuild_worker_progress | task=3 | batches=8/57 | elapsed=0.0s
+prebuild_worker_progress | task=6 | batches=8/57 | elapsed=0.0s
+prebuild_worker_progress | task=2 | batches=16/57 | elapsed=0.1s
+prebuild_worker_progress | task=5 | batches=1/57 | elapsed=0.0s
+prebuild_worker_progress | task=1 | batches=16/57 | elapsed=0.1s
+prebuild_worker_progress | task=0 | batches=16/57 | elapsed=0.1s
+prebuild_worker_progress | task=3 | batches=16/57 | elapsed=0.1s
+prebuild_worker_progress | task=6 | batches=16/57 | elapsed=0.1s
+prebuild_worker_progress | task=4 | batches=1/57 | elapsed=0.0s
+prebuild_worker_progress | task=5 | batches=8/57 | elapsed=0.0s
+prebuild_worker_progress | task=2 | batches=24/57 | elapsed=0.1s
+prebuild_worker_progress | task=1 | batches=24/57 | elapsed=0.1s
+prebuild_worker_progress | task=0 | batches=24/57 | elapsed=0.1s
+prebuild_worker_progress | task=3 | batches=24/57 | elapsed=0.1s
+prebuild_worker_progress | task=6 | batches=24/57 | elapsed=0.1s
+prebuild_worker_progress | task=4 | batches=8/57 | elapsed=0.0s
+prebuild_worker_progress | task=5 | batches=16/57 | elapsed=0.1s
+prebuild_worker_progress | task=2 | batches=32/57 | elapsed=0.1s
+prebuild_worker_progress | task=1 | batches=32/57 | elapsed=0.1s
+prebuild_worker_progress | task=3 | batches=32/57 | elapsed=0.1s
+prebuild_worker_progress | task=0 | batches=32/57 | elapsed=0.1s
+prebuild_worker_progress | task=6 | batches=32/57 | elapsed=0.1s
+prebuild_worker_progress | task=4 | batches=16/57 | elapsed=0.1s
+prebuild_worker_progress | task=2 | batches=40/57 | elapsed=0.1s
+prebuild_worker_progress | task=5 | batches=24/57 | elapsed=0.1s
+prebuild_worker_progress | task=1 | batches=40/57 | elapsed=0.2s
+prebuild_worker_progress | task=7 | batches=1/57 | elapsed=0.0s
+prebuild_worker_progress | task=3 | batches=40/57 | elapsed=0.1s
+prebuild_worker_progress | task=0 | batches=40/57 | elapsed=0.2s
+prebuild_worker_progress | task=6 | batches=40/57 | elapsed=0.1s
+prebuild_worker_progress | task=4 | batches=24/57 | elapsed=0.1s
+prebuild_worker_progress | task=2 | batches=48/57 | elapsed=0.2s
+prebuild_worker_progress | task=5 | batches=32/57 | elapsed=0.1s
+prebuild_worker_progress | task=7 | batches=8/57 | elapsed=0.0s
+prebuild_worker_progress | task=1 | batches=48/57 | elapsed=0.2s
+prebuild_worker_progress | task=3 | batches=48/57 | elapsed=0.2s
+prebuild_worker_progress | task=0 | batches=48/57 | elapsed=0.2s
+prebuild_worker_progress | task=6 | batches=48/57 | elapsed=0.2s
+prebuild_worker_progress | task=4 | batches=32/57 | elapsed=0.1s
+prebuild_worker_progress | task=2 | batches=56/57 | elapsed=0.2s
+prebuild_worker_progress | task=5 | batches=40/57 | elapsed=0.1s
+prebuild_worker_progress | task=7 | batches=16/57 | elapsed=0.1s
+prebuild_worker_progress | task=1 | batches=56/57 | elapsed=0.2s
+prebuild_worker_progress | task=2 | batches=57/57 | elapsed=0.2s
+prebuild_worker_progress | task=3 | batches=56/57 | elapsed=0.2s
+prebuild_worker_progress | task=1 | batches=57/57 | elapsed=0.2s
+prebuild_worker_progress | task=4 | batches=40/57 | elapsed=0.1s
+prebuild_worker_progress | task=0 | batches=56/57 | elapsed=0.2s
+prebuild_worker_progress | task=6 | batches=56/57 | elapsed=0.2s
+prebuild_worker_progress | task=3 | batches=57/57 | elapsed=0.2s
+prebuild_worker_progress | task=6 | batches=57/57 | elapsed=0.2s
+prebuild_worker_progress | task=0 | batches=57/57 | elapsed=0.2s
+prebuild_worker_progress | task=5 | batches=48/57 | elapsed=0.2s
+prebuild_worker_progress | task=7 | batches=24/57 | elapsed=0.1s
+prebuild_worker_progress | task=4 | batches=48/57 | elapsed=0.2s
+prebuild_worker_progress | task=5 | batches=56/57 | elapsed=0.2s
+prebuild_worker_progress | task=7 | batches=32/57 | elapsed=0.1s
+prebuild_worker_progress | task=5 | batches=57/57 | elapsed=0.2s
+prebuild_worker_progress | task=4 | batches=56/57 | elapsed=0.2s
+prebuild_worker_progress | task=4 | batches=57/57 | elapsed=0.2s
+prebuild_worker_progress | task=7 | batches=40/57 | elapsed=0.2s
+prebuild_worker_progress | task=8 | batches=1/57 | elapsed=0.0s
+prebuild_worker_progress | task=7 | batches=48/57 | elapsed=0.2s
+prebuild_worker_progress | task=8 | batches=8/57 | elapsed=0.0s
+prebuild_worker_progress | task=7 | batches=56/57 | elapsed=0.2s
+prebuild_worker_progress | task=7 | batches=57/57 | elapsed=0.2s
+prebuild_worker_progress | task=8 | batches=16/57 | elapsed=0.1s
+prebuild_worker_progress | task=8 | batches=24/57 | elapsed=0.1s
+prebuild_worker_progress | task=8 | batches=32/57 | elapsed=0.1s
+prebuild_worker_progress | task=8 | batches=40/57 | elapsed=0.1s
+prebuild_worker_progress | task=8 | batches=48/57 | elapsed=0.2s
+prebuild_worker_progress | task=8 | batches=56/57 | elapsed=0.2s
+prebuild_worker_progress | task=8 | batches=57/57 | elapsed=0.2s
+/venv/main/lib/python3.12/multiprocessing/resource_tracker.py:279: UserWarning: resource_tracker: There appear to be 5 leaked semaphore objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '

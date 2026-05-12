@@ -46,7 +46,298 @@ def _lowrank_backward_block_config() -> tuple[int, int, int, int]:
     )
 
 
+def _lowrank_backward_autotune_configs() -> list[triton.Config]:
+    if triton is None:
+        return []
+    return [
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 32, "BLOCK_R": 32}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 32, "BLOCK_R": 32}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "BLOCK_R": 32}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 32, "BLOCK_K": 32, "BLOCK_R": 32}, num_warps=8, num_stages=2),
+    ]
+
+
 if triton is not None and tl is not None:
+    @triton.jit
+    def _multihead_signed_smoothmax_pass1_full_kernel(
+        target_ptr,
+        source_weighted_ptr,
+        proj_state_ptr,
+        proj_val_ptr,
+        grad_state_ptr,
+        grad_val_ptr,
+        bias_ptr,
+        row_max_ptr,
+        row_denom_ptr,
+        edge_numer_ptr,
+        stride_target_h,
+        stride_target_b,
+        stride_target_n,
+        stride_target_r,
+        stride_source_h,
+        stride_source_b,
+        stride_source_n,
+        stride_source_r,
+        stride_proj_state_b,
+        stride_proj_state_n,
+        stride_proj_val_b,
+        stride_proj_val_n,
+        stride_proj_val_d,
+        stride_grad_state_b,
+        stride_grad_state_n,
+        stride_grad_val_b,
+        stride_grad_val_n,
+        stride_grad_val_d,
+        stride_row_max_b,
+        stride_row_max_m,
+        stride_row_denom_b,
+        stride_row_denom_m,
+        stride_edge_numer_b,
+        stride_edge_numer_m,
+        num_nodes,
+        rank_dim,
+        val_dim,
+        heads: tl.constexpr,
+        has_bias: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_b = tl.program_id(1)
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        mask_m = offs_m < num_nodes
+        neg_large = -1.0e30
+        row_max = tl.full((BLOCK_M,), neg_large, dtype=tl.float32)
+
+        for source_base in range(0, num_nodes, BLOCK_N):
+            offs_n = source_base + tl.arange(0, BLOCK_N)
+            mask_n = offs_n < num_nodes
+            causal = offs_n[None, :] <= offs_m[:, None]
+            full_mask = mask_m[:, None] & mask_n[None, :] & causal
+
+            max_abs = tl.full((BLOCK_M, BLOCK_N), neg_large, dtype=tl.float32)
+            for head in range(heads):
+                score = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+                for k_start in range(0, rank_dim, BLOCK_K):
+                    offs_k = k_start + tl.arange(0, BLOCK_K)
+                    mask_k = offs_k < rank_dim
+                    a = tl.load(
+                        target_ptr
+                        + head * stride_target_h
+                        + pid_b * stride_target_b
+                        + offs_m[:, None] * stride_target_n
+                        + offs_k[None, :] * stride_target_r,
+                        mask=mask_m[:, None] & mask_k[None, :],
+                        other=0.0,
+                    )
+                    b = tl.load(
+                        source_weighted_ptr
+                        + head * stride_source_h
+                        + pid_b * stride_source_b
+                        + offs_n[None, :] * stride_source_n
+                        + offs_k[:, None] * stride_source_r,
+                        mask=mask_k[:, None] & mask_n[None, :],
+                        other=0.0,
+                    )
+                    score += tl.dot(a, b, allow_tf32=False, out_dtype=tl.float32)
+                if has_bias:
+                    score += tl.load(bias_ptr + head)
+                max_abs = tl.maximum(max_abs, tl.where(full_mask, tl.abs(score), neg_large))
+            row_max = tl.maximum(row_max, tl.max(max_abs, axis=1))
+
+        row_denom = tl.zeros((BLOCK_M,), dtype=tl.float32)
+        edge_numer = tl.zeros((BLOCK_M,), dtype=tl.float32)
+        grad_state = tl.load(
+            grad_state_ptr + pid_b * stride_grad_state_b + offs_m * stride_grad_state_n,
+            mask=mask_m,
+            other=0.0,
+        )
+        for source_base in range(0, num_nodes, BLOCK_N):
+            offs_n = source_base + tl.arange(0, BLOCK_N)
+            mask_n = offs_n < num_nodes
+            causal = offs_n[None, :] <= offs_m[:, None]
+            full_mask = mask_m[:, None] & mask_n[None, :] & causal
+
+            max_abs = tl.full((BLOCK_M, BLOCK_N), neg_large, dtype=tl.float32)
+            for head in range(heads):
+                score = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+                for k_start in range(0, rank_dim, BLOCK_K):
+                    offs_k = k_start + tl.arange(0, BLOCK_K)
+                    mask_k = offs_k < rank_dim
+                    a = tl.load(
+                        target_ptr
+                        + head * stride_target_h
+                        + pid_b * stride_target_b
+                        + offs_m[:, None] * stride_target_n
+                        + offs_k[None, :] * stride_target_r,
+                        mask=mask_m[:, None] & mask_k[None, :],
+                        other=0.0,
+                    )
+                    b = tl.load(
+                        source_weighted_ptr
+                        + head * stride_source_h
+                        + pid_b * stride_source_b
+                        + offs_n[None, :] * stride_source_n
+                        + offs_k[:, None] * stride_source_r,
+                        mask=mask_k[:, None] & mask_n[None, :],
+                        other=0.0,
+                    )
+                    score += tl.dot(a, b, allow_tf32=False, out_dtype=tl.float32)
+                if has_bias:
+                    score += tl.load(bias_ptr + head)
+                max_abs = tl.maximum(max_abs, tl.where(full_mask, tl.abs(score), neg_large))
+
+            denom_heads = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            numer_heads = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            for head in range(heads):
+                score = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+                for k_start in range(0, rank_dim, BLOCK_K):
+                    offs_k = k_start + tl.arange(0, BLOCK_K)
+                    mask_k = offs_k < rank_dim
+                    a = tl.load(
+                        target_ptr
+                        + head * stride_target_h
+                        + pid_b * stride_target_b
+                        + offs_m[:, None] * stride_target_n
+                        + offs_k[None, :] * stride_target_r,
+                        mask=mask_m[:, None] & mask_k[None, :],
+                        other=0.0,
+                    )
+                    b = tl.load(
+                        source_weighted_ptr
+                        + head * stride_source_h
+                        + pid_b * stride_source_b
+                        + offs_n[None, :] * stride_source_n
+                        + offs_k[:, None] * stride_source_r,
+                        mask=mask_k[:, None] & mask_n[None, :],
+                        other=0.0,
+                    )
+                    score += tl.dot(a, b, allow_tf32=False, out_dtype=tl.float32)
+                if has_bias:
+                    score += tl.load(bias_ptr + head)
+                p = tl.where(full_mask, tl.exp(tl.abs(score) - max_abs), 0.0)
+                denom_heads += p
+                numer_heads += score * p
+            combined = numer_heads / tl.maximum(denom_heads, 1.0e-20)
+
+            source_state = tl.load(
+                proj_state_ptr + pid_b * stride_proj_state_b + offs_n * stride_proj_state_n,
+                mask=mask_n,
+                other=0.0,
+            )
+            grad_edges = grad_state[:, None] * source_state[None, :]
+            for v_start in range(0, val_dim, BLOCK_K):
+                offs_v = v_start + tl.arange(0, BLOCK_K)
+                mask_v = offs_v < val_dim
+                grad_val_v = tl.load(
+                    grad_val_ptr + pid_b * stride_grad_val_b + offs_m[:, None] * stride_grad_val_n + offs_v[None, :] * stride_grad_val_d,
+                    mask=mask_m[:, None] & mask_v[None, :],
+                    other=0.0,
+                )
+                proj_val_v = tl.load(
+                    proj_val_ptr + pid_b * stride_proj_val_b + offs_n[:, None] * stride_proj_val_n + offs_v[None, :] * stride_proj_val_d,
+                    mask=mask_n[:, None] & mask_v[None, :],
+                    other=0.0,
+                )
+                grad_edges += tl.dot(grad_val_v, tl.trans(proj_val_v), allow_tf32=False, out_dtype=tl.float32)
+
+            scaled = tl.where(full_mask, tl.exp(tl.abs(combined) - row_max[:, None]), 0.0)
+            row_denom += tl.sum(scaled, axis=1)
+            signs = tl.where(combined > 0, 1.0, tl.where(combined < 0, -1.0, 0.0))
+            edge_numer += tl.sum(grad_edges * signs * scaled, axis=1)
+
+        tl.store(row_max_ptr + pid_b * stride_row_max_b + offs_m * stride_row_max_m, row_max, mask=mask_m)
+        tl.store(row_denom_ptr + pid_b * stride_row_denom_b + offs_m * stride_row_denom_m, row_denom, mask=mask_m)
+        tl.store(edge_numer_ptr + pid_b * stride_edge_numer_b + offs_m * stride_edge_numer_m, edge_numer, mask=mask_m)
+
+    @triton.jit
+    def _signed_abs_softmax_tile_stats_kernel(
+        scores_ptr,
+        grad_edges_ptr,
+        max_out_ptr,
+        denom_out_ptr,
+        numer_out_ptr,
+        stride_scores_b,
+        stride_scores_m,
+        stride_scores_n,
+        stride_grad_b,
+        stride_grad_m,
+        stride_grad_n,
+        stride_max_b,
+        stride_max_m,
+        stride_denom_b,
+        stride_denom_m,
+        stride_numer_b,
+        stride_numer_m,
+        source_start,
+        target_start,
+        num_nodes,
+        tile_nodes,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_b = tl.program_id(1)
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        mask_m = offs_m < num_nodes
+        neg_large = -1.0e30
+        row_max = tl.full((BLOCK_M,), neg_large, dtype=tl.float32)
+
+        for n_start in range(0, tile_nodes, BLOCK_N):
+            offs_n = n_start + tl.arange(0, BLOCK_N)
+            source_idx = source_start + offs_n
+            mask_n = offs_n < tile_nodes
+            target_idx = target_start + offs_m
+            causal = source_idx[None, :] <= target_idx[:, None]
+            full_mask = mask_m[:, None] & mask_n[None, :] & causal
+            score_ptrs = (
+                scores_ptr
+                + pid_b * stride_scores_b
+                + offs_m[:, None] * stride_scores_m
+                + offs_n[None, :] * stride_scores_n
+            )
+            scores = tl.load(score_ptrs, mask=full_mask, other=0.0)
+            row_max = tl.maximum(row_max, tl.max(tl.where(full_mask, tl.abs(scores), neg_large), axis=1))
+
+        denom = tl.zeros((BLOCK_M,), dtype=tl.float32)
+        numer = tl.zeros((BLOCK_M,), dtype=tl.float32)
+        for n_start in range(0, tile_nodes, BLOCK_N):
+            offs_n = n_start + tl.arange(0, BLOCK_N)
+            source_idx = source_start + offs_n
+            mask_n = offs_n < tile_nodes
+            target_idx = target_start + offs_m
+            causal = source_idx[None, :] <= target_idx[:, None]
+            full_mask = mask_m[:, None] & mask_n[None, :] & causal
+            score_ptrs = (
+                scores_ptr
+                + pid_b * stride_scores_b
+                + offs_m[:, None] * stride_scores_m
+                + offs_n[None, :] * stride_scores_n
+            )
+            grad_ptrs = (
+                grad_edges_ptr
+                + pid_b * stride_grad_b
+                + offs_m[:, None] * stride_grad_m
+                + offs_n[None, :] * stride_grad_n
+            )
+            scores = tl.load(score_ptrs, mask=full_mask, other=0.0)
+            grad_edges = tl.load(grad_ptrs, mask=full_mask, other=0.0)
+            scaled = tl.where(full_mask, tl.exp(tl.abs(scores) - row_max[:, None]), 0.0)
+            denom += tl.sum(scaled, axis=1)
+            numer += tl.sum(
+                grad_edges
+                * tl.where(scores > 0, 1.0, tl.where(scores < 0, -1.0, 0.0))
+                * scaled,
+                axis=1,
+            )
+
+        tl.store(max_out_ptr + pid_b * stride_max_b + offs_m * stride_max_m, row_max, mask=mask_m)
+        tl.store(denom_out_ptr + pid_b * stride_denom_b + offs_m * stride_denom_m, denom, mask=mask_m)
+        tl.store(numer_out_ptr + pid_b * stride_numer_b + offs_m * stride_numer_m, numer, mask=mask_m)
+
     @triton.jit
     def _signed_abs_softmax_edge_dot_tile_kernel(
         scores_ptr,
@@ -65,6 +356,7 @@ if triton is not None and tl is not None:
         stride_out_b,
         stride_out_m,
         source_start,
+        target_start,
         num_nodes,
         tile_nodes,
         BLOCK_M: tl.constexpr,
@@ -92,7 +384,8 @@ if triton is not None and tl is not None:
             offs_n = n_start + tl.arange(0, BLOCK_N)
             source_idx = source_start + offs_n
             mask_n = offs_n < tile_nodes
-            causal = source_idx[None, :] <= offs_m[:, None]
+            target_idx = target_start + offs_m
+            causal = source_idx[None, :] <= target_idx[:, None]
             full_mask = mask_m[:, None] & mask_n[None, :] & causal
 
             score_ptrs = (
@@ -120,6 +413,370 @@ if triton is not None and tl is not None:
 
         out_ptrs = out_ptr + pid_b * stride_out_b + offs_m * stride_out_m
         tl.store(out_ptrs, acc, mask=mask_m)
+
+    @triton.jit
+    def _signed_abs_softmax_backward_tile_kernel(
+        scores_ptr,
+        grad_edges_ptr,
+        row_max_ptr,
+        row_denom_ptr,
+        edge_dot_ptr,
+        edges_out_ptr,
+        grad_scores_out_ptr,
+        stride_scores_b,
+        stride_scores_m,
+        stride_scores_n,
+        stride_grad_b,
+        stride_grad_m,
+        stride_grad_n,
+        stride_row_b,
+        stride_row_m,
+        stride_edge_dot_b,
+        stride_edge_dot_m,
+        stride_edges_b,
+        stride_edges_m,
+        stride_edges_n,
+        stride_grad_scores_b,
+        stride_grad_scores_m,
+        stride_grad_scores_n,
+        source_start,
+        target_start,
+        num_nodes,
+        tile_nodes,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        pid_b = tl.program_id(2)
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        target_idx = target_start + offs_m
+        source_idx = source_start + offs_n
+        mask_m = offs_m < num_nodes
+        mask_n = offs_n < tile_nodes
+        causal = source_idx[None, :] <= target_idx[:, None]
+        full_mask = mask_m[:, None] & mask_n[None, :] & causal
+
+        score_ptrs = (
+            scores_ptr
+            + pid_b * stride_scores_b
+            + offs_m[:, None] * stride_scores_m
+            + offs_n[None, :] * stride_scores_n
+        )
+        grad_ptrs = (
+            grad_edges_ptr
+            + pid_b * stride_grad_b
+            + offs_m[:, None] * stride_grad_m
+            + offs_n[None, :] * stride_grad_n
+        )
+        scores = tl.load(score_ptrs, mask=full_mask, other=0.0)
+        grad_edges = tl.load(grad_ptrs, mask=full_mask, other=0.0)
+        row_max = tl.load(
+            row_max_ptr + pid_b * stride_row_b + offs_m * stride_row_m,
+            mask=mask_m,
+            other=-float("inf"),
+        )
+        row_denom = tl.load(
+            row_denom_ptr + pid_b * stride_row_b + offs_m * stride_row_m,
+            mask=mask_m,
+            other=1.0,
+        )
+        edge_dot = tl.load(
+            edge_dot_ptr + pid_b * stride_edge_dot_b + offs_m * stride_edge_dot_m,
+            mask=mask_m,
+            other=0.0,
+        )
+        probs = tl.where(
+            full_mask,
+            tl.exp(tl.abs(scores) - row_max[:, None]) / tl.maximum(row_denom[:, None], 1.0e-20),
+            0.0,
+        )
+        signs = tl.where(scores > 0, 1.0, tl.where(scores < 0, -1.0, 0.0))
+        edges = signs * probs
+        grad_scores = tl.where(
+            full_mask,
+            edges * (signs * grad_edges - edge_dot[:, None]),
+            0.0,
+        )
+
+        edge_ptrs = (
+            edges_out_ptr
+            + pid_b * stride_edges_b
+            + offs_m[:, None] * stride_edges_m
+            + offs_n[None, :] * stride_edges_n
+        )
+        grad_scores_ptrs = (
+            grad_scores_out_ptr
+            + pid_b * stride_grad_scores_b
+            + offs_m[:, None] * stride_grad_scores_m
+            + offs_n[None, :] * stride_grad_scores_n
+        )
+        tl.store(edge_ptrs, edges, mask=mask_m[:, None] & mask_n[None, :])
+        tl.store(grad_scores_ptrs, grad_scores, mask=mask_m[:, None] & mask_n[None, :])
+
+    @triton.jit
+    def _signed_abs_softmax_tile_stats_from_proj_kernel(
+        scores_ptr,
+        proj_state_ptr,
+        proj_val_ptr,
+        grad_state_ptr,
+        grad_val_ptr,
+        max_out_ptr,
+        denom_out_ptr,
+        numer_out_ptr,
+        stride_scores_b,
+        stride_scores_m,
+        stride_scores_n,
+        stride_proj_state_b,
+        stride_proj_state_n,
+        stride_proj_val_b,
+        stride_proj_val_n,
+        stride_proj_val_d,
+        stride_grad_state_b,
+        stride_grad_state_m,
+        stride_grad_val_b,
+        stride_grad_val_m,
+        stride_grad_val_d,
+        stride_max_b,
+        stride_max_m,
+        stride_denom_b,
+        stride_denom_m,
+        stride_numer_b,
+        stride_numer_m,
+        source_start,
+        target_start,
+        num_rows,
+        tile_nodes,
+        val_dim,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_b = tl.program_id(1)
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        mask_m = offs_m < num_rows
+        target_idx = target_start + offs_m
+        neg_large = -1.0e30
+        row_max = tl.full((BLOCK_M,), neg_large, dtype=tl.float32)
+
+        for n_start in range(0, tile_nodes, BLOCK_N):
+            offs_n = n_start + tl.arange(0, BLOCK_N)
+            source_idx = source_start + offs_n
+            mask_n = offs_n < tile_nodes
+            causal = source_idx[None, :] <= target_idx[:, None]
+            full_mask = mask_m[:, None] & mask_n[None, :] & causal
+            scores = tl.load(
+                scores_ptr
+                + pid_b * stride_scores_b
+                + offs_m[:, None] * stride_scores_m
+                + offs_n[None, :] * stride_scores_n,
+                mask=full_mask,
+                other=0.0,
+            )
+            row_max = tl.maximum(row_max, tl.max(tl.where(full_mask, tl.abs(scores), neg_large), axis=1))
+
+        grad_state = tl.load(
+            grad_state_ptr + pid_b * stride_grad_state_b + offs_m * stride_grad_state_m,
+            mask=mask_m,
+            other=0.0,
+        )
+        row_denom = tl.zeros((BLOCK_M,), dtype=tl.float32)
+        row_numer = tl.zeros((BLOCK_M,), dtype=tl.float32)
+        for n_start in range(0, tile_nodes, BLOCK_N):
+            offs_n = n_start + tl.arange(0, BLOCK_N)
+            source_idx = source_start + offs_n
+            mask_n = offs_n < tile_nodes
+            causal = source_idx[None, :] <= target_idx[:, None]
+            full_mask = mask_m[:, None] & mask_n[None, :] & causal
+
+            scores = tl.load(
+                scores_ptr
+                + pid_b * stride_scores_b
+                + offs_m[:, None] * stride_scores_m
+                + offs_n[None, :] * stride_scores_n,
+                mask=full_mask,
+                other=0.0,
+            )
+            source_state = tl.load(
+                proj_state_ptr + pid_b * stride_proj_state_b + source_idx * stride_proj_state_n,
+                mask=mask_n,
+                other=0.0,
+            )
+            grad_edges = grad_state[:, None] * source_state[None, :]
+            for k_start in range(0, val_dim, BLOCK_K):
+                offs_k = k_start + tl.arange(0, BLOCK_K)
+                mask_k = offs_k < val_dim
+                grad_val = tl.load(
+                    grad_val_ptr
+                    + pid_b * stride_grad_val_b
+                    + offs_m[:, None] * stride_grad_val_m
+                    + offs_k[None, :] * stride_grad_val_d,
+                    mask=mask_m[:, None] & mask_k[None, :],
+                    other=0.0,
+                )
+                proj_val = tl.load(
+                    proj_val_ptr
+                    + pid_b * stride_proj_val_b
+                    + source_idx[:, None] * stride_proj_val_n
+                    + offs_k[None, :] * stride_proj_val_d,
+                    mask=mask_n[:, None] & mask_k[None, :],
+                    other=0.0,
+                )
+                grad_edges += tl.dot(grad_val, tl.trans(proj_val), allow_tf32=False, out_dtype=tl.float32)
+            scaled = tl.where(full_mask, tl.exp(tl.abs(scores) - row_max[:, None]), 0.0)
+            signs = tl.where(scores > 0, 1.0, tl.where(scores < 0, -1.0, 0.0))
+            row_denom += tl.sum(scaled, axis=1)
+            row_numer += tl.sum(grad_edges * signs * scaled, axis=1)
+
+        tl.store(max_out_ptr + pid_b * stride_max_b + offs_m * stride_max_m, row_max, mask=mask_m)
+        tl.store(denom_out_ptr + pid_b * stride_denom_b + offs_m * stride_denom_m, row_denom, mask=mask_m)
+        tl.store(numer_out_ptr + pid_b * stride_numer_b + offs_m * stride_numer_m, row_numer, mask=mask_m)
+
+    @triton.jit
+    def _signed_abs_softmax_backward_from_proj_tile_kernel(
+        scores_ptr,
+        proj_state_ptr,
+        proj_val_ptr,
+        grad_state_ptr,
+        grad_val_ptr,
+        row_max_ptr,
+        row_denom_ptr,
+        edge_dot_ptr,
+        edges_out_ptr,
+        grad_scores_out_ptr,
+        stride_scores_b,
+        stride_scores_m,
+        stride_scores_n,
+        stride_proj_state_b,
+        stride_proj_state_n,
+        stride_proj_val_b,
+        stride_proj_val_n,
+        stride_proj_val_d,
+        stride_grad_state_b,
+        stride_grad_state_m,
+        stride_grad_val_b,
+        stride_grad_val_m,
+        stride_grad_val_d,
+        stride_row_b,
+        stride_row_m,
+        stride_edge_dot_b,
+        stride_edge_dot_m,
+        stride_edges_b,
+        stride_edges_m,
+        stride_edges_n,
+        stride_grad_scores_b,
+        stride_grad_scores_m,
+        stride_grad_scores_n,
+        source_start,
+        target_start,
+        num_rows,
+        tile_nodes,
+        val_dim,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        pid_b = tl.program_id(2)
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask_m = offs_m < num_rows
+        mask_n = offs_n < tile_nodes
+        target_idx = target_start + offs_m
+        source_idx = source_start + offs_n
+        causal = source_idx[None, :] <= target_idx[:, None]
+        full_mask = mask_m[:, None] & mask_n[None, :] & causal
+
+        scores = tl.load(
+            scores_ptr
+            + pid_b * stride_scores_b
+            + offs_m[:, None] * stride_scores_m
+            + offs_n[None, :] * stride_scores_n,
+            mask=full_mask,
+            other=0.0,
+        )
+        grad_state = tl.load(
+            grad_state_ptr + pid_b * stride_grad_state_b + offs_m * stride_grad_state_m,
+            mask=mask_m,
+            other=0.0,
+        )
+        source_state = tl.load(
+            proj_state_ptr + pid_b * stride_proj_state_b + source_idx * stride_proj_state_n,
+            mask=mask_n,
+            other=0.0,
+        )
+        grad_edges = grad_state[:, None] * source_state[None, :]
+        for k_start in range(0, val_dim, BLOCK_K):
+            offs_k = k_start + tl.arange(0, BLOCK_K)
+            mask_k = offs_k < val_dim
+            grad_val = tl.load(
+                grad_val_ptr
+                + pid_b * stride_grad_val_b
+                + offs_m[:, None] * stride_grad_val_m
+                + offs_k[None, :] * stride_grad_val_d,
+                mask=mask_m[:, None] & mask_k[None, :],
+                other=0.0,
+            )
+            proj_val = tl.load(
+                proj_val_ptr
+                + pid_b * stride_proj_val_b
+                + source_idx[:, None] * stride_proj_val_n
+                + offs_k[None, :] * stride_proj_val_d,
+                mask=mask_n[:, None] & mask_k[None, :],
+                other=0.0,
+            )
+            grad_edges += tl.dot(grad_val, tl.trans(proj_val), allow_tf32=False, out_dtype=tl.float32)
+
+        row_max = tl.load(
+            row_max_ptr + pid_b * stride_row_b + offs_m * stride_row_m,
+            mask=mask_m,
+            other=-float("inf"),
+        )
+        row_denom = tl.load(
+            row_denom_ptr + pid_b * stride_row_b + offs_m * stride_row_m,
+            mask=mask_m,
+            other=1.0,
+        )
+        edge_dot = tl.load(
+            edge_dot_ptr + pid_b * stride_edge_dot_b + offs_m * stride_edge_dot_m,
+            mask=mask_m,
+            other=0.0,
+        )
+        probs = tl.where(
+            full_mask,
+            tl.exp(tl.abs(scores) - row_max[:, None]) / tl.maximum(row_denom[:, None], 1.0e-20),
+            0.0,
+        )
+        signs = tl.where(scores > 0, 1.0, tl.where(scores < 0, -1.0, 0.0))
+        edges = signs * probs
+        grad_scores = tl.where(
+            full_mask,
+            edges * (signs * grad_edges - edge_dot[:, None]),
+            0.0,
+        )
+
+        tl.store(
+            edges_out_ptr
+            + pid_b * stride_edges_b
+            + offs_m[:, None] * stride_edges_m
+            + offs_n[None, :] * stride_edges_n,
+            edges,
+            mask=mask_m[:, None] & mask_n[None, :],
+        )
+        tl.store(
+            grad_scores_out_ptr
+            + pid_b * stride_grad_scores_b
+            + offs_m[:, None] * stride_grad_scores_m
+            + offs_n[None, :] * stride_grad_scores_n,
+            grad_scores,
+            mask=mask_m[:, None] & mask_n[None, :],
+        )
 
     @triton.jit
     def _multihead_signed_smoothmax_scores_and_head_grads_tile_kernel(
@@ -268,6 +925,161 @@ if triton is not None and tl is not None:
             g3 = p3 * (1.0 + tl.where(score_3 > 0, 1.0, tl.where(score_3 < 0, -1.0, 0.0)) * (score_3 - combined))
             out_ptrs = grad_out_ptr + pid_b * stride_grad_out_b + 3 * stride_grad_out_h + offs_m[:, None] * stride_grad_out_m + offs_n[None, :] * stride_grad_out_n
             tl.store(out_ptrs, tl.where(full_mask, g3, 0.0), mask=mask_m[:, None] & mask_n[None, :])
+
+    @triton.jit
+    def _multihead_signed_smoothmax_tile_partials_kernel(
+        target_ptr,
+        source_proj_ptr,
+        source_weighted_ptr,
+        core_ptr,
+        grad_scores_ptr,
+        head_grads_ptr,
+        grad_target_ptr,
+        grad_source_ptr,
+        grad_core_ptr,
+        grad_bias_ptr,
+        stride_target_b,
+        stride_target_h,
+        stride_target_n,
+        stride_target_r,
+        stride_source_proj_b,
+        stride_source_proj_h,
+        stride_source_proj_n,
+        stride_source_proj_r,
+        stride_source_weighted_b,
+        stride_source_weighted_h,
+        stride_source_weighted_n,
+        stride_source_weighted_r,
+        stride_core_h,
+        stride_core_r,
+        stride_grad_scores_b,
+        stride_grad_scores_m,
+        stride_grad_scores_n,
+        stride_head_grads_h,
+        stride_head_grads_b,
+        stride_head_grads_m,
+        stride_head_grads_n,
+        stride_grad_target_b,
+        stride_grad_target_h,
+        stride_grad_target_n,
+        stride_grad_target_r,
+        stride_grad_source_b,
+        stride_grad_source_h,
+        stride_grad_source_n,
+        stride_grad_source_r,
+        stride_grad_core_h,
+        stride_grad_core_r,
+        stride_grad_bias_h,
+        num_nodes,
+        tile_nodes,
+        rank_dim,
+        has_bias: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_R: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_b = tl.program_id(1)
+        owned_head = tl.program_id(2)
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        mask_m = offs_m < num_nodes
+        bias_acc = tl.zeros((), dtype=tl.float32)
+
+        for r_start in range(0, rank_dim, BLOCK_R):
+            offs_r = r_start + tl.arange(0, BLOCK_R)
+            mask_r = offs_r < rank_dim
+            grad_target_acc = tl.zeros((BLOCK_M, BLOCK_R), dtype=tl.float32)
+
+            for n_start in range(0, tile_nodes, BLOCK_N):
+                offs_n = n_start + tl.arange(0, BLOCK_N)
+                mask_n = offs_n < tile_nodes
+
+                grad_scores = tl.load(
+                    grad_scores_ptr
+                    + pid_b * stride_grad_scores_b
+                    + offs_m[:, None] * stride_grad_scores_m
+                    + offs_n[None, :] * stride_grad_scores_n,
+                    mask=mask_m[:, None] & mask_n[None, :],
+                    other=0.0,
+                )
+                head_g = tl.load(
+                    head_grads_ptr
+                    + owned_head * stride_head_grads_h
+                    + pid_b * stride_head_grads_b
+                    + offs_m[:, None] * stride_head_grads_m
+                    + offs_n[None, :] * stride_head_grads_n,
+                    mask=mask_m[:, None] & mask_n[None, :],
+                    other=0.0,
+                )
+                gs = grad_scores * head_g
+                if has_bias and r_start == 0:
+                    bias_acc += tl.sum(gs)
+
+                target_r = tl.load(
+                    target_ptr
+                    + pid_b * stride_target_b
+                    + owned_head * stride_target_h
+                    + offs_m[:, None] * stride_target_n
+                    + offs_r[None, :] * stride_target_r,
+                    mask=mask_m[:, None] & mask_r[None, :],
+                    other=0.0,
+                )
+                source_weighted_r = tl.load(
+                    source_weighted_ptr
+                    + pid_b * stride_source_weighted_b
+                    + owned_head * stride_source_weighted_h
+                    + offs_n[:, None] * stride_source_weighted_n
+                    + offs_r[None, :] * stride_source_weighted_r,
+                    mask=mask_n[:, None] & mask_r[None, :],
+                    other=0.0,
+                )
+                grad_target_acc += tl.dot(gs, source_weighted_r, allow_tf32=False, out_dtype=tl.float32)
+                grad_source_part = tl.dot(tl.trans(gs), target_r, allow_tf32=False, out_dtype=tl.float32)
+
+                core_r = tl.load(
+                    core_ptr + owned_head * stride_core_h + offs_r * stride_core_r,
+                    mask=mask_r,
+                    other=0.0,
+                )
+                source_proj_r = tl.load(
+                    source_proj_ptr
+                    + pid_b * stride_source_proj_b
+                    + owned_head * stride_source_proj_h
+                    + offs_n[:, None] * stride_source_proj_n
+                    + offs_r[None, :] * stride_source_proj_r,
+                    mask=mask_n[:, None] & mask_r[None, :],
+                    other=0.0,
+                )
+                grad_source_ptrs = (
+                    grad_source_ptr
+                    + pid_b * stride_grad_source_b
+                    + owned_head * stride_grad_source_h
+                    + offs_n[:, None] * stride_grad_source_n
+                    + offs_r[None, :] * stride_grad_source_r
+                )
+                tl.atomic_add(
+                    grad_source_ptrs,
+                    grad_source_part * core_r[None, :],
+                    mask=mask_n[:, None] & mask_r[None, :],
+                )
+                tl.atomic_add(
+                    grad_core_ptr + owned_head * stride_grad_core_h + offs_r * stride_grad_core_r,
+                    tl.sum(grad_source_part * source_proj_r, axis=0),
+                    mask=mask_r,
+                )
+
+            grad_target_ptrs = (
+                grad_target_ptr
+                + pid_b * stride_grad_target_b
+                + owned_head * stride_grad_target_h
+                + offs_m[:, None] * stride_grad_target_n
+                + offs_r[None, :] * stride_grad_target_r
+            )
+            tl.store(grad_target_ptrs, grad_target_acc, mask=mask_m[:, None] & mask_r[None, :])
+
+        if has_bias:
+            tl.atomic_add(grad_bias_ptr + owned_head * stride_grad_bias_h, bias_acc)
 
     @triton.jit
     def _multihead_signed_smoothmax_scores_tile_kernel(
@@ -1831,6 +2643,7 @@ def signed_abs_softmax_edge_dot_tile(
     row_max_bm: torch.Tensor,
     row_denom_bm: torch.Tensor,
     source_start: int,
+    target_start: int = 0,
 ) -> torch.Tensor:
     if not triton_signed_smoothmax_available():
         raise RuntimeError("Triton is unavailable.")
@@ -1869,6 +2682,7 @@ def signed_abs_softmax_edge_dot_tile(
         out.stride(0),
         out.stride(1),
         source_start,
+        target_start,
         num_nodes,
         tile_nodes,
         BLOCK_M=64,
@@ -1877,6 +2691,441 @@ def signed_abs_softmax_edge_dot_tile(
         num_stages=2,
     )
     return out
+
+
+def signed_abs_softmax_tile_stats(
+    scores_bmn: torch.Tensor,
+    grad_edges_bmn: torch.Tensor,
+    source_start: int,
+    target_start: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not triton_signed_smoothmax_available():
+        raise RuntimeError("Triton is unavailable.")
+    if scores_bmn.ndim != 3 or grad_edges_bmn.ndim != 3:
+        raise ValueError("expected scores and grad_edges [batch, nodes, tile] tensors")
+    if scores_bmn.shape != grad_edges_bmn.shape:
+        raise ValueError("scores and grad_edges must have the same shape")
+    if scores_bmn.device.type != "cuda":
+        raise ValueError("Triton signed_smoothmax path requires CUDA tensors.")
+
+    scores = scores_bmn.contiguous().to(dtype=torch.float32)
+    grad_edges = grad_edges_bmn.contiguous().to(dtype=torch.float32)
+    batch, num_nodes, tile_nodes = scores.shape
+    row_max = torch.empty((batch, num_nodes), device=scores.device, dtype=torch.float32)
+    row_denom = torch.empty((batch, num_nodes), device=scores.device, dtype=torch.float32)
+    row_numer = torch.empty((batch, num_nodes), device=scores.device, dtype=torch.float32)
+    grid = (triton.cdiv(num_nodes, 64), batch)
+    _signed_abs_softmax_tile_stats_kernel[grid](
+        scores,
+        grad_edges,
+        row_max,
+        row_denom,
+        row_numer,
+        scores.stride(0),
+        scores.stride(1),
+        scores.stride(2),
+        grad_edges.stride(0),
+        grad_edges.stride(1),
+        grad_edges.stride(2),
+        row_max.stride(0),
+        row_max.stride(1),
+        row_denom.stride(0),
+        row_denom.stride(1),
+        row_numer.stride(0),
+        row_numer.stride(1),
+        source_start,
+        target_start,
+        num_nodes,
+        tile_nodes,
+        BLOCK_M=64,
+        BLOCK_N=32,
+        num_warps=4,
+        num_stages=2,
+    )
+    return row_max, row_denom, row_numer
+
+
+def signed_abs_softmax_backward_tile(
+    scores_bmn: torch.Tensor,
+    grad_edges_bmn: torch.Tensor,
+    row_max_bm: torch.Tensor,
+    row_denom_bm: torch.Tensor,
+    edge_dot_bm: torch.Tensor,
+    source_start: int,
+    target_start: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not triton_signed_smoothmax_available():
+        raise RuntimeError("Triton is unavailable.")
+    if scores_bmn.ndim != 3 or grad_edges_bmn.ndim != 3:
+        raise ValueError("expected scores and grad_edges [batch, rows, tile] tensors")
+    if row_max_bm.ndim != 2 or row_denom_bm.ndim != 2 or edge_dot_bm.ndim != 2:
+        raise ValueError("expected row stats [batch, rows] tensors")
+    if scores_bmn.shape != grad_edges_bmn.shape:
+        raise ValueError("scores and grad_edges must have the same shape")
+    if scores_bmn.shape[:2] != row_max_bm.shape or row_max_bm.shape != row_denom_bm.shape or row_max_bm.shape != edge_dot_bm.shape:
+        raise ValueError("row stats must match [batch, rows]")
+    if scores_bmn.device.type != "cuda":
+        raise ValueError("Triton signed_smoothmax path requires CUDA tensors.")
+
+    scores = scores_bmn.contiguous().to(dtype=torch.float32)
+    grad_edges = grad_edges_bmn.contiguous().to(dtype=torch.float32)
+    row_max = row_max_bm.contiguous().to(dtype=torch.float32)
+    row_denom = row_denom_bm.contiguous().to(dtype=torch.float32)
+    edge_dot = edge_dot_bm.contiguous().to(dtype=torch.float32)
+    batch, num_rows, tile_nodes = scores.shape
+    edges = torch.empty_like(scores, dtype=torch.float32)
+    grad_scores = torch.empty_like(scores, dtype=torch.float32)
+    grid = (triton.cdiv(num_rows, 64), triton.cdiv(tile_nodes, 32), batch)
+    _signed_abs_softmax_backward_tile_kernel[grid](
+        scores,
+        grad_edges,
+        row_max,
+        row_denom,
+        edge_dot,
+        edges,
+        grad_scores,
+        scores.stride(0),
+        scores.stride(1),
+        scores.stride(2),
+        grad_edges.stride(0),
+        grad_edges.stride(1),
+        grad_edges.stride(2),
+        row_max.stride(0),
+        row_max.stride(1),
+        edge_dot.stride(0),
+        edge_dot.stride(1),
+        edges.stride(0),
+        edges.stride(1),
+        edges.stride(2),
+        grad_scores.stride(0),
+        grad_scores.stride(1),
+        grad_scores.stride(2),
+        source_start,
+        target_start,
+        num_rows,
+        tile_nodes,
+        BLOCK_M=64,
+        BLOCK_N=32,
+        num_warps=4,
+        num_stages=2,
+    )
+    return edges, grad_scores
+
+
+def signed_abs_softmax_tile_stats_from_projections(
+    scores_bmn: torch.Tensor,
+    projected_state_bn: torch.Tensor,
+    projected_val_bnd: torch.Tensor,
+    grad_state_bm: torch.Tensor,
+    grad_val_bmd: torch.Tensor,
+    source_start: int,
+    target_start: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not triton_signed_smoothmax_available():
+        raise RuntimeError("Triton is unavailable.")
+    scores = scores_bmn.contiguous().to(dtype=torch.float32)
+    projected_state = projected_state_bn.contiguous().to(dtype=torch.float32)
+    projected_val = projected_val_bnd.contiguous().to(dtype=torch.float32)
+    grad_state = grad_state_bm.contiguous().to(dtype=torch.float32)
+    grad_val = grad_val_bmd.contiguous().to(dtype=torch.float32)
+    batch, num_rows, tile_nodes = scores.shape
+    val_dim = int(projected_val.shape[-1])
+    row_max = torch.empty((batch, num_rows), device=scores.device, dtype=torch.float32)
+    row_denom = torch.empty((batch, num_rows), device=scores.device, dtype=torch.float32)
+    row_numer = torch.empty((batch, num_rows), device=scores.device, dtype=torch.float32)
+    grid = (triton.cdiv(num_rows, 64), batch)
+    _signed_abs_softmax_tile_stats_from_proj_kernel[grid](
+        scores,
+        projected_state,
+        projected_val,
+        grad_state,
+        grad_val,
+        row_max,
+        row_denom,
+        row_numer,
+        scores.stride(0),
+        scores.stride(1),
+        scores.stride(2),
+        projected_state.stride(0),
+        projected_state.stride(1),
+        projected_val.stride(0),
+        projected_val.stride(1),
+        projected_val.stride(2),
+        grad_state.stride(0),
+        grad_state.stride(1),
+        grad_val.stride(0),
+        grad_val.stride(1),
+        grad_val.stride(2),
+        row_max.stride(0),
+        row_max.stride(1),
+        row_denom.stride(0),
+        row_denom.stride(1),
+        row_numer.stride(0),
+        row_numer.stride(1),
+        source_start,
+        target_start,
+        num_rows,
+        tile_nodes,
+        val_dim,
+        BLOCK_M=64,
+        BLOCK_N=32,
+        BLOCK_K=32,
+        num_warps=4,
+        num_stages=2,
+    )
+    return row_max, row_denom, row_numer
+
+
+def signed_abs_softmax_backward_tile_from_projections(
+    scores_bmn: torch.Tensor,
+    projected_state_bn: torch.Tensor,
+    projected_val_bnd: torch.Tensor,
+    grad_state_bm: torch.Tensor,
+    grad_val_bmd: torch.Tensor,
+    row_max_bm: torch.Tensor,
+    row_denom_bm: torch.Tensor,
+    edge_dot_bm: torch.Tensor,
+    source_start: int,
+    target_start: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not triton_signed_smoothmax_available():
+        raise RuntimeError("Triton is unavailable.")
+    scores = scores_bmn.contiguous().to(dtype=torch.float32)
+    projected_state = projected_state_bn.contiguous().to(dtype=torch.float32)
+    projected_val = projected_val_bnd.contiguous().to(dtype=torch.float32)
+    grad_state = grad_state_bm.contiguous().to(dtype=torch.float32)
+    grad_val = grad_val_bmd.contiguous().to(dtype=torch.float32)
+    row_max = row_max_bm.contiguous().to(dtype=torch.float32)
+    row_denom = row_denom_bm.contiguous().to(dtype=torch.float32)
+    edge_dot = edge_dot_bm.contiguous().to(dtype=torch.float32)
+    batch, num_rows, tile_nodes = scores.shape
+    val_dim = int(projected_val.shape[-1])
+    edges = torch.empty_like(scores, dtype=torch.float32)
+    grad_scores = torch.empty_like(scores, dtype=torch.float32)
+    grid = (triton.cdiv(num_rows, 64), triton.cdiv(tile_nodes, 32), batch)
+    _signed_abs_softmax_backward_from_proj_tile_kernel[grid](
+        scores,
+        projected_state,
+        projected_val,
+        grad_state,
+        grad_val,
+        row_max,
+        row_denom,
+        edge_dot,
+        edges,
+        grad_scores,
+        scores.stride(0),
+        scores.stride(1),
+        scores.stride(2),
+        projected_state.stride(0),
+        projected_state.stride(1),
+        projected_val.stride(0),
+        projected_val.stride(1),
+        projected_val.stride(2),
+        grad_state.stride(0),
+        grad_state.stride(1),
+        grad_val.stride(0),
+        grad_val.stride(1),
+        grad_val.stride(2),
+        row_max.stride(0),
+        row_max.stride(1),
+        edge_dot.stride(0),
+        edge_dot.stride(1),
+        edges.stride(0),
+        edges.stride(1),
+        edges.stride(2),
+        grad_scores.stride(0),
+        grad_scores.stride(1),
+        grad_scores.stride(2),
+        source_start,
+        target_start,
+        num_rows,
+        tile_nodes,
+        val_dim,
+        BLOCK_M=64,
+        BLOCK_N=32,
+        BLOCK_K=32,
+        num_warps=4,
+        num_stages=2,
+    )
+    return edges, grad_scores
+
+
+def multihead_signed_smoothmax_pass1_full(
+    projected_target_hbnr: torch.Tensor,
+    weighted_source_hbnr: torch.Tensor,
+    projected_state_bn: torch.Tensor,
+    projected_val_bnd: torch.Tensor,
+    grad_state_bn: torch.Tensor,
+    grad_val_bnd: torch.Tensor,
+    biases: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not triton_signed_smoothmax_available():
+        raise RuntimeError("Triton is unavailable.")
+    heads, batch, nodes, rank_dim = projected_target_hbnr.shape
+    if weighted_source_hbnr.shape != projected_target_hbnr.shape:
+        raise ValueError("weighted_source must match projected_target")
+    if projected_state_bn.shape != (batch, nodes):
+        raise ValueError("projected_state must be [batch, nodes]")
+    if projected_val_bnd.shape[:2] != (batch, nodes):
+        raise ValueError("projected_val must match [batch, nodes, dim]")
+    if grad_state_bn.shape != (batch, nodes) or grad_val_bnd.shape != projected_val_bnd.shape:
+        raise ValueError("gradient tensors must align with projected tensors")
+    if projected_target_hbnr.device.type != "cuda":
+        raise ValueError("Triton signed_smoothmax path requires CUDA tensors.")
+
+    target = projected_target_hbnr.contiguous().to(dtype=torch.float32)
+    source_weighted = weighted_source_hbnr.contiguous().to(dtype=torch.float32)
+    projected_state = projected_state_bn.contiguous().to(dtype=torch.float32)
+    projected_val = projected_val_bnd.contiguous().to(dtype=torch.float32)
+    grad_state = grad_state_bn.contiguous().to(dtype=torch.float32)
+    grad_val = grad_val_bnd.contiguous().to(dtype=torch.float32)
+    bias = None if biases is None or biases.numel() == 0 else biases.contiguous().to(dtype=torch.float32, device=target.device)
+    row_max = torch.empty((batch, nodes), device=target.device, dtype=torch.float32)
+    row_denom = torch.empty((batch, nodes), device=target.device, dtype=torch.float32)
+    edge_numer = torch.empty((batch, nodes), device=target.device, dtype=torch.float32)
+    grid = (triton.cdiv(nodes, 32), batch)
+    _multihead_signed_smoothmax_pass1_full_kernel[grid](
+        target,
+        source_weighted,
+        projected_state,
+        projected_val,
+        grad_state,
+        grad_val,
+        bias if bias is not None else target,
+        row_max,
+        row_denom,
+        edge_numer,
+        target.stride(0),
+        target.stride(1),
+        target.stride(2),
+        target.stride(3),
+        source_weighted.stride(0),
+        source_weighted.stride(1),
+        source_weighted.stride(2),
+        source_weighted.stride(3),
+        projected_state.stride(0),
+        projected_state.stride(1),
+        projected_val.stride(0),
+        projected_val.stride(1),
+        projected_val.stride(2),
+        grad_state.stride(0),
+        grad_state.stride(1),
+        grad_val.stride(0),
+        grad_val.stride(1),
+        grad_val.stride(2),
+        row_max.stride(0),
+        row_max.stride(1),
+        row_denom.stride(0),
+        row_denom.stride(1),
+        edge_numer.stride(0),
+        edge_numer.stride(1),
+        nodes,
+        rank_dim,
+        int(projected_val.shape[-1]),
+        heads=heads,
+        has_bias=bias is not None,
+        BLOCK_M=32,
+        BLOCK_N=32,
+        BLOCK_K=32,
+        num_warps=4,
+        num_stages=2,
+    )
+    return row_max, row_denom, edge_numer / row_denom.clamp_min(torch.finfo(row_denom.dtype).tiny)
+
+
+def multihead_signed_smoothmax_tile_partials(
+    projected_target_bhnr: torch.Tensor,
+    projected_source_tile_bhnr: torch.Tensor,
+    weighted_source_tile_bhnr: torch.Tensor,
+    core_hr: torch.Tensor,
+    grad_scores_bmn: torch.Tensor,
+    head_grads_hbmn: torch.Tensor,
+    biases: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    if not triton_signed_smoothmax_available():
+        raise RuntimeError("Triton is unavailable.")
+    batch, heads, num_nodes, rank_dim = projected_target_bhnr.shape
+    batch2, heads2, tile_nodes, rank_dim2 = projected_source_tile_bhnr.shape
+    if (batch, heads, rank_dim) != (batch2, heads2, rank_dim2):
+        raise ValueError("projected tensors must align")
+    if weighted_source_tile_bhnr.shape != projected_source_tile_bhnr.shape:
+        raise ValueError("weighted_source_tile must match projected_source_tile")
+    if grad_scores_bmn.shape != (batch, num_nodes, tile_nodes):
+        raise ValueError("grad_scores must be [batch, nodes, tile_nodes]")
+    if head_grads_hbmn.shape != (heads, batch, num_nodes, tile_nodes):
+        raise ValueError("head_grads must be [heads, batch, nodes, tile_nodes]")
+    if projected_target_bhnr.device.type != "cuda":
+        raise ValueError("Triton signed_smoothmax path requires CUDA tensors.")
+
+    target = projected_target_bhnr.contiguous().to(dtype=torch.float32)
+    source_proj = projected_source_tile_bhnr.contiguous().to(dtype=torch.float32)
+    source_weighted = weighted_source_tile_bhnr.contiguous().to(dtype=torch.float32)
+    core = core_hr.contiguous().to(dtype=torch.float32)
+    grad_scores = grad_scores_bmn.contiguous().to(dtype=torch.float32)
+    head_grads = head_grads_hbmn.contiguous().to(dtype=torch.float32)
+    bias = None if biases is None or biases.numel() == 0 else biases.contiguous().to(dtype=torch.float32, device=target.device)
+    grad_target = torch.empty_like(target, dtype=torch.float32)
+    grad_source = torch.zeros_like(source_proj, dtype=torch.float32)
+    grad_core = torch.zeros_like(core, dtype=torch.float32)
+    grad_bias = None if bias is None else torch.zeros((heads,), device=target.device, dtype=torch.float32)
+
+    block_m, block_n, _, block_r = _lowrank_backward_block_config()
+    grid = (triton.cdiv(num_nodes, block_m), batch, heads)
+    _multihead_signed_smoothmax_tile_partials_kernel[grid](
+        target,
+        source_proj,
+        source_weighted,
+        core,
+        grad_scores,
+        head_grads,
+        grad_target,
+        grad_source,
+        grad_core,
+        grad_bias if grad_bias is not None else grad_core,
+        target.stride(0),
+        target.stride(1),
+        target.stride(2),
+        target.stride(3),
+        source_proj.stride(0),
+        source_proj.stride(1),
+        source_proj.stride(2),
+        source_proj.stride(3),
+        source_weighted.stride(0),
+        source_weighted.stride(1),
+        source_weighted.stride(2),
+        source_weighted.stride(3),
+        core.stride(0),
+        core.stride(1),
+        grad_scores.stride(0),
+        grad_scores.stride(1),
+        grad_scores.stride(2),
+        head_grads.stride(0),
+        head_grads.stride(1),
+        head_grads.stride(2),
+        head_grads.stride(3),
+        grad_target.stride(0),
+        grad_target.stride(1),
+        grad_target.stride(2),
+        grad_target.stride(3),
+        grad_source.stride(0),
+        grad_source.stride(1),
+        grad_source.stride(2),
+        grad_source.stride(3),
+        grad_core.stride(0),
+        grad_core.stride(1),
+        grad_bias.stride(0) if grad_bias is not None else 0,
+        num_nodes,
+        tile_nodes,
+        rank_dim,
+        has_bias=bias is not None,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_R=block_r,
+        num_warps=4,
+        num_stages=2,
+    )
+    return grad_target, grad_source, grad_core, grad_bias
 
 
 def diagonal_signed_smoothmax_scores_tile(
@@ -3117,6 +4366,348 @@ if triton is not None and tl is not None:
                 source_acc += source_weighted_part * core_owned[None, :]
                 tl.store(grad_source_ptrs, source_acc, mask=mask_n[:, None] & mask_r[None, :])
 
+    @triton.jit
+    def _lowrank_signed_smoothmax_backward_target_owned_generic_kernel(
+        target_ptr,
+        source_proj_ptr,
+        source_weighted_ptr,
+        core_ptr,
+        bias_ptr,
+        proj_state_ptr,
+        proj_val_ptr,
+        grad_state_ptr,
+        grad_val_ptr,
+        row_max_ptr,
+        row_denom_ptr,
+        edge_dot_ptr,
+        grad_target_ptr,
+        grad_core_partial_ptr,
+        grad_bias_partial_ptr,
+        stride_target_h, stride_target_b, stride_target_n, stride_target_r,
+        stride_source_proj_h, stride_source_proj_b, stride_source_proj_n, stride_source_proj_r,
+        stride_source_weighted_h, stride_source_weighted_b, stride_source_weighted_n, stride_source_weighted_r,
+        stride_core_h, stride_core_r,
+        stride_proj_state_b, stride_proj_state_n,
+        stride_proj_val_b, stride_proj_val_n, stride_proj_val_d,
+        stride_grad_state_b, stride_grad_state_n,
+        stride_grad_val_b, stride_grad_val_n, stride_grad_val_d,
+        stride_row_b, stride_row_m,
+        stride_edge_dot_b, stride_edge_dot_m,
+        stride_grad_target_h, stride_grad_target_b, stride_grad_target_n, stride_grad_target_r,
+        stride_grad_core_partial_b, stride_grad_core_partial_rb, stride_grad_core_partial_h, stride_grad_core_partial_r,
+        stride_grad_bias_partial_b, stride_grad_bias_partial_rb, stride_grad_bias_partial_h,
+        num_nodes, rank_dim, val_dim,
+        has_bias: tl.constexpr, heads: tl.constexpr,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_R: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_b = tl.program_id(1)
+        owned_head = tl.program_id(2)
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        mask_m = offs_m < num_nodes
+        grad_state = tl.load(grad_state_ptr + pid_b * stride_grad_state_b + offs_m * stride_grad_state_n, mask=mask_m, other=0.0)
+        row_max = tl.load(row_max_ptr + pid_b * stride_row_b + offs_m * stride_row_m, mask=mask_m, other=-float("inf"))
+        row_denom = tl.load(row_denom_ptr + pid_b * stride_row_b + offs_m * stride_row_m, mask=mask_m, other=1.0)
+        edge_dot = tl.load(edge_dot_ptr + pid_b * stride_edge_dot_b + offs_m * stride_edge_dot_m, mask=mask_m, other=0.0)
+        bias_partial = tl.zeros((), dtype=tl.float32)
+
+        for source_base in range(0, num_nodes, BLOCK_N):
+            offs_n = source_base + tl.arange(0, BLOCK_N)
+            mask_n = offs_n < num_nodes
+            causal = offs_n[None, :] <= offs_m[:, None]
+            full_mask = mask_m[:, None] & mask_n[None, :] & causal
+            grad_edges = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+            source_state = tl.load(
+                proj_state_ptr + pid_b * stride_proj_state_b + offs_n * stride_proj_state_n,
+                mask=mask_n,
+                other=0.0,
+            )
+            for v_start in range(0, val_dim, BLOCK_K):
+                offs_v = v_start + tl.arange(0, BLOCK_K)
+                mask_v = offs_v < val_dim
+                grad_val_v = tl.load(
+                    grad_val_ptr + pid_b * stride_grad_val_b + offs_m[:, None] * stride_grad_val_n + offs_v[None, :] * stride_grad_val_d,
+                    mask=mask_m[:, None] & mask_v[None, :],
+                    other=0.0,
+                )
+                proj_val_v = tl.load(
+                    proj_val_ptr + pid_b * stride_proj_val_b + offs_n[:, None] * stride_proj_val_n + offs_v[None, :] * stride_proj_val_d,
+                    mask=mask_n[:, None] & mask_v[None, :],
+                    other=0.0,
+                )
+                grad_edges += tl.dot(grad_val_v, tl.trans(proj_val_v * source_state[:, None]), allow_tf32=False, out_dtype=tl.float32)
+            grad_edges += grad_state[:, None] * source_state[None, :]
+
+            neg_large = -1.0e30
+            max_abs = tl.full((BLOCK_M, BLOCK_N), neg_large, dtype=tl.float32)
+            owned_score = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            for head in range(heads):
+                score = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+                for k_start in range(0, rank_dim, BLOCK_K):
+                    offs_k = k_start + tl.arange(0, BLOCK_K)
+                    mask_k = offs_k < rank_dim
+                    a = tl.load(
+                        target_ptr + head * stride_target_h + pid_b * stride_target_b + offs_m[:, None] * stride_target_n + offs_k[None, :] * stride_target_r,
+                        mask=mask_m[:, None] & mask_k[None, :], other=0.0,
+                    )
+                    b = tl.load(
+                        source_weighted_ptr + head * stride_source_weighted_h + pid_b * stride_source_weighted_b + offs_n[:, None] * stride_source_weighted_n + offs_k[None, :] * stride_source_weighted_r,
+                        mask=mask_n[:, None] & mask_k[None, :], other=0.0,
+                    )
+                    score += tl.dot(a, tl.trans(b), allow_tf32=False, out_dtype=tl.float32)
+                if has_bias:
+                    score += tl.load(bias_ptr + head)
+                max_abs = tl.maximum(max_abs, tl.where(full_mask, tl.abs(score), neg_large))
+                owned_score = tl.where(owned_head == head, score, owned_score)
+
+            denom_heads = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            numer = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            owned_p = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            for head in range(heads):
+                score = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+                for k_start in range(0, rank_dim, BLOCK_K):
+                    offs_k = k_start + tl.arange(0, BLOCK_K)
+                    mask_k = offs_k < rank_dim
+                    a = tl.load(
+                        target_ptr + head * stride_target_h + pid_b * stride_target_b + offs_m[:, None] * stride_target_n + offs_k[None, :] * stride_target_r,
+                        mask=mask_m[:, None] & mask_k[None, :], other=0.0,
+                    )
+                    b = tl.load(
+                        source_weighted_ptr + head * stride_source_weighted_h + pid_b * stride_source_weighted_b + offs_n[:, None] * stride_source_weighted_n + offs_k[None, :] * stride_source_weighted_r,
+                        mask=mask_n[:, None] & mask_k[None, :], other=0.0,
+                    )
+                    score += tl.dot(a, tl.trans(b), allow_tf32=False, out_dtype=tl.float32)
+                if has_bias:
+                    score += tl.load(bias_ptr + head)
+                p = tl.where(full_mask, tl.exp(tl.abs(score) - max_abs), 0.0)
+                denom_heads += p
+                numer += score * p
+                owned_p = tl.where(owned_head == head, p, owned_p)
+
+            safe_head_denom = tl.maximum(denom_heads, 1.0e-20)
+            combined = numer / safe_head_denom
+            probs = tl.where(full_mask, tl.exp(tl.abs(combined) - row_max[:, None]) / tl.maximum(row_denom[:, None], 1.0e-20), 0.0)
+            signs = tl.where(combined > 0, 1.0, tl.where(combined < 0, -1.0, 0.0))
+            grad_scores = tl.where(full_mask, signs * probs * (signs * grad_edges - edge_dot[:, None]), 0.0)
+            owned_sign = tl.where(owned_score > 0, 1.0, tl.where(owned_score < 0, -1.0, 0.0))
+            owned_g = tl.where(full_mask, (owned_p / safe_head_denom) * (1.0 + owned_sign * (owned_score - combined)), 0.0)
+            gs = grad_scores * owned_g
+            if has_bias:
+                bias_partial += tl.sum(gs)
+
+            for r_start in range(0, rank_dim, BLOCK_R):
+                offs_r = r_start + tl.arange(0, BLOCK_R)
+                mask_r = offs_r < rank_dim
+                target_r = tl.load(
+                    target_ptr + owned_head * stride_target_h + pid_b * stride_target_b + offs_m[:, None] * stride_target_n + offs_r[None, :] * stride_target_r,
+                    mask=mask_m[:, None] & mask_r[None, :], other=0.0,
+                )
+                source_weighted_r = tl.load(
+                    source_weighted_ptr + owned_head * stride_source_weighted_h + pid_b * stride_source_weighted_b + offs_n[:, None] * stride_source_weighted_n + offs_r[None, :] * stride_source_weighted_r,
+                    mask=mask_n[:, None] & mask_r[None, :], other=0.0,
+                )
+                grad_target_ptrs = (
+                    grad_target_ptr + owned_head * stride_grad_target_h + pid_b * stride_grad_target_b + offs_m[:, None] * stride_grad_target_n + offs_r[None, :] * stride_grad_target_r
+                )
+                grad_target_acc = tl.load(grad_target_ptrs, mask=mask_m[:, None] & mask_r[None, :], other=0.0)
+                grad_target_acc += tl.dot(gs, source_weighted_r, allow_tf32=False, out_dtype=tl.float32)
+                tl.store(grad_target_ptrs, grad_target_acc, mask=mask_m[:, None] & mask_r[None, :])
+                source_weighted_part = tl.dot(tl.trans(gs), target_r, allow_tf32=False, out_dtype=tl.float32)
+                source_proj_r = tl.load(
+                    source_proj_ptr + owned_head * stride_source_proj_h + pid_b * stride_source_proj_b + offs_n[:, None] * stride_source_proj_n + offs_r[None, :] * stride_source_proj_r,
+                    mask=mask_n[:, None] & mask_r[None, :], other=0.0,
+                )
+                core_partial = tl.load(
+                    grad_core_partial_ptr + pid_b * stride_grad_core_partial_b + pid_m * stride_grad_core_partial_rb + owned_head * stride_grad_core_partial_h + offs_r * stride_grad_core_partial_r,
+                    mask=mask_r, other=0.0,
+                )
+                core_partial += tl.sum(source_weighted_part * source_proj_r, axis=0)
+                tl.store(
+                    grad_core_partial_ptr + pid_b * stride_grad_core_partial_b + pid_m * stride_grad_core_partial_rb + owned_head * stride_grad_core_partial_h + offs_r * stride_grad_core_partial_r,
+                    core_partial,
+                    mask=mask_r,
+                )
+
+        if has_bias:
+            tl.store(
+                grad_bias_partial_ptr + pid_b * stride_grad_bias_partial_b + pid_m * stride_grad_bias_partial_rb + owned_head * stride_grad_bias_partial_h,
+                bias_partial,
+            )
+
+    @triton.jit
+    def _lowrank_signed_smoothmax_backward_source_owned_generic_kernel(
+        target_ptr,
+        source_weighted_ptr,
+        core_ptr,
+        bias_ptr,
+        proj_state_ptr,
+        proj_val_ptr,
+        grad_state_ptr,
+        grad_val_ptr,
+        row_max_ptr,
+        row_denom_ptr,
+        edge_dot_ptr,
+        grad_source_ptr,
+        grad_proj_state_ptr,
+        grad_proj_val_ptr,
+        stride_target_h, stride_target_b, stride_target_n, stride_target_r,
+        stride_source_weighted_h, stride_source_weighted_b, stride_source_weighted_n, stride_source_weighted_r,
+        stride_core_h, stride_core_r,
+        stride_proj_state_b, stride_proj_state_n,
+        stride_proj_val_b, stride_proj_val_n, stride_proj_val_d,
+        stride_grad_state_b, stride_grad_state_n,
+        stride_grad_val_b, stride_grad_val_n, stride_grad_val_d,
+        stride_row_b, stride_row_m,
+        stride_edge_dot_b, stride_edge_dot_m,
+        stride_grad_source_h, stride_grad_source_b, stride_grad_source_n, stride_grad_source_r,
+        stride_grad_proj_state_b, stride_grad_proj_state_n,
+        stride_grad_proj_val_b, stride_grad_proj_val_n, stride_grad_proj_val_d,
+        num_nodes, rank_dim, val_dim,
+        has_bias: tl.constexpr, heads: tl.constexpr,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_R: tl.constexpr,
+    ):
+        pid_n = tl.program_id(0)
+        pid_b = tl.program_id(1)
+        owned_head = tl.program_id(2)
+
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < num_nodes
+        source_state = tl.load(proj_state_ptr + pid_b * stride_proj_state_b + offs_n * stride_proj_state_n, mask=mask_n, other=0.0)
+        grad_proj_state_acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+        for target_base in range(0, num_nodes, BLOCK_M):
+            offs_m = target_base + tl.arange(0, BLOCK_M)
+            mask_m = offs_m < num_nodes
+            causal = offs_n[None, :] <= offs_m[:, None]
+            full_mask = mask_m[:, None] & mask_n[None, :] & causal
+            grad_edges = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            grad_state = tl.load(grad_state_ptr + pid_b * stride_grad_state_b + offs_m * stride_grad_state_n, mask=mask_m, other=0.0)
+            row_max = tl.load(row_max_ptr + pid_b * stride_row_b + offs_m * stride_row_m, mask=mask_m, other=-float("inf"))
+            row_denom = tl.load(row_denom_ptr + pid_b * stride_row_b + offs_m * stride_row_m, mask=mask_m, other=1.0)
+            edge_dot = tl.load(edge_dot_ptr + pid_b * stride_edge_dot_b + offs_m * stride_edge_dot_m, mask=mask_m, other=0.0)
+
+            for v_start in range(0, val_dim, BLOCK_K):
+                offs_v = v_start + tl.arange(0, BLOCK_K)
+                mask_v = offs_v < val_dim
+                grad_val_v = tl.load(
+                    grad_val_ptr + pid_b * stride_grad_val_b + offs_m[:, None] * stride_grad_val_n + offs_v[None, :] * stride_grad_val_d,
+                    mask=mask_m[:, None] & mask_v[None, :], other=0.0,
+                )
+                proj_val_v = tl.load(
+                    proj_val_ptr + pid_b * stride_proj_val_b + offs_n[:, None] * stride_proj_val_n + offs_v[None, :] * stride_proj_val_d,
+                    mask=mask_n[:, None] & mask_v[None, :], other=0.0,
+                )
+                grad_edges += tl.dot(grad_val_v, tl.trans(proj_val_v * source_state[:, None]), allow_tf32=False, out_dtype=tl.float32)
+            grad_edges += grad_state[:, None] * source_state[None, :]
+
+            neg_large = -1.0e30
+            max_abs = tl.full((BLOCK_M, BLOCK_N), neg_large, dtype=tl.float32)
+            owned_score = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            for head in range(heads):
+                score = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+                for k_start in range(0, rank_dim, BLOCK_K):
+                    offs_k = k_start + tl.arange(0, BLOCK_K)
+                    mask_k = offs_k < rank_dim
+                    a = tl.load(
+                        target_ptr + head * stride_target_h + pid_b * stride_target_b + offs_m[:, None] * stride_target_n + offs_k[None, :] * stride_target_r,
+                        mask=mask_m[:, None] & mask_k[None, :], other=0.0,
+                    )
+                    b = tl.load(
+                        source_weighted_ptr + head * stride_source_weighted_h + pid_b * stride_source_weighted_b + offs_n[:, None] * stride_source_weighted_n + offs_k[None, :] * stride_source_weighted_r,
+                        mask=mask_n[:, None] & mask_k[None, :], other=0.0,
+                    )
+                    score += tl.dot(a, tl.trans(b), allow_tf32=False, out_dtype=tl.float32)
+                if has_bias:
+                    score += tl.load(bias_ptr + head)
+                max_abs = tl.maximum(max_abs, tl.where(full_mask, tl.abs(score), neg_large))
+                owned_score = tl.where(owned_head == head, score, owned_score)
+
+            denom_heads = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            numer = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            owned_p = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            for head in range(heads):
+                score = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+                for k_start in range(0, rank_dim, BLOCK_K):
+                    offs_k = k_start + tl.arange(0, BLOCK_K)
+                    mask_k = offs_k < rank_dim
+                    a = tl.load(
+                        target_ptr + head * stride_target_h + pid_b * stride_target_b + offs_m[:, None] * stride_target_n + offs_k[None, :] * stride_target_r,
+                        mask=mask_m[:, None] & mask_k[None, :], other=0.0,
+                    )
+                    b = tl.load(
+                        source_weighted_ptr + head * stride_source_weighted_h + pid_b * stride_source_weighted_b + offs_n[:, None] * stride_source_weighted_n + offs_k[None, :] * stride_source_weighted_r,
+                        mask=mask_n[:, None] & mask_k[None, :], other=0.0,
+                    )
+                    score += tl.dot(a, tl.trans(b), allow_tf32=False, out_dtype=tl.float32)
+                if has_bias:
+                    score += tl.load(bias_ptr + head)
+                p = tl.where(full_mask, tl.exp(tl.abs(score) - max_abs), 0.0)
+                denom_heads += p
+                numer += score * p
+                owned_p = tl.where(owned_head == head, p, owned_p)
+
+            safe_head_denom = tl.maximum(denom_heads, 1.0e-20)
+            combined = numer / safe_head_denom
+            probs = tl.where(full_mask, tl.exp(tl.abs(combined) - row_max[:, None]) / tl.maximum(row_denom[:, None], 1.0e-20), 0.0)
+            signs = tl.where(combined > 0, 1.0, tl.where(combined < 0, -1.0, 0.0))
+            edges = signs * probs
+            if owned_head == 0:
+                grad_proj_state_acc += tl.sum(edges * grad_state[:, None], axis=0)
+                for v_start in range(0, val_dim, BLOCK_K):
+                    offs_v = v_start + tl.arange(0, BLOCK_K)
+                    mask_v = offs_v < val_dim
+                    grad_val_v = tl.load(
+                        grad_val_ptr + pid_b * stride_grad_val_b + offs_m[:, None] * stride_grad_val_n + offs_v[None, :] * stride_grad_val_d,
+                        mask=mask_m[:, None] & mask_v[None, :], other=0.0,
+                    )
+                    grad_proj_val_ptrs = (
+                        grad_proj_val_ptr
+                        + pid_b * stride_grad_proj_val_b
+                        + offs_n[:, None] * stride_grad_proj_val_n
+                        + offs_v[None, :] * stride_grad_proj_val_d
+                    )
+                    grad_proj_val_acc = tl.load(
+                        grad_proj_val_ptrs,
+                        mask=mask_n[:, None] & mask_v[None, :],
+                        other=0.0,
+                    )
+                    grad_proj_val_acc += tl.dot(tl.trans(edges), grad_val_v, allow_tf32=False, out_dtype=tl.float32)
+                    tl.store(
+                        grad_proj_val_ptrs,
+                        grad_proj_val_acc,
+                        mask=mask_n[:, None] & mask_v[None, :],
+                    )
+            grad_scores = tl.where(full_mask, signs * probs * (signs * grad_edges - edge_dot[:, None]), 0.0)
+            owned_sign = tl.where(owned_score > 0, 1.0, tl.where(owned_score < 0, -1.0, 0.0))
+            owned_g = tl.where(full_mask, (owned_p / safe_head_denom) * (1.0 + owned_sign * (owned_score - combined)), 0.0)
+            gs = grad_scores * owned_g
+
+            for r_start in range(0, rank_dim, BLOCK_R):
+                offs_r = r_start + tl.arange(0, BLOCK_R)
+                mask_r = offs_r < rank_dim
+                target_r = tl.load(
+                    target_ptr + owned_head * stride_target_h + pid_b * stride_target_b + offs_m[:, None] * stride_target_n + offs_r[None, :] * stride_target_r,
+                    mask=mask_m[:, None] & mask_r[None, :], other=0.0,
+                )
+                source_weighted_part = tl.dot(tl.trans(gs), target_r, allow_tf32=False, out_dtype=tl.float32)
+                core_owned = tl.load(core_ptr + owned_head * stride_core_h + offs_r * stride_core_r, mask=mask_r, other=0.0)
+                grad_source_ptrs = (
+                    grad_source_ptr + owned_head * stride_grad_source_h + pid_b * stride_grad_source_b + offs_n[:, None] * stride_grad_source_n + offs_r[None, :] * stride_grad_source_r
+                )
+                source_acc = tl.load(grad_source_ptrs, mask=mask_n[:, None] & mask_r[None, :], other=0.0)
+                source_acc += source_weighted_part * core_owned[None, :]
+                tl.store(grad_source_ptrs, source_acc, mask=mask_n[:, None] & mask_r[None, :])
+
+        if owned_head == 0:
+            tl.store(
+                grad_proj_state_ptr + pid_b * stride_grad_proj_state_b + offs_n * stride_grad_proj_state_n,
+                grad_proj_state_acc,
+                mask=mask_n,
+            )
+
+
 
 def diagonal_signed_smoothmax_backward_owner(
     flat_val_bnd: torch.Tensor,
@@ -3279,3 +4870,91 @@ def lowrank_signed_smoothmax_backward_owner(
         num_warps=4, num_stages=2,
     )
     return grad_target, grad_source, grad_core_partial, grad_bias_partial
+
+
+def lowrank_signed_smoothmax_backward_owner_generic(
+    projected_target_hbnr: torch.Tensor,
+    projected_source_hbnr: torch.Tensor,
+    weighted_source_hbnr: torch.Tensor,
+    core_hr: torch.Tensor,
+    projected_state_bn: torch.Tensor,
+    projected_val_bnd: torch.Tensor,
+    grad_state_bn: torch.Tensor,
+    grad_val_bnd: torch.Tensor,
+    row_max_bm: torch.Tensor,
+    row_denom_bm: torch.Tensor,
+    edge_dot_bm: torch.Tensor,
+    biases: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    if not triton_signed_smoothmax_available():
+        raise RuntimeError("Triton is unavailable.")
+    heads, batch, nodes, rank_dim = projected_target_hbnr.shape
+    val_dim = int(projected_val_bnd.shape[-1])
+    row_blocks = triton.cdiv(nodes, _lowrank_backward_block_config()[0])
+    target = projected_target_hbnr.contiguous()
+    source_proj = projected_source_hbnr.contiguous()
+    source_weighted = weighted_source_hbnr.contiguous()
+    core = core_hr.contiguous()
+    projected_state = projected_state_bn.contiguous().to(dtype=torch.float32)
+    projected_val = projected_val_bnd.contiguous().to(dtype=torch.float32)
+    grad_state = grad_state_bn.contiguous().to(dtype=torch.float32)
+    grad_val = grad_val_bnd.contiguous().to(dtype=torch.float32)
+    row_max = row_max_bm.contiguous().to(dtype=torch.float32)
+    row_denom = row_denom_bm.contiguous().to(dtype=torch.float32)
+    edge_dot = edge_dot_bm.contiguous().to(dtype=torch.float32)
+    bias = None if biases is None or biases.numel() == 0 else biases.contiguous().to(dtype=torch.float32, device=target.device)
+    grad_target = torch.zeros_like(target, dtype=torch.float32)
+    grad_source = torch.zeros_like(source_proj, dtype=torch.float32)
+    grad_proj_state = torch.zeros_like(projected_state, dtype=torch.float32)
+    grad_proj_val = torch.zeros_like(projected_val, dtype=torch.float32)
+    grad_core_partial = torch.zeros((batch, row_blocks, heads, rank_dim), dtype=torch.float32, device=target.device)
+    grad_bias_partial = None if bias is None else torch.zeros((batch, row_blocks, heads), dtype=torch.float32, device=target.device)
+    block_m, block_n, block_k, block_r = _lowrank_backward_block_config()
+    _lowrank_signed_smoothmax_backward_target_owned_generic_kernel[(row_blocks, batch, heads)](
+        target, source_proj, source_weighted, core, bias if bias is not None else target,
+        projected_state, projected_val, grad_state, grad_val,
+        row_max, row_denom, edge_dot,
+        grad_target, grad_core_partial, grad_bias_partial if grad_bias_partial is not None else grad_target,
+        target.stride(0), target.stride(1), target.stride(2), target.stride(3),
+        source_proj.stride(0), source_proj.stride(1), source_proj.stride(2), source_proj.stride(3),
+        source_weighted.stride(0), source_weighted.stride(1), source_weighted.stride(2), source_weighted.stride(3),
+        core.stride(0), core.stride(1),
+        projected_state.stride(0), projected_state.stride(1),
+        projected_val.stride(0), projected_val.stride(1), projected_val.stride(2),
+        grad_state.stride(0), grad_state.stride(1),
+        grad_val.stride(0), grad_val.stride(1), grad_val.stride(2),
+        row_max.stride(0), row_max.stride(1),
+        edge_dot.stride(0), edge_dot.stride(1),
+        grad_target.stride(0), grad_target.stride(1), grad_target.stride(2), grad_target.stride(3),
+        grad_core_partial.stride(0), grad_core_partial.stride(1), grad_core_partial.stride(2), grad_core_partial.stride(3),
+        grad_bias_partial.stride(0) if grad_bias_partial is not None else 0,
+        grad_bias_partial.stride(1) if grad_bias_partial is not None else 0,
+        grad_bias_partial.stride(2) if grad_bias_partial is not None else 0,
+        num_nodes=nodes, rank_dim=rank_dim, val_dim=val_dim,
+        has_bias=bias is not None, heads=heads,
+        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k, BLOCK_R=block_r,
+        num_warps=4, num_stages=2,
+    )
+    _lowrank_signed_smoothmax_backward_source_owned_generic_kernel[(triton.cdiv(nodes, block_n), batch, heads)](
+        target, source_weighted, core, bias if bias is not None else target,
+        projected_state, projected_val, grad_state, grad_val,
+        row_max, row_denom, edge_dot,
+        grad_source, grad_proj_state, grad_proj_val,
+        target.stride(0), target.stride(1), target.stride(2), target.stride(3),
+        source_weighted.stride(0), source_weighted.stride(1), source_weighted.stride(2), source_weighted.stride(3),
+        core.stride(0), core.stride(1),
+        projected_state.stride(0), projected_state.stride(1),
+        projected_val.stride(0), projected_val.stride(1), projected_val.stride(2),
+        grad_state.stride(0), grad_state.stride(1),
+        grad_val.stride(0), grad_val.stride(1), grad_val.stride(2),
+        row_max.stride(0), row_max.stride(1),
+        edge_dot.stride(0), edge_dot.stride(1),
+        grad_source.stride(0), grad_source.stride(1), grad_source.stride(2), grad_source.stride(3),
+        grad_proj_state.stride(0), grad_proj_state.stride(1),
+        grad_proj_val.stride(0), grad_proj_val.stride(1), grad_proj_val.stride(2),
+        num_nodes=nodes, rank_dim=rank_dim, val_dim=val_dim,
+        has_bias=bias is not None, heads=heads,
+        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k, BLOCK_R=block_r,
+        num_warps=4, num_stages=2,
+    )
+    return grad_target, grad_source, grad_proj_state, grad_proj_val, grad_core_partial, grad_bias_partial

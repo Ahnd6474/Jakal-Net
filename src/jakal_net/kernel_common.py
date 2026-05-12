@@ -440,6 +440,19 @@ def build_topk_mask(scores: Tensor, topk: int, *, dim: int = -1) -> Tensor:
     return mask.scatter(dim, indices, True)
 
 
+def nonself_block_mask(
+    target_start: int,
+    target_end: int,
+    source_start: int,
+    source_end: int,
+    *,
+    device: torch.device | None = None,
+) -> Tensor:
+    target_idx = torch.arange(target_start, target_end, device=device).unsqueeze(-1)
+    source_idx = torch.arange(source_start, source_end, device=device).unsqueeze(0)
+    return source_idx != target_idx
+
+
 def causal_window_mask(
     target_start: int,
     target_end: int,
@@ -453,7 +466,7 @@ def causal_window_mask(
         raise ValueError("window must be non-negative.")
     target_idx = torch.arange(target_start, target_end, device=device).unsqueeze(-1)
     source_idx = torch.arange(source_start, source_end, device=device).unsqueeze(0)
-    return (source_idx <= target_idx) & (source_idx >= target_idx - window)
+    return (source_idx < target_idx) & (source_idx >= target_idx - window)
 
 
 def normalize_slot_mask(

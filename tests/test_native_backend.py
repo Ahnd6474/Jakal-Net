@@ -4,6 +4,7 @@ import unittest
 from unittest import mock
 
 import torch
+from torch import nn
 
 from jakal_net import (
     BilinearPairwise,
@@ -16,6 +17,7 @@ from jakal_net import (
     LowRankBilinearPairwise,
     LowRankBilinearRoute,
     MLPRoute,
+    MultiHeadPairwise,
     Propagation,
     SparsePropagation,
     SparseTransition,
@@ -26,6 +28,8 @@ from jakal_net import (
 from jakal_net import native_available
 from jakal_net.native_backend import DISABLE_NATIVE_ENV
 import jakal_net.native_backend as native_backend
+from jakal_net.propagation_stack import PropagationLayer
+from jakal_net.modules import ResidualFeedForward
 
 
 def _state_proj_fn(state: torch.Tensor) -> torch.Tensor:
@@ -182,6 +186,77 @@ class NativeBackendTests(unittest.TestCase):
         self.assertTrue(torch.allclose(kernel_delta.delta_state, native_delta.delta_state))
         self.assertTrue(torch.allclose(kernel_delta.delta_val, native_delta.delta_val))
 
+    def test_native_scan_apply_delta_applies_post_norm_to_value(self) -> None:
+        layer_state = torch.tensor([[0.0]], dtype=torch.float32)
+        layer_val = torch.tensor([[[1.0, 3.0]]], dtype=torch.float32)
+        delta_state = torch.zeros_like(layer_state)
+        delta_val = layer_val.clone()
+        norm_weight = torch.tensor([2.0, 0.5], dtype=torch.float32)
+        norm_bias = torch.tensor([0.1, -0.2], dtype=torch.float32)
+
+        next_state, next_val = native_backend._native_scan_apply_delta(
+            layer_state,
+            layer_val,
+            delta_state,
+            delta_val,
+            norm_weight,
+            norm_bias,
+            state_activation_name="signed_softmax",
+        )
+
+        self.assertEqual(next_state.shape, layer_state.shape)
+        expected_val = torch.nn.functional.layer_norm(
+            layer_val + delta_val,
+            [layer_val.shape[-1]],
+            norm_weight,
+            norm_bias,
+            1e-5,
+        )
+        self.assertTrue(torch.allclose(next_val, expected_val, atol=1e-6, rtol=1e-6))
+
+    def test_low_rank_propagation_value_ffn_reference_uses_post_norm_propagation_without_ffn_norm(self) -> None:
+        layer_state = torch.tensor([[0.0]], dtype=torch.float32)
+        layer_val = torch.tensor([[[1.0, 3.0]]], dtype=torch.float32)
+        val_norm_weight = torch.ones(2, dtype=torch.float32)
+        val_norm_bias = torch.zeros(2, dtype=torch.float32)
+        ffn_norm_weight = torch.ones(2, dtype=torch.float32)
+        ffn_norm_bias = torch.zeros(2, dtype=torch.float32)
+        ffn_in_weight = torch.zeros((2, 2), dtype=torch.float32)
+        ffn_in_bias = torch.zeros(2, dtype=torch.float32)
+        ffn_out_weight = torch.zeros((2, 2), dtype=torch.float32)
+        ffn_out_bias = torch.zeros(2, dtype=torch.float32)
+
+        _, next_val = native_backend._propagation_value_ffn_reference(
+            layer_state=layer_state,
+            layer_val=layer_val,
+            source_weight=torch.tensor([[1.0, 0.0]], dtype=torch.float32),
+            target_weight=torch.tensor([[1.0, 0.0]], dtype=torch.float32),
+            core_weight=torch.ones(1, dtype=torch.float32),
+            bias=None,
+            window=0,
+            residual_gate=torch.ones((), dtype=torch.float32),
+            val_norm_weight=val_norm_weight,
+            val_norm_bias=val_norm_bias,
+            ffn_norm_weight=ffn_norm_weight,
+            ffn_norm_bias=ffn_norm_bias,
+            ffn_in_weight=ffn_in_weight,
+            ffn_in_bias=ffn_in_bias,
+            ffn_out_weight=ffn_out_weight,
+            ffn_out_bias=ffn_out_bias,
+            ffn_residual_scale=torch.zeros((), dtype=torch.float32),
+            state_activation_name="signed_softmax",
+            ffn_activation_name="gelu",
+        )
+
+        expected_val = torch.nn.functional.layer_norm(
+            layer_val + layer_val * torch.nn.functional.softplus(layer_state).unsqueeze(-1),
+            [layer_val.shape[-1]],
+            val_norm_weight,
+            val_norm_bias,
+            1e-5,
+        )
+        self.assertTrue(torch.allclose(next_val, expected_val, atol=1e-6, rtol=1e-6))
+
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable.")
 class CudaNativeBackendTests(unittest.TestCase):
@@ -210,6 +285,89 @@ class CudaNativeBackendTests(unittest.TestCase):
         self, left: torch.Tensor, right: torch.Tensor, *, atol: float = 1e-5, rtol: float = 1e-5
     ) -> None:
         self.assertTrue(torch.allclose(left, right, atol=atol, rtol=rtol))
+
+    def _make_prop_ffn_layer(self, *, window: int) -> PropagationLayer:
+        dim = 16
+        rank = 8
+        propagation = SparsePropagation(
+            pairwise_fn=LowRankBilinearPairwise(dim=dim, rank=rank).to(self.device),
+            sparse_type="window",
+            window=window,
+            edge_compress_fn=_signed_abs_softmax_edges,
+            state_weight_edges=True,
+            implementation="streaming",
+            target_block_size=128,
+            source_block_size=128,
+        )
+        return PropagationLayer(
+            propagation=propagation,
+            norm=nn.LayerNorm(dim).to(self.device),
+            ffn=ResidualFeedForward(
+                dim,
+                hidden_mult=2.0,
+                residual_scale=0.25,
+                learnable_residual_scale=True,
+                activation="gelu",
+            ).to(self.device),
+            unit_norm_values=False,
+            residual_gate_init=0.1,
+        ).to(self.device)
+
+    def test_propagation_value_ffn_fused_fastpath_matches_streaming_reference_on_cuda(self) -> None:
+        for window in (3, 8):
+            dense = window + 1 >= 9
+            if not native_backend.propagation_value_ffn_fused_native_available(
+                "cuda", dense=dense
+            ):
+                self.skipTest("Propagation+FFN fused native path is unavailable.")
+
+            with self.subTest(window=window):
+                torch.manual_seed(1234)
+                reference = self._make_prop_ffn_layer(window=window)
+                fused = self._make_prop_ffn_layer(window=window)
+                fused.load_state_dict(reference.state_dict())
+
+                reference_state = torch.randn(2, 9, device=self.device, requires_grad=True)
+                reference_val = torch.randn(2, 9, 16, device=self.device, requires_grad=True)
+                fused_state = reference_state.detach().clone().requires_grad_(True)
+                fused_val = reference_val.detach().clone().requires_grad_(True)
+
+                with mock.patch.dict(
+                    os.environ,
+                    {"JAKAL_NET_ENABLE_EXPERIMENTAL_PROP_FFN_FUSED": "0"},
+                    clear=False,
+                ):
+                    reference_out = reference(
+                        Layer(dim=16, num_nodes=9, state=reference_state, val=reference_val)
+                    )
+                    reference_loss = (
+                        reference_out.state.float().sum() + reference_out.val.float().sum()
+                    )
+                    reference_loss.backward()
+
+                with mock.patch.dict(
+                    os.environ,
+                    {"JAKAL_NET_ENABLE_EXPERIMENTAL_PROP_FFN_FUSED": "1"},
+                    clear=False,
+                ):
+                    fused_out = fused(Layer(dim=16, num_nodes=9, state=fused_state, val=fused_val))
+                    fused_loss = fused_out.state.float().sum() + fused_out.val.float().sum()
+                    fused_loss.backward()
+
+                self.assert_tensor_close(
+                    reference_out.state, fused_out.state, atol=1e-6, rtol=1e-6
+                )
+                self.assert_tensor_close(reference_out.val, fused_out.val, atol=1e-5, rtol=1e-5)
+                self.assert_tensor_close(
+                    reference_state.grad, fused_state.grad, atol=1e-6, rtol=1e-6
+                )
+                self.assert_tensor_close(reference_val.grad, fused_val.grad, atol=1e-5, rtol=1e-5)
+                self.assert_tensor_close(
+                    reference.residual_gate.grad,
+                    fused.residual_gate.grad,
+                    atol=1e-5,
+                    rtol=1e-5,
+                )
 
     def test_dense_propagation_native_uses_cuda_backend_and_matches_reference(self) -> None:
         torch.manual_seed(30)
@@ -281,7 +439,7 @@ class CudaNativeBackendTests(unittest.TestCase):
         module = native_backend._native_module()
         with mock.patch.object(module, "propagation_dense", wraps=module.propagation_dense) as wrapped:
             native_delta = native.compute_delta(layer)
-        self.assertGreater(wrapped.call_count, 0)
+        self.assertEqual(wrapped.call_count, 0)
         self.assert_delta_close(reference_delta, native_delta)
 
     def test_dense_propagation_native_hadamard_mlp_matches_reference_on_cuda(self) -> None:
@@ -542,6 +700,42 @@ class CudaNativeBackendTests(unittest.TestCase):
             topk_native_delta = topk_native.compute_delta(layer)
         self.assertGreater(wrapped_topk.call_count, 0)
         self.assert_delta_close(topk_reference_delta, topk_native_delta)
+
+    def test_sparse_propagation_native_multihead_signed_smoothmax_matches_reference_on_cuda(self) -> None:
+        torch.manual_seed(32)
+        layer = Layer(
+            dim=5,
+            num_nodes=9,
+            state=torch.randn(2, 9, device=self.device),
+            val=torch.randn(2, 9, 5, device=self.device),
+        )
+        reference = SparsePropagation(
+            pairwise_fn=MultiHeadPairwise(
+                [LowRankBilinearPairwise(dim=5, rank=4).to(self.device) for _ in range(4)],
+                aggregate="signed_smoothmax",
+            ),
+            sparse_type="window",
+            window=8,
+            edge_compress_fn=_signed_abs_softmax_edges,
+            state_weight_edges=True,
+            implementation="reference",
+        )
+        native = SparsePropagation(
+            pairwise_fn=MultiHeadPairwise(
+                [LowRankBilinearPairwise(dim=5, rank=4).to(self.device) for _ in range(4)],
+                aggregate="signed_smoothmax",
+            ),
+            sparse_type="window",
+            window=8,
+            edge_compress_fn=_signed_abs_softmax_edges,
+            state_weight_edges=True,
+            implementation="native",
+        )
+        native.pairwise_fn.load_state_dict(reference.pairwise_fn.state_dict())
+
+        reference_delta = reference.compute_delta(layer)
+        native_delta = native.compute_delta(layer)
+        self.assert_delta_close(reference_delta, native_delta, atol=1e-5, rtol=1e-5)
 
     def test_dense_transition_native_matches_reference_with_mlp_route_on_cuda(self) -> None:
         torch.manual_seed(32)

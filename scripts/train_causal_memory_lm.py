@@ -5,6 +5,7 @@ from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from concurrent.futures import as_completed
 from contextlib import nullcontext
+import hashlib
 import json
 import math
 import multiprocessing as mp
@@ -428,6 +429,7 @@ class FlatPretokenizedShard:
         target_out: torch.Tensor,
         loss_mask_out: torch.Tensor,
         loss_mode: str = "default",
+        clear_outputs: bool = True,
     ) -> bool:
         if self.context_flat is None or self.loss_mask_flat is None or self.is_continuation is None:
             self.ensure_loaded()
@@ -437,9 +439,10 @@ class FlatPretokenizedShard:
         token_end = int(self.chunk_token_offsets[chunk_index + 1].item())
         active_context = self.context_flat[token_start:token_end]
         active_length = int(active_context.shape[0])
-        context_out.fill_(self.pad_token_id)
-        target_out.fill_(self.pad_token_id)
-        loss_mask_out.zero_()
+        if clear_outputs:
+            context_out.fill_(self.pad_token_id)
+            target_out.fill_(self.pad_token_id)
+            loss_mask_out.zero_()
         if active_length > 0:
             context_out[:active_length].copy_(active_context.to(dtype=torch.long))
             target_out[active_length - 1] = self.eos_token_id if is_last_chunk else self.cont_token_id
@@ -1267,6 +1270,273 @@ class SynchronousDocumentBatchProvider:
     def close(self) -> None:
         if self._previous_pin_memory is not None and hasattr(self.batcher, "pin_memory"):
             self.batcher.pin_memory = bool(self._previous_pin_memory)
+
+
+def _materialize_flat_plan_block(
+    batcher: FlatDocumentChunkBatcher,
+    plan_block: PrebuiltFlatBatchPlanBlock,
+    *,
+    pin_memory: bool,
+) -> PrebuiltBatchBlock:
+    if not plan_block.plans:
+        raise ValueError("flat plan block must contain at least one plan.")
+    batch_count = len(plan_block.plans)
+    batch_size = int(plan_block.plans[0].plan.batch_size)
+    seq_len = int(batcher.seq_len)
+    pad_token_id = int(batcher.pad_token_id)
+    context = torch.full((batch_count, batch_size, seq_len), pad_token_id, dtype=torch.long)
+    target = torch.full((batch_count, batch_size, seq_len), pad_token_id, dtype=torch.long)
+    loss_mask = torch.zeros((batch_count, batch_size, seq_len), dtype=torch.float32)
+    reset_mask = torch.zeros((batch_count, batch_size), dtype=torch.bool)
+    started_at = time.perf_counter()
+    for local_index, plan_entry in enumerate(plan_block.plans):
+        plan = plan_entry.plan
+        if int(plan.batch_size) != batch_size:
+            raise ValueError("flat plan block must use a consistent batch_size.")
+        reset_mask[local_index].copy_(torch.as_tensor(plan.reset_mask, dtype=torch.bool))
+        shard_cache = {
+            int(shard_index): batcher.collection.get_shard(int(shard_index))
+            for shard_index in set(plan.shard_indices)
+        }
+        for item_index in range(batch_size):
+            shard = shard_cache[int(plan.shard_indices[item_index])]
+            shard.copy_chunk_tensors_into(
+                plan.chunk_indices[item_index],
+                document_index=plan.document_indices[item_index],
+                is_last_chunk=plan.is_last_chunk[item_index],
+                context_out=context[local_index, item_index],
+                target_out=target[local_index, item_index],
+                loss_mask_out=loss_mask[local_index, item_index],
+                clear_outputs=False,
+            )
+        if plan_entry.reset_all:
+            reset_mask[local_index].fill_(True)
+    if pin_memory:
+        context = context.pin_memory()
+        target = target.pin_memory()
+        loss_mask = loss_mask.pin_memory()
+        reset_mask = reset_mask.pin_memory()
+    return PrebuiltBatchBlock(
+        context=context,
+        target=target,
+        loss_mask=loss_mask,
+        reset_mask=reset_mask,
+        build_seconds=time.perf_counter() - started_at,
+    )
+
+
+class RollingFlatPlanPrefetchProvider:
+    def __init__(
+        self,
+        batcher: FlatDocumentChunkBatcher,
+        *,
+        device: torch.device,
+        total_steps: int,
+        start_step: int,
+        stage1_ratio: float,
+        stage2_ratio: float,
+        stage1_span: int,
+        stage2_span: int,
+        stage3_span: int,
+        stage1_batch_size: int,
+        stage2_batch_size: int,
+        stage3_batch_size: int,
+        stage1_grad_accum_steps: int,
+        stage2_grad_accum_steps: int,
+        stage3_grad_accum_steps: int,
+        queued_blocks: int,
+        block_size: int,
+        materializer_threads: int,
+    ) -> None:
+        self.batcher = batcher
+        self.device = device
+        self.total_steps = int(total_steps)
+        self.start_step = int(start_step)
+        self.block_size = max(1, int(block_size))
+        self.queued_blocks = max(1, int(queued_blocks))
+        self.materializer_threads = max(1, int(materializer_threads))
+        self._plan_queue: queue.Queue[tuple[int, PrebuiltFlatBatchPlanBlock] | _PrefetchFailure | None] = queue.Queue(
+            maxsize=self.queued_blocks
+        )
+        self._result_queue: queue.Queue[
+            tuple[str, int, PrebuiltBatchBlock] | tuple[str, int, BaseException]
+        ] = queue.Queue(
+            maxsize=self.queued_blocks
+        )
+        self._stop = threading.Event()
+        self._current_block: PrebuiltBatchBlock | None = None
+        self._current_block_index = 0
+        self._consumed_batches = 0
+        self._next_chunk_index = 0
+        self._pending_blocks: dict[int, PrebuiltBatchBlock] = {}
+        self._produced_batches = 0
+        self._total_batch_build_seconds = 0.0
+        # Threaded materialization shares a single shard cache inside one process.
+        # Disable eviction here to avoid unloading a shard while another thread is
+        # still copying from it.
+        self.batcher.collection.max_loaded_shards = 0
+        with self.batcher.collection._cache_lock:
+            self.batcher.collection._loaded_shard_lru.clear()
+        stages = [
+            resolve_curriculum_stage(
+                step=step,
+                total_steps=total_steps,
+                stage1_ratio=stage1_ratio,
+                stage2_ratio=stage2_ratio,
+                stage1_span=stage1_span,
+                stage2_span=stage2_span,
+                stage3_span=stage3_span,
+                stage1_batch_size=stage1_batch_size,
+                stage2_batch_size=stage2_batch_size,
+                stage3_batch_size=stage3_batch_size,
+                stage1_grad_accum_steps=stage1_grad_accum_steps,
+                stage2_grad_accum_steps=stage2_grad_accum_steps,
+                stage3_grad_accum_steps=stage3_grad_accum_steps,
+            )
+            for step in range(self.start_step + 1, self.total_steps + 1)
+        ]
+        self.stage_chunks = [
+            stages[index : index + self.block_size]
+            for index in range(0, len(stages), self.block_size)
+        ]
+        if not self.stage_chunks:
+            raise ValueError("rolling flat plan prefetch has no stages to build.")
+        self.total_batches = sum(len(chunk) for chunk in self.stage_chunks)
+        self._planner_thread = threading.Thread(
+            target=self._planner_worker,
+            name="cmem_flat_plan_prefetch",
+            daemon=True,
+        )
+        self._materializer_threads = [
+            threading.Thread(
+                target=self._materializer_worker,
+                name=f"cmem_flat_materialize_{index}",
+                daemon=True,
+            )
+            for index in range(self.materializer_threads)
+        ]
+        self._planner_thread.start()
+        for thread in self._materializer_threads:
+            thread.start()
+
+    def _planner_worker(self) -> None:
+        try:
+            for chunk_index, stage_chunk in enumerate(self.stage_chunks):
+                if self._stop.is_set():
+                    break
+                started_at = time.perf_counter()
+                plans: list[PrebuiltFlatBatchPlan] = []
+                for stage in stage_chunk:
+                    self.batcher.set_batch_size(stage.batch_size)
+                    self.batcher.set_bucket_weights(stage.bucket_weights)
+                    plans.append(
+                        PrebuiltFlatBatchPlan(
+                            plan=self.batcher.next_batch_plan(),
+                            reset_all=bool(stage.freeze_memory),
+                        )
+                    )
+                block = PrebuiltFlatBatchPlanBlock(
+                    plans=tuple(plans),
+                    build_seconds=time.perf_counter() - started_at,
+                )
+                placed = False
+                while not placed and not self._stop.is_set():
+                    try:
+                        self._plan_queue.put((chunk_index, block), timeout=0.1)
+                        placed = True
+                    except queue.Full:
+                        continue
+            for _ in range(self.materializer_threads):
+                while not self._stop.is_set():
+                    try:
+                        self._plan_queue.put(None, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+        except BaseException as exc:  # pragma: no cover - defensive background thread path
+            while not self._stop.is_set():
+                try:
+                    self._plan_queue.put(_PrefetchFailure(exc), timeout=0.1)
+                    return
+                except queue.Full:
+                    continue
+
+    def _materializer_worker(self) -> None:
+        while not self._stop.is_set():
+            item = self._plan_queue.get()
+            if isinstance(item, _PrefetchFailure):
+                while not self._stop.is_set():
+                    try:
+                        self._result_queue.put(("error", -1, item.error), timeout=0.1)
+                        return
+                    except queue.Full:
+                        continue
+            if item is None:
+                return
+            chunk_index, plan_block = item
+            try:
+                block = _materialize_flat_plan_block(
+                    self.batcher,
+                    plan_block,
+                    pin_memory=bool(getattr(self.batcher, "pin_memory", False)),
+                )
+                while not self._stop.is_set():
+                    try:
+                        self._result_queue.put(("block", int(chunk_index), block), timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+            except BaseException as exc:  # pragma: no cover - defensive background thread path
+                while not self._stop.is_set():
+                    try:
+                        self._result_queue.put(("error", int(chunk_index), exc), timeout=0.1)
+                        return
+                    except queue.Full:
+                        continue
+
+    def _next_ordered_block(self) -> PrebuiltBatchBlock:
+        if self._next_chunk_index >= len(self.stage_chunks):
+            raise StopIteration("rolling flat plan prefetch is exhausted.")
+        while self._next_chunk_index not in self._pending_blocks:
+            kind, chunk_index, payload = self._result_queue.get()
+            if kind == "error":
+                raise RuntimeError("Rolling flat plan prefetcher failed.") from payload
+            if kind != "block":
+                raise RuntimeError(f"Unexpected rolling flat plan message: {kind}")
+            self._pending_blocks[int(chunk_index)] = payload
+        block = self._pending_blocks.pop(self._next_chunk_index)
+        self._next_chunk_index += 1
+        self._produced_batches += block.batch_count
+        self._total_batch_build_seconds += block.build_seconds
+        return block
+
+    def next_batch(self) -> DocumentBatch:
+        if self._current_block is None or self._current_block_index >= self._current_block.batch_count:
+            self._current_block = self._next_ordered_block()
+            self._current_block_index = 0
+        local_index = self._current_block_index
+        self._current_block_index += 1
+        self._consumed_batches += 1
+        batch = DocumentBatch(
+            context=self._current_block.context[local_index],
+            target=self._current_block.target[local_index],
+            loss_mask=self._current_block.loss_mask[local_index],
+            reset_mask=self._current_block.reset_mask[local_index],
+        )
+        return move_batch_to_device(batch, device=self.device, non_blocking=True)
+
+    def stats(self) -> tuple[float, int]:
+        average = self._total_batch_build_seconds / max(1, self._produced_batches)
+        buffered = sum(block.batch_count for block in self._pending_blocks.values())
+        if self._current_block is not None:
+            buffered += max(0, self._current_block.batch_count - self._current_block_index)
+        return average, buffered
+
+    def close(self) -> None:
+        self._stop.set()
+        self._planner_thread.join(timeout=1.0)
+        for thread in self._materializer_threads:
+            thread.join(timeout=1.0)
 
 
 class RollingProcessDocumentBatchProvider:
@@ -2379,6 +2649,14 @@ class FlatDocumentChunkBatcher:
         )
         clone.pin_memory = self.pin_memory
         clone.set_bucket_weights(dict(zip(self.active_buckets, self.active_bucket_weights)))
+        # Each forked prefetch worker gets its own shard cache; keep it close to the
+        # active working set instead of inheriting the large parent-process default.
+        worker_max_loaded_shards = max(1, int(self.active_shards_per_bucket) + 1)
+        current_max_loaded_shards = int(clone.collection.max_loaded_shards)
+        if current_max_loaded_shards <= 0 or current_max_loaded_shards > worker_max_loaded_shards:
+            clone.collection.max_loaded_shards = worker_max_loaded_shards
+        with clone.collection._cache_lock:
+            clone.collection._loaded_shard_lru.clear()
         return clone
 
     def set_batch_size(self, batch_size: int) -> None:
@@ -2493,7 +2771,8 @@ class FlatDocumentChunkBatcher:
             else:
                 reset_mask.append(False)
             reference = self.documents[self.current_doc[item_index]]
-            shard = self.collection.get_shard(reference.shard_index)
+            # Planning only needs metadata; avoid faulting in the whole shard payload here.
+            shard = self.collection.shards[reference.shard_index]
             chunk_start, chunk_end = shard.document_chunk_range(reference.document_index)
             chunk_index = chunk_start + self.current_chunk[item_index]
             last_chunk = chunk_index == chunk_end - 1
@@ -4137,6 +4416,175 @@ def compute_learning_rate(
     return base_lr * (min_ratio + (1.0 - min_ratio) * cosine)
 
 
+def estimate_total_optimizer_steps(
+    *,
+    total_micro_steps: int,
+    stage1_ratio: float,
+    stage2_ratio: float,
+    stage1_span: int = 1,
+    stage2_span: int = 1,
+    stage3_span: int = 1,
+    stage1_batch_size: int = 1,
+    stage2_batch_size: int = 1,
+    stage3_batch_size: int = 1,
+    stage1_grad_accum_steps: int = 1,
+    stage2_grad_accum_steps: int = 1,
+    stage3_grad_accum_steps: int = 1,
+) -> int:
+    optimizer_steps = 0
+    for micro_step in range(1, max(1, int(total_micro_steps)) + 1):
+        stage = resolve_curriculum_stage(
+            step=micro_step,
+            total_steps=total_micro_steps,
+            stage1_ratio=stage1_ratio,
+            stage2_ratio=stage2_ratio,
+            stage1_span=stage1_span,
+            stage2_span=stage2_span,
+            stage3_span=stage3_span,
+            stage1_batch_size=stage1_batch_size,
+            stage2_batch_size=stage2_batch_size,
+            stage3_batch_size=stage3_batch_size,
+            stage1_grad_accum_steps=stage1_grad_accum_steps,
+            stage2_grad_accum_steps=stage2_grad_accum_steps,
+            stage3_grad_accum_steps=stage3_grad_accum_steps,
+        )
+        if micro_step % stage.grad_accum_steps == 0 or micro_step == total_micro_steps:
+            optimizer_steps += 1
+    return max(1, optimizer_steps)
+
+
+def _parse_trace_optimizer_steps_env() -> set[int]:
+    raw = os.environ.get("JAKAL_REPRO_TRACE_OPT_STEPS", "").strip()
+    if not raw:
+        return set()
+    result: set[int] = set()
+    for part in raw.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        if "-" in token:
+            start_str, end_str = token.split("-", 1)
+            start = int(start_str)
+            end = int(end_str)
+            if end < start:
+                start, end = end, start
+            result.update(range(max(1, start), max(1, end) + 1))
+        else:
+            value = int(token)
+            if value > 0:
+                result.add(value)
+    return result
+
+
+def _print_every_optimizer_step_enabled() -> bool:
+    raw = os.environ.get("JAKAL_PRINT_EVERY_OPT_STEP", "").strip().lower()
+    if not raw:
+        return False
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _trace_param_limit_from_env(default: int = 4) -> int:
+    raw = os.environ.get("JAKAL_REPRO_TRACE_PARAM_LIMIT", "").strip()
+    if not raw:
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return default
+
+
+def _tensor_trace_hash(tensor: torch.Tensor, *, sample_elements: int = 2048) -> str:
+    detached = tensor.detach()
+    flat = detached.reshape(-1)
+    if flat.numel() > sample_elements:
+        flat = flat[:sample_elements]
+    cpu = flat.to(device="cpu").contiguous()
+    digest = hashlib.sha1()
+    digest.update(str(detached.dtype).encode("utf-8"))
+    digest.update(str(tuple(detached.shape)).encode("utf-8"))
+    digest.update(cpu.numpy().tobytes())
+    return digest.hexdigest()[:16]
+
+
+def _batch_trace_hash(batch: DocumentBatch) -> str:
+    digest = hashlib.sha1()
+    for tensor in (batch.context, batch.target, batch.loss_mask, batch.reset_mask):
+        digest.update(_tensor_trace_hash(tensor).encode("utf-8"))
+    return digest.hexdigest()[:16]
+
+
+def _select_trace_parameter_names(
+    named_parameters: Sequence[tuple[str, torch.nn.Parameter]],
+    *,
+    limit: int,
+) -> tuple[str, ...]:
+    selected: list[str] = []
+    for name, parameter in sorted(named_parameters, key=lambda item: item[0]):
+        if not parameter.requires_grad or parameter.numel() <= 0 or not parameter.is_floating_point():
+            continue
+        selected.append(name)
+        if len(selected) >= limit:
+            break
+    return tuple(selected)
+
+
+def _snapshot_trace_parameter(
+    parameter: torch.nn.Parameter,
+    *,
+    sample_elements: int = 4096,
+) -> dict[str, Any]:
+    detached = parameter.detach()
+    flat = detached.reshape(-1)
+    if flat.numel() > sample_elements:
+        flat = flat[:sample_elements]
+    sample = flat.to(device="cpu").clone()
+    return {
+        "sample": sample,
+        "full_norm": float(torch.linalg.vector_norm(detached.to(dtype=torch.float64)).item()),
+        "sample_hash": _tensor_trace_hash(sample),
+    }
+
+
+def _capture_trace_parameter_snapshots(
+    named_parameters: Sequence[tuple[str, torch.nn.Parameter]],
+    parameter_names: Sequence[str],
+) -> dict[str, dict[str, Any]]:
+    selected = set(parameter_names)
+    snapshots: dict[str, dict[str, Any]] = {}
+    for name, parameter in named_parameters:
+        if name not in selected:
+            continue
+        snapshots[name] = _snapshot_trace_parameter(parameter)
+    return snapshots
+
+
+def _summarize_trace_parameter_deltas(
+    *,
+    named_parameters: Sequence[tuple[str, torch.nn.Parameter]],
+    before_snapshots: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    for name, parameter in named_parameters:
+        before = before_snapshots.get(name)
+        if before is None:
+            continue
+        after = _snapshot_trace_parameter(parameter)
+        before_sample = before["sample"]
+        after_sample = after["sample"]
+        delta_sample_norm = float(torch.linalg.vector_norm((after_sample - before_sample).to(dtype=torch.float64)).item())
+        summaries.append(
+            {
+                "name": name,
+                "before_norm": before["full_norm"],
+                "after_norm": after["full_norm"],
+                "before_hash": before["sample_hash"],
+                "after_hash": after["sample_hash"],
+                "delta_sample_norm": delta_sample_norm,
+            }
+        )
+    return summaries
+
+
 def compute_decayed_scalar(
     *,
     step: int,
@@ -5404,7 +5852,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--memory-slots", type=int, nargs="+", default=[256, 64, 16])
     parser.add_argument("--memory-update-intervals", type=int, nargs="+")
     parser.add_argument("--prediction-layers", type=int, default=2)
-    parser.add_argument("--s-window", type=int, default=256)
+    parser.add_argument(
+        "--s-window",
+        type=int,
+        default=0,
+        help="Sequence propagation window. Use 0 for full causal dense propagation across the whole sequence.",
+    )
     parser.add_argument("--s-microbatch-size", type=int, default=0)
     parser.add_argument("--prediction-window", type=int, default=64)
     parser.add_argument("--checkpoint-sequence-layers", action="store_true")
@@ -5451,6 +5904,11 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help="Residual scale for state_val FFN outputs.",
+    )
+    parser.add_argument(
+        "--feed-forward-learnable-residual-scale",
+        action="store_true",
+        help="Learn a positive FFN residual scale instead of using a fixed constant.",
     )
     parser.add_argument(
         "--feed-forward-random-output-init",
@@ -6052,6 +6510,7 @@ def build_rnn_aux_optimizer(
 def main() -> None:
     args = parse_args()
     forced_unit_norm_policy = "none"
+    requested_legacy_layer_split = (int(args.s_layers), int(args.prediction_layers))
     requested_stage_spans = (
         int(args.curriculum_stage1_span),
         int(args.curriculum_stage2_span),
@@ -6151,6 +6610,13 @@ def main() -> None:
         print(
             "warning | overriding requested curriculum document spans to 1 | "
             f"requested={requested_stage_spans}",
+            flush=True,
+        )
+    if args.model_kind == "causal_memory" and int(args.propagation_layers) > 0:
+        print(
+            "warning | using propagation_layers as the single causal stack depth; "
+            f"ignoring legacy layer split s_layers={requested_legacy_layer_split[0]} "
+            f"prediction_layers={requested_legacy_layer_split[1]}",
             flush=True,
         )
 
@@ -6389,6 +6855,20 @@ def main() -> None:
         )
         print(f"hf_embedding_dim | source={hf_dim_source} | dim={args.dim}", flush=True)
     total_steps = max(1, int(math.ceil(steps_per_epoch * args.epochs)))
+    total_optimizer_steps = estimate_total_optimizer_steps(
+        total_micro_steps=total_steps,
+        stage1_ratio=args.curriculum_stage1_ratio,
+        stage2_ratio=args.curriculum_stage2_ratio,
+        stage1_span=args.curriculum_stage1_span,
+        stage2_span=args.curriculum_stage2_span,
+        stage3_span=args.curriculum_stage3_span,
+        stage1_batch_size=stage1_batch_size,
+        stage2_batch_size=stage2_batch_size,
+        stage3_batch_size=stage3_batch_size,
+        stage1_grad_accum_steps=stage1_grad_accum_steps,
+        stage2_grad_accum_steps=stage2_grad_accum_steps,
+        stage3_grad_accum_steps=stage3_grad_accum_steps,
+    )
     lowrank_lion_default_schedule_applied = False
     if (
         args.model_kind == "causal_memory"
@@ -6503,8 +6983,32 @@ def main() -> None:
         source_batcher: DocumentChunkBatcher | FlatDocumentChunkBatcher,
         *,
         start_step_value: int,
-    ) -> RollingFileDocumentBatchProvider:
-        return RollingFileDocumentBatchProvider(
+    ) -> RollingProcessDocumentBatchProvider | RollingFlatPlanPrefetchProvider:
+        if isinstance(source_batcher, FlatDocumentChunkBatcher):
+            return RollingFlatPlanPrefetchProvider(
+                source_batcher,
+                device=device,
+                total_steps=total_steps,
+                start_step=start_step_value,
+                stage1_ratio=args.curriculum_stage1_ratio,
+                stage2_ratio=args.curriculum_stage2_ratio,
+                stage1_span=args.curriculum_stage1_span,
+                stage2_span=args.curriculum_stage2_span,
+                stage3_span=args.curriculum_stage3_span,
+                stage1_batch_size=stage1_batch_size,
+                stage2_batch_size=stage2_batch_size,
+                stage3_batch_size=stage3_batch_size,
+                stage1_grad_accum_steps=stage1_grad_accum_steps,
+                stage2_grad_accum_steps=stage2_grad_accum_steps,
+                stage3_grad_accum_steps=stage3_grad_accum_steps,
+                queued_blocks=max(1, int(args.rolling_prefetch_blocks)),
+                block_size=max(1, int(args.rolling_prefetch_block_size)),
+                materializer_threads=max(
+                    1,
+                    int(args.rolling_prefetch_workers) * max(1, int(args.rolling_prefetch_worker_threads)),
+                ),
+            )
+        return RollingProcessDocumentBatchProvider(
             source_batcher,
             device=device,
             total_steps=total_steps,
@@ -6520,12 +7024,11 @@ def main() -> None:
             stage1_grad_accum_steps=stage1_grad_accum_steps,
             stage2_grad_accum_steps=stage2_grad_accum_steps,
             stage3_grad_accum_steps=stage3_grad_accum_steps,
-            pin_memory=bool(args.prefetch_pin_memory),
+            pin_memory=False,
             workers=max(1, int(args.rolling_prefetch_workers)),
             worker_threads=max(1, int(args.rolling_prefetch_worker_threads)),
             block_size=max(1, int(args.rolling_prefetch_block_size)),
             queued_blocks=max(1, int(args.rolling_prefetch_blocks)),
-            cache_dir=None if args.rolling_prefetch_cache_dir is None else Path(args.rolling_prefetch_cache_dir),
         )
 
     batcher: DocumentChunkBatcher | FlatDocumentChunkBatcher | None = None
@@ -6533,6 +7036,7 @@ def main() -> None:
         AsyncDocumentBatchPrefetcher
         | SynchronousDocumentBatchProvider
         | RollingProcessDocumentBatchProvider
+        | RollingFlatPlanPrefetchProvider
         | RollingFileDocumentBatchProvider
         | PrebuiltDocumentBatchProvider
         | None
@@ -6573,16 +7077,16 @@ def main() -> None:
             dropout=args.transformer_dropout,
         ).to(device)
     else:
-        total_propagation_layers = int(args.s_layers) + int(args.prediction_layers)
+        total_propagation_layers = resolve_total_propagation_layers(args)
         model = CausalMemoryLM(
             vocab_size=vocab_size,
             dim=args.dim,
             max_seq_len=args.seq_len,
             propagation_layers=total_propagation_layers,
-            s_layers=args.s_layers,
+            s_layers=total_propagation_layers,
             memory_slots=tuple(args.memory_slots),
             memory_update_intervals=None if args.memory_update_intervals is None else tuple(args.memory_update_intervals),
-            prediction_layers=args.prediction_layers,
+            prediction_layers=0,
             s_window=args.s_window,
             s_microbatch_size=None if args.s_microbatch_size <= 0 else args.s_microbatch_size,
             prediction_window=args.prediction_window,
@@ -6598,6 +7102,7 @@ def main() -> None:
             feed_forward_hidden_mult=args.feed_forward_hidden_mult,
             feed_forward_kind=args.feed_forward_kind,
             feed_forward_residual_scale=args.feed_forward_residual_scale,
+            feed_forward_learnable_residual_scale=args.feed_forward_learnable_residual_scale,
             feed_forward_zero_init_output=not args.feed_forward_random_output_init,
             feed_forward_activation=args.feed_forward_activation,
             memory_topk=args.memory_topk,
@@ -6656,9 +7161,11 @@ def main() -> None:
     else:
         print(
             f"model=causal_memory_doc | params={parameter_count:,} | dim={args.dim} | seq_len={args.seq_len} | "
-            f"propagation_layers={total_propagation_layers} | legacy_s_layers={args.s_layers} | "
-            f"legacy_prediction_layers={args.prediction_layers} | "
-            f"s_window={args.s_window} | s_microbatch_size={args.s_microbatch_size} | "
+            f"propagation_layers={total_propagation_layers} | "
+            f"legacy_s_layers={requested_legacy_layer_split[0]} | "
+            f"legacy_prediction_layers={requested_legacy_layer_split[1]} | "
+            f"full_dense_causal={args.s_window <= 0} | s_window={args.s_window} | "
+            f"s_microbatch_size={args.s_microbatch_size} | "
             f"scan_backend={args.scan_backend} | scan_checkpoint_chunk_size={args.scan_checkpoint_chunk_size} | "
             f"memory_slots={args.memory_slots} | memory_update_intervals={args.memory_update_intervals} | knowledge_nodes={args.knowledge_nodes} | "
             f"memory_train_mode={args.memory_train_mode} | memory_eval_mode={args.memory_eval_mode} | eval_topk={args.eval_topk or args.memory_topk} | "
@@ -6671,6 +7178,7 @@ def main() -> None:
             f"feed_forward_hidden_mult={args.feed_forward_hidden_mult:g} | "
             f"feed_forward_kind={args.feed_forward_kind} | "
             f"feed_forward_residual_scale={args.feed_forward_residual_scale:g} | "
+            f"feed_forward_learnable_residual_scale={args.feed_forward_learnable_residual_scale} | "
             f"feed_forward_zero_init_output={not args.feed_forward_random_output_init} | "
             f"feed_forward_activation={args.feed_forward_activation} | "
             f"optimizer={args.optimizer} | checkpoint_sequence={args.checkpoint_sequence_layers} | "
@@ -6747,6 +7255,7 @@ def main() -> None:
                     "forced_unit_norm_policy": forced_unit_norm_policy,
                     "forced_document_span_policy": forced_document_span_policy,
                     "lowrank_lion_default_schedule_applied": lowrank_lion_default_schedule_applied,
+                    "repro_trace_optimizer_steps": sorted(_parse_trace_optimizer_steps_env()),
                 },
                 "tokenizer_label": tokenizer_label,
                 "tokenizer_model_path": tokenizer_model_path,
@@ -6823,6 +7332,7 @@ def main() -> None:
     train_memory_state: tuple[Any, ...] | None = None
     active_stage_name: str | None = None
     start_step = 0
+    optimizer_step = 0
     best_val_loss = float("inf")
     if args.resume_checkpoint:
         checkpoint_path = Path(args.resume_checkpoint)
@@ -6864,6 +7374,7 @@ def main() -> None:
                 "memory state, batcher state, and RNG are reset per rank",
                 flush=True,
             )
+        optimizer_step = start_step
     if args.compile_model:
         compiler = getattr(torch, "compile", None)
         if compiler is None:
@@ -6954,6 +7465,18 @@ def main() -> None:
         for parameter_name, parameter in model.named_parameters()
         if parameter.requires_grad
     ]
+    trace_optimizer_steps = _parse_trace_optimizer_steps_env()
+    trace_param_names = _select_trace_parameter_names(
+        grad_clip_named_parameters,
+        limit=_trace_param_limit_from_env(),
+    )
+    trace_path = run_dir / "repro_trace.jsonl"
+    if trace_optimizer_steps and is_main_process:
+        print(
+            f"repro_trace | optimizer_steps={sorted(trace_optimizer_steps)} | "
+            f"params={list(trace_param_names)} | path={trace_path}",
+            flush=True,
+        )
     stage1_cuda_graph_runner: Stage1CudaGraphRunner | Stage1ForwardCudaGraphRunner | None = None
 
     def save_training_checkpoint(
@@ -7026,9 +7549,12 @@ def main() -> None:
                 flush=True,
             )
 
+        should_step_optimizer = step % stage.grad_accum_steps == 0 or step == total_steps
+        next_optimizer_step = optimizer_step + 1 if should_step_optimizer else optimizer_step
+        pending_optimizer_step = optimizer_step + 1
         lr = compute_learning_rate(
-            step=step,
-            total_steps=total_steps,
+            step=pending_optimizer_step,
+            total_steps=total_optimizer_steps,
             base_lr=args.learning_rate,
             warmup_start_lr=args.warmup_start_lr,
             warmup_steps=args.warmup_steps,
@@ -7047,9 +7573,13 @@ def main() -> None:
         should_collect_model_stats = (
             writer is not None
             and args.model_kind == "causal_memory"
-            and (step == 1 or step % 25 == 0)
+            and should_step_optimizer
+            and (next_optimizer_step == 1 or next_optimizer_step % 25 == 0)
             and not args.cuda_graph_stage1
         )
+        should_trace_step = next_optimizer_step in trace_optimizer_steps
+        trace_before_snapshots: dict[str, dict[str, Any]] = {}
+        trace_forward_events: list[dict[str, Any]] = []
         set_model_track_stats(model, should_collect_model_stats)
         for span_index in range(stage.document_span):
             batch = override_batch_reset(
@@ -7121,6 +7651,19 @@ def main() -> None:
             span_losses.append(main_loss_value)
             last_span_loss_tensor = loss
             current_memory_state = None if stage.freeze_memory else next_memory_state
+            if should_trace_step and is_main_process:
+                trace_forward_events.append(
+                    {
+                        "event": "forward",
+                        "optimizer_step": pending_optimizer_step,
+                        "micro_step": step,
+                        "span_index": span_index,
+                        "stage": stage.name,
+                        "batch_hash": _batch_trace_hash(batch),
+                        "loss": float(loss.detach().float().item()),
+                        "main_loss": float(main_loss_value),
+                    }
+                )
 
         if loss_is_finite and last_span_loss_tensor is not None and not used_cuda_graph:
             total_span_loss = last_span_loss_tensor / stage.grad_accum_steps
@@ -7146,8 +7689,9 @@ def main() -> None:
         if should_collect_model_stats:
             set_model_track_stats(model, False)
 
-        should_step_optimizer = step % stage.grad_accum_steps == 0 or step == total_steps
         grad_group_diagnostics: dict[str, dict[str, float | int]] = {}
+        preclip_grad_norm = float("nan")
+        postclip_grad_norm = float("nan")
         if loss_is_finite and should_step_optimizer:
             if scaler is not None:
                 scaler.unscale_(optimizer)
@@ -7166,20 +7710,26 @@ def main() -> None:
                     grad_clip_named_parameters,
                     lr=lr,
                 )
+            if should_trace_step and is_main_process:
+                trace_before_snapshots = _capture_trace_parameter_snapshots(
+                    grad_clip_named_parameters,
+                    trace_param_names,
+                )
             try:
                 if args.fast_grad_clip:
-                    grad_norm = clip_grad_norm_fast(
+                    preclip_grad_norm = clip_grad_norm_fast(
                         grad_clip_parameters,
                         args.grad_clip,
                     )
-                    if not math.isfinite(grad_norm):
+                    if not math.isfinite(preclip_grad_norm):
                         raise RuntimeError("non-finite grad norm before clipping")
+                    grad_norm = preclip_grad_norm
                 else:
-                    grad_norm = compute_grad_norm_float64(grad_clip_parameters)
+                    preclip_grad_norm = compute_grad_norm_float64(grad_clip_parameters)
                     if (
                         args.diagnose_nonfinite_grad
-                        and math.isfinite(grad_norm)
-                        and grad_norm >= 1.0e6
+                        and math.isfinite(preclip_grad_norm)
+                        and preclip_grad_norm >= 1.0e6
                     ):
                         gradient_extremes = summarize_gradient_extremes(
                             grad_clip_named_parameters,
@@ -7187,7 +7737,7 @@ def main() -> None:
                         )
                         if gradient_extremes:
                             print(
-                                f"diagnose_large_grad_preclip | step={step} | grad_norm={grad_norm:.6g} | "
+                                f"diagnose_large_grad_preclip | step={step} | grad_norm={preclip_grad_norm:.6g} | "
                                 + " | ".join(gradient_extremes),
                                 flush=True,
                             )
@@ -7195,6 +7745,8 @@ def main() -> None:
                         grad_clip_parameters,
                         args.grad_clip,
                     )
+                if should_trace_step and is_main_process:
+                    postclip_grad_norm = compute_grad_norm_float64(grad_clip_parameters)
             except RuntimeError as exc:
                 grad_norm = float("nan")
                 print(f"warning | step={step} | non-finite grad norm; skipping optimizer step | {exc}", flush=True)
@@ -7240,6 +7792,7 @@ def main() -> None:
                 else:
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+                optimizer_step = next_optimizer_step
         else:
             grad_norm = float("nan")
 
@@ -7265,29 +7818,53 @@ def main() -> None:
                 if isinstance(stat_value, torch.Tensor):
                     vi_lion_stats[history_key] = float(stat_value.detach().float().cpu().item())
             break
-        if writer is not None:
-            writer.add_scalar("train/loss", train_loss, step)
-            writer.add_scalar("train/lr", lr, step)
-            writer.add_scalar("train/document_span", stage.document_span, step)
-            writer.add_scalar("train/cpu_batch_ms", avg_cpu_batch_seconds * 1000.0, step)
-            writer.add_scalar("train/prefetch_queue_size", prefetch_queue_size, step)
-            if not math.isnan(grad_norm):
-                writer.add_scalar("train/grad_norm", grad_norm, step)
+        did_optimizer_step = loss_is_finite and should_step_optimizer and not math.isnan(grad_norm)
+        if should_trace_step and is_main_process:
+            for trace_event in trace_forward_events:
+                append_jsonl(trace_path, trace_event)
+            if should_step_optimizer:
+                trace_payload: dict[str, Any] = {
+                    "event": "optimizer_step",
+                    "optimizer_step": pending_optimizer_step,
+                    "micro_step": step,
+                    "stage": stage.name,
+                    "lr": lr,
+                    "did_optimizer_step": did_optimizer_step,
+                    "train_loss": train_loss,
+                    "preclip_grad_norm": preclip_grad_norm,
+                    "logged_grad_norm": grad_norm,
+                    "postclip_grad_norm": postclip_grad_norm,
+                }
+                if trace_before_snapshots:
+                    trace_payload["parameter_deltas"] = _summarize_trace_parameter_deltas(
+                        named_parameters=grad_clip_named_parameters,
+                        before_snapshots=trace_before_snapshots,
+                    )
+                append_jsonl(trace_path, trace_payload)
+        if writer is not None and did_optimizer_step:
+            writer.add_scalar("train/loss", train_loss, optimizer_step)
+            writer.add_scalar("train/lr", lr, optimizer_step)
+            writer.add_scalar("train/document_span", stage.document_span, optimizer_step)
+            writer.add_scalar("train/cpu_batch_ms", avg_cpu_batch_seconds * 1000.0, optimizer_step)
+            writer.add_scalar("train/prefetch_queue_size", prefetch_queue_size, optimizer_step)
+            writer.add_scalar("train/grad_norm", grad_norm, optimizer_step)
             for group_name, group_stats in grad_group_diagnostics.items():
                 for stat_name, stat_value in group_stats.items():
                     writer.add_scalar(
                         f"train_grad_group/{group_name}/{stat_name}",
                         float(stat_value),
-                        step,
+                        optimizer_step,
                     )
             for stat_name, stat_value in vi_lion_stats.items():
-                writer.add_scalar(f"train/{stat_name}", stat_value, step)
+                writer.add_scalar(f"train/{stat_name}", stat_value, optimizer_step)
             for bucket_name, bucket_weight in bucket_weights.items():
-                writer.add_scalar(f"train_bucket_weight/{bucket_name}", bucket_weight, step)
+                writer.add_scalar(f"train_bucket_weight/{bucket_name}", bucket_weight, optimizer_step)
             for stat_name, stat_value in model_stats.items():
-                writer.add_scalar(f"train_model/{stat_name}", stat_value, step)
+                writer.add_scalar(f"train_model/{stat_name}", stat_value, optimizer_step)
 
-        should_print_progress = step == 1 or step % 25 == 0
+        should_print_progress = did_optimizer_step and (
+            _print_every_optimizer_step_enabled() or optimizer_step == 1 or optimizer_step % 25 == 0
+        )
         if should_print_progress and is_main_process:
             elapsed = time.time() - start_time
             vi_lion_progress = ""
@@ -7300,7 +7877,8 @@ def main() -> None:
                     f" | vi_ratio={vi_lion_stats.get('vi_grad_rms_ratio', float('nan')):.3g}"
                 )
             print(
-                f"progress | step={step:5d}/{total_steps} | stage={stage.name} | span={stage.document_span} | "
+                f"progress | step={optimizer_step:5d}/{total_optimizer_steps} | micro_step={step:5d}/{total_steps} | "
+                f"stage={stage.name} | span={stage.document_span} | "
                 f"train_loss={train_loss:.4f} | lr={lr:.6g} | "
                 f"cpu_batch_ms={avg_cpu_batch_seconds * 1000.0:.1f} | prefetch_q={prefetch_queue_size} | "
                 f"elapsed={elapsed:.1f}s{vi_lion_progress}",
@@ -7322,11 +7900,11 @@ def main() -> None:
             print("grad_diagnose | " + " | ".join(group_messages), flush=True)
 
         val_loss = None
-        should_eval = is_main_process and (
-            step == total_steps
+        should_eval = is_main_process and did_optimizer_step and (
+            optimizer_step == total_optimizer_steps
             or (
-                step >= max(1, int(args.eval_start_step))
-                and step % args.eval_interval == 0
+                optimizer_step >= max(1, int(args.eval_start_step))
+                and optimizer_step % args.eval_interval == 0
             )
         )
         if should_eval:
@@ -7349,19 +7927,19 @@ def main() -> None:
                 )
             val_ppl = perplexity_from_loss(val_loss)
             print(
-                f"eval | step={step} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
+                f"eval | step={optimizer_step} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
                 f"val_ppl={val_ppl:.2f}",
                 flush=True,
             )
             if writer is not None:
-                writer.add_scalar("eval/val_loss", val_loss, step)
-                writer.add_scalar("eval/val_ppl", val_ppl, step)
+                writer.add_scalar("eval/val_loss", val_loss, optimizer_step)
+                writer.add_scalar("eval/val_ppl", val_ppl, optimizer_step)
                 should_log_eval_samples = (
-                    step == total_steps
+                    optimizer_step == total_optimizer_steps
                     or (
                         args.eval_sample_interval > 0
-                        and step >= max(1, int(args.eval_start_step))
-                        and step % args.eval_sample_interval == 0
+                        and optimizer_step >= max(1, int(args.eval_start_step))
+                        and optimizer_step % args.eval_sample_interval == 0
                     )
                 )
                 if should_log_eval_samples:
@@ -7374,7 +7952,7 @@ def main() -> None:
                             vocab=decode_vocab,
                             device=device,
                             precision=args.precision,
-                            step=step,
+                            step=optimizer_step,
                             max_samples=1,
                         )
                     else:
@@ -7385,37 +7963,41 @@ def main() -> None:
                             vocab=decode_vocab,
                             device=device,
                             precision=args.precision,
-                            step=step,
+                            step=optimizer_step,
                             max_samples=1,
                         )
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 save_training_checkpoint(
                     checkpoints_dir / "best.pt",
-                    step=step,
+                    step=optimizer_step,
                     train_loss=train_loss,
                     val_loss=val_loss,
                 )
                 if is_main_process:
                     write_json(
                         checkpoints_dir / "best.json",
-                        {"step": step, "train_loss": train_loss, "val_loss": val_loss},
+                        {"step": optimizer_step, "train_loss": train_loss, "val_loss": val_loss},
                     )
 
-        if is_main_process and (step == total_steps or step % args.checkpoint_interval == 0):
+        if is_main_process and did_optimizer_step and (
+            optimizer_step == total_optimizer_steps
+            or optimizer_step % args.checkpoint_interval == 0
+        ):
             save_training_checkpoint(
                 checkpoints_dir / "last.pt",
-                step=step,
+                step=optimizer_step,
                 train_loss=train_loss,
                 val_loss=val_loss,
             )
             write_json(
                 checkpoints_dir / "last.json",
-                {"step": step, "train_loss": train_loss, "val_loss": val_loss},
+                {"step": optimizer_step, "train_loss": train_loss, "val_loss": val_loss},
             )
 
         row = {
-            "step": step,
+            "step": optimizer_step,
+            "micro_step": step,
             "stage": stage.name,
             "document_span": stage.document_span,
             "train_loss": train_loss,
@@ -7427,7 +8009,7 @@ def main() -> None:
         if grad_group_diagnostics:
             row["grad_group_diagnostics"] = grad_group_diagnostics
         row.update(vi_lion_stats)
-        if is_main_process:
+        if is_main_process and did_optimizer_step:
             history_rows.append(row)
             append_jsonl(run_dir / "history.jsonl", row)
 

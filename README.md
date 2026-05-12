@@ -276,6 +276,50 @@ This is important when using multi-head route/edge kernels: the heads do not
 only affect `S -> B` writes, but also `B`'s internal same-level and cross-level
 communication.
 
+### Current `seq512` no-memory training path
+
+The most stable current path is the `causal_memory` runner with the effective
+memory path disabled and the model treated as one full-causal propagation
+stack. In this mode:
+
+- `document_span` is forced to `1`
+- `propagation_layers` is the only effective depth control
+- `s_window=0` means full dense causal propagation over the entire chunk
+- flat pretokenized shards use metadata-only planning plus in-process threaded
+  materialization to avoid the earlier multi-process RAM blowups
+
+The current wiki-only recipe that produced the best validation curve so far is:
+
+```bash
+PYTHONPATH=src python -m torch.distributed.run --nproc_per_node=2 \
+  scripts/train_causal_memory_lm.py \
+  --device cuda \
+  --precision bf16 \
+  --model-kind causal_memory \
+  --pretokenized-dir artifacts/wiki6m_hf16k/pretokenized_seq512 \
+  --seq-len 512 \
+  --dim 384 \
+  --propagation-layers 6 \
+  --pairwise-kind low_rank_bilinear \
+  --pairwise-rank 256 \
+  --implementation streaming \
+  --batch-size 384 \
+  --grad-accum-steps 1 \
+  --learning-rate 2.5e-4 \
+  --warmup-start-lr 1e-4 \
+  --warmup-steps 500 \
+  --lr-decay-start-step 4000 \
+  --lr-decay-steps 12000 \
+  --lr-min-ratio 0.2 \
+  --feed-forward-kind value \
+  --feed-forward-residual-scale 0.25 \
+  --feed-forward-learnable-residual-scale
+```
+
+In this configuration, the `value` FFN materially outperformed the FFN-off
+baseline on the same `seq512` wiki setup, and the current run reached
+validation loss near `4.06` with perplexity near `57.8`.
+
 ## RoBERTa-base Embedding + Large Body Configuration
 
 For an English-first setup where code and math are added on top of a stable

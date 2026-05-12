@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TypeVar
 
 import torch
@@ -11,7 +12,7 @@ from jakal_net._architectural_common import (
     softsign_state,
 )
 from jakal_net.core import Layer
-from jakal_net.modules import LearnedPositionEncoding, ResidualFeedForward, StateValueFeedForward
+from jakal_net.modules import LearnedPositionEncoding, ResidualFeedForward, StateValueFeedForward, make_norm
 from jakal_net.propagation import SparsePropagation
 from jakal_net.propagation_stack import (
     PropagationStack,
@@ -46,13 +47,17 @@ class SModule(nn.Module):
         s_microbatch_size: int | None = None,
         checkpoint_sequence_layers: bool = False,
         unit_norm_values: bool = False,
-        propagation_residual_gate_init: float = 0.1,
+        state_activation_kind: str = "signed_softmax",
+        norm_kind: str = "layernorm",
+        propagation_residual_gate_init: float = 1.0,
         feed_forward_layers: bool = True,
         feed_forward_hidden_mult: float = 2.0,
         feed_forward_kind: str = "value",
         feed_forward_residual_scale: float = 1.0,
+        feed_forward_learnable_residual_scale: bool = False,
         feed_forward_zero_init_output: bool = True,
         feed_forward_activation: str = "gelu",
+        feed_forward_input_norm: bool = True,
     ) -> None:
         super().__init__()
         if vocab_size <= 0:
@@ -81,13 +86,17 @@ class SModule(nn.Module):
         self.s_microbatch_size = s_microbatch_size
         self.checkpoint_sequence_layers = checkpoint_sequence_layers
         self.unit_norm_values = unit_norm_values
+        self.state_activation_kind = str(state_activation_kind)
+        self.norm_kind = norm_kind
         self.propagation_residual_gate_init = float(propagation_residual_gate_init)
         self.feed_forward_layers = bool(feed_forward_layers)
         self.feed_forward_hidden_mult = float(feed_forward_hidden_mult)
         self.feed_forward_kind = feed_forward_kind
         self.feed_forward_residual_scale = float(feed_forward_residual_scale)
+        self.feed_forward_learnable_residual_scale = bool(feed_forward_learnable_residual_scale)
         self.feed_forward_zero_init_output = bool(feed_forward_zero_init_output)
         self.feed_forward_activation = feed_forward_activation
+        self.feed_forward_input_norm = bool(feed_forward_input_norm)
         self.sequence_anchor = bool(sequence_anchor)
 
         self.token_embedding = nn.Embedding(vocab_size, dim)
@@ -103,9 +112,10 @@ class SModule(nn.Module):
         if unit_norm_values:
             self.sequence_input_norm = nn.Identity()
         else:
-            self.sequence_input_norm = nn.LayerNorm(dim)
-        sequence_norm_factory = nn.Identity if unit_norm_values else lambda: nn.LayerNorm(dim)
-        sequence_window = max_seq_len if s_window is None else max(1, s_window)
+            self.sequence_input_norm = make_norm(dim, norm_kind)
+        sequence_norm_factory = nn.Identity if unit_norm_values else lambda: make_norm(dim, norm_kind)
+        full_dense_causal = s_window is None or int(s_window) <= 0
+        sequence_window = max_seq_len if full_dense_causal else max(1, int(s_window))
         sequence_nodes = max_seq_len + (1 if self.sequence_anchor else 0)
         full_window_block_size = sequence_nodes if sequence_window + 1 >= sequence_nodes else None
         self.sequence_stack = PropagationStack(
@@ -138,12 +148,17 @@ class SModule(nn.Module):
                 kind=self.feed_forward_kind,
                 hidden_mult=self.feed_forward_hidden_mult,
                 residual_scale=self.feed_forward_residual_scale,
+                learnable_residual_scale=self.feed_forward_learnable_residual_scale,
                 zero_init_output=self.feed_forward_zero_init_output,
                 activation=self.feed_forward_activation,
+                norm_kind=self.norm_kind,
+                use_input_norm=self.feed_forward_input_norm,
             ),
             unit_norm_values=self.unit_norm_values,
+            state_activation_kind=self.state_activation_kind,
             residual_gate_init=self.propagation_residual_gate_init,
         )
+        self.full_dense_causal = bool(full_dense_causal)
 
     def _can_use_dense_apply_fastpath(self, layer: Layer, propagation: SparsePropagation) -> bool:
         return can_use_dense_apply_fastpath(layer, propagation)
@@ -153,18 +168,24 @@ class SModule(nn.Module):
         layer: Layer,
         delta_state: Tensor,
         delta_val: Tensor,
-        norm: nn.Module,
+        norm: nn.Module | None = None,
     ) -> Layer:
         return apply_dense_delta_fastpath(
             layer,
             delta_state,
             delta_val,
-            norm,
+            norm=norm,
             unit_norm_values=self.unit_norm_values,
+            state_activation_kind=self.state_activation_kind,
         )
 
     def _apply_ffn(self, layer: Layer, ffn: nn.Module) -> Layer:
-        return apply_propagation_ffn(layer, ffn, unit_norm_values=self.unit_norm_values)
+        return apply_propagation_ffn(
+            layer,
+            ffn,
+            unit_norm_values=self.unit_norm_values,
+            state_activation_kind=self.state_activation_kind,
+        )
 
     @property
     def total_layers(self) -> int:
@@ -288,13 +309,11 @@ class SModule(nn.Module):
             val=token_val,
         )
 
-    def _encode_single(
+    def build_input_layer(
         self,
         input_ids: Tensor,
         *,
         state_projection: nn.Module,
-        start: int = 0,
-        end: int | None = None,
     ) -> Layer:
         if input_ids.ndim != 2:
             raise ValueError("input_ids must have shape [batch, seq_len].")
@@ -312,9 +331,7 @@ class SModule(nn.Module):
             dtype=token_val.dtype,
         ).unsqueeze(0)
         token_val = self.sequence_input_norm(token_val)
-        token_state_source = token_val
-
-        token_state = state_projection(token_state_source).squeeze(-1)
+        token_state = state_projection(token_val).squeeze(-1)
         if self.unit_norm_values:
             token_state = softsign_state(token_state)
         if self.sequence_anchor:
@@ -335,8 +352,43 @@ class SModule(nn.Module):
         else:
             seq_val = token_val
             seq_state = token_state
-        num_nodes = int(seq_val.shape[1])
-        layer = Layer(dim=self.dim, num_nodes=num_nodes, state=seq_state, val=seq_val)
+        return Layer(
+            dim=self.dim,
+            num_nodes=int(seq_val.shape[1]),
+            state=seq_state,
+            val=seq_val,
+        )
+
+    def run_propagation_interleaved(
+        self,
+        layer: Layer,
+        *,
+        start: int = 0,
+        end: int | None = None,
+        checkpoint_layers: bool | None = None,
+        before_block: Callable[[Layer, int], Layer] | None = None,
+    ) -> Layer:
+        if checkpoint_layers is None:
+            checkpoint_layers = self.checkpoint_sequence_layers
+        stop = len(self.sequence_stack.blocks) if end is None else int(end)
+        for block_index in range(int(start), stop):
+            if before_block is not None:
+                layer = before_block(layer, block_index)
+            layer = self.sequence_stack.blocks[block_index](layer, checkpoint_layer=checkpoint_layers)
+        return layer
+
+    def _encode_single(
+        self,
+        input_ids: Tensor,
+        *,
+        state_projection: nn.Module,
+        start: int = 0,
+        end: int | None = None,
+    ) -> Layer:
+        layer = self.build_input_layer(
+            input_ids,
+            state_projection=state_projection,
+        )
         return self.run_propagation(
             layer,
             start=start,

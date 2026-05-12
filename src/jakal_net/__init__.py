@@ -3,6 +3,7 @@ from jakal_net.causal_memory_lm import (
     MemoryScanOutput,
     ModelRecurrentState,
 )
+from jakal_net.causal_memory_bk_lm import CausalMemoryBKLM
 from jakal_net.core import Layer, LayerDelta
 from jakal_net.devices import describe_device, resolve_device
 from jakal_net.hierarchical_memory import BModule, BScanOutput
@@ -41,6 +42,7 @@ __all__ = [
     "BilinearPairwiseRoute",
     "BModule",
     "BScanOutput",
+    "CausalMemoryBKLM",
     "CausalMemoryLM",
     "describe_device",
     "DiagonalBilinearPairwise",

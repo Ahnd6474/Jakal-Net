@@ -1,0 +1,1 @@
+{"kind": "progress", "step": 1, "total_steps": 27459, "stage": "stage1", "span": 1, "train_loss": 9.7767, "lr": 0.0001, "cpu_batch_ms": 5.1, "prefetch_q": 27458, "elapsed_s": 4.8}
