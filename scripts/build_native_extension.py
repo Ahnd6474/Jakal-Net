@@ -46,6 +46,13 @@ def main() -> None:
         extra_cflags.append("/DWITH_CUDA") if os.name == "nt" else extra_cflags.append(
             "-DWITH_CUDA"
         )
+    extra_include_paths = [str(native_dir)]
+    for candidate in (
+        Path("/home/dannyahn/.local/opt/python3.12-dev-root/usr/include/python3.12"),
+        Path("/home/dannyahn/.local/opt/python3.12-dev-root/usr/include"),
+    ):
+        if candidate.exists():
+            extra_include_paths.append(str(candidate))
 
     module = load(
         name=args.module_name,
@@ -53,7 +60,7 @@ def main() -> None:
         build_directory=str(build_dir),
         verbose=args.verbose,
         with_cuda=use_cuda,
-        extra_include_paths=[str(native_dir)],
+        extra_include_paths=extra_include_paths,
         extra_cflags=extra_cflags,
         extra_cuda_cflags=["-std=c++17"] if use_cuda else None,
     )
