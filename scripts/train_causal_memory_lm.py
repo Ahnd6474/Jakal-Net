@@ -166,7 +166,6 @@ class TrainingCurriculumStage:
     freeze_skip: bool
     batch_size: int = 1
     grad_accum_steps: int = 1
-    bucket_weights: dict[str, float] = field(default_factory=dict, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -781,69 +780,6 @@ def summarize_document_buckets(documents: Sequence[SerializedDocument | Tokenize
     return {bucket: summary[bucket] for bucket in SCHEDULED_BUCKET_ORDER if bucket in summary}
 
 
-def resolve_bucket_weights(*, step: int, total_steps: int) -> dict[str, float]:
-    if total_steps <= 1:
-        progress = 1.0
-    else:
-        progress = max(0.0, min(1.0, (step - 1) / (total_steps - 1)))
-    conditioned_progress = 0.0 if progress <= 0.20 else (progress - 0.20) / 0.80
-    pure_front = 0.20 + 0.80 * ((1.0 - progress) ** 1.5)
-    conditioned_late = conditioned_progress ** 1.5
-    return {
-        "mixed_dialogue": 1.0,
-        "arxiv": 1.0,
-        "pubmed": 1.0,
-        "dialogue": pure_front,
-        "wiki": pure_front,
-        "code": pure_front,
-        "math": pure_front,
-        "docs": pure_front,
-        "math_qa": conditioned_late,
-        "reasoning": conditioned_late,
-    }
-
-
-def resolve_stage_bucket_weights(*, stage_name: str) -> dict[str, float]:
-    if stage_name == "stage1":
-        return {
-            "mixed_dialogue": 1.0,
-            "arxiv": 1.0,
-            "pubmed": 1.0,
-            "dialogue": 1.0,
-            "wiki": 1.0,
-            "code": 1.0,
-            "math": 1.0,
-            "docs": 1.0,
-            "math_qa": 0.0,
-            "reasoning": 0.0,
-        }
-    if stage_name == "stage2":
-        return {
-            "mixed_dialogue": 1.0,
-            "arxiv": 1.0,
-            "pubmed": 1.0,
-            "dialogue": 0.6,
-            "wiki": 0.6,
-            "code": 0.6,
-            "math": 0.6,
-            "docs": 0.6,
-            "math_qa": 0.35,
-            "reasoning": 0.35,
-        }
-    return {
-        "mixed_dialogue": 1.0,
-        "arxiv": 1.0,
-        "pubmed": 1.0,
-        "dialogue": 0.2,
-        "wiki": 0.2,
-        "code": 0.2,
-        "math": 0.2,
-        "docs": 0.2,
-        "math_qa": 1.0,
-        "reasoning": 1.0,
-    }
-
-
 def sample_documents_uniform_by_bucket(
     documents: Sequence[TokenizedDocument],
     *,
@@ -1428,7 +1364,6 @@ class RollingFlatPlanPrefetchProvider:
                 plans: list[PrebuiltFlatBatchPlan] = []
                 for stage in stage_chunk:
                     self.batcher.set_batch_size(stage.batch_size)
-                    self.batcher.set_bucket_weights(stage.bucket_weights)
                     plans.append(
                         PrebuiltFlatBatchPlan(
                             plan=self.batcher.next_batch_plan(),
@@ -1959,7 +1894,6 @@ def _prebuild_process_worker(
     worker_started_at = time.perf_counter()
     for local_index, stage in enumerate(worker_stages):
         worker_batcher.set_batch_size(stage.batch_size)
-        worker_batcher.set_bucket_weights(stage.bucket_weights)
         batch = override_batch_reset(worker_batcher.next_batch(), reset_all=stage.freeze_memory)
         context[local_index].copy_(batch.context)
         target[local_index].copy_(batch.target)
@@ -2006,7 +1940,6 @@ def _prebuild_process_worker_to_file(
     worker_started_at = time.perf_counter()
     for local_index, stage in enumerate(worker_stages):
         worker_batcher.set_batch_size(stage.batch_size)
-        worker_batcher.set_bucket_weights(stage.bucket_weights)
         batch = override_batch_reset(worker_batcher.next_batch(), reset_all=stage.freeze_memory)
         context[local_index].copy_(batch.context)
         target[local_index].copy_(batch.target)
@@ -2072,7 +2005,6 @@ def _rolling_prefetch_worker(
             worker_started_at = time.perf_counter()
             for local_index, stage in enumerate(worker_stages):
                 worker_batcher.set_batch_size(stage.batch_size)
-                worker_batcher.set_bucket_weights(stage.bucket_weights)
                 batch = override_batch_reset(worker_batcher.next_batch(), reset_all=stage.freeze_memory)
                 context[local_index].copy_(batch.context)
                 target[local_index].copy_(batch.target)
@@ -2134,7 +2066,6 @@ def _rolling_file_prefetch_worker(
             worker_started_at = time.perf_counter()
             for local_index, stage in enumerate(worker_stages):
                 worker_batcher.set_batch_size(stage.batch_size)
-                worker_batcher.set_bucket_weights(stage.bucket_weights)
                 batch = override_batch_reset(worker_batcher.next_batch(), reset_all=stage.freeze_memory)
                 context[local_index].copy_(batch.context)
                 target[local_index].copy_(batch.target)
@@ -2229,7 +2160,6 @@ def prebuild_training_batches(
                 stage3_grad_accum_steps=stage3_grad_accum_steps,
             )
             batcher.set_batch_size(stage.batch_size)
-            batcher.set_bucket_weights(stage.bucket_weights)
             if stage.name != last_stage_name:
                 print(
                     f"prebuild_stage | step={step} | stage={stage.name} | span={stage.document_span} | "
@@ -2294,7 +2224,6 @@ def prebuild_flat_batch_plan_blocks(
             stage3_grad_accum_steps=stage3_grad_accum_steps,
         )
         batcher.set_batch_size(stage.batch_size)
-        batcher.set_bucket_weights(stage.bucket_weights)
         if stage.name != last_stage_name:
             print(
                 f"prebuild_index_stage | step={step} | stage={stage.name} | span={stage.document_span} | "
@@ -2556,7 +2485,6 @@ def prebuild_training_batches_parallel(
         try:
             for stage in worker_plan:
                 worker_batcher.set_batch_size(stage.batch_size)
-                worker_batcher.set_bucket_weights(stage.bucket_weights)
                 for _ in range(stage.document_span):
                     worker_batches.append(
                         override_batch_reset(
@@ -4240,7 +4168,6 @@ def resolve_curriculum_stage(
             freeze_skip=True,
             batch_size=max(1, stage1_batch_size),
             grad_accum_steps=max(1, stage1_grad_accum_steps),
-            bucket_weights=resolve_stage_bucket_weights(stage_name="stage1"),
         )
     if stage2_end > 0 and step <= stage2_end:
         return TrainingCurriculumStage(
@@ -4251,7 +4178,6 @@ def resolve_curriculum_stage(
             freeze_skip=True,
             batch_size=max(1, stage2_batch_size),
             grad_accum_steps=max(1, stage2_grad_accum_steps),
-            bucket_weights=resolve_stage_bucket_weights(stage_name="stage2"),
         )
     return TrainingCurriculumStage(
         name="stage3",
@@ -4261,7 +4187,6 @@ def resolve_curriculum_stage(
         freeze_skip=False,
         batch_size=max(1, stage3_batch_size),
         grad_accum_steps=max(1, stage3_grad_accum_steps),
-        bucket_weights=resolve_stage_bucket_weights(stage_name="stage3"),
     )
 
 
@@ -5441,6 +5366,20 @@ def collect_model_internal_stats(model: torch.nn.Module) -> dict[str, float]:
     return {}
 
 
+def _ensure_local_python_dev_headers_for_inductor() -> None:
+    include_root = "/home/dannyahn/.local/opt/python3.12-dev-root/usr/include"
+    include_py = os.path.join(include_root, "python3.12")
+    include_arch = os.path.join(include_root, "x86_64-linux-gnu", "python3.12")
+    paths = [include_root, include_py, include_arch]
+    for name in ("CPATH", "C_INCLUDE_PATH"):
+        existing = [part for part in os.environ.get(name, "").split(":") if part]
+        merged: list[str] = []
+        for path in [*paths, *existing]:
+            if path and path not in merged:
+                merged.append(path)
+        os.environ[name] = ":".join(merged)
+
+
 class Stage1CudaGraphRunner:
     def __init__(
         self,
@@ -5890,7 +5829,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--feed-forward-hidden-mult",
         type=float,
-        default=2.0,
+        default=4.0,
         help="Hidden width multiplier for memory-model FFN blocks.",
     )
     parser.add_argument(
@@ -7379,6 +7318,22 @@ def main() -> None:
         compiler = getattr(torch, "compile", None)
         if compiler is None:
             raise RuntimeError("--compile-model requires torch.compile support.")
+        _ensure_local_python_dev_headers_for_inductor()
+        torch.set_float32_matmul_precision("high")
+        dynamo = getattr(torch, "_dynamo", None)
+        dynamo_config = getattr(dynamo, "config", None) if dynamo is not None else None
+        if dynamo_config is not None:
+            cache_limit = getattr(dynamo_config, "cache_size_limit", None)
+            if isinstance(cache_limit, int) and cache_limit < 32:
+                dynamo_config.cache_size_limit = 32
+        os.environ["JAKAL_NET_LOWRANK_SIGNED_SMOOTHMAX_COMPILE"] = "0"
+        os.environ["JAKAL_NET_MULTIHEAD_SIGNED_SMOOTHMAX_TRITON_FORWARD"] = "0"
+        os.environ["JAKAL_NET_MULTIHEAD_SIGNED_SMOOTHMAX_TRITON_FORWARD_LOWRANK"] = "0"
+        os.environ["JAKAL_NET_MULTIHEAD_SIGNED_SMOOTHMAX_TRITON_BACKWARD"] = "0"
+        os.environ["JAKAL_NET_MULTIHEAD_SIGNED_SMOOTHMAX_TRITON_BACKWARD_LOWRANK"] = "0"
+        os.environ["JAKAL_NET_MULTIHEAD_SIGNED_SMOOTHMAX_TRITON_EDGE_DOT"] = "0"
+        os.environ["JAKAL_NET_MULTIHEAD_SIGNED_SMOOTHMAX_TRITON_DIAGONAL_TILE"] = "0"
+        os.environ["TORCHINDUCTOR_CUDAGRAPHS"] = "0"
         compile_kwargs: dict[str, Any] = {"fullgraph": False}
         if args.compile_mode != "default":
             compile_kwargs["mode"] = args.compile_mode
@@ -7530,9 +7485,7 @@ def main() -> None:
             stage2_grad_accum_steps=stage2_grad_accum_steps,
             stage3_grad_accum_steps=stage3_grad_accum_steps,
         )
-        bucket_weights = stage.bucket_weights
         batcher.set_batch_size(stage.batch_size)
-        batcher.set_bucket_weights(bucket_weights)
         if stage.name != active_stage_name:
             if not args.prebuild_train_batches and int(args.rolling_prefetch_workers) <= 0:
                 prefetcher.close()
@@ -7544,8 +7497,7 @@ def main() -> None:
             print(
                 f"curriculum | step={step} | stage={stage.name} | span={stage.document_span} | "
                 f"batch_size={stage.batch_size} | grad_accum_steps={stage.grad_accum_steps} | "
-                f"freeze_memory={stage.freeze_memory} | freeze_propagation={stage.freeze_propagation} | freeze_skip={stage.freeze_skip} | "
-                f"bucket_weights={{{', '.join(f'{key}:{value:.3f}' for key, value in bucket_weights.items() if value > 0.0)}}}",
+                f"freeze_memory={stage.freeze_memory} | freeze_propagation={stage.freeze_propagation} | freeze_skip={stage.freeze_skip}",
                 flush=True,
             )
 
@@ -7576,12 +7528,18 @@ def main() -> None:
             and should_step_optimizer
             and (next_optimizer_step == 1 or next_optimizer_step % 25 == 0)
             and not args.cuda_graph_stage1
+            and not args.compile_model
         )
         should_trace_step = next_optimizer_step in trace_optimizer_steps
         trace_before_snapshots: dict[str, dict[str, Any]] = {}
         trace_forward_events: list[dict[str, Any]] = []
         set_model_track_stats(model, should_collect_model_stats)
         for span_index in range(stage.document_span):
+            if args.compile_model:
+                compiler_ns = getattr(torch, "compiler", None)
+                mark_step_begin = getattr(compiler_ns, "cudagraph_mark_step_begin", None) if compiler_ns is not None else None
+                if callable(mark_step_begin):
+                    mark_step_begin()
             batch = override_batch_reset(
                 prefetcher.next_batch(),
                 reset_all=stage.freeze_memory,
@@ -7857,10 +7815,8 @@ def main() -> None:
                     )
             for stat_name, stat_value in vi_lion_stats.items():
                 writer.add_scalar(f"train/{stat_name}", stat_value, optimizer_step)
-            for bucket_name, bucket_weight in bucket_weights.items():
-                writer.add_scalar(f"train_bucket_weight/{bucket_name}", bucket_weight, optimizer_step)
             for stat_name, stat_value in model_stats.items():
-                writer.add_scalar(f"train_model/{stat_name}", stat_value, optimizer_step)
+                writer.add_scalar(f"train_model_summary/{stat_name}", stat_value, optimizer_step)
 
         should_print_progress = did_optimizer_step and (
             _print_every_optimizer_step_enabled() or optimizer_step == 1 or optimizer_step % 25 == 0

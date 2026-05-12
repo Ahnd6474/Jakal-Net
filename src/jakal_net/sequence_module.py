@@ -51,7 +51,7 @@ class SModule(nn.Module):
         norm_kind: str = "layernorm",
         propagation_residual_gate_init: float = 1.0,
         feed_forward_layers: bool = True,
-        feed_forward_hidden_mult: float = 2.0,
+        feed_forward_hidden_mult: float = 4.0,
         feed_forward_kind: str = "value",
         feed_forward_residual_scale: float = 1.0,
         feed_forward_learnable_residual_scale: bool = False,
@@ -219,14 +219,21 @@ class SModule(nn.Module):
                 propagation.last_stats = None
 
     def collect_propagation_stats(self) -> dict[str, float]:
-        stats: dict[str, float] = {}
-        for index, block in enumerate(self.sequence_stack.blocks):
-            prefix = f"layer_{index:02d}"
-            stats[f"{prefix}/residual_gate"] = float(block.residual_gate.detach().float().item())
+        metric_values: dict[str, list[float]] = {"residual_gate": []}
+        for block in self.sequence_stack.blocks:
+            metric_values["residual_gate"].append(float(block.residual_gate.detach().float().item()))
             if getattr(block.propagation, "last_stats", None):
                 assert block.propagation.last_stats is not None
                 for key, value in block.propagation.last_stats.items():
-                    stats[f"{prefix}/{key}"] = float(value)
+                    metric_values.setdefault(key, []).append(float(value))
+
+        stats: dict[str, float] = {}
+        for metric_name, values in metric_values.items():
+            if not values:
+                continue
+            tensor_values = torch.tensor(values, dtype=torch.float32)
+            stats[f"{metric_name}/mean"] = float(tensor_values.mean().item())
+            stats[f"{metric_name}/std"] = float(tensor_values.std(unbiased=False).item())
         return stats
 
     @property

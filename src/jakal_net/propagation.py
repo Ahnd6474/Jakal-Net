@@ -140,6 +140,18 @@ def _summarize_edges(
     }
 
 
+def _torch_is_compiling() -> bool:
+    compiler = getattr(torch, "compiler", None)
+    is_compiling = getattr(compiler, "is_compiling", None) if compiler is not None else None
+    if callable(is_compiling):
+        return bool(is_compiling())
+    dynamo = getattr(torch, "_dynamo", None)
+    dynamo_is_compiling = getattr(dynamo, "is_compiling", None) if dynamo is not None else None
+    if callable(dynamo_is_compiling):
+        return bool(dynamo_is_compiling())
+    return False
+
+
 class Propagation(nn.Module):
     def __init__(
         self,
@@ -395,7 +407,7 @@ class Propagation(nn.Module):
         return Propagation._compute_delta_streaming(self, layer)
 
     def compute_delta(self, layer: Layer) -> LayerDelta:
-        if self.track_stats:
+        if self.track_stats and not _torch_is_compiling():
             self._record_stats(layer)
         else:
             self.last_stats = None
@@ -845,7 +857,7 @@ class SparsePropagation(Propagation):
         return self._compute_delta_streaming(layer)
 
     def compute_delta(self, layer: Layer) -> LayerDelta:
-        if self.track_stats:
+        if self.track_stats and not _torch_is_compiling():
             self._record_stats(layer)
         else:
             self.last_stats = None

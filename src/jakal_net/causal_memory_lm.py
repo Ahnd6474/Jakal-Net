@@ -100,7 +100,7 @@ class CausalMemoryLM(nn.Module):
         disable_memory: bool = False,
         disable_memory_read: bool = False,
         disable_memory_propagation: bool = False,
-        feed_forward_hidden_mult: float = 2.0,
+        feed_forward_hidden_mult: float = 4.0,
         feed_forward_kind: str = "value",
         feed_forward_residual_scale: float = 1.0,
         feed_forward_learnable_residual_scale: bool = False,

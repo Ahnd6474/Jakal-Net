@@ -782,6 +782,10 @@ def _causal_tril_mask(nodes: int, device: torch.device) -> Tensor:
     if mask is None or mask.device != device:
         mask = torch.ones((int(nodes), int(nodes)), dtype=torch.bool, device=device).tril()
         _CAUSAL_TRIL_MASK_CACHE[key] = mask
+    compiler = getattr(torch, "compiler", None)
+    is_compiling = getattr(compiler, "is_compiling", None) if compiler is not None else None
+    if callable(is_compiling) and bool(is_compiling()):
+        return mask.clone()
     return mask
 
 
@@ -6489,7 +6493,10 @@ def _low_rank_multihead_signed_smoothmax_causal_dense_gemm_tensors(
     biases: Tensor,
     has_bias: bool,
 ) -> tuple[Tensor, Tensor]:
-    if _lowrank_signed_smoothmax_exact_compile_enabled():
+    compiler = getattr(torch, "compiler", None)
+    is_compiling = getattr(compiler, "is_compiling", None) if compiler is not None else None
+    model_compile_active = bool(is_compiling()) if callable(is_compiling) else False
+    if _lowrank_signed_smoothmax_exact_compile_enabled() and not model_compile_active:
         return _compiled_low_rank_multihead_signed_smoothmax_causal_dense_gemm_tensors()(
             layer_val=layer_val,
             projected_state=projected_state,
