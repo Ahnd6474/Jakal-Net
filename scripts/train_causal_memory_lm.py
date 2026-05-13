@@ -5,7 +5,6 @@ from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from concurrent.futures import as_completed
 from contextlib import nullcontext
-import hashlib
 import json
 import math
 import multiprocessing as mp
@@ -166,6 +165,7 @@ class TrainingCurriculumStage:
     freeze_skip: bool
     batch_size: int = 1
     grad_accum_steps: int = 1
+    bucket_weights: dict[str, float] = field(default_factory=dict, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -780,6 +780,69 @@ def summarize_document_buckets(documents: Sequence[SerializedDocument | Tokenize
     return {bucket: summary[bucket] for bucket in SCHEDULED_BUCKET_ORDER if bucket in summary}
 
 
+def resolve_bucket_weights(*, step: int, total_steps: int) -> dict[str, float]:
+    if total_steps <= 1:
+        progress = 1.0
+    else:
+        progress = max(0.0, min(1.0, (step - 1) / (total_steps - 1)))
+    conditioned_progress = 0.0 if progress <= 0.20 else (progress - 0.20) / 0.80
+    pure_front = 0.20 + 0.80 * ((1.0 - progress) ** 1.5)
+    conditioned_late = conditioned_progress ** 1.5
+    return {
+        "mixed_dialogue": 1.0,
+        "arxiv": 1.0,
+        "pubmed": 1.0,
+        "dialogue": pure_front,
+        "wiki": pure_front,
+        "code": pure_front,
+        "math": pure_front,
+        "docs": pure_front,
+        "math_qa": conditioned_late,
+        "reasoning": conditioned_late,
+    }
+
+
+def resolve_stage_bucket_weights(*, stage_name: str) -> dict[str, float]:
+    if stage_name == "stage1":
+        return {
+            "mixed_dialogue": 1.0,
+            "arxiv": 1.0,
+            "pubmed": 1.0,
+            "dialogue": 1.0,
+            "wiki": 1.0,
+            "code": 1.0,
+            "math": 1.0,
+            "docs": 1.0,
+            "math_qa": 0.0,
+            "reasoning": 0.0,
+        }
+    if stage_name == "stage2":
+        return {
+            "mixed_dialogue": 1.0,
+            "arxiv": 1.0,
+            "pubmed": 1.0,
+            "dialogue": 0.6,
+            "wiki": 0.6,
+            "code": 0.6,
+            "math": 0.6,
+            "docs": 0.6,
+            "math_qa": 0.35,
+            "reasoning": 0.35,
+        }
+    return {
+        "mixed_dialogue": 1.0,
+        "arxiv": 1.0,
+        "pubmed": 1.0,
+        "dialogue": 0.2,
+        "wiki": 0.2,
+        "code": 0.2,
+        "math": 0.2,
+        "docs": 0.2,
+        "math_qa": 1.0,
+        "reasoning": 1.0,
+    }
+
+
 def sample_documents_uniform_by_bucket(
     documents: Sequence[TokenizedDocument],
     *,
@@ -1364,6 +1427,7 @@ class RollingFlatPlanPrefetchProvider:
                 plans: list[PrebuiltFlatBatchPlan] = []
                 for stage in stage_chunk:
                     self.batcher.set_batch_size(stage.batch_size)
+                    self.batcher.set_bucket_weights(stage.bucket_weights)
                     plans.append(
                         PrebuiltFlatBatchPlan(
                             plan=self.batcher.next_batch_plan(),
@@ -1894,6 +1958,7 @@ def _prebuild_process_worker(
     worker_started_at = time.perf_counter()
     for local_index, stage in enumerate(worker_stages):
         worker_batcher.set_batch_size(stage.batch_size)
+        worker_batcher.set_bucket_weights(stage.bucket_weights)
         batch = override_batch_reset(worker_batcher.next_batch(), reset_all=stage.freeze_memory)
         context[local_index].copy_(batch.context)
         target[local_index].copy_(batch.target)
@@ -1940,6 +2005,7 @@ def _prebuild_process_worker_to_file(
     worker_started_at = time.perf_counter()
     for local_index, stage in enumerate(worker_stages):
         worker_batcher.set_batch_size(stage.batch_size)
+        worker_batcher.set_bucket_weights(stage.bucket_weights)
         batch = override_batch_reset(worker_batcher.next_batch(), reset_all=stage.freeze_memory)
         context[local_index].copy_(batch.context)
         target[local_index].copy_(batch.target)
@@ -2005,6 +2071,7 @@ def _rolling_prefetch_worker(
             worker_started_at = time.perf_counter()
             for local_index, stage in enumerate(worker_stages):
                 worker_batcher.set_batch_size(stage.batch_size)
+                worker_batcher.set_bucket_weights(stage.bucket_weights)
                 batch = override_batch_reset(worker_batcher.next_batch(), reset_all=stage.freeze_memory)
                 context[local_index].copy_(batch.context)
                 target[local_index].copy_(batch.target)
@@ -2066,6 +2133,7 @@ def _rolling_file_prefetch_worker(
             worker_started_at = time.perf_counter()
             for local_index, stage in enumerate(worker_stages):
                 worker_batcher.set_batch_size(stage.batch_size)
+                worker_batcher.set_bucket_weights(stage.bucket_weights)
                 batch = override_batch_reset(worker_batcher.next_batch(), reset_all=stage.freeze_memory)
                 context[local_index].copy_(batch.context)
                 target[local_index].copy_(batch.target)
@@ -2160,6 +2228,7 @@ def prebuild_training_batches(
                 stage3_grad_accum_steps=stage3_grad_accum_steps,
             )
             batcher.set_batch_size(stage.batch_size)
+            batcher.set_bucket_weights(stage.bucket_weights)
             if stage.name != last_stage_name:
                 print(
                     f"prebuild_stage | step={step} | stage={stage.name} | span={stage.document_span} | "
@@ -2224,6 +2293,7 @@ def prebuild_flat_batch_plan_blocks(
             stage3_grad_accum_steps=stage3_grad_accum_steps,
         )
         batcher.set_batch_size(stage.batch_size)
+        batcher.set_bucket_weights(stage.bucket_weights)
         if stage.name != last_stage_name:
             print(
                 f"prebuild_index_stage | step={step} | stage={stage.name} | span={stage.document_span} | "
@@ -2485,6 +2555,7 @@ def prebuild_training_batches_parallel(
         try:
             for stage in worker_plan:
                 worker_batcher.set_batch_size(stage.batch_size)
+                worker_batcher.set_bucket_weights(stage.bucket_weights)
                 for _ in range(stage.document_span):
                     worker_batches.append(
                         override_batch_reset(
@@ -4168,6 +4239,7 @@ def resolve_curriculum_stage(
             freeze_skip=True,
             batch_size=max(1, stage1_batch_size),
             grad_accum_steps=max(1, stage1_grad_accum_steps),
+            bucket_weights=resolve_stage_bucket_weights(stage_name="stage1"),
         )
     if stage2_end > 0 and step <= stage2_end:
         return TrainingCurriculumStage(
@@ -4178,6 +4250,7 @@ def resolve_curriculum_stage(
             freeze_skip=True,
             batch_size=max(1, stage2_batch_size),
             grad_accum_steps=max(1, stage2_grad_accum_steps),
+            bucket_weights=resolve_stage_bucket_weights(stage_name="stage2"),
         )
     return TrainingCurriculumStage(
         name="stage3",
@@ -4187,7 +4260,45 @@ def resolve_curriculum_stage(
         freeze_skip=False,
         batch_size=max(1, stage3_batch_size),
         grad_accum_steps=max(1, stage3_grad_accum_steps),
+        bucket_weights=resolve_stage_bucket_weights(stage_name="stage3"),
     )
+
+
+def count_optimizer_steps(
+    *,
+    total_steps: int,
+    stage1_ratio: float,
+    stage2_ratio: float,
+    stage1_span: int = 1,
+    stage2_span: int = 1,
+    stage3_span: int = 1,
+    stage1_batch_size: int = 1,
+    stage2_batch_size: int = 1,
+    stage3_batch_size: int = 1,
+    stage1_grad_accum_steps: int = 1,
+    stage2_grad_accum_steps: int = 1,
+    stage3_grad_accum_steps: int = 1,
+) -> int:
+    optimizer_steps = 0
+    for step in range(1, total_steps + 1):
+        stage = resolve_curriculum_stage(
+            step=step,
+            total_steps=total_steps,
+            stage1_ratio=stage1_ratio,
+            stage2_ratio=stage2_ratio,
+            stage1_span=stage1_span,
+            stage2_span=stage2_span,
+            stage3_span=stage3_span,
+            stage1_batch_size=stage1_batch_size,
+            stage2_batch_size=stage2_batch_size,
+            stage3_batch_size=stage3_batch_size,
+            stage1_grad_accum_steps=stage1_grad_accum_steps,
+            stage2_grad_accum_steps=stage2_grad_accum_steps,
+            stage3_grad_accum_steps=stage3_grad_accum_steps,
+        )
+        if step % stage.grad_accum_steps == 0 or step == total_steps:
+            optimizer_steps += 1
+    return optimizer_steps
 
 
 def apply_training_curriculum(model: torch.nn.Module, stage: TrainingCurriculumStage) -> None:
@@ -4339,175 +4450,6 @@ def compute_learning_rate(
     progress = max(0.0, min(1.0, (step - warmup_steps) / denom))
     cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
     return base_lr * (min_ratio + (1.0 - min_ratio) * cosine)
-
-
-def estimate_total_optimizer_steps(
-    *,
-    total_micro_steps: int,
-    stage1_ratio: float,
-    stage2_ratio: float,
-    stage1_span: int = 1,
-    stage2_span: int = 1,
-    stage3_span: int = 1,
-    stage1_batch_size: int = 1,
-    stage2_batch_size: int = 1,
-    stage3_batch_size: int = 1,
-    stage1_grad_accum_steps: int = 1,
-    stage2_grad_accum_steps: int = 1,
-    stage3_grad_accum_steps: int = 1,
-) -> int:
-    optimizer_steps = 0
-    for micro_step in range(1, max(1, int(total_micro_steps)) + 1):
-        stage = resolve_curriculum_stage(
-            step=micro_step,
-            total_steps=total_micro_steps,
-            stage1_ratio=stage1_ratio,
-            stage2_ratio=stage2_ratio,
-            stage1_span=stage1_span,
-            stage2_span=stage2_span,
-            stage3_span=stage3_span,
-            stage1_batch_size=stage1_batch_size,
-            stage2_batch_size=stage2_batch_size,
-            stage3_batch_size=stage3_batch_size,
-            stage1_grad_accum_steps=stage1_grad_accum_steps,
-            stage2_grad_accum_steps=stage2_grad_accum_steps,
-            stage3_grad_accum_steps=stage3_grad_accum_steps,
-        )
-        if micro_step % stage.grad_accum_steps == 0 or micro_step == total_micro_steps:
-            optimizer_steps += 1
-    return max(1, optimizer_steps)
-
-
-def _parse_trace_optimizer_steps_env() -> set[int]:
-    raw = os.environ.get("JAKAL_REPRO_TRACE_OPT_STEPS", "").strip()
-    if not raw:
-        return set()
-    result: set[int] = set()
-    for part in raw.split(","):
-        token = part.strip()
-        if not token:
-            continue
-        if "-" in token:
-            start_str, end_str = token.split("-", 1)
-            start = int(start_str)
-            end = int(end_str)
-            if end < start:
-                start, end = end, start
-            result.update(range(max(1, start), max(1, end) + 1))
-        else:
-            value = int(token)
-            if value > 0:
-                result.add(value)
-    return result
-
-
-def _print_every_optimizer_step_enabled() -> bool:
-    raw = os.environ.get("JAKAL_PRINT_EVERY_OPT_STEP", "").strip().lower()
-    if not raw:
-        return False
-    return raw not in {"0", "false", "no", "off"}
-
-
-def _trace_param_limit_from_env(default: int = 4) -> int:
-    raw = os.environ.get("JAKAL_REPRO_TRACE_PARAM_LIMIT", "").strip()
-    if not raw:
-        return default
-    try:
-        return max(1, int(raw))
-    except ValueError:
-        return default
-
-
-def _tensor_trace_hash(tensor: torch.Tensor, *, sample_elements: int = 2048) -> str:
-    detached = tensor.detach()
-    flat = detached.reshape(-1)
-    if flat.numel() > sample_elements:
-        flat = flat[:sample_elements]
-    cpu = flat.to(device="cpu").contiguous()
-    digest = hashlib.sha1()
-    digest.update(str(detached.dtype).encode("utf-8"))
-    digest.update(str(tuple(detached.shape)).encode("utf-8"))
-    digest.update(cpu.numpy().tobytes())
-    return digest.hexdigest()[:16]
-
-
-def _batch_trace_hash(batch: DocumentBatch) -> str:
-    digest = hashlib.sha1()
-    for tensor in (batch.context, batch.target, batch.loss_mask, batch.reset_mask):
-        digest.update(_tensor_trace_hash(tensor).encode("utf-8"))
-    return digest.hexdigest()[:16]
-
-
-def _select_trace_parameter_names(
-    named_parameters: Sequence[tuple[str, torch.nn.Parameter]],
-    *,
-    limit: int,
-) -> tuple[str, ...]:
-    selected: list[str] = []
-    for name, parameter in sorted(named_parameters, key=lambda item: item[0]):
-        if not parameter.requires_grad or parameter.numel() <= 0 or not parameter.is_floating_point():
-            continue
-        selected.append(name)
-        if len(selected) >= limit:
-            break
-    return tuple(selected)
-
-
-def _snapshot_trace_parameter(
-    parameter: torch.nn.Parameter,
-    *,
-    sample_elements: int = 4096,
-) -> dict[str, Any]:
-    detached = parameter.detach()
-    flat = detached.reshape(-1)
-    if flat.numel() > sample_elements:
-        flat = flat[:sample_elements]
-    sample = flat.to(device="cpu").clone()
-    return {
-        "sample": sample,
-        "full_norm": float(torch.linalg.vector_norm(detached.to(dtype=torch.float64)).item()),
-        "sample_hash": _tensor_trace_hash(sample),
-    }
-
-
-def _capture_trace_parameter_snapshots(
-    named_parameters: Sequence[tuple[str, torch.nn.Parameter]],
-    parameter_names: Sequence[str],
-) -> dict[str, dict[str, Any]]:
-    selected = set(parameter_names)
-    snapshots: dict[str, dict[str, Any]] = {}
-    for name, parameter in named_parameters:
-        if name not in selected:
-            continue
-        snapshots[name] = _snapshot_trace_parameter(parameter)
-    return snapshots
-
-
-def _summarize_trace_parameter_deltas(
-    *,
-    named_parameters: Sequence[tuple[str, torch.nn.Parameter]],
-    before_snapshots: dict[str, dict[str, Any]],
-) -> list[dict[str, Any]]:
-    summaries: list[dict[str, Any]] = []
-    for name, parameter in named_parameters:
-        before = before_snapshots.get(name)
-        if before is None:
-            continue
-        after = _snapshot_trace_parameter(parameter)
-        before_sample = before["sample"]
-        after_sample = after["sample"]
-        delta_sample_norm = float(torch.linalg.vector_norm((after_sample - before_sample).to(dtype=torch.float64)).item())
-        summaries.append(
-            {
-                "name": name,
-                "before_norm": before["full_norm"],
-                "after_norm": after["full_norm"],
-                "before_hash": before["sample_hash"],
-                "after_hash": after["sample_hash"],
-                "delta_sample_norm": delta_sample_norm,
-            }
-        )
-    return summaries
 
 
 def compute_decayed_scalar(
@@ -5366,20 +5308,6 @@ def collect_model_internal_stats(model: torch.nn.Module) -> dict[str, float]:
     return {}
 
 
-def _ensure_local_python_dev_headers_for_inductor() -> None:
-    include_root = "/home/dannyahn/.local/opt/python3.12-dev-root/usr/include"
-    include_py = os.path.join(include_root, "python3.12")
-    include_arch = os.path.join(include_root, "x86_64-linux-gnu", "python3.12")
-    paths = [include_root, include_py, include_arch]
-    for name in ("CPATH", "C_INCLUDE_PATH"):
-        existing = [part for part in os.environ.get(name, "").split(":") if part]
-        merged: list[str] = []
-        for path in [*paths, *existing]:
-            if path and path not in merged:
-                merged.append(path)
-        os.environ[name] = ":".join(merged)
-
-
 class Stage1CudaGraphRunner:
     def __init__(
         self,
@@ -5668,6 +5596,8 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     rnn_aux_optimizer: torch.optim.Optimizer | None,
     step: int,
+    micro_step: int | None,
+    optimizer_step: int | None,
     args: argparse.Namespace,
     train_loss: float,
     val_loss: float | None,
@@ -5689,6 +5619,8 @@ def save_checkpoint(
             "rnn_aux_optimizer_state_dict": None if rnn_aux_optimizer is None else rnn_aux_optimizer.state_dict(),
             "rnn_aux_state_dict": None if rnn_aux_head is None else rnn_aux_head.state_dict(),
             "step": step,
+            "micro_step": micro_step,
+            "optimizer_step": optimizer_step,
             "args": vars(args),
             "train_loss": train_loss,
             "val_loss": val_loss,
@@ -5829,7 +5761,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--feed-forward-hidden-mult",
         type=float,
-        default=4.0,
+        default=2.0,
         help="Hidden width multiplier for memory-model FFN blocks.",
     )
     parser.add_argument(
@@ -6794,8 +6726,8 @@ def main() -> None:
         )
         print(f"hf_embedding_dim | source={hf_dim_source} | dim={args.dim}", flush=True)
     total_steps = max(1, int(math.ceil(steps_per_epoch * args.epochs)))
-    total_optimizer_steps = estimate_total_optimizer_steps(
-        total_micro_steps=total_steps,
+    total_optimizer_steps = count_optimizer_steps(
+        total_steps=total_steps,
         stage1_ratio=args.curriculum_stage1_ratio,
         stage2_ratio=args.curriculum_stage2_ratio,
         stage1_span=args.curriculum_stage1_span,
@@ -7194,7 +7126,6 @@ def main() -> None:
                     "forced_unit_norm_policy": forced_unit_norm_policy,
                     "forced_document_span_policy": forced_document_span_policy,
                     "lowrank_lion_default_schedule_applied": lowrank_lion_default_schedule_applied,
-                    "repro_trace_optimizer_steps": sorted(_parse_trace_optimizer_steps_env()),
                 },
                 "tokenizer_label": tokenizer_label,
                 "tokenizer_model_path": tokenizer_model_path,
@@ -7271,14 +7202,15 @@ def main() -> None:
     train_memory_state: tuple[Any, ...] | None = None
     active_stage_name: str | None = None
     start_step = 0
-    optimizer_step = 0
+    start_optimizer_step = 0
     best_val_loss = float("inf")
     if args.resume_checkpoint:
         checkpoint_path = Path(args.resume_checkpoint)
         checkpoint = load_checkpoint(checkpoint_path, device=device)
         unwrap_model(model).load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        start_step = int(checkpoint.get("step", 0))
+        start_step = int(checkpoint.get("micro_step", checkpoint.get("step", 0)))
+        start_optimizer_step = int(checkpoint.get("optimizer_step", checkpoint.get("step", 0)))
         checkpoint_val_loss = checkpoint.get("val_loss")
         if checkpoint_val_loss is not None:
             best_val_loss = float(checkpoint_val_loss)
@@ -7303,7 +7235,7 @@ def main() -> None:
                     if isinstance(state, torch.Tensor)
                 ])
         print(
-            f"resumed_checkpoint | path={checkpoint_path} | step={start_step} | "
+            f"resumed_checkpoint | path={checkpoint_path} | micro_step={start_step} | optimizer_step={start_optimizer_step} | "
             f"train_loss={checkpoint.get('train_loss')} | val_loss={checkpoint.get('val_loss')}",
             flush=True,
         )
@@ -7313,27 +7245,10 @@ def main() -> None:
                 "memory state, batcher state, and RNG are reset per rank",
                 flush=True,
             )
-        optimizer_step = start_step
     if args.compile_model:
         compiler = getattr(torch, "compile", None)
         if compiler is None:
             raise RuntimeError("--compile-model requires torch.compile support.")
-        _ensure_local_python_dev_headers_for_inductor()
-        torch.set_float32_matmul_precision("high")
-        dynamo = getattr(torch, "_dynamo", None)
-        dynamo_config = getattr(dynamo, "config", None) if dynamo is not None else None
-        if dynamo_config is not None:
-            cache_limit = getattr(dynamo_config, "cache_size_limit", None)
-            if isinstance(cache_limit, int) and cache_limit < 32:
-                dynamo_config.cache_size_limit = 32
-        os.environ["JAKAL_NET_LOWRANK_SIGNED_SMOOTHMAX_COMPILE"] = "0"
-        os.environ["JAKAL_NET_MULTIHEAD_SIGNED_SMOOTHMAX_TRITON_FORWARD"] = "0"
-        os.environ["JAKAL_NET_MULTIHEAD_SIGNED_SMOOTHMAX_TRITON_FORWARD_LOWRANK"] = "0"
-        os.environ["JAKAL_NET_MULTIHEAD_SIGNED_SMOOTHMAX_TRITON_BACKWARD"] = "0"
-        os.environ["JAKAL_NET_MULTIHEAD_SIGNED_SMOOTHMAX_TRITON_BACKWARD_LOWRANK"] = "0"
-        os.environ["JAKAL_NET_MULTIHEAD_SIGNED_SMOOTHMAX_TRITON_EDGE_DOT"] = "0"
-        os.environ["JAKAL_NET_MULTIHEAD_SIGNED_SMOOTHMAX_TRITON_DIAGONAL_TILE"] = "0"
-        os.environ["TORCHINDUCTOR_CUDAGRAPHS"] = "0"
         compile_kwargs: dict[str, Any] = {"fullgraph": False}
         if args.compile_mode != "default":
             compile_kwargs["mode"] = args.compile_mode
@@ -7414,30 +7329,23 @@ def main() -> None:
         )
     optimizer.zero_grad(set_to_none=True)
     start_time = time.time()
+    optimizer_step = start_optimizer_step
+    consumed_batches = 0
+    total_batch_wait_seconds = 0.0
     grad_clip_parameters = list(model.parameters())
     grad_clip_named_parameters = [
         (parameter_name, parameter)
         for parameter_name, parameter in model.named_parameters()
         if parameter.requires_grad
     ]
-    trace_optimizer_steps = _parse_trace_optimizer_steps_env()
-    trace_param_names = _select_trace_parameter_names(
-        grad_clip_named_parameters,
-        limit=_trace_param_limit_from_env(),
-    )
-    trace_path = run_dir / "repro_trace.jsonl"
-    if trace_optimizer_steps and is_main_process:
-        print(
-            f"repro_trace | optimizer_steps={sorted(trace_optimizer_steps)} | "
-            f"params={list(trace_param_names)} | path={trace_path}",
-            flush=True,
-        )
     stage1_cuda_graph_runner: Stage1CudaGraphRunner | Stage1ForwardCudaGraphRunner | None = None
 
     def save_training_checkpoint(
         path: Path,
         *,
         step: int,
+        micro_step: int,
+        optimizer_step: int,
         train_loss: float,
         val_loss: float | None,
     ) -> None:
@@ -7454,6 +7362,8 @@ def main() -> None:
             optimizer=optimizer,
             rnn_aux_optimizer=None,
             step=step,
+            micro_step=micro_step,
+            optimizer_step=optimizer_step,
             args=args,
             train_loss=train_loss,
             val_loss=val_loss,
@@ -7467,7 +7377,7 @@ def main() -> None:
             cuda_rng_state=(torch.cuda.get_rng_state_all() if device.type == "cuda" else None),
         )
         if not args.prebuild_train_batches:
-            prefetcher = create_live_batch_provider(start_step_value=step)
+            prefetcher = create_live_batch_provider(start_step_value=micro_step)
 
     for step in range(start_step + 1, total_steps + 1):
         stage = resolve_curriculum_stage(
@@ -7485,7 +7395,9 @@ def main() -> None:
             stage2_grad_accum_steps=stage2_grad_accum_steps,
             stage3_grad_accum_steps=stage3_grad_accum_steps,
         )
+        bucket_weights = stage.bucket_weights
         batcher.set_batch_size(stage.batch_size)
+        batcher.set_bucket_weights(bucket_weights)
         if stage.name != active_stage_name:
             if not args.prebuild_train_batches and int(args.rolling_prefetch_workers) <= 0:
                 prefetcher.close()
@@ -7497,16 +7409,14 @@ def main() -> None:
             print(
                 f"curriculum | step={step} | stage={stage.name} | span={stage.document_span} | "
                 f"batch_size={stage.batch_size} | grad_accum_steps={stage.grad_accum_steps} | "
-                f"freeze_memory={stage.freeze_memory} | freeze_propagation={stage.freeze_propagation} | freeze_skip={stage.freeze_skip}",
+                f"freeze_memory={stage.freeze_memory} | freeze_propagation={stage.freeze_propagation} | freeze_skip={stage.freeze_skip} | "
+                f"bucket_weights={{{', '.join(f'{key}:{value:.3f}' for key, value in bucket_weights.items() if value > 0.0)}}}",
                 flush=True,
             )
 
-        should_step_optimizer = step % stage.grad_accum_steps == 0 or step == total_steps
-        next_optimizer_step = optimizer_step + 1 if should_step_optimizer else optimizer_step
-        pending_optimizer_step = optimizer_step + 1
         lr = compute_learning_rate(
-            step=pending_optimizer_step,
-            total_steps=total_optimizer_steps,
+            step=step,
+            total_steps=total_steps,
             base_lr=args.learning_rate,
             warmup_start_lr=args.warmup_start_lr,
             warmup_steps=args.warmup_steps,
@@ -7525,25 +7435,18 @@ def main() -> None:
         should_collect_model_stats = (
             writer is not None
             and args.model_kind == "causal_memory"
-            and should_step_optimizer
-            and (next_optimizer_step == 1 or next_optimizer_step % 25 == 0)
+            and (step == 1 or step % 25 == 0)
             and not args.cuda_graph_stage1
-            and not args.compile_model
         )
-        should_trace_step = next_optimizer_step in trace_optimizer_steps
-        trace_before_snapshots: dict[str, dict[str, Any]] = {}
-        trace_forward_events: list[dict[str, Any]] = []
         set_model_track_stats(model, should_collect_model_stats)
         for span_index in range(stage.document_span):
-            if args.compile_model:
-                compiler_ns = getattr(torch, "compiler", None)
-                mark_step_begin = getattr(compiler_ns, "cudagraph_mark_step_begin", None) if compiler_ns is not None else None
-                if callable(mark_step_begin):
-                    mark_step_begin()
+            batch_wait_started_at = time.perf_counter()
             batch = override_batch_reset(
                 prefetcher.next_batch(),
                 reset_all=stage.freeze_memory,
             )
+            total_batch_wait_seconds += time.perf_counter() - batch_wait_started_at
+            consumed_batches += 1
             use_stage1_cuda_graph = (
                 args.cuda_graph_stage1
                 and device.type == "cuda"
@@ -7609,19 +7512,6 @@ def main() -> None:
             span_losses.append(main_loss_value)
             last_span_loss_tensor = loss
             current_memory_state = None if stage.freeze_memory else next_memory_state
-            if should_trace_step and is_main_process:
-                trace_forward_events.append(
-                    {
-                        "event": "forward",
-                        "optimizer_step": pending_optimizer_step,
-                        "micro_step": step,
-                        "span_index": span_index,
-                        "stage": stage.name,
-                        "batch_hash": _batch_trace_hash(batch),
-                        "loss": float(loss.detach().float().item()),
-                        "main_loss": float(main_loss_value),
-                    }
-                )
 
         if loss_is_finite and last_span_loss_tensor is not None and not used_cuda_graph:
             total_span_loss = last_span_loss_tensor / stage.grad_accum_steps
@@ -7647,9 +7537,9 @@ def main() -> None:
         if should_collect_model_stats:
             set_model_track_stats(model, False)
 
+        should_step_optimizer = step % stage.grad_accum_steps == 0 or step == total_steps
         grad_group_diagnostics: dict[str, dict[str, float | int]] = {}
-        preclip_grad_norm = float("nan")
-        postclip_grad_norm = float("nan")
+        did_optimizer_step = False
         if loss_is_finite and should_step_optimizer:
             if scaler is not None:
                 scaler.unscale_(optimizer)
@@ -7668,26 +7558,20 @@ def main() -> None:
                     grad_clip_named_parameters,
                     lr=lr,
                 )
-            if should_trace_step and is_main_process:
-                trace_before_snapshots = _capture_trace_parameter_snapshots(
-                    grad_clip_named_parameters,
-                    trace_param_names,
-                )
             try:
                 if args.fast_grad_clip:
-                    preclip_grad_norm = clip_grad_norm_fast(
+                    grad_norm = clip_grad_norm_fast(
                         grad_clip_parameters,
                         args.grad_clip,
                     )
-                    if not math.isfinite(preclip_grad_norm):
+                    if not math.isfinite(grad_norm):
                         raise RuntimeError("non-finite grad norm before clipping")
-                    grad_norm = preclip_grad_norm
                 else:
-                    preclip_grad_norm = compute_grad_norm_float64(grad_clip_parameters)
+                    grad_norm = compute_grad_norm_float64(grad_clip_parameters)
                     if (
                         args.diagnose_nonfinite_grad
-                        and math.isfinite(preclip_grad_norm)
-                        and preclip_grad_norm >= 1.0e6
+                        and math.isfinite(grad_norm)
+                        and grad_norm >= 1.0e6
                     ):
                         gradient_extremes = summarize_gradient_extremes(
                             grad_clip_named_parameters,
@@ -7695,7 +7579,7 @@ def main() -> None:
                         )
                         if gradient_extremes:
                             print(
-                                f"diagnose_large_grad_preclip | step={step} | grad_norm={preclip_grad_norm:.6g} | "
+                                f"diagnose_large_grad_preclip | step={step} | grad_norm={grad_norm:.6g} | "
                                 + " | ".join(gradient_extremes),
                                 flush=True,
                             )
@@ -7703,8 +7587,6 @@ def main() -> None:
                         grad_clip_parameters,
                         args.grad_clip,
                     )
-                if should_trace_step and is_main_process:
-                    postclip_grad_norm = compute_grad_norm_float64(grad_clip_parameters)
             except RuntimeError as exc:
                 grad_norm = float("nan")
                 print(f"warning | step={step} | non-finite grad norm; skipping optimizer step | {exc}", flush=True)
@@ -7750,7 +7632,8 @@ def main() -> None:
                 else:
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-                optimizer_step = next_optimizer_step
+                optimizer_step += 1
+                did_optimizer_step = True
         else:
             grad_norm = float("nan")
 
@@ -7758,7 +7641,10 @@ def main() -> None:
         train_aux_loss = 0.0
         avg_rnn_batch_seconds = 0.0
         rnn_prefetch_queue_size = 0
-        avg_cpu_batch_seconds, prefetch_queue_size = prefetcher.stats()
+        avg_provider_batch_seconds, prefetch_queue_size = prefetcher.stats()
+        avg_batch_wait_seconds = (
+            total_batch_wait_seconds / consumed_batches if consumed_batches > 0 else 0.0
+        )
         vi_lion_stats: dict[str, float] = {}
         for param_group in optimizer.param_groups:
             if "vi_last_scale" not in param_group:
@@ -7776,36 +7662,19 @@ def main() -> None:
                 if isinstance(stat_value, torch.Tensor):
                     vi_lion_stats[history_key] = float(stat_value.detach().float().cpu().item())
             break
-        did_optimizer_step = loss_is_finite and should_step_optimizer and not math.isnan(grad_norm)
-        if should_trace_step and is_main_process:
-            for trace_event in trace_forward_events:
-                append_jsonl(trace_path, trace_event)
-            if should_step_optimizer:
-                trace_payload: dict[str, Any] = {
-                    "event": "optimizer_step",
-                    "optimizer_step": pending_optimizer_step,
-                    "micro_step": step,
-                    "stage": stage.name,
-                    "lr": lr,
-                    "did_optimizer_step": did_optimizer_step,
-                    "train_loss": train_loss,
-                    "preclip_grad_norm": preclip_grad_norm,
-                    "logged_grad_norm": grad_norm,
-                    "postclip_grad_norm": postclip_grad_norm,
-                }
-                if trace_before_snapshots:
-                    trace_payload["parameter_deltas"] = _summarize_trace_parameter_deltas(
-                        named_parameters=grad_clip_named_parameters,
-                        before_snapshots=trace_before_snapshots,
-                    )
-                append_jsonl(trace_path, trace_payload)
         if writer is not None and did_optimizer_step:
             writer.add_scalar("train/loss", train_loss, optimizer_step)
             writer.add_scalar("train/lr", lr, optimizer_step)
             writer.add_scalar("train/document_span", stage.document_span, optimizer_step)
-            writer.add_scalar("train/cpu_batch_ms", avg_cpu_batch_seconds * 1000.0, optimizer_step)
+            writer.add_scalar("train/cpu_batch_ms", avg_batch_wait_seconds * 1000.0, optimizer_step)
+            writer.add_scalar(
+                "train/provider_batch_build_ms",
+                avg_provider_batch_seconds * 1000.0,
+                optimizer_step,
+            )
             writer.add_scalar("train/prefetch_queue_size", prefetch_queue_size, optimizer_step)
-            writer.add_scalar("train/grad_norm", grad_norm, optimizer_step)
+            if not math.isnan(grad_norm):
+                writer.add_scalar("train/grad_norm", grad_norm, optimizer_step)
             for group_name, group_stats in grad_group_diagnostics.items():
                 for stat_name, stat_value in group_stats.items():
                     writer.add_scalar(
@@ -7815,12 +7684,12 @@ def main() -> None:
                     )
             for stat_name, stat_value in vi_lion_stats.items():
                 writer.add_scalar(f"train/{stat_name}", stat_value, optimizer_step)
+            for bucket_name, bucket_weight in bucket_weights.items():
+                writer.add_scalar(f"train_bucket_weight/{bucket_name}", bucket_weight, optimizer_step)
             for stat_name, stat_value in model_stats.items():
-                writer.add_scalar(f"train_model_summary/{stat_name}", stat_value, optimizer_step)
+                writer.add_scalar(f"train_model/{stat_name}", stat_value, optimizer_step)
 
-        should_print_progress = did_optimizer_step and (
-            _print_every_optimizer_step_enabled() or optimizer_step == 1 or optimizer_step % 25 == 0
-        )
+        should_print_progress = did_optimizer_step and (optimizer_step == 1 or optimizer_step % 25 == 0)
         if should_print_progress and is_main_process:
             elapsed = time.time() - start_time
             vi_lion_progress = ""
@@ -7833,10 +7702,12 @@ def main() -> None:
                     f" | vi_ratio={vi_lion_stats.get('vi_grad_rms_ratio', float('nan')):.3g}"
                 )
             print(
-                f"progress | step={optimizer_step:5d}/{total_optimizer_steps} | micro_step={step:5d}/{total_steps} | "
+                f"progress | opt_step={optimizer_step:5d}/{total_optimizer_steps} | micro_step={step:5d}/{total_steps} | "
                 f"stage={stage.name} | span={stage.document_span} | "
                 f"train_loss={train_loss:.4f} | lr={lr:.6g} | "
-                f"cpu_batch_ms={avg_cpu_batch_seconds * 1000.0:.1f} | prefetch_q={prefetch_queue_size} | "
+                f"cpu_batch_ms={avg_batch_wait_seconds * 1000.0:.1f} | "
+                f"provider_batch_ms={avg_provider_batch_seconds * 1000.0:.1f} | "
+                f"prefetch_q={prefetch_queue_size} | "
                 f"elapsed={elapsed:.1f}s{vi_lion_progress}",
                 flush=True,
             )
@@ -7883,7 +7754,7 @@ def main() -> None:
                 )
             val_ppl = perplexity_from_loss(val_loss)
             print(
-                f"eval | step={optimizer_step} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
+                f"eval | opt_step={optimizer_step} | micro_step={step} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
                 f"val_ppl={val_ppl:.2f}",
                 flush=True,
             )
@@ -7927,45 +7798,52 @@ def main() -> None:
                 save_training_checkpoint(
                     checkpoints_dir / "best.pt",
                     step=optimizer_step,
+                    micro_step=step,
+                    optimizer_step=optimizer_step,
                     train_loss=train_loss,
                     val_loss=val_loss,
                 )
                 if is_main_process:
                     write_json(
                         checkpoints_dir / "best.json",
-                        {"step": optimizer_step, "train_loss": train_loss, "val_loss": val_loss},
+                        {"step": optimizer_step, "micro_step": step, "train_loss": train_loss, "val_loss": val_loss},
                     )
 
         if is_main_process and did_optimizer_step and (
-            optimizer_step == total_optimizer_steps
-            or optimizer_step % args.checkpoint_interval == 0
+            optimizer_step == total_optimizer_steps or optimizer_step % args.checkpoint_interval == 0
         ):
             save_training_checkpoint(
                 checkpoints_dir / "last.pt",
                 step=optimizer_step,
+                micro_step=step,
+                optimizer_step=optimizer_step,
                 train_loss=train_loss,
                 val_loss=val_loss,
             )
             write_json(
                 checkpoints_dir / "last.json",
-                {"step": optimizer_step, "train_loss": train_loss, "val_loss": val_loss},
+                {"step": optimizer_step, "micro_step": step, "train_loss": train_loss, "val_loss": val_loss},
             )
 
-        row = {
-            "step": optimizer_step,
-            "micro_step": step,
-            "stage": stage.name,
-            "document_span": stage.document_span,
-            "train_loss": train_loss,
-            "grad_norm": grad_norm,
-            "lr": lr,
-            "val_loss": val_loss,
-            "val_ppl": None if val_loss is None else perplexity_from_loss(val_loss),
-        }
-        if grad_group_diagnostics:
-            row["grad_group_diagnostics"] = grad_group_diagnostics
-        row.update(vi_lion_stats)
         if is_main_process and did_optimizer_step:
+            row = {
+                "step": optimizer_step,
+                "micro_step": step,
+                "optimizer_step": optimizer_step,
+                "stage": stage.name,
+                "document_span": stage.document_span,
+                "train_loss": train_loss,
+                "grad_norm": grad_norm,
+                "lr": lr,
+                "cpu_batch_ms": avg_batch_wait_seconds * 1000.0,
+                "provider_batch_build_ms": avg_provider_batch_seconds * 1000.0,
+                "prefetch_queue_size": prefetch_queue_size,
+                "val_loss": val_loss,
+                "val_ppl": None if val_loss is None else perplexity_from_loss(val_loss),
+            }
+            if grad_group_diagnostics:
+                row["grad_group_diagnostics"] = grad_group_diagnostics
+            row.update(vi_lion_stats)
             history_rows.append(row)
             append_jsonl(run_dir / "history.jsonl", row)
 

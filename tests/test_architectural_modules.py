@@ -56,7 +56,7 @@ class ArchitecturalModuleTests(unittest.TestCase):
         self.assertEqual(layer.state.shape, (2, 6))
         self.assertEqual(layer.val.shape, (2, 6, 8))
         self.assertAlmostEqual(
-            float(s_module.sequence_stack.blocks[0].residual_gate.detach().item()),
+            float(s_module.sequence_stack.blocks[0].residual_scale.detach().item()),
             1.0,
         )
 
@@ -206,7 +206,9 @@ class ArchitecturalModuleTests(unittest.TestCase):
             norm=norm,
             ffn=nn.Identity(),
             unit_norm_values=False,
-            residual_gate_init=1.0,
+            state_activation_kind="signed_softmax",
+            residual_scale_style="rezero",
+            residual_scale_init=1.0,
         )
 
         actual = propagation_layer(layer)
@@ -230,7 +232,9 @@ class ArchitecturalModuleTests(unittest.TestCase):
             norm=norm,
             ffn=nn.Identity(),
             unit_norm_values=False,
-            residual_gate_init=1.0,
+            state_activation_kind="signed_softmax",
+            residual_scale_style="rezero",
+            residual_scale_init=1.0,
         )
 
         actual = propagation_layer(layer)

@@ -6,7 +6,7 @@ import torch
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
-from jakal_net._architectural_common import apply_delta, normalize_state, softsign_state
+from jakal_net._architectural_common import apply_delta, signed_softmax_state, softsign_state
 from jakal_net.core import Layer, LayerDelta
 from jakal_net.modules import ResidualFeedForward, StateValueFeedForward
 from jakal_net.propagation import SparsePropagation
@@ -22,8 +22,6 @@ def make_propagation_ffn(
     learnable_residual_scale: bool,
     zero_init_output: bool,
     activation: str,
-    norm_kind: str = "layernorm",
-    use_input_norm: bool = True,
 ) -> nn.Module:
     if not enabled:
         return nn.Identity()
@@ -35,8 +33,6 @@ def make_propagation_ffn(
             learnable_residual_scale=learnable_residual_scale,
             zero_init_output=zero_init_output,
             activation=activation,
-            norm_kind=norm_kind,
-            use_input_norm=use_input_norm,
         )
     return ResidualFeedForward(
         dim,
@@ -44,8 +40,6 @@ def make_propagation_ffn(
         residual_scale=residual_scale,
         learnable_residual_scale=learnable_residual_scale,
         activation=activation,
-        norm_kind=norm_kind,
-        use_input_norm=use_input_norm,
     )
 
 
@@ -59,19 +53,19 @@ def apply_dense_delta_fastpath(
     layer: Layer,
     delta_state: Tensor,
     delta_val: Tensor,
+    norm: nn.Module,
     *,
-    norm: nn.Module | None,
     unit_norm_values: bool,
-    state_activation_kind: str | None = None,
 ) -> Layer:
-    next_val = layer.val + delta_val
-    if norm is not None and not isinstance(norm, nn.Identity):
-        next_val = norm(next_val)
-    if state_activation_kind is None:
-        state_activation_kind = "softsign" if unit_norm_values else "signed_softmax"
+    updated_val = layer.val + delta_val
+    val = norm(updated_val)
+    touched = delta_val.detach().abs().amax(dim=-1) > 0
+    val = torch.where(touched.unsqueeze(-1), val, updated_val)
     return layer.with_tensors(
-        state=normalize_state(layer.state + delta_state, activation_kind=state_activation_kind),
-        val=next_val,
+        state=softsign_state(layer.state + delta_state)
+        if unit_norm_values
+        else signed_softmax_state(layer.state + delta_state),
+        val=val,
     )
 
 
@@ -80,13 +74,11 @@ def apply_propagation_ffn(
     ffn: nn.Module,
     *,
     unit_norm_values: bool,
-    state_activation_kind: str | None = None,
 ) -> Layer:
     if isinstance(ffn, StateValueFeedForward):
         state, val = ffn(layer.state, layer.val)
-        if state_activation_kind is None:
-            state_activation_kind = "softsign" if unit_norm_values else "signed_softmax"
-        state = normalize_state(state, activation_kind=state_activation_kind)
+        if unit_norm_values:
+            state = softsign_state(state)
         return layer.with_tensors(state=state, val=val)
     val = ffn(layer.val)
     return layer.with_tensors(val=val)
@@ -100,7 +92,6 @@ class PropagationLayer(nn.Module):
         norm: nn.Module,
         ffn: nn.Module,
         unit_norm_values: bool,
-        state_activation_kind: str,
         residual_gate_init: float,
     ) -> None:
         super().__init__()
@@ -108,7 +99,6 @@ class PropagationLayer(nn.Module):
         self.norm = norm
         self.ffn = ffn
         self.unit_norm_values = bool(unit_norm_values)
-        self.state_activation_kind = str(state_activation_kind)
         self.residual_gate = nn.Parameter(torch.tensor(float(residual_gate_init)))
 
     def _run_layer(self, layer: Layer) -> Layer:
@@ -124,9 +114,8 @@ class PropagationLayer(nn.Module):
                 layer,
                 scaled_delta.delta_state,
                 scaled_delta.delta_val,
-                norm=self.norm,
+                self.norm,
                 unit_norm_values=self.unit_norm_values,
-                state_activation_kind=self.state_activation_kind,
             )
         else:
             next_layer = apply_delta(
@@ -135,13 +124,11 @@ class PropagationLayer(nn.Module):
                 residual=True,
                 val_norm=self.norm,
                 unit_norm_values=self.unit_norm_values,
-                state_activation_kind=self.state_activation_kind,
             )
         return apply_propagation_ffn(
             next_layer,
             self.ffn,
             unit_norm_values=self.unit_norm_values,
-            state_activation_kind=self.state_activation_kind,
         )
 
     def forward(self, layer: Layer, *, checkpoint_layer: bool = False) -> Layer:
@@ -172,8 +159,7 @@ class PropagationStack(nn.Module):
         norm_factory: Callable[[], nn.Module],
         ffn_factory: Callable[[], nn.Module],
         unit_norm_values: bool,
-        state_activation_kind: str = "signed_softmax",
-        residual_gate_init: float = 1.0,
+        residual_gate_init: float = 0.1,
     ) -> None:
         super().__init__()
         if depth <= 0:
@@ -184,8 +170,7 @@ class PropagationStack(nn.Module):
                 norm=norm_factory(),
                 ffn=ffn_factory(),
                 unit_norm_values=unit_norm_values,
-                state_activation_kind=state_activation_kind,
-                residual_gate_init=float(residual_gate_init),
+                residual_gate_init=residual_gate_init,
             )
             for _ in range(depth)
         )

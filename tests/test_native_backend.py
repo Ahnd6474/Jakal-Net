@@ -310,7 +310,7 @@ class CudaNativeBackendTests(unittest.TestCase):
                 activation="gelu",
             ).to(self.device),
             unit_norm_values=False,
-            residual_gate_init=0.1,
+            residual_scale_init=0.1,
         ).to(self.device)
 
     def test_propagation_value_ffn_fused_fastpath_matches_streaming_reference_on_cuda(self) -> None:
@@ -363,8 +363,8 @@ class CudaNativeBackendTests(unittest.TestCase):
                 )
                 self.assert_tensor_close(reference_val.grad, fused_val.grad, atol=1e-5, rtol=1e-5)
                 self.assert_tensor_close(
-                    reference.residual_gate.grad,
-                    fused.residual_gate.grad,
+                    reference.residual_scale.grad,
+                    fused.residual_scale.grad,
                     atol=1e-5,
                     rtol=1e-5,
                 )

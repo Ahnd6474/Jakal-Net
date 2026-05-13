@@ -25,7 +25,7 @@ from jakal_net.modules import (
 
 STATE_MASS_PER_NODE = 1.0
 PARAM_INIT_STD = 0.02
-LOW_RANK_SCALE_INIT = float(os.environ.get("JAKAL_LOW_RANK_SCALE_INIT", "0.1"))
+LOW_RANK_SCALE_INIT = 0.1
 LOW_RANK_REFERENCE_RANK = 128.0
 UNIT_NORM_EPS = 1e-6
 
@@ -244,14 +244,6 @@ def softsign_state(state: Tensor) -> Tensor:
     return F.softsign(torch.nan_to_num(state))
 
 
-def normalize_state(state: Tensor, *, activation_kind: str = "signed_softmax") -> Tensor:
-    if activation_kind == "signed_softmax":
-        return signed_softmax_state(state)
-    if activation_kind == "softsign":
-        return softsign_state(state)
-    raise ValueError(f"Unsupported state activation kind: {activation_kind!r}.")
-
-
 def signed_abs_softmax_edges(scores: Tensor) -> Tensor:
     clean_scores = torch.nan_to_num(scores)
     return torch.sign(clean_scores) * torch.softmax(clean_scores.abs(), dim=-1)
@@ -268,12 +260,9 @@ def apply_delta(
     residual: bool = True,
     val_norm: nn.LayerNorm | None = None,
     unit_norm_values: bool = False,
-    state_activation_kind: str | None = None,
 ) -> Layer:
     updated = layer.apply_delta(delta, merge_mode="add" if residual else "replace")
-    if state_activation_kind is None:
-        state_activation_kind = "softsign" if unit_norm_values else "signed_softmax"
-    state = normalize_state(updated.state, activation_kind=state_activation_kind)
+    state = softsign_state(updated.state) if unit_norm_values else signed_softmax_state(updated.state)
     if val_norm is None:
         val = updated.val
     elif residual:

@@ -132,17 +132,6 @@ def _inverse_softplus(value: float) -> float:
     return float(torch.log(torch.expm1(torch.tensor(value))).item())
 
 
-def make_norm(dim: int, kind: str = "layernorm") -> nn.Module:
-    if kind == "layernorm":
-        return nn.LayerNorm(dim)
-    if kind == "rmsnorm":
-        rms_norm = getattr(nn, "RMSNorm", None)
-        if rms_norm is not None:
-            return rms_norm(dim)
-        return nn.LayerNorm(dim)
-    raise ValueError(f"Unsupported norm kind: {kind!r}.")
-
-
 class ResidualFeedForward(nn.Module):
     def __init__(
         self,
@@ -153,8 +142,6 @@ class ResidualFeedForward(nn.Module):
         residual_scale: float = 1.0,
         learnable_residual_scale: bool = False,
         activation: str = "gelu",
-        norm_kind: str = "layernorm",
-        use_input_norm: bool = True,
     ) -> None:
         super().__init__()
         if dim <= 0:
@@ -166,7 +153,7 @@ class ResidualFeedForward(nn.Module):
         if residual_scale < 0.0:
             raise ValueError("residual_scale must be non-negative.")
         hidden_dim = max(dim, int(round(float(dim) * float(hidden_mult))))
-        self.input_norm = make_norm(dim, norm_kind) if use_input_norm else nn.Identity()
+        self.input_norm = nn.LayerNorm(dim)
         self.learnable_residual_scale = bool(learnable_residual_scale)
         if self.learnable_residual_scale:
             self.residual_scale_param = nn.Parameter(torch.tensor(_inverse_softplus(float(residual_scale))))
@@ -213,8 +200,6 @@ class StateValueFeedForward(nn.Module):
         learnable_residual_scale: bool = False,
         zero_init_output: bool = True,
         activation: str = "gelu",
-        norm_kind: str = "layernorm",
-        use_input_norm: bool = True,
     ) -> None:
         super().__init__()
         if dim <= 0:
@@ -227,7 +212,7 @@ class StateValueFeedForward(nn.Module):
             raise ValueError("residual_scale must be non-negative.")
         hidden_dim = max(dim, int(round(float(dim) * float(hidden_mult))))
         self.learnable_residual_scale = bool(learnable_residual_scale)
-        self.input_norm = make_norm(dim, norm_kind) if use_input_norm else nn.Identity()
+        self.input_norm = nn.LayerNorm(dim)
         if self.learnable_residual_scale:
             self.residual_scale_param = nn.Parameter(torch.tensor(_inverse_softplus(float(residual_scale))))
             self.register_buffer("fixed_residual_scale", None, persistent=False)

@@ -2357,132 +2357,6 @@ __global__ void low_rank_multihead_max_causal_signed_abs_forward_kernel(
 }
 
 template <typename scalar_t>
-__global__ void low_rank_multihead_signed_smoothmax_causal_signed_abs_forward_exact_kernel_2d(
-    const scalar_t* __restrict__ weighted_projected_source,
-    const scalar_t* __restrict__ projected_target,
-    const float* __restrict__ projected_state,
-    const float* __restrict__ projected_val,
-    const scalar_t* __restrict__ biases,
-    float* __restrict__ delta_state,
-    float* __restrict__ delta_val,
-    float* __restrict__ row_max_out,
-    float* __restrict__ row_denom_out,
-    int64_t heads,
-    int64_t batch_flat,
-    int64_t nodes,
-    int64_t rank_dim,
-    int64_t out_dim,
-    bool has_bias) {
-  const int64_t linear_row = blockIdx.x;
-  const int64_t batch = linear_row / nodes;
-  const int64_t target = linear_row - batch * nodes;
-  const int tid_x = threadIdx.x;
-  const int tid_y = threadIdx.y;
-  const int tid = tid_y * blockDim.x + tid_x;
-  const int total_threads = blockDim.x * blockDim.y;
-  const int64_t active_sources = target + 1;
-  extern __shared__ float shared[];
-  float* scores = shared;
-  float* edges = scores + active_sources;
-  float* reduce = edges + active_sources;
-  float* shared_head_scores = reduce + total_threads;
-  const int64_t state_base = batch * nodes;
-  const int64_t val_base = batch * nodes * out_dim;
-  const int64_t delta_val_base = linear_row * out_dim;
-
-  float local_max = 0.0f;
-  for (int64_t source = tid; source < active_sources; source += total_threads) {
-    float head_max_abs = 0.0f;
-    for (int64_t head = 0; head < heads; ++head) {
-      const float head_score = low_rank_multihead_raw_score(
-          weighted_projected_source,
-          projected_target,
-          biases,
-          heads,
-          batch_flat,
-          nodes,
-          rank_dim,
-          batch,
-          target,
-          source,
-          head,
-          has_bias);
-      shared_head_scores[source * heads + head] = head_score;
-      head_max_abs = fmaxf(head_max_abs, fabsf(head_score));
-    }
-    float head_denom = 0.0f;
-    float weighted_sum = 0.0f;
-    for (int64_t head = 0; head < heads; ++head) {
-      const float head_score = shared_head_scores[source * heads + head];
-      const float head_prob_unnorm = expf(fabsf(head_score) - head_max_abs);
-      head_denom += head_prob_unnorm;
-      weighted_sum += head_score * head_prob_unnorm;
-    }
-    const float score = weighted_sum / fmaxf(head_denom, 1.0e-20f);
-    scores[source] = score;
-    local_max = fmaxf(local_max, fabsf(score));
-  }
-  reduce[tid] = local_max;
-  __syncthreads();
-  for (int stride = total_threads / 2; stride > 0; stride >>= 1) {
-    if (tid < stride) {
-      reduce[tid] = fmaxf(reduce[tid], reduce[tid + stride]);
-    }
-    __syncthreads();
-  }
-  const float row_max = reduce[0];
-
-  float local_sum = 0.0f;
-  for (int64_t source = tid; source < active_sources; source += total_threads) {
-    local_sum += expf(fabsf(scores[source]) - row_max);
-  }
-  reduce[tid] = local_sum;
-  __syncthreads();
-  for (int stride = total_threads / 2; stride > 0; stride >>= 1) {
-    if (tid < stride) {
-      reduce[tid] += reduce[tid + stride];
-    }
-    __syncthreads();
-  }
-  const float denom = reduce[0] > 0.0f ? reduce[0] : 1.0f;
-
-  float state_acc = 0.0f;
-  for (int64_t source = tid; source < active_sources; source += total_threads) {
-    const float score = scores[source];
-    float edge = expf(fabsf(score) - row_max) / denom;
-    if (score < 0.0f) {
-      edge = -edge;
-    } else if (score == 0.0f) {
-      edge = 0.0f;
-    }
-    edges[source] = edge;
-    state_acc += edge * projected_state[state_base + source];
-  }
-  reduce[tid] = state_acc;
-  __syncthreads();
-  for (int stride = total_threads / 2; stride > 0; stride >>= 1) {
-    if (tid < stride) {
-      reduce[tid] += reduce[tid + stride];
-    }
-    __syncthreads();
-  }
-  if (tid == 0) {
-    delta_state[linear_row] = reduce[0];
-    row_max_out[linear_row] = row_max;
-    row_denom_out[linear_row] = denom;
-  }
-  __syncthreads();
-
-  for (int64_t out = tid; out < out_dim; out += total_threads) {
-    float acc = 0.0f;
-    for (int64_t source = 0; source < active_sources; ++source) {
-      acc += edges[source] * projected_val[val_base + source * out_dim + out];
-    }
-    delta_val[delta_val_base + out] = acc;
-  }
-}
-
-template <typename scalar_t>
 __global__ void low_rank_multihead_max_causal_signed_abs_backward_kernel(
     const scalar_t* __restrict__ weighted_projected_source,
     const scalar_t* __restrict__ projected_source,
@@ -2718,21 +2592,15 @@ __global__ void low_rank_multihead_signed_smoothmax_causal_signed_abs_backward_k
   const int64_t linear_row = blockIdx.x;
   const int64_t batch = linear_row / nodes;
   const int64_t target = linear_row - batch * nodes;
-  const int tid_x = threadIdx.x;
-  const int tid_y = threadIdx.y;
-  const int tid = tid_y * blockDim.x + tid_x;
-  const int total_threads = blockDim.x * blockDim.y;
+  const int tid = threadIdx.x;
   const int64_t active_sources = target + 1;
-  const int source_tile = blockDim.x;
   extern __shared__ float shared[];
-  float* reduce = shared;
-  float* scores = reduce + total_threads;
-  float* edges = scores + source_tile;
-  float* grad_edges = edges + source_tile;
-  float* ge_partials = grad_edges + source_tile;
-  float* shared_head_scores = ge_partials + source_tile * blockDim.y;
-  float* shared_target_grads = shared_head_scores + source_tile * heads;
-  float* shared_core_grads = shared_target_grads + heads * rank_dim;
+  float* scores = shared;
+  float* edges = scores + active_sources;
+  float* grad_edges = edges + active_sources;
+  float* reduce = grad_edges + active_sources;
+  float* shared_head_scores = reduce + blockDim.x;
+  float* shared_core_grads = shared_head_scores + active_sources * heads;
   float* shared_bias_grads = shared_core_grads + heads * rank_dim;
   const int64_t state_base = batch * nodes;
   const int64_t val_base = batch * nodes * out_dim;
@@ -2740,176 +2608,104 @@ __global__ void low_rank_multihead_signed_smoothmax_causal_signed_abs_backward_k
   const float row_max_value = row_max[linear_row];
   const float row_denom_value = fmaxf(row_denom[linear_row], 1.0e-20f);
 
-  for (int64_t index = tid; index < heads * rank_dim; index += total_threads) {
-    shared_target_grads[index] = 0.0f;
+  for (int64_t index = tid; index < heads * rank_dim; index += blockDim.x) {
     shared_core_grads[index] = 0.0f;
   }
-  for (int64_t head = tid; head < heads; head += total_threads) {
+  for (int64_t head = tid; head < heads; head += blockDim.x) {
     shared_bias_grads[head] = 0.0f;
   }
   __syncthreads();
 
-  const float g_state = grad_delta_state[linear_row];
-  float local_edge_dot = 0.0f;
-
-  for (int64_t tile_start = 0; tile_start < active_sources; tile_start += source_tile) {
-    const int64_t source = tile_start + tid_x;
-    const bool valid_source = source < active_sources;
-
-    if (tid_y == 0 && valid_source) {
-      float head_max_abs = 0.0f;
-      for (int64_t head = 0; head < heads; ++head) {
-        const float head_score = low_rank_multihead_raw_score(
-            weighted_projected_source,
-            projected_target,
-            biases,
-            heads,
-            batch_flat,
-            nodes,
-            rank_dim,
-            batch,
-            target,
-            source,
-            head,
-            has_bias);
-        shared_head_scores[tid_x * heads + head] = head_score;
-        head_max_abs = fmaxf(head_max_abs, fabsf(head_score));
-      }
-      float head_denom = 0.0f;
-      float weighted_sum = 0.0f;
-      for (int64_t head = 0; head < heads; ++head) {
-        const float head_score = shared_head_scores[tid_x * heads + head];
-        const float head_prob_unnorm = expf(fabsf(head_score) - head_max_abs);
-        head_denom += head_prob_unnorm;
-        weighted_sum += head_score * head_prob_unnorm;
-      }
-      const float score = weighted_sum / fmaxf(head_denom, 1.0e-20f);
-      scores[tid_x] = score;
-      float edge = expf(fabsf(score) - row_max_value) / row_denom_value;
-      if (score < 0.0f) {
-        edge = -edge;
-      } else if (score == 0.0f) {
-        edge = 0.0f;
-      }
-      edges[tid_x] = edge;
+  for (int64_t source = tid; source < active_sources; source += blockDim.x) {
+    float head_max_abs = 0.0f;
+    for (int64_t head = 0; head < heads; ++head) {
+      const float head_score = low_rank_multihead_raw_score(
+          weighted_projected_source,
+          projected_target,
+          biases,
+          heads,
+          batch_flat,
+          nodes,
+          rank_dim,
+          batch,
+          target,
+          source,
+          head,
+          has_bias);
+      shared_head_scores[source * heads + head] = head_score;
+      head_max_abs = fmaxf(head_max_abs, fabsf(head_score));
     }
-    __syncthreads();
-
-    if (valid_source) {
-      const int64_t source_val_offset = val_base + source * out_dim;
-      float partial = 0.0f;
-      for (int64_t feature = tid_y; feature < out_dim; feature += blockDim.y) {
-        partial += grad_delta_val[target_val_grad_offset + feature] *
-                   projected_val[source_val_offset + feature];
-        atomicAdd(
-            grad_projected_val + source_val_offset + feature,
-            edges[tid_x] * grad_delta_val[target_val_grad_offset + feature]);
-      }
-      ge_partials[tid_x * blockDim.y + tid_y] = partial;
+    float head_denom = 0.0f;
+    float weighted_sum = 0.0f;
+    for (int64_t head = 0; head < heads; ++head) {
+      const float head_score = shared_head_scores[source * heads + head];
+      const float head_prob_unnorm = expf(fabsf(head_score) - head_max_abs);
+      head_denom += head_prob_unnorm;
+      weighted_sum += head_score * head_prob_unnorm;
     }
-    __syncthreads();
-
-    float local_dot = 0.0f;
-    if (tid_y == 0 && valid_source) {
-      float ge = g_state * projected_state[state_base + source];
-      for (int lane = 0; lane < blockDim.y; ++lane) {
-        ge += ge_partials[tid_x * blockDim.y + lane];
-      }
-      local_dot = ge * edges[tid_x];
-      atomicAdd(grad_projected_state + state_base + source, edges[tid_x] * g_state);
-    }
-    __syncthreads();
-    local_edge_dot += local_dot;
+    scores[source] = weighted_sum / fmaxf(head_denom, 1.0e-20f);
   }
-
-  reduce[tid] = local_edge_dot;
   __syncthreads();
-  for (int stride = total_threads / 2; stride > 0; stride >>= 1) {
+
+  for (int64_t source = tid; source < active_sources; source += blockDim.x) {
+    const float score = scores[source];
+    float edge = expf(fabsf(score) - row_max_value) / row_denom_value;
+    if (score < 0.0f) {
+      edge = -edge;
+    } else if (score == 0.0f) {
+      edge = 0.0f;
+    }
+    edges[source] = edge;
+  }
+  __syncthreads();
+
+  const float g_state = grad_delta_state[linear_row];
+  float local_dot = 0.0f;
+  for (int64_t source = tid; source < active_sources; source += blockDim.x) {
+    const int64_t source_val_offset = val_base + source * out_dim;
+    float ge = g_state * projected_state[state_base + source];
+    for (int64_t feature = 0; feature < out_dim; ++feature) {
+      ge += grad_delta_val[target_val_grad_offset + feature] *
+            projected_val[source_val_offset + feature];
+    }
+    grad_edges[source] = ge;
+    local_dot += ge * edges[source];
+    atomicAdd(grad_projected_state + state_base + source, edges[source] * g_state);
+    for (int64_t feature = 0; feature < out_dim; ++feature) {
+      atomicAdd(
+          grad_projected_val + source_val_offset + feature,
+          edges[source] * grad_delta_val[target_val_grad_offset + feature]);
+    }
+  }
+  reduce[tid] = local_dot;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
     if (tid < stride) {
       reduce[tid] += reduce[tid + stride];
     }
     __syncthreads();
   }
   const float edge_dot = reduce[0];
-  __syncthreads();
 
-  for (int64_t tile_start = 0; tile_start < active_sources; tile_start += source_tile) {
-    const int64_t source = tile_start + tid_x;
-    const bool valid_source = source < active_sources;
+  for (int64_t source = tid; source < active_sources; source += blockDim.x) {
+    const float score = scores[source];
+    const float sign = score > 0.0f ? 1.0f : (score < 0.0f ? -1.0f : 0.0f);
+    const float prob = fabsf(edges[source]);
+    const float grad_score =
+        sign == 0.0f ? 0.0f : sign * prob * (sign * grad_edges[source] - edge_dot);
 
-    if (tid_y == 0 && valid_source) {
-      float head_max_abs = 0.0f;
-      for (int64_t head = 0; head < heads; ++head) {
-        const float head_score = low_rank_multihead_raw_score(
-            weighted_projected_source,
-            projected_target,
-            biases,
-            heads,
-            batch_flat,
-            nodes,
-            rank_dim,
-            batch,
-            target,
-            source,
-            head,
-            has_bias);
-        shared_head_scores[tid_x * heads + head] = head_score;
-        head_max_abs = fmaxf(head_max_abs, fabsf(head_score));
-      }
-      float head_denom = 0.0f;
-      float weighted_sum = 0.0f;
-      for (int64_t head = 0; head < heads; ++head) {
-        const float head_score = shared_head_scores[tid_x * heads + head];
-        const float head_prob_unnorm = expf(fabsf(head_score) - head_max_abs);
-        head_denom += head_prob_unnorm;
-        weighted_sum += head_score * head_prob_unnorm;
-      }
-      const float score = weighted_sum / fmaxf(head_denom, 1.0e-20f);
-      scores[tid_x] = score;
-      float edge = expf(fabsf(score) - row_max_value) / row_denom_value;
-      if (score < 0.0f) {
-        edge = -edge;
-      } else if (score == 0.0f) {
-        edge = 0.0f;
-      }
-      edges[tid_x] = edge;
+    float head_max_abs = 0.0f;
+    for (int64_t head = 0; head < heads; ++head) {
+      head_max_abs = fmaxf(head_max_abs, fabsf(shared_head_scores[source * heads + head]));
     }
-    __syncthreads();
-
-    if (valid_source) {
-      const int64_t source_val_offset = val_base + source * out_dim;
-      float partial = 0.0f;
-      for (int64_t feature = tid_y; feature < out_dim; feature += blockDim.y) {
-        partial += grad_delta_val[target_val_grad_offset + feature] *
-                   projected_val[source_val_offset + feature];
-      }
-      ge_partials[tid_x * blockDim.y + tid_y] = partial;
+    float head_denom = 0.0f;
+    for (int64_t head = 0; head < heads; ++head) {
+      head_denom += expf(fabsf(shared_head_scores[source * heads + head]) - head_max_abs);
     }
-    __syncthreads();
+    head_denom = fmaxf(head_denom, 1.0e-20f);
 
-    if (valid_source && tid_y < heads) {
-      const float score = scores[tid_x];
-      const float sign = score > 0.0f ? 1.0f : (score < 0.0f ? -1.0f : 0.0f);
-      const float prob = fabsf(edges[tid_x]);
-      float ge = g_state * projected_state[state_base + source];
-      for (int lane = 0; lane < blockDim.y; ++lane) {
-        ge += ge_partials[tid_x * blockDim.y + lane];
-      }
-      const float grad_score =
-          sign == 0.0f ? 0.0f : sign * prob * (sign * ge - edge_dot);
-
-      float head_max_abs = 0.0f;
-      for (int64_t head = 0; head < heads; ++head) {
-        head_max_abs = fmaxf(head_max_abs, fabsf(shared_head_scores[tid_x * heads + head]));
-      }
-      float head_denom = 0.0f;
-      for (int64_t head = 0; head < heads; ++head) {
-        head_denom += expf(fabsf(shared_head_scores[tid_x * heads + head]) - head_max_abs);
-      }
-      head_denom = fmaxf(head_denom, 1.0e-20f);
-
-      const int64_t head = tid_y;
-      const float head_score = shared_head_scores[tid_x * heads + head];
+    for (int64_t head = 0; head < heads; ++head) {
+      const float head_score = shared_head_scores[source * heads + head];
       const float head_sign = head_score > 0.0f ? 1.0f : (head_score < 0.0f ? -1.0f : 0.0f);
       const float head_prob = expf(fabsf(head_score) - head_max_abs) / head_denom;
       const float head_grad = head_prob * (1.0f + head_sign * (head_score - score)) * grad_score;
@@ -2925,24 +2721,22 @@ __global__ void low_rank_multihead_signed_smoothmax_causal_signed_abs_backward_k
         const float source_r = static_cast<float>(projected_source[source_offset + r]);
         const float weighted_source_r = static_cast<float>(weighted_projected_source[source_offset + r]);
         const float core = static_cast<float>(core_weights[weight_offset + r]);
-        atomicAdd(shared_target_grads + weight_offset + r, head_grad * weighted_source_r);
+        atomicAdd(grad_projected_target + target_offset + r, head_grad * weighted_source_r);
         atomicAdd(grad_projected_source + source_offset + r, head_grad * core * target_r);
         atomicAdd(shared_core_grads + weight_offset + r, head_grad * target_r * source_r);
       }
     }
-    __syncthreads();
   }
+  __syncthreads();
 
-  for (int64_t index = tid; index < heads * rank_dim; index += total_threads) {
-    grad_projected_target[((index / rank_dim) * batch_flat + batch) * nodes * rank_dim + target * rank_dim + (index % rank_dim)] =
-        shared_target_grads[index];
+  for (int64_t index = tid; index < heads * rank_dim; index += blockDim.x) {
     const float value = shared_core_grads[index];
     if (value != 0.0f) {
       atomicAdd(grad_core_weights + index, value);
     }
   }
   if (has_bias) {
-    for (int64_t head = tid; head < heads; head += total_threads) {
+    for (int64_t head = tid; head < heads; head += blockDim.x) {
       const float value = shared_bias_grads[head];
       if (value != 0.0f) {
         atomicAdd(grad_biases + head, value);
@@ -4484,87 +4278,6 @@ jakal_net_low_rank_multihead_max_propagation_causal_dense_signed_abs_forward_cud
   return {delta_state, delta_val};
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-jakal_net_low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_forward_cuda(
-    const torch::Tensor& weighted_projected_source,
-    const torch::Tensor& projected_target,
-    const torch::Tensor& projected_state,
-    const torch::Tensor& projected_val,
-    const torch::Tensor& biases,
-    bool has_bias) {
-  require_cuda_contiguous(weighted_projected_source, "weighted_projected_source");
-  require_cuda_contiguous(projected_target, "projected_target");
-  require_cuda_contiguous(projected_state, "projected_state");
-  require_cuda_contiguous(projected_val, "projected_val");
-  if (has_bias) {
-    require_cuda_contiguous(biases, "biases");
-  }
-  if (weighted_projected_source.dim() != 4 || projected_target.dim() != 4 ||
-      projected_state.dim() != 2 || projected_val.dim() != 3) {
-    throw std::runtime_error("multihead low-rank signed_smoothmax causal dense forward received invalid ranks.");
-  }
-  if (weighted_projected_source.sizes() != projected_target.sizes()) {
-    throw std::runtime_error("weighted_projected_source and projected_target must share [heads,batch,nodes,rank].");
-  }
-  if (projected_state.scalar_type() != torch::kFloat32 ||
-      projected_val.scalar_type() != torch::kFloat32) {
-    throw std::runtime_error("projected_state/projected_val must be float32.");
-  }
-  if (weighted_projected_source.scalar_type() != projected_target.scalar_type()) {
-    throw std::runtime_error("multihead projected score tensors must share dtype.");
-  }
-  const auto heads = weighted_projected_source.size(0);
-  const auto batch_flat = weighted_projected_source.size(1);
-  const auto nodes = weighted_projected_source.size(2);
-  const auto rank_dim = weighted_projected_source.size(3);
-  const auto out_dim = projected_val.size(2);
-  if (heads <= 0 || projected_state.size(0) != batch_flat || projected_state.size(1) != nodes ||
-      projected_val.size(0) != batch_flat || projected_val.size(1) != nodes) {
-    throw std::runtime_error("multihead low-rank signed_smoothmax causal dense forward input shapes are incompatible.");
-  }
-  if (has_bias && (biases.dim() != 1 || biases.size(0) != heads ||
-                   biases.scalar_type() != weighted_projected_source.scalar_type())) {
-    throw std::runtime_error("biases must be [heads] and share score dtype.");
-  }
-  auto delta_state = torch::empty({batch_flat, nodes}, projected_state.options());
-  auto delta_val = torch::empty({batch_flat, nodes, out_dim}, projected_val.options());
-  auto row_max = torch::empty({batch_flat, nodes}, projected_state.options());
-  auto row_denom = torch::empty({batch_flat, nodes}, projected_state.options());
-  const int threads_x = 128;
-  const int threads_y = 4;
-  const dim3 threads(threads_x, threads_y);
-  const int total_threads = threads_x * threads_y;
-  const auto shmem = static_cast<size_t>(
-      (2 * nodes + total_threads + heads * nodes) * sizeof(float));
-  const auto stream = at::cuda::getCurrentCUDAStream();
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      torch::kHalf,
-      torch::kBFloat16,
-      weighted_projected_source.scalar_type(),
-      "low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_forward_cuda",
-      [&] {
-        low_rank_multihead_signed_smoothmax_causal_signed_abs_forward_exact_kernel_2d<scalar_t>
-            <<<batch_flat * nodes, threads, shmem, stream>>>(
-                weighted_projected_source.data_ptr<scalar_t>(),
-                projected_target.data_ptr<scalar_t>(),
-                projected_state.data_ptr<float>(),
-                projected_val.data_ptr<float>(),
-                has_bias ? biases.data_ptr<scalar_t>() : nullptr,
-                delta_state.data_ptr<float>(),
-                delta_val.data_ptr<float>(),
-                row_max.data_ptr<float>(),
-                row_denom.data_ptr<float>(),
-                heads,
-                batch_flat,
-                nodes,
-                rank_dim,
-                out_dim,
-                has_bias);
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
-      });
-  return {delta_state, delta_val, row_max, row_denom};
-}
-
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 jakal_net_low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cuda(
     const torch::Tensor& weighted_projected_source,
@@ -4756,22 +4469,14 @@ jakal_net_low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_ab
   auto grad_projected_val = torch::zeros({batch_flat, nodes, out_dim}, projected_val.options());
   auto grad_core_weights = torch::zeros({heads, rank_dim}, projected_val.options());
   auto grad_biases = torch::zeros({heads}, projected_val.options());
-  const int threads_x = 128;
-  const int threads_y = 4;
-  const dim3 threads(threads_x, threads_y);
-  const int total_threads = threads_x * threads_y;
-  const int source_tile = threads_x;
-  const int64_t shared_floats =
-      total_threads +                       // reduce
-      source_tile +                        // scores
-      source_tile +                        // edges
-      source_tile +                        // grad_edges
-      static_cast<int64_t>(source_tile) * threads_y +  // ge_partials
-      static_cast<int64_t>(source_tile) * heads +      // shared_head_scores
-      heads * rank_dim +                  // shared_target_grads
-      heads * rank_dim +                  // shared_core_grads
-      heads;                              // shared_bias_grads
-  const auto shmem = static_cast<size_t>(shared_floats * sizeof(float));
+  const int threads = multihead_causal_dense_threads();
+  const auto extra_head_scores = heads * nodes * static_cast<int64_t>(sizeof(float));
+  const auto extra_block_grads =
+      (heads * rank_dim + heads) * static_cast<int64_t>(sizeof(float));
+  const auto shmem = static_cast<size_t>(
+      (3 * nodes + threads) * sizeof(float) +
+      extra_head_scores +
+      extra_block_grads);
   const auto stream = at::cuda::getCurrentCUDAStream();
   AT_DISPATCH_FLOATING_TYPES_AND2(
       torch::kHalf,

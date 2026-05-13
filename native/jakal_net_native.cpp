@@ -569,28 +569,6 @@ low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_forward_bmm_cud
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_forward_cuda_wrapper(
-    const torch::Tensor& weighted_projected_source,
-    const torch::Tensor& projected_target,
-    const torch::Tensor& projected_state,
-    const torch::Tensor& projected_val,
-    const torch::Tensor& biases,
-    bool has_bias) {
-#ifdef WITH_CUDA
-  return jakal_net_low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_forward_cuda(
-      weighted_projected_source,
-      projected_target,
-      projected_state,
-      projected_val,
-      biases,
-      has_bias);
-#else
-  throw std::runtime_error(
-      "low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_forward_cuda requires a CUDA-enabled build.");
-#endif
-}
-
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 diagonal_multihead_smoothmax_propagation_causal_dense_signed_abs_forward_bmm_cuda_wrapper(
     const torch::Tensor& layer_val,
     const torch::Tensor& projected_state,
@@ -4322,7 +4300,6 @@ std::vector<std::string> supported_ops() {
             "bilinear_propagation_causal_dense_signed_abs_backward_cuda",
             "low_rank_multihead_max_propagation_causal_dense_signed_abs_forward_cuda",
             "low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cuda",
-            "low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_forward_cuda",
             "low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_backward_cuda",
             "low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_forward_bmm_cuda",
             "low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_backward_bmm_cuda",
@@ -5866,10 +5843,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cuda",
       &low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cuda_wrapper,
       "CUDA fused multi-head max low-rank propagation causal dense backward with signed_abs_softmax");
-  m.def(
-      "low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_forward_cuda",
-      &low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_forward_cuda_wrapper,
-      "CUDA fused multi-head signed_smoothmax low-rank propagation causal dense forward with signed_abs_softmax");
   m.def(
       "low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_backward_cuda",
       &low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_backward_cuda_wrapper,

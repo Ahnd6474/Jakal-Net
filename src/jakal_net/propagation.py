@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from typing import Callable
 
 import torch
@@ -97,8 +96,6 @@ def _native_edge_compress_name(edge_compress_fn: Callable[[Tensor], Tensor]) -> 
 
 
 def _disable_native_multihead_signed_smoothmax_path(pairwise_fn: object) -> bool:
-    if os.environ.get("JAKAL_NET_DISABLE_LOWRANK_SIGNED_SMOOTHMAX_EXACT", "").strip().lower() in {"1", "true", "yes", "on"}:
-        return False
     if not isinstance(pairwise_fn, MultiHeadPairwise):
         return False
     if pairwise_fn.aggregate != "signed_smoothmax":
@@ -138,18 +135,6 @@ def _summarize_edges(
         "edge_signed_mean": float(signed_mean.item()),
         "edge_topk_overlap": float(overlap.item()),
     }
-
-
-def _torch_is_compiling() -> bool:
-    compiler = getattr(torch, "compiler", None)
-    is_compiling = getattr(compiler, "is_compiling", None) if compiler is not None else None
-    if callable(is_compiling):
-        return bool(is_compiling())
-    dynamo = getattr(torch, "_dynamo", None)
-    dynamo_is_compiling = getattr(dynamo, "is_compiling", None) if dynamo is not None else None
-    if callable(dynamo_is_compiling):
-        return bool(dynamo_is_compiling())
-    return False
 
 
 class Propagation(nn.Module):
@@ -326,11 +311,6 @@ class Propagation(nn.Module):
         )
 
     def _compute_delta_kernel_preferred(self, layer: Layer) -> LayerDelta:
-        if (
-            isinstance(self.pairwise_fn, MultiHeadPairwise)
-            and self.pairwise_fn.aggregate in {"smoothmax", "signed_smoothmax"}
-        ):
-            return self._compute_delta_reference(layer)
         signed_smoothmax_lowrank_native = (
             _disable_native_multihead_signed_smoothmax_path(self.pairwise_fn)
             and self.implementation == "native"
@@ -407,7 +387,7 @@ class Propagation(nn.Module):
         return Propagation._compute_delta_streaming(self, layer)
 
     def compute_delta(self, layer: Layer) -> LayerDelta:
-        if self.track_stats and not _torch_is_compiling():
+        if self.track_stats:
             self._record_stats(layer)
         else:
             self.last_stats = None
@@ -735,11 +715,6 @@ class SparsePropagation(Propagation):
         return self._compute_topk_delta_streaming(layer)
 
     def _compute_delta_kernel_preferred(self, layer: Layer) -> LayerDelta:
-        if (
-            isinstance(self.pairwise_fn, MultiHeadPairwise)
-            and self.pairwise_fn.aggregate in {"smoothmax", "signed_smoothmax"}
-        ):
-            return self._compute_delta_reference(layer)
         signed_smoothmax_lowrank_dense_native = (
             _disable_native_multihead_signed_smoothmax_path(self.pairwise_fn)
             and self.implementation == "native"
@@ -857,7 +832,7 @@ class SparsePropagation(Propagation):
         return self._compute_delta_streaming(layer)
 
     def compute_delta(self, layer: Layer) -> LayerDelta:
-        if self.track_stats and not _torch_is_compiling():
+        if self.track_stats:
             self._record_stats(layer)
         else:
             self.last_stats = None

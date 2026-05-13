@@ -133,15 +133,6 @@ jakal_net_low_rank_multihead_max_propagation_causal_dense_signed_abs_forward_cud
     bool has_bias,
     const std::string& aggregate);
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-jakal_net_low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_forward_cuda(
-    const torch::Tensor& weighted_projected_source,
-    const torch::Tensor& projected_target,
-    const torch::Tensor& projected_state,
-    const torch::Tensor& projected_val,
-    const torch::Tensor& biases,
-    bool has_bias);
-
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 jakal_net_low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cuda(
     const torch::Tensor& weighted_projected_source,
