@@ -57,6 +57,17 @@ _COMPILED_UNIT_NORMALIZE_VALUES = _maybe_compile(_unit_normalize_values_impl)
 _COMPILED_SIGNED_SOFTMAX_STATE = _maybe_compile(_signed_softmax_state_impl)
 
 
+def _rms_state_impl(state: Tensor, *, eps: float = UNIT_NORM_EPS) -> Tensor:
+    clean_state = torch.nan_to_num(state)
+    rms = clean_state.square().mean(dim=-1, keepdim=True).add(eps).sqrt()
+    return clean_state / rms
+
+
+_COMPILED_RMS_STATE = _maybe_compile(_rms_state_impl)
+
+STATE_UPDATE_KINDS = frozenset({"signed_softmax", "softsign", "rms", "rms_softsign"})
+
+
 def _make_single_pairwise(
     kind: str,
     *,
@@ -244,6 +255,44 @@ def softsign_state(state: Tensor) -> Tensor:
     return F.softsign(torch.nan_to_num(state))
 
 
+def rms_state(state: Tensor, *, eps: float = UNIT_NORM_EPS) -> Tensor:
+    return _COMPILED_RMS_STATE(state, eps=eps)
+
+
+def rms_softsign_state(state: Tensor, *, eps: float = UNIT_NORM_EPS) -> Tensor:
+    return F.softsign(rms_state(state, eps=eps))
+
+
+def validate_state_update_kind(kind: str) -> str:
+    normalized = str(kind).strip().lower()
+    if normalized not in STATE_UPDATE_KINDS:
+        raise ValueError(f"Unsupported state_update_kind: {kind!r}.")
+    return normalized
+
+
+def apply_state_update(
+    state: Tensor,
+    delta_state: Tensor,
+    *,
+    residual: bool = True,
+    unit_norm_values: bool = False,
+    state_update_kind: str = "signed_softmax",
+) -> Tensor:
+    raw_state = state + delta_state if residual else delta_state
+    if unit_norm_values:
+        return softsign_state(raw_state)
+    normalized_kind = validate_state_update_kind(state_update_kind)
+    if normalized_kind == "signed_softmax":
+        return signed_softmax_state(raw_state)
+    if normalized_kind == "softsign":
+        return softsign_state(raw_state)
+    if normalized_kind == "rms":
+        return rms_state(raw_state)
+    if normalized_kind == "rms_softsign":
+        return rms_softsign_state(raw_state)
+    raise AssertionError(f"Unhandled state_update_kind: {normalized_kind}")
+
+
 def signed_abs_softmax_edges(scores: Tensor) -> Tensor:
     clean_scores = torch.nan_to_num(scores)
     return torch.sign(clean_scores) * torch.softmax(clean_scores.abs(), dim=-1)
@@ -260,9 +309,17 @@ def apply_delta(
     residual: bool = True,
     val_norm: nn.LayerNorm | None = None,
     unit_norm_values: bool = False,
+    state_residual: bool = True,
+    state_update_kind: str = "signed_softmax",
 ) -> Layer:
     updated = layer.apply_delta(delta, merge_mode="add" if residual else "replace")
-    state = softsign_state(updated.state) if unit_norm_values else signed_softmax_state(updated.state)
+    state = apply_state_update(
+        layer.state,
+        delta.delta_state,
+        residual=state_residual,
+        unit_norm_values=unit_norm_values,
+        state_update_kind=state_update_kind,
+    )
     if val_norm is None:
         val = updated.val
     elif residual:

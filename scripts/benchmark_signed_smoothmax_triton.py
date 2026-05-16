@@ -113,6 +113,16 @@ def _build_model(
     ).to(device)
 
 
+def _maybe_compile_model(model: CausalMemoryLM, args: argparse.Namespace) -> CausalMemoryLM:
+    if not getattr(args, "compile_model", False):
+        return model
+    return torch.compile(
+        model,
+        backend=args.compile_backend,
+        mode=args.compile_mode,
+    )
+
+
 def _make_batch(*, batch_size: int, seq_len: int, vocab_size: int, device: torch.device) -> DocumentBatch:
     return DocumentBatch(
         context=torch.randint(0, vocab_size, (batch_size, seq_len), device=device, dtype=torch.long),
@@ -202,6 +212,12 @@ def run_exactness_compare(args: argparse.Namespace) -> dict[str, object]:
         env["JAKAL_NET_TRITON_SIGNED_SMOOTHMAX_DIAG_PASS2_BLOCKS"] = args.diag_blocks
     if args.lowrank_blocks:
         env["JAKAL_NET_TRITON_SIGNED_SMOOTHMAX_LOWRANK_PASS2_BLOCKS"] = args.lowrank_blocks
+    if args.kind == "lowrank" and args.signed_bmm is not None:
+        env["JAKAL_NET_LOWRANK_SIGNED_SMOOTHMAX_BMM_CUDA"] = _bool_env(args.signed_bmm)
+    if args.kind == "lowrank" and args.signed_fused_cuda is not None:
+        env["JAKAL_NET_MULTIHEAD_SIGNED_SMOOTHMAX_FUSED_CUDA"] = _bool_env(args.signed_fused_cuda)
+    if args.tf32_score_tile is not None:
+        env["JAKAL_NET_ENABLE_TF32_SCORE_TILE_CUDA"] = _bool_env(args.tf32_score_tile)
 
     with _temporary_env(env):
         _set_seed(args.seed)
@@ -220,6 +236,7 @@ def run_exactness_compare(args: argparse.Namespace) -> dict[str, object]:
             aggregate="signed_smoothmax",
             device=device,
         )
+        reference = _maybe_compile_model(reference, args)
         _set_seed(args.seed)
         native = _build_model(
             implementation="native",
@@ -237,6 +254,7 @@ def run_exactness_compare(args: argparse.Namespace) -> dict[str, object]:
             device=device,
         )
         native.load_state_dict(reference.state_dict())
+        native = _maybe_compile_model(native, args)
 
         batch = _make_batch(
             batch_size=args.batch_size,
@@ -262,6 +280,12 @@ def run_exactness_compare(args: argparse.Namespace) -> dict[str, object]:
             "triton_forward": args.triton_forward,
             "diag_blocks": args.diag_blocks,
             "lowrank_blocks": args.lowrank_blocks,
+            "signed_bmm": args.signed_bmm,
+            "signed_fused_cuda": args.signed_fused_cuda,
+            "tf32_score_tile": args.tf32_score_tile,
+            "compile_model": bool(getattr(args, "compile_model", False)),
+            "compile_backend": getattr(args, "compile_backend", None),
+            "compile_mode": getattr(args, "compile_mode", None),
             "loss_diff": float((ref_loss.detach() - native_loss.detach()).abs().item()),
             "forward_max_diff": float((ref_val.detach() - native_val.detach()).abs().max().item()),
             "param_grad_name": grad_name,
@@ -379,6 +403,12 @@ def run_one_step_benchmark(args: argparse.Namespace) -> dict[str, object]:
         env["JAKAL_NET_TRITON_SIGNED_SMOOTHMAX_DIAG_PASS2_BLOCKS"] = args.diag_blocks
     if args.lowrank_blocks:
         env["JAKAL_NET_TRITON_SIGNED_SMOOTHMAX_LOWRANK_PASS2_BLOCKS"] = args.lowrank_blocks
+    if args.kind == "lowrank" and args.signed_bmm is not None:
+        env["JAKAL_NET_LOWRANK_SIGNED_SMOOTHMAX_BMM_CUDA"] = _bool_env(args.signed_bmm)
+    if args.kind == "lowrank" and args.signed_fused_cuda is not None:
+        env["JAKAL_NET_MULTIHEAD_SIGNED_SMOOTHMAX_FUSED_CUDA"] = _bool_env(args.signed_fused_cuda)
+    if args.tf32_score_tile is not None:
+        env["JAKAL_NET_ENABLE_TF32_SCORE_TILE_CUDA"] = _bool_env(args.tf32_score_tile)
 
     with _temporary_env(env):
         _set_seed(args.seed)
@@ -397,6 +427,7 @@ def run_one_step_benchmark(args: argparse.Namespace) -> dict[str, object]:
             aggregate="signed_smoothmax",
             device=device,
         )
+        model = _maybe_compile_model(model, args)
         optimizer = Lion(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         batch = _make_batch(
             batch_size=args.batch_size,
@@ -433,6 +464,12 @@ def run_one_step_benchmark(args: argparse.Namespace) -> dict[str, object]:
                 "triton_forward": args.triton_forward,
                 "diag_blocks": args.diag_blocks,
                 "lowrank_blocks": args.lowrank_blocks,
+                "signed_bmm": args.signed_bmm,
+                "signed_fused_cuda": args.signed_fused_cuda,
+                "tf32_score_tile": args.tf32_score_tile,
+                "compile_model": args.compile_model,
+                "compile_backend": args.compile_backend,
+                "compile_mode": args.compile_mode,
                 "warmup": args.warmup,
                 "iters": args.iters,
             }
@@ -631,7 +668,7 @@ def run_diagonal_propagation_diagnose(args: argparse.Namespace) -> dict[str, obj
         for stage in stages:
             ref_prop = _get_diag_prop(reference, stage)
             native_prop = _get_diag_prop(native, stage)
-            directional_val = ref_prop._directional_val(layer.val)
+            directional_val = ref_prop._directional_val(layer.state, layer.val)
             ref_scores = ref_prop.pairwise_fn(directional_val, directional_val)
             native_scores = native_prop.pairwise_fn(directional_val, directional_val)
             ref_projected_state, ref_projected_val = ref_prop._project_inputs(layer, directional_val=directional_val)
@@ -743,7 +780,7 @@ def run_lowrank_backward_diagnose(args: argparse.Namespace) -> dict[str, object]
     results: dict[str, object] = {}
     for stage in stages:
         prop = _get_lowrank_prop(model, stage)
-        directional_val = prop._directional_val(layer.val)
+        directional_val = prop._directional_val(layer.state, layer.val)
         projected_state, projected_val = prop._project_inputs(layer, directional_val=directional_val)
         projected_state, projected_val = prop._fold_state_weight_into_projected_inputs(
             projected_state,
@@ -875,7 +912,7 @@ def run_lowrank_custom_backward_diagnose(args: argparse.Namespace) -> dict[str, 
     results: dict[str, object] = {}
     for stage in stages:
         prop = _get_lowrank_prop(model, stage)
-        directional_val = prop._directional_val(layer.val)
+        directional_val = prop._directional_val(layer.state, layer.val)
         projected_state, projected_val = prop._project_inputs(layer, directional_val=directional_val)
         projected_state, projected_val = prop._fold_state_weight_into_projected_inputs(
             projected_state,
@@ -1036,13 +1073,13 @@ def run_lowrank_forward_diagnose(args: argparse.Namespace) -> dict[str, object]:
     for stage in stages:
         ref_prop = _get_lowrank_prop(reference, stage)
         trial_prop = _get_lowrank_prop(trial, stage)
-        directional_val = ref_prop._directional_val(layer.val)
+        directional_val = ref_prop._directional_val(layer.state, layer.val)
         projected_state, projected_val = ref_prop._project_inputs(layer, directional_val=directional_val)
         lowrank_parts = _low_rank_multihead_max_parts(trial_prop.pairwise_fn)
         if lowrank_parts is None:
             raise RuntimeError("Expected lowrank multihead parts.")
         source_weights, target_weights, core_weights, biases, has_bias, _aggregate = lowrank_parts
-        projected_source, projected_target, weighted_source, _core_cast = _LowRankMultiHeadMaxPropagationCausalDenseSignedAbs._project(
+        projected_source, projected_target, weighted_source, _core_cast, _raw_projected_source, _raw_projected_target = _LowRankMultiHeadMaxPropagationCausalDenseSignedAbs._project(
             directional_val,
             source_weights,
             target_weights,
@@ -1141,6 +1178,9 @@ def main() -> None:
         subparser.add_argument("--seed", type=int, default=1337)
         subparser.add_argument("--triton-backward", action=argparse.BooleanOptionalAction, default=None)
         subparser.add_argument("--triton-forward", action=argparse.BooleanOptionalAction, default=None)
+        subparser.add_argument("--signed-bmm", action=argparse.BooleanOptionalAction, default=None)
+        subparser.add_argument("--signed-fused-cuda", action=argparse.BooleanOptionalAction, default=None)
+        subparser.add_argument("--tf32-score-tile", action=argparse.BooleanOptionalAction, default=None)
         subparser.add_argument("--diag-blocks")
         subparser.add_argument("--lowrank-blocks")
         subparser.add_argument("--diag-tile-mode", choices=["auto", "triton", "fallback"], default="auto")
@@ -1166,6 +1206,9 @@ def main() -> None:
     bench_parser.add_argument("--lr", type=float, default=2e-5)
     bench_parser.add_argument("--weight-decay", type=float, default=0.1)
     bench_parser.add_argument("--lm-head-chunk", type=int, default=8192)
+    bench_parser.add_argument("--compile-model", action=argparse.BooleanOptionalAction, default=False)
+    bench_parser.add_argument("--compile-backend", default="inductor")
+    bench_parser.add_argument("--compile-mode", default="default")
     bench_parser.set_defaults(func=run_one_step_benchmark)
 
     sweep_parser = subparsers.add_parser("sweep")

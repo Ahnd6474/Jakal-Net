@@ -9,6 +9,7 @@ from jakal_net._architectural_common import (
     make_pairwise,
     signed_abs_softmax_edges,
     softsign_state,
+    validate_state_update_kind,
 )
 from jakal_net.core import Layer
 from jakal_net.modules import LearnedPositionEncoding, ResidualFeedForward, StateValueFeedForward
@@ -47,6 +48,8 @@ class SModule(nn.Module):
         checkpoint_sequence_layers: bool = False,
         unit_norm_values: bool = False,
         propagation_residual_gate_init: float = 0.1,
+        state_residual: bool = True,
+        state_update_kind: str = "signed_softmax",
         feed_forward_layers: bool = True,
         feed_forward_hidden_mult: float = 2.0,
         feed_forward_kind: str = "value",
@@ -83,6 +86,8 @@ class SModule(nn.Module):
         self.checkpoint_sequence_layers = checkpoint_sequence_layers
         self.unit_norm_values = unit_norm_values
         self.propagation_residual_gate_init = float(propagation_residual_gate_init)
+        self.state_residual = bool(state_residual)
+        self.state_update_kind = validate_state_update_kind(state_update_kind)
         self.feed_forward_layers = bool(feed_forward_layers)
         self.feed_forward_hidden_mult = float(feed_forward_hidden_mult)
         self.feed_forward_kind = feed_forward_kind
@@ -147,6 +152,8 @@ class SModule(nn.Module):
             ),
             unit_norm_values=self.unit_norm_values,
             residual_gate_init=self.propagation_residual_gate_init,
+            state_residual=self.state_residual,
+            state_update_kind=self.state_update_kind,
         )
         self.full_dense_causal = bool(full_dense_causal)
 

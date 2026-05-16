@@ -11,6 +11,7 @@ from jakal_net._architectural_common import (
     clone_layer,
     init_pairwise_or_route_scales,
     softsign_state,
+    validate_state_update_kind,
 )
 from jakal_net.core import Layer
 from jakal_net.propagation import SparsePropagation
@@ -92,6 +93,8 @@ class CausalMemoryLM(nn.Module):
         implementation: str = "streaming",
         unit_norm_values: bool = False,
         propagation_residual_gate_init: float = 0.1,
+        state_residual: bool = True,
+        state_update_kind: str = "signed_softmax",
         feed_forward_layers: bool = True,
         memory_feed_forward_layers: bool | None = None,
         disable_memory: bool = False,
@@ -152,6 +155,8 @@ class CausalMemoryLM(nn.Module):
         self.checkpoint_prediction_layers = bool(checkpoint_prediction_layers)
         self.unit_norm_values = bool(unit_norm_values)
         self.propagation_residual_gate_init = float(propagation_residual_gate_init)
+        self.state_residual = bool(state_residual)
+        self.state_update_kind = validate_state_update_kind(state_update_kind)
         self.feed_forward_layers = bool(feed_forward_layers)
         self.memory_feed_forward_layers = (
             self.feed_forward_layers if memory_feed_forward_layers is None else bool(memory_feed_forward_layers)
@@ -209,6 +214,8 @@ class CausalMemoryLM(nn.Module):
             checkpoint_sequence_layers=checkpoint_sequence_layers or checkpoint_prediction_layers,
             unit_norm_values=unit_norm_values,
             propagation_residual_gate_init=self.propagation_residual_gate_init,
+            state_residual=self.state_residual,
+            state_update_kind=self.state_update_kind,
             feed_forward_layers=self.feed_forward_layers,
             feed_forward_hidden_mult=self.feed_forward_hidden_mult,
             feed_forward_kind=self.feed_forward_kind,

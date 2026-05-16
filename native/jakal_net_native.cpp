@@ -77,6 +77,17 @@ torch::Tensor reshape_val(
   return flat_val.reshape(shape);
 }
 
+std::pair<torch::Tensor, torch::Tensor> sanitize_empty_row_stats(
+    const torch::Tensor& row_max,
+    const torch::Tensor& row_denom) {
+  auto empty_rows = row_denom <= 0;
+  auto safe_row_max = torch::where(empty_rows, torch::zeros_like(row_max), row_max);
+  auto safe_row_denom = torch::where(empty_rows, torch::ones_like(row_denom), row_denom);
+  safe_row_max = torch::nan_to_num(safe_row_max, 0.0, 0.0, 0.0);
+  safe_row_denom = torch::nan_to_num(safe_row_denom, 1.0, 1.0, 1.0);
+  return {safe_row_max, safe_row_denom};
+}
+
 bool supports_cuda_runtime() {
 #if JAKAL_NET_HAS_TORCH_CUDA_HEADER
   return torch::cuda::is_available();
@@ -123,7 +134,7 @@ torch::Tensor normalized_low_rank_core(const torch::Tensor& core) {
 }
 
 int64_t multihead_smoothmax_bmm_tile_size() {
-  constexpr int64_t kDefaultTileSize = 64;
+  constexpr int64_t kDefaultTileSize = 512;
   if (const char* raw = std::getenv("JAKAL_NET_MULTIHEAD_SMOOTHMAX_BMM_TILE_SIZE")) {
     char* end = nullptr;
     const long parsed = std::strtol(raw, &end, 10);
@@ -446,6 +457,28 @@ low_rank_multihead_max_propagation_causal_dense_signed_abs_forward_cuda_wrapper(
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_forward_cuda_wrapper(
+    const torch::Tensor& weighted_projected_source,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& projected_state,
+    const torch::Tensor& projected_val,
+    const torch::Tensor& biases,
+    bool has_bias) {
+#ifdef WITH_CUDA
+  return jakal_net_low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_forward_cuda(
+      weighted_projected_source,
+      projected_target,
+      projected_state,
+      projected_val,
+      biases,
+      has_bias);
+#else
+  throw std::runtime_error(
+      "low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_forward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_forward_bmm_cuda_wrapper(
     const torch::Tensor& weighted_projected_source,
     const torch::Tensor& projected_target,
@@ -549,18 +582,37 @@ low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_forward_bmm_cud
     auto tile_stats = combined_tile.abs().masked_fill(combined_invalid_tile, score_neg_inf);
     auto tile_signs = torch::sign(combined_tile).masked_fill(combined_invalid_tile, 0.0);
     auto tile_row_max = std::get<0>(tile_stats.max(-1, false));
-    auto new_row_max = torch::maximum(row_max, tile_row_max);
-    auto prev_scale = torch::exp(row_max - new_row_max);
+    auto had_prev = row_denom > 0;
+    auto safe_prev_row_max = torch::where(had_prev, row_max, torch::zeros_like(row_max));
+    auto safe_tile_row_max = torch::where(
+        torch::isfinite(tile_row_max),
+        tile_row_max,
+        safe_prev_row_max
+    );
+    auto new_row_max = torch::maximum(safe_prev_row_max, safe_tile_row_max);
+    auto prev_scale = torch::where(
+        had_prev,
+        torch::exp(safe_prev_row_max - new_row_max),
+        torch::zeros_like(new_row_max)
+    );
     auto tile_exp =
         torch::exp(tile_stats - new_row_max.unsqueeze(-1)).masked_fill(combined_invalid_tile, 0.0);
     row_denom = row_denom * prev_scale + tile_exp.sum(-1);
+    auto projected_state_tile = state_f32.narrow(1, source_start, source_width);
+    auto edges_tile = tile_signs * tile_exp;
     numer_state = numer_state * prev_scale +
-        torch::bmm(tile_signs * tile_exp, state_f32.narrow(1, source_start, source_width).unsqueeze(-1))
-            .squeeze(-1);
-    numer_val = numer_val * prev_scale.unsqueeze(-1) +
-        torch::bmm(tile_signs * tile_exp, val_f32.narrow(1, source_start, source_width));
+        torch::bmm(edges_tile, projected_state_tile.unsqueeze(-1)).squeeze(-1);
+    if (signed_smoothmax) {
+      auto weighted_edges_tile = edges_tile * projected_state_tile.unsqueeze(1);
+      numer_val = numer_val * prev_scale.unsqueeze(-1) +
+          torch::bmm(weighted_edges_tile, val_f32.narrow(1, source_start, source_width));
+    } else {
+      numer_val = numer_val * prev_scale.unsqueeze(-1) +
+          torch::bmm(edges_tile, val_f32.narrow(1, source_start, source_width));
+    }
     row_max = new_row_max;
   }
+  std::tie(row_max, row_denom) = sanitize_empty_row_stats(row_max, row_denom);
   auto denom = row_denom.clamp_min(1.0e-20);
   auto delta_state = numer_state / denom;
   auto delta_val = numer_val / denom.unsqueeze(-1);
@@ -669,8 +721,19 @@ diagonal_multihead_smoothmax_propagation_causal_dense_signed_abs_forward_bmm_cud
     auto tile_stats = combined_tile.abs().masked_fill(combined_invalid_tile, score_neg_inf);
     auto tile_signs = torch::sign(combined_tile).masked_fill(combined_invalid_tile, 0.0);
     auto tile_row_max = std::get<0>(tile_stats.max(-1, false));
-    auto new_row_max = torch::maximum(row_max, tile_row_max);
-    auto prev_scale = torch::exp(row_max - new_row_max);
+    auto had_prev = row_denom > 0;
+    auto safe_prev_row_max = torch::where(had_prev, row_max, torch::zeros_like(row_max));
+    auto safe_tile_row_max = torch::where(
+        torch::isfinite(tile_row_max),
+        tile_row_max,
+        safe_prev_row_max
+    );
+    auto new_row_max = torch::maximum(safe_prev_row_max, safe_tile_row_max);
+    auto prev_scale = torch::where(
+        had_prev,
+        torch::exp(safe_prev_row_max - new_row_max),
+        torch::zeros_like(new_row_max)
+    );
     auto tile_exp = torch::exp(tile_stats - new_row_max.unsqueeze(-1)).masked_fill(combined_invalid_tile, 0.0);
     row_denom = row_denom * prev_scale + tile_exp.sum(-1);
     numer_state = numer_state * prev_scale +
@@ -680,6 +743,7 @@ diagonal_multihead_smoothmax_propagation_causal_dense_signed_abs_forward_bmm_cud
         torch::bmm(tile_signs * tile_exp, val_f32.narrow(1, source_start, source_width));
     row_max = new_row_max;
   }
+  std::tie(row_max, row_denom) = sanitize_empty_row_stats(row_max, row_denom);
   auto denom = row_denom.clamp_min(1.0e-20);
   auto delta_state = numer_state / denom;
   auto delta_val = numer_val / denom.unsqueeze(-1);
@@ -862,9 +926,6 @@ low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_backward_bmm_cu
   auto core_scale = core_weights.reshape({heads, 1, 1, rank_dim}).to(score_dtype);
   auto core_scale_f32 = core_weights.reshape({heads, 1, 1, rank_dim}).to(torch::kFloat32);
   auto projected_val_t = projected_val_f32.transpose(1, 2).contiguous();
-  std::vector<torch::Tensor> cached_grad_edges_tiles;
-  cached_grad_edges_tiles.reserve((nodes + tile_size - 1) / tile_size);
-
   if (row_max.numel() == 0 || row_denom.numel() == 0) {
     for (int64_t source_start = 0; source_start < nodes; source_start += tile_size) {
       const auto source_width = std::min<int64_t>(tile_size, nodes - source_start);
@@ -901,13 +962,25 @@ low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_backward_bmm_cu
         tile_stats = combined_tile.abs().masked_fill(combined_invalid_tile, score_neg_inf);
       }
       auto tile_row_max = std::get<0>(tile_stats.max(-1, false));
-      auto new_row_max = torch::maximum(row_max_f32, tile_row_max);
-      auto prev_scale = torch::exp(row_max_f32 - new_row_max);
+      auto had_prev = row_denom_f32 > 0;
+      auto safe_prev_row_max = torch::where(had_prev, row_max_f32, torch::zeros_like(row_max_f32));
+      auto safe_tile_row_max = torch::where(
+          torch::isfinite(tile_row_max),
+          tile_row_max,
+          safe_prev_row_max
+      );
+      auto new_row_max = torch::maximum(safe_prev_row_max, safe_tile_row_max);
+      auto prev_scale = torch::where(
+          had_prev,
+          torch::exp(safe_prev_row_max - new_row_max),
+          torch::zeros_like(new_row_max)
+      );
       auto tile_exp = torch::exp(tile_stats - new_row_max.unsqueeze(-1)).masked_fill(combined_invalid_tile, 0.0);
       row_denom_f32 = row_denom_f32 * prev_scale + tile_exp.sum(-1);
       row_max_f32 = new_row_max;
     }
   }
+  std::tie(row_max_f32, row_denom_f32) = sanitize_empty_row_stats(row_max_f32, row_denom_f32);
 
   for (int64_t source_start = 0; source_start < nodes; source_start += tile_size) {
     const auto source_width = std::min<int64_t>(tile_size, nodes - source_start);
@@ -931,8 +1004,12 @@ low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_backward_bmm_cu
     auto valid_tile = mask.narrow(1, source_start, source_width).view({1, 1, nodes, source_width});
     auto invalid_tile = valid_tile.logical_not();
     auto combined_invalid_tile = valid_tile.view({1, nodes, source_width}).logical_not();
+    auto projected_state_tile = projected_state_f32.narrow(1, source_start, source_width);
+    auto projected_val_tile = projected_val_f32.narrow(1, source_start, source_width);
     auto probs_tile = torch::Tensor();
     auto signs_tile = torch::Tensor();
+    auto edges_tile = torch::Tensor();
+    auto grad_edges_tile = torch::Tensor();
     if (signed_smoothmax) {
       auto zeroed_score_tile = score_tile.masked_fill(invalid_tile, 0.0);
       auto abs_score_tile = score_tile.abs().masked_fill(invalid_tile, score_neg_inf);
@@ -941,25 +1018,35 @@ low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_backward_bmm_cu
       probs_tile = torch::exp(combined_tile.abs() - row_max_f32.unsqueeze(-1)) / row_denom_f32.unsqueeze(-1);
       probs_tile = probs_tile.masked_fill(combined_invalid_tile, 0.0);
       signs_tile = torch::sign(combined_tile).masked_fill(combined_invalid_tile, 0.0);
+      edges_tile = signs_tile * probs_tile;
+      auto weighted_val_tile = projected_val_tile * projected_state_tile.unsqueeze(-1);
+      grad_edges_tile =
+          grad_delta_state_expanded * projected_state_tile.unsqueeze(1) +
+          torch::bmm(grad_delta_val_f32, weighted_val_tile.transpose(1, 2));
+      edge_dot = edge_dot + (grad_edges_tile * edges_tile).sum(-1);
+      auto edge_transpose = edges_tile.transpose(1, 2);
+      auto grad_val_reduced = torch::bmm(edge_transpose, grad_delta_val_f32);
+      grad_projected_state.narrow(1, source_start, source_width).add_(
+          torch::bmm(edge_transpose, grad_delta_state_expanded).squeeze(-1) +
+          (grad_val_reduced * projected_val_tile).sum(-1));
+      grad_projected_val.narrow(1, source_start, source_width).add_(
+          grad_val_reduced * projected_state_tile.unsqueeze(-1));
     } else {
       auto masked_score_tile = score_tile.masked_fill(invalid_tile, score_neg_inf);
       auto combined_tile = torch::logsumexp(masked_score_tile, {0}) - log_heads;
       probs_tile = torch::exp(combined_tile.abs() - row_max_f32.unsqueeze(-1)) / row_denom_f32.unsqueeze(-1);
       probs_tile = probs_tile.masked_fill(combined_invalid_tile, 0.0);
       signs_tile = torch::sign(combined_tile).masked_fill(combined_invalid_tile, 0.0);
+      edges_tile = signs_tile * probs_tile;
+      grad_edges_tile =
+          grad_delta_state_expanded * projected_state_tile.unsqueeze(1) +
+          torch::bmm(grad_delta_val_f32, projected_val_t.narrow(2, source_start, source_width));
+      edge_dot = edge_dot + (grad_edges_tile * edges_tile).sum(-1);
+      grad_projected_state.narrow(1, source_start, source_width).add_(
+          torch::bmm(edges_tile.transpose(1, 2), grad_delta_state_expanded).squeeze(-1));
+      grad_projected_val.narrow(1, source_start, source_width).add_(
+          torch::bmm(edges_tile.transpose(1, 2), grad_delta_val_f32));
     }
-    auto edges_tile = signs_tile * probs_tile;
-
-    auto projected_state_tile = projected_state_f32.narrow(1, source_start, source_width);
-    auto grad_edges_tile =
-        grad_delta_state_expanded * projected_state_tile.unsqueeze(1) +
-        torch::bmm(grad_delta_val_f32, projected_val_t.narrow(2, source_start, source_width));
-    edge_dot = edge_dot + (grad_edges_tile * edges_tile).sum(-1);
-    cached_grad_edges_tiles.push_back(grad_edges_tile.to(torch::kBFloat16));
-    grad_projected_state.narrow(1, source_start, source_width).add_(
-        torch::bmm(edges_tile.transpose(1, 2), grad_delta_state_expanded).squeeze(-1));
-    grad_projected_val.narrow(1, source_start, source_width).add_(
-        torch::bmm(edges_tile.transpose(1, 2), grad_delta_val_f32));
   }
 
   for (int64_t source_start = 0; source_start < nodes; source_start += tile_size) {
@@ -1008,7 +1095,19 @@ low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_backward_bmm_cu
       signs_tile = torch::sign(combined_tile).masked_fill(combined_invalid_tile, 0.0);
     }
     auto edges_tile = signs_tile * probs_tile;
-    auto grad_edges_tile = cached_grad_edges_tiles[(source_start / tile_size)].to(torch::kFloat32);
+    auto projected_state_tile = projected_state_f32.narrow(1, source_start, source_width);
+    auto projected_val_tile = projected_val_f32.narrow(1, source_start, source_width);
+    auto grad_edges_tile = torch::Tensor();
+    if (signed_smoothmax) {
+      auto weighted_val_tile = projected_val_tile * projected_state_tile.unsqueeze(-1);
+      grad_edges_tile =
+          grad_delta_state_expanded * projected_state_tile.unsqueeze(1) +
+          torch::bmm(grad_delta_val_f32, weighted_val_tile.transpose(1, 2));
+    } else {
+      grad_edges_tile =
+          grad_delta_state_expanded * projected_state_tile.unsqueeze(1) +
+          torch::bmm(grad_delta_val_f32, projected_val_t.narrow(2, source_start, source_width));
+    }
     auto grad_scores_tile =
         signs_tile * probs_tile * (signs_tile * grad_edges_tile - edge_dot.unsqueeze(-1));
     grad_scores_tile = grad_scores_tile.masked_fill(combined_invalid_tile, 0.0);
@@ -4300,6 +4399,7 @@ std::vector<std::string> supported_ops() {
             "bilinear_propagation_causal_dense_signed_abs_backward_cuda",
             "low_rank_multihead_max_propagation_causal_dense_signed_abs_forward_cuda",
             "low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cuda",
+            "low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_forward_cuda",
             "low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_backward_cuda",
             "low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_forward_bmm_cuda",
             "low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_backward_bmm_cuda",
@@ -5843,6 +5943,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cuda",
       &low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cuda_wrapper,
       "CUDA fused multi-head max low-rank propagation causal dense backward with signed_abs_softmax");
+  m.def(
+      "low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_forward_cuda",
+      &low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_forward_cuda_wrapper,
+      "CUDA fused multi-head signed_smoothmax low-rank propagation causal dense forward with signed_abs_softmax");
   m.def(
       "low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_backward_cuda",
       &low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_backward_cuda_wrapper,

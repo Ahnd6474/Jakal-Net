@@ -5848,6 +5848,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--unit-norm-values", action="store_true")
     parser.add_argument("--disable-forced-unit-norm-values", action="store_true")
     parser.add_argument("--propagation-residual-gate-init", type=float, default=0.1)
+    parser.add_argument(
+        "--state-update-kind",
+        choices=("signed_softmax", "softsign", "rms", "rms_softsign"),
+        default="signed_softmax",
+    )
+    parser.add_argument("--disable-state-residual", action="store_true")
     parser.add_argument("--implementation", choices=("reference", "streaming", "kernel", "native"), default="streaming")
     parser.add_argument("--knowledge-nodes", type=int, default=0)
     parser.add_argument("--knowledge-route-topk", type=int, default=0)
@@ -6749,8 +6755,8 @@ def main() -> None:
         and args.lr_decay_steps == 0
         and abs(float(args.lr_min_ratio)) <= 1.0e-12
     ):
-        args.lr_decay_start_step = max(int(args.warmup_steps), int(0.6 * total_steps))
-        args.lr_decay_steps = max(1, total_steps - int(args.lr_decay_start_step))
+        args.lr_decay_start_step = max(int(args.warmup_steps), int(0.6 * total_optimizer_steps))
+        args.lr_decay_steps = max(1, total_optimizer_steps - int(args.lr_decay_start_step))
         args.lr_min_ratio = 0.25
         lowrank_lion_default_schedule_applied = True
     run_name = args.run_name or build_run_name(args)
@@ -6999,6 +7005,8 @@ def main() -> None:
             implementation=args.implementation,
             unit_norm_values=args.unit_norm_values,
             propagation_residual_gate_init=args.propagation_residual_gate_init,
+            state_residual=not args.disable_state_residual,
+            state_update_kind=args.state_update_kind,
             knowledge_nodes=args.knowledge_nodes,
             knowledge_route_topk=None if args.knowledge_route_topk <= 0 else args.knowledge_route_topk,
             knowledge_propagation_topk=None if args.knowledge_propagation_topk <= 0 else args.knowledge_propagation_topk,
@@ -7043,6 +7051,7 @@ def main() -> None:
             f"unit_norm_values={args.unit_norm_values} | feed_forward_layers={not args.disable_feed_forward_layers} | "
             f"pairwise_head_aggregate={args.pairwise_head_aggregate} | "
             f"propagation_residual_gate_init={args.propagation_residual_gate_init:g} | "
+            f"state_update_kind={args.state_update_kind} | state_residual={not args.disable_state_residual} | "
             f"memory_feed_forward_layers={not (args.disable_feed_forward_layers or args.disable_memory_feed_forward_layers)} | "
             f"disable_memory={args.disable_memory} | disable_memory_read={args.disable_memory_read} | "
             f"disable_memory_propagation={args.disable_memory_propagation} | "
@@ -7414,9 +7423,10 @@ def main() -> None:
                 flush=True,
             )
 
+        schedule_step = optimizer_step + 1
         lr = compute_learning_rate(
-            step=step,
-            total_steps=total_steps,
+            step=schedule_step,
+            total_steps=total_optimizer_steps,
             base_lr=args.learning_rate,
             warmup_start_lr=args.warmup_start_lr,
             warmup_steps=args.warmup_steps,
@@ -7427,6 +7437,12 @@ def main() -> None:
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
+        should_step_optimizer = step % stage.grad_accum_steps == 0 or step == total_steps
+        suppress_ddp_sync = (
+            isinstance(model, DistributedDataParallel)
+            and stage.grad_accum_steps > 1
+            and not should_step_optimizer
+        )
         current_memory_state = None if stage.freeze_memory else train_memory_state
         span_losses: list[float] = []
         last_span_loss_tensor: torch.Tensor | None = None
@@ -7439,105 +7455,105 @@ def main() -> None:
             and not args.cuda_graph_stage1
         )
         set_model_track_stats(model, should_collect_model_stats)
-        for span_index in range(stage.document_span):
-            batch_wait_started_at = time.perf_counter()
-            batch = override_batch_reset(
-                prefetcher.next_batch(),
-                reset_all=stage.freeze_memory,
-            )
-            total_batch_wait_seconds += time.perf_counter() - batch_wait_started_at
-            consumed_batches += 1
-            use_stage1_cuda_graph = (
-                args.cuda_graph_stage1
-                and device.type == "cuda"
-                and scaler is None
-                and stage.name == "stage1"
-                and stage.document_span == 1
-                and stage.grad_accum_steps == 1
-                and not stage.freeze_memory
-                and span_index == 0
-            )
-            if use_stage1_cuda_graph:
-                if (
-                    stage1_cuda_graph_runner is None
-                    or tuple(stage1_cuda_graph_runner.static_batch.context.shape) != tuple(batch.context.shape)
-                ):
-                    stage1_cuda_graph_runner = Stage1ForwardCudaGraphRunner(
-                        model=model,
-                        batch=batch,
+        ddp_sync_context = model.no_sync() if suppress_ddp_sync else nullcontext()
+        with ddp_sync_context:
+            for span_index in range(stage.document_span):
+                batch_wait_started_at = time.perf_counter()
+                batch = override_batch_reset(
+                    prefetcher.next_batch(),
+                    reset_all=stage.freeze_memory,
+                )
+                total_batch_wait_seconds += time.perf_counter() - batch_wait_started_at
+                consumed_batches += 1
+                use_stage1_cuda_graph = (
+                    args.cuda_graph_stage1
+                    and device.type == "cuda"
+                    and scaler is None
+                    and stage.name == "stage1"
+                    and stage.document_span == 1
+                    and stage.grad_accum_steps == 1
+                    and not stage.freeze_memory
+                    and span_index == 0
+                )
+                if use_stage1_cuda_graph:
+                    if (
+                        stage1_cuda_graph_runner is None
+                        or tuple(stage1_cuda_graph_runner.static_batch.context.shape) != tuple(batch.context.shape)
+                    ):
+                        stage1_cuda_graph_runner = Stage1ForwardCudaGraphRunner(
+                            model=model,
+                            batch=batch,
+                            precision=args.precision,
+                        )
+                        print("cuda_graph | mode=forward_only", flush=True)
+                    loss, main_loss_value, next_memory_state = stage1_cuda_graph_runner.replay(
+                        batch,
+                        memory_state=current_memory_state,
+                    )
+                    used_cuda_graph = isinstance(stage1_cuda_graph_runner, Stage1CudaGraphRunner)
+                else:
+                    loss, main_loss_value, next_memory_state = run_model(
+                        model,
+                        batch,
+                        memory_state=current_memory_state,
                         precision=args.precision,
+                        grad_enabled=True,
                     )
-                    print("cuda_graph | mode=forward_only", flush=True)
-                loss, main_loss_value, next_memory_state = stage1_cuda_graph_runner.replay(
-                    batch,
-                    memory_state=current_memory_state,
-                )
-                used_cuda_graph = isinstance(stage1_cuda_graph_runner, Stage1CudaGraphRunner)
-            else:
-                loss, main_loss_value, next_memory_state = run_model(
-                    model,
-                    batch,
-                    memory_state=current_memory_state,
-                    precision=args.precision,
-                    grad_enabled=True,
-            )
-            loss_is_finite = bool(torch.isfinite(loss.detach()).item())
-            if not loss_is_finite:
-                print(
-                    f"warning | step={step} | span_index={span_index} | non-finite loss; skipping optimizer step",
-                    flush=True,
-                )
-                parameter_diagnostics = summarize_nonfinite_parameters(
-                    grad_clip_named_parameters,
-                    limit=args.diagnose_nonfinite_limit,
-                )
-                if parameter_diagnostics:
+                loss_is_finite = bool(torch.isfinite(loss.detach()).item())
+                if not loss_is_finite:
                     print(
-                        "diagnose_nonfinite_param | "
-                        + " | ".join(parameter_diagnostics),
+                        f"warning | step={step} | span_index={span_index} | non-finite loss; skipping optimizer step",
                         flush=True,
                     )
-                else:
-                    print("diagnose_nonfinite_param | all_finite", flush=True)
-                memory_diagnostics = summarize_nonfinite_memory_state(next_memory_state)
-                if memory_diagnostics:
-                    print(
-                        "diagnose_nonfinite_memory | "
-                        + " | ".join(memory_diagnostics),
-                        flush=True,
+                    parameter_diagnostics = summarize_nonfinite_parameters(
+                        grad_clip_named_parameters,
+                        limit=args.diagnose_nonfinite_limit,
                     )
-                else:
-                    print("diagnose_nonfinite_memory | all_finite", flush=True)
-                break
-            span_losses.append(main_loss_value)
-            last_span_loss_tensor = loss
-            current_memory_state = None if stage.freeze_memory else next_memory_state
+                    if parameter_diagnostics:
+                        print(
+                            "diagnose_nonfinite_param | "
+                            + " | ".join(parameter_diagnostics),
+                            flush=True,
+                        )
+                    else:
+                        print("diagnose_nonfinite_param | all_finite", flush=True)
+                    memory_diagnostics = summarize_nonfinite_memory_state(next_memory_state)
+                    if memory_diagnostics:
+                        print(
+                            "diagnose_nonfinite_memory | "
+                            + " | ".join(memory_diagnostics),
+                            flush=True,
+                        )
+                    else:
+                        print("diagnose_nonfinite_memory | all_finite", flush=True)
+                    break
+                span_losses.append(main_loss_value)
+                last_span_loss_tensor = loss
+                current_memory_state = None if stage.freeze_memory else next_memory_state
 
-        if loss_is_finite and last_span_loss_tensor is not None and not used_cuda_graph:
-            total_span_loss = last_span_loss_tensor / stage.grad_accum_steps
-            if scaler is not None:
-                scaler.scale(total_span_loss).backward()
+            if loss_is_finite and last_span_loss_tensor is not None and not used_cuda_graph:
+                total_span_loss = last_span_loss_tensor / stage.grad_accum_steps
+                if scaler is not None:
+                    scaler.scale(total_span_loss).backward()
+                else:
+                    total_span_loss.backward()
+                del total_span_loss
+                train_memory_state = None if stage.freeze_memory else detach_memory_state(current_memory_state)
+                if not memory_state_is_finite(train_memory_state):
+                    print(f"warning | step={step} | non-finite memory state; resetting memory", flush=True)
+                    train_memory_state = None
+            elif loss_is_finite and used_cuda_graph:
+                train_memory_state = detach_memory_state(current_memory_state)
+                if not memory_state_is_finite(train_memory_state):
+                    print(f"warning | step={step} | non-finite memory state; resetting memory", flush=True)
+                    train_memory_state = None
             else:
-                total_span_loss.backward()
-            del total_span_loss
-            train_memory_state = None if stage.freeze_memory else detach_memory_state(current_memory_state)
-            if not memory_state_is_finite(train_memory_state):
-                print(f"warning | step={step} | non-finite memory state; resetting memory", flush=True)
+                optimizer.zero_grad(set_to_none=True)
                 train_memory_state = None
-        elif loss_is_finite and used_cuda_graph:
-            train_memory_state = detach_memory_state(current_memory_state)
-            if not memory_state_is_finite(train_memory_state):
-                print(f"warning | step={step} | non-finite memory state; resetting memory", flush=True)
-                train_memory_state = None
-        else:
-            optimizer.zero_grad(set_to_none=True)
-            train_memory_state = None
 
         model_stats = collect_model_internal_stats(model) if should_collect_model_stats else {}
         if should_collect_model_stats:
             set_model_track_stats(model, False)
-
-        should_step_optimizer = step % stage.grad_accum_steps == 0 or step == total_steps
         grad_group_diagnostics: dict[str, dict[str, float | int]] = {}
         did_optimizer_step = False
         if loss_is_finite and should_step_optimizer:

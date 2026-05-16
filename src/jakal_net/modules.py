@@ -186,7 +186,7 @@ class ResidualFeedForward(nn.Module):
         else:
             assert self.fixed_residual_scale is not None
             scale = self.fixed_residual_scale.to(device=val.device, dtype=val.dtype)
-        return val + scale * self.net(self.input_norm(val))
+        return self.input_norm(val + scale * self.net(val))
 
 
 class StateValueFeedForward(nn.Module):

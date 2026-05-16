@@ -14,6 +14,7 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from jakal_net.core import LayerDelta
+from jakal_net._architectural_common import apply_state_update
 from jakal_net.kernel_common import (
     pairwise_kernel_spec,
     pairwise_route_kernel_spec,
@@ -1176,8 +1177,17 @@ def _native_scan_apply_delta(
     delta_val: Tensor,
     val_norm_weight: Tensor,
     val_norm_bias: Tensor,
+    *,
+    state_residual: bool = True,
+    state_update_kind: str = "signed_softmax",
 ) -> tuple[Tensor, Tensor]:
-    next_state = _native_scan_signed_softmax_state(layer_state + delta_state)
+    next_state = apply_state_update(
+        layer_state,
+        delta_state,
+        residual=state_residual,
+        unit_norm_values=False,
+        state_update_kind=state_update_kind,
+    )
     next_val = _native_scan_layer_norm(layer_val + delta_val, val_norm_weight, val_norm_bias)
     return next_state, next_val
 
@@ -4979,6 +4989,11 @@ def _lowrank_smoothmax_bmm_cuda_enabled() -> bool:
     value = os.environ.get("JAKAL_NET_LOWRANK_SMOOTHMAX_BMM_CUDA", "1").strip().lower()
     return value in {"1", "true", "yes", "on"}
 
+
+def _lowrank_signed_smoothmax_bmm_cuda_enabled() -> bool:
+    value = os.environ.get("JAKAL_NET_LOWRANK_SIGNED_SMOOTHMAX_BMM_CUDA", "1").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
 def _normalized_lowrank_core(core: Tensor, *, dtype: torch.dtype | None = None) -> Tensor:
     cast = core.to(dtype=dtype or core.dtype)
     denom = torch.linalg.vector_norm(cast, ord=2, dim=-1, keepdim=True).clamp_min(1e-6)
@@ -5296,6 +5311,7 @@ def _signed_smoothmax_backward_recompute_tiles(
             grad_scores = signs * probs * (signs * grad_edges - edge_dot.unsqueeze(-1))
             grad_scores = grad_scores.masked_fill(~valid_mask, 0.0)
             grad_scores_h = grad_scores.unsqueeze(0) * head_grads.to(dtype=grad_scores.dtype)
+            tile_nodes = int(source_end - source_start)
             grad_scores_flat = grad_scores_h.reshape(heads * batch_flat, nodes, tile_nodes).to(dtype=projected_target.dtype)
             weighted_source_tile = weighted_source[:, :, source_start:source_end, :].reshape(
                 heads * batch_flat,
@@ -5607,6 +5623,11 @@ class _LowRankMultiHeadMaxPropagationCausalDenseSignedAbs(Function):
             tile_exp = torch.exp(stats - new_max.unsqueeze(-1)).masked_fill(~valid_scores, 0.0)
             row_denom = row_denom * old_scale + tile_exp.sum(dim=-1)
             row_max = new_max
+        empty_rows = row_denom <= 0.0
+        row_max = torch.where(empty_rows, torch.zeros_like(row_max), row_max)
+        row_denom = torch.where(empty_rows, torch.ones_like(row_denom), row_denom)
+        row_max = torch.nan_to_num(row_max, nan=0.0, neginf=0.0, posinf=0.0)
+        row_denom = torch.nan_to_num(row_denom, nan=1.0, neginf=1.0, posinf=1.0)
         return row_max, row_denom.clamp_min(1.0e-20)
 
     @staticmethod
@@ -5653,11 +5674,24 @@ class _LowRankMultiHeadMaxPropagationCausalDenseSignedAbs(Function):
             and native_supports("low_rank_multihead_max_propagation_causal_dense_signed_abs_forward_cuda")
             and native_supports("low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cuda")
         )
+        use_signed_smoothmax_fused_cuda = (
+            str(aggregate) == "signed_smoothmax"
+            and _multihead_signed_smoothmax_fused_cuda_enabled()
+            and flat_val.is_cuda
+            and native_supports("low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_forward_cuda")
+            and nodes % 16 == 0
+            and int(projected_target.shape[-1]) % 8 == 0
+            and out_dim % 16 == 0
+        )
         use_smoothmax_bmm_cuda = (
             str(aggregate) in {"smoothmax", "signed_smoothmax"}
-            and str(aggregate) != "signed_smoothmax"
-            and _lowrank_smoothmax_bmm_cuda_enabled()
+            and (
+                _lowrank_smoothmax_bmm_cuda_enabled()
+                if str(aggregate) == "smoothmax"
+                else _lowrank_signed_smoothmax_bmm_cuda_enabled()
+            )
             and not use_native_cuda
+            and not use_signed_smoothmax_fused_cuda
             and flat_val.is_cuda
             and native_supports("low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_forward_bmm_cuda")
         )
@@ -5677,6 +5711,24 @@ class _LowRankMultiHeadMaxPropagationCausalDenseSignedAbs(Function):
             )
             row_max = flat_val.new_empty((0,), dtype=torch.float32)
             row_denom = flat_val.new_empty((0,), dtype=torch.float32)
+        elif use_signed_smoothmax_fused_cuda:
+            fused_weighted_source = weighted_source.to(dtype=torch.float32).contiguous()
+            fused_projected_target = projected_target.to(dtype=torch.float32).contiguous()
+            fused_bias_arg = (
+                biases.to(dtype=torch.float32, device=flat_val.device).contiguous()
+                if bool(has_bias)
+                else biases
+            )
+            delta_state, delta_val, row_max, row_denom = (
+                _native_module().low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_forward_cuda(
+                    fused_weighted_source,
+                    fused_projected_target,
+                    state_f32,
+                    val_f32,
+                    fused_bias_arg,
+                    bool(has_bias),
+                )
+            )
         elif use_smoothmax_bmm_cuda:
             delta_state, delta_val, row_max, row_denom = (
                 _native_module().low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_forward_bmm_cuda(
@@ -5739,7 +5791,7 @@ class _LowRankMultiHeadMaxPropagationCausalDenseSignedAbs(Function):
                     delta_state = delta_state + torch.bmm(edges, state_f32[:, source_start:source_end].unsqueeze(-1)).squeeze(-1)
                     delta_val = delta_val + torch.bmm(edges, val_f32[:, source_start:source_end, :])
             saved_scores = flat_val.new_empty((0,), dtype=torch.float32)
-        if use_native_cuda or use_smoothmax_bmm_cuda:
+        if use_native_cuda or use_signed_smoothmax_fused_cuda or use_smoothmax_bmm_cuda:
             saved_scores = flat_val.new_empty((0,), dtype=torch.float32)
         ctx.has_bias = bool(has_bias)
         ctx.aggregate = str(aggregate)
@@ -5751,6 +5803,7 @@ class _LowRankMultiHeadMaxPropagationCausalDenseSignedAbs(Function):
         ctx.projected_val_dtype = projected_val.dtype
         ctx.tile_size = int(tile_size)
         ctx.used_native_cuda = bool(use_native_cuda)
+        ctx.used_signed_smoothmax_fused_cuda = bool(use_signed_smoothmax_fused_cuda)
         ctx.used_smoothmax_bmm_cuda = bool(use_smoothmax_bmm_cuda)
         ctx.projected_val_is_raw = bool(use_raw_weighted_edges)
         ctx.save_for_backward(
@@ -5799,7 +5852,37 @@ class _LowRankMultiHeadMaxPropagationCausalDenseSignedAbs(Function):
         )
         bias_arg = biases.to(dtype=projected_target.dtype).contiguous() if ctx.has_bias else biases
         tile_size = int(ctx.tile_size)
-        if str(ctx.aggregate) == "signed_smoothmax":
+        if (
+            str(ctx.aggregate) == "signed_smoothmax"
+            and bool(getattr(ctx, "used_signed_smoothmax_fused_cuda", False))
+            and native_supports("low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_backward_bmm_cuda")
+        ):
+            (
+                grad_projected_source,
+                grad_projected_target,
+                grad_projected_state,
+                grad_projected_val,
+                grad_core_weights,
+                grad_biases,
+            ) = _native_module().low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_backward_bmm_cuda(
+                weighted_source,
+                projected_source,
+                projected_target,
+                flat_projected_state,
+                flat_projected_val,
+                core_cast,
+                bias_arg,
+                row_max,
+                row_denom,
+                flat_grad_state,
+                flat_grad_val,
+                bool(ctx.has_bias),
+                str(ctx.aggregate),
+            )
+        elif (
+            str(ctx.aggregate) == "signed_smoothmax"
+            and not bool(getattr(ctx, "used_smoothmax_bmm_cuda", False))
+        ):
             (
                 grad_projected_source,
                 grad_projected_target,
@@ -5825,7 +5908,7 @@ class _LowRankMultiHeadMaxPropagationCausalDenseSignedAbs(Function):
                 allow_triton=False,
             )
         elif (
-            str(ctx.aggregate) == "smoothmax"
+            str(ctx.aggregate) in {"smoothmax", "signed_smoothmax"}
             and bool(getattr(ctx, "used_smoothmax_bmm_cuda", False))
             and native_supports("low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_backward_bmm_cuda")
         ):
