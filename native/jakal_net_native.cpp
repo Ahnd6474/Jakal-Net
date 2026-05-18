@@ -25,6 +25,58 @@
 bool jakal_net_compiled_with_cuda_source() {
   return false;
 }
+
+bool jakal_net_query_topk_reduce_cuda_available() {
+  return false;
+}
+
+bool jakal_net_low_rank_pairwise_topk_forward_cuda_available() {
+  return false;
+}
+
+bool jakal_net_low_rank_propagation_topk_forward_cuda_available() {
+  return false;
+}
+
+bool jakal_net_low_rank_propagation_window_forward_cuda_available() {
+  return false;
+}
+
+bool jakal_net_low_rank_propagation_window_signed_abs_forward_cuda_available() {
+  return false;
+}
+
+bool jakal_net_low_rank_propagation_causal_dense_signed_abs_forward_cuda_available() {
+  return false;
+}
+
+bool jakal_net_low_rank_propagation_causal_dense_signed_abs_backward_cuda_available() {
+  return false;
+}
+
+bool jakal_net_bilinear_propagation_causal_dense_signed_abs_backward_cuda_available() {
+  return false;
+}
+
+bool jakal_net_low_rank_multihead_max_propagation_causal_dense_signed_abs_cuda_available() {
+  return false;
+}
+
+bool jakal_net_diagonal_propagation_causal_dense_signed_abs_cuda_available() {
+  return false;
+}
+
+bool jakal_net_low_rank_propagation_dense_forward_cuda_available() {
+  return false;
+}
+
+bool jakal_net_low_rank_dense_scores_tf32_cuda_available() {
+  return false;
+}
+
+bool jakal_net_low_rank_propagation_dense_tf32_forward_cuda_available() {
+  return false;
+}
 #endif
 
 namespace {
@@ -89,7 +141,7 @@ std::pair<torch::Tensor, torch::Tensor> sanitize_empty_row_stats(
 }
 
 bool supports_cuda_runtime() {
-#if JAKAL_NET_HAS_TORCH_CUDA_HEADER
+#if defined(WITH_CUDA) && JAKAL_NET_HAS_TORCH_CUDA_HEADER
   return torch::cuda::is_available();
 #else
   return false;
@@ -463,7 +515,8 @@ low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_forward_
     const torch::Tensor& projected_state,
     const torch::Tensor& projected_val,
     const torch::Tensor& biases,
-    bool has_bias) {
+    bool has_bias,
+    bool state_weight_delta_state) {
 #ifdef WITH_CUDA
   return jakal_net_low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_forward_cuda(
       weighted_projected_source,
@@ -471,7 +524,8 @@ low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_forward_
       projected_state,
       projected_val,
       biases,
-      has_bias);
+      has_bias,
+      state_weight_delta_state);
 #else
   throw std::runtime_error(
       "low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_forward_cuda requires a CUDA-enabled build.");
@@ -486,7 +540,8 @@ low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_forward_bmm_cud
     const torch::Tensor& projected_val,
     const torch::Tensor& biases,
     bool has_bias,
-    const std::string& aggregate) {
+    const std::string& aggregate,
+    bool state_weight_delta_state) {
   if (!weighted_projected_source.is_cuda() || !projected_target.is_cuda() ||
       !projected_state.is_cuda() || !projected_val.is_cuda()) {
     throw std::runtime_error("smoothmax bmm forward requires CUDA tensors.");
@@ -600,13 +655,19 @@ low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_forward_bmm_cud
     row_denom = row_denom * prev_scale + tile_exp.sum(-1);
     auto projected_state_tile = state_f32.narrow(1, source_start, source_width);
     auto edges_tile = tile_signs * tile_exp;
-    numer_state = numer_state * prev_scale +
-        torch::bmm(edges_tile, projected_state_tile.unsqueeze(-1)).squeeze(-1);
     if (signed_smoothmax) {
-      auto weighted_edges_tile = edges_tile * projected_state_tile.unsqueeze(1);
+      if (state_weight_delta_state) {
+        numer_state = numer_state * prev_scale +
+            torch::bmm(edges_tile, projected_state_tile.unsqueeze(-1)).squeeze(-1);
+      } else {
+        numer_state = numer_state * prev_scale + edges_tile.sum(-1);
+      }
       numer_val = numer_val * prev_scale.unsqueeze(-1) +
-          torch::bmm(weighted_edges_tile, val_f32.narrow(1, source_start, source_width));
+          torch::bmm(edges_tile, val_f32.narrow(1, source_start, source_width) *
+                                   projected_state_tile.unsqueeze(-1));
     } else {
+      numer_state = numer_state * prev_scale +
+          torch::bmm(edges_tile, projected_state_tile.unsqueeze(-1)).squeeze(-1);
       numer_val = numer_val * prev_scale.unsqueeze(-1) +
           torch::bmm(edges_tile, val_f32.narrow(1, source_start, source_width));
     }
@@ -796,7 +857,8 @@ low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_backward
     const torch::Tensor& row_denom,
     const torch::Tensor& grad_delta_state,
     const torch::Tensor& grad_delta_val,
-    bool has_bias) {
+    bool has_bias,
+    bool state_weight_delta_state) {
 #ifdef WITH_CUDA
   return jakal_net_low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_backward_cuda(
       weighted_projected_source,
@@ -810,7 +872,8 @@ low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_backward
       row_denom,
       grad_delta_state,
       grad_delta_val,
-      has_bias);
+      has_bias,
+      state_weight_delta_state);
 #else
   throw std::runtime_error(
       "low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_backward_cuda requires a CUDA-enabled build.");
@@ -831,7 +894,8 @@ low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_backward_bmm_cu
     const torch::Tensor& grad_delta_state,
     const torch::Tensor& grad_delta_val,
     bool has_bias,
-    const std::string& aggregate) {
+    const std::string& aggregate,
+    bool state_weight_delta_state) {
   if (!weighted_projected_source.is_cuda() || !projected_source.is_cuda() ||
       !projected_target.is_cuda() || !projected_state.is_cuda() || !projected_val.is_cuda() ||
       !core_weights.is_cuda() || !grad_delta_state.is_cuda() || !grad_delta_val.is_cuda()) {
@@ -1020,15 +1084,22 @@ low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_backward_bmm_cu
       signs_tile = torch::sign(combined_tile).masked_fill(combined_invalid_tile, 0.0);
       edges_tile = signs_tile * probs_tile;
       auto weighted_val_tile = projected_val_tile * projected_state_tile.unsqueeze(-1);
-      grad_edges_tile =
-          grad_delta_state_expanded * projected_state_tile.unsqueeze(1) +
-          torch::bmm(grad_delta_val_f32, weighted_val_tile.transpose(1, 2));
+      grad_edges_tile = torch::bmm(grad_delta_val_f32, weighted_val_tile.transpose(1, 2));
+      if (state_weight_delta_state) {
+        grad_edges_tile =
+            grad_edges_tile + grad_delta_state_expanded * projected_state_tile.unsqueeze(1);
+      } else {
+        grad_edges_tile = grad_edges_tile + grad_delta_state_expanded;
+      }
       edge_dot = edge_dot + (grad_edges_tile * edges_tile).sum(-1);
       auto edge_transpose = edges_tile.transpose(1, 2);
       auto grad_val_reduced = torch::bmm(edge_transpose, grad_delta_val_f32);
-      grad_projected_state.narrow(1, source_start, source_width).add_(
-          torch::bmm(edge_transpose, grad_delta_state_expanded).squeeze(-1) +
-          (grad_val_reduced * projected_val_tile).sum(-1));
+      auto grad_state_update = (grad_val_reduced * projected_val_tile).sum(-1);
+      if (state_weight_delta_state) {
+        grad_state_update =
+            grad_state_update + torch::bmm(edge_transpose, grad_delta_state_expanded).squeeze(-1);
+      }
+      grad_projected_state.narrow(1, source_start, source_width).add_(grad_state_update);
       grad_projected_val.narrow(1, source_start, source_width).add_(
           grad_val_reduced * projected_state_tile.unsqueeze(-1));
     } else {
@@ -1100,9 +1171,13 @@ low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_backward_bmm_cu
     auto grad_edges_tile = torch::Tensor();
     if (signed_smoothmax) {
       auto weighted_val_tile = projected_val_tile * projected_state_tile.unsqueeze(-1);
-      grad_edges_tile =
-          grad_delta_state_expanded * projected_state_tile.unsqueeze(1) +
-          torch::bmm(grad_delta_val_f32, weighted_val_tile.transpose(1, 2));
+      grad_edges_tile = torch::bmm(grad_delta_val_f32, weighted_val_tile.transpose(1, 2));
+      if (state_weight_delta_state) {
+        grad_edges_tile =
+            grad_edges_tile + grad_delta_state_expanded * projected_state_tile.unsqueeze(1);
+      } else {
+        grad_edges_tile = grad_edges_tile + grad_delta_state_expanded;
+      }
     } else {
       grad_edges_tile =
           grad_delta_state_expanded * projected_state_tile.unsqueeze(1) +
@@ -1150,6 +1225,72 @@ low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_backward_bmm_cu
       grad_projected_val,
       grad_core_weights,
       grad_biases};
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+low_rank_multihead_projection_epilogue_backward_cuda_wrapper(
+    const torch::Tensor& grad_projected_source,
+    const torch::Tensor& grad_projected_target,
+    const torch::Tensor& flat_val,
+    const torch::Tensor& source_weights,
+    const torch::Tensor& target_weights) {
+#ifdef WITH_CUDA
+  return jakal_net_low_rank_multihead_projection_epilogue_backward_cuda(
+      grad_projected_source,
+      grad_projected_target,
+      flat_val,
+      source_weights,
+      target_weights);
+#else
+  throw std::runtime_error(
+      "low_rank_multihead_projection_epilogue_backward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+low_rank_multihead_projection_tiles_backward_cuda_wrapper(
+    const torch::Tensor& grad_scores_heads,
+    const torch::Tensor& weighted_source_tile,
+    const torch::Tensor& source_tile,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& core_weights,
+    bool has_bias) {
+#ifdef WITH_CUDA
+  return jakal_net_low_rank_multihead_projection_tiles_backward_cuda(
+      grad_scores_heads,
+      weighted_source_tile,
+      source_tile,
+      projected_target,
+      core_weights,
+      has_bias);
+#else
+  throw std::runtime_error(
+      "low_rank_multihead_projection_tiles_backward_cuda requires a CUDA-enabled build.");
+#endif
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+low_rank_multihead_projection_tiles_weighted_backward_cuda_wrapper(
+    const torch::Tensor& grad_scores,
+    const torch::Tensor& head_weights,
+    const torch::Tensor& weighted_source_tile,
+    const torch::Tensor& source_tile,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& core_weights,
+    bool has_bias) {
+#ifdef WITH_CUDA
+  return jakal_net_low_rank_multihead_projection_tiles_weighted_backward_cuda(
+      grad_scores,
+      head_weights,
+      weighted_source_tile,
+      source_tile,
+      projected_target,
+      core_weights,
+      has_bias);
+#else
+  throw std::runtime_error(
+      "low_rank_multihead_projection_tiles_weighted_backward_cuda requires a CUDA-enabled build.");
+#endif
 }
 
 std::tuple<torch::Tensor, torch::Tensor>
@@ -1911,11 +2052,6 @@ torch::Tensor signed_softmax_state(const torch::Tensor& state) {
   return torch::sign(clean_state) * magnitude * state_mass;
 }
 
-torch::Tensor signed_abs_softmax_scores(const torch::Tensor& scores) {
-  auto clean_scores = torch::nan_to_num(scores);
-  return torch::nan_to_num(torch::sign(clean_scores) * torch::softmax(clean_scores.abs(), -1));
-}
-
 torch::Tensor entmax15_scores(
     const torch::Tensor& scores,
     const c10::optional<torch::Tensor>& mask = c10::nullopt) {
@@ -1983,6 +2119,40 @@ torch::Tensor signed_entmax15_backward_scores(
       grad_input.sum(-1, true) / gppr_sum.clamp_min(std::numeric_limits<double>::epsilon()),
       torch::zeros_like(gppr_sum));
   auto grad_scores = (grad_input - correction * gppr) * signs;
+  if (mask.has_value()) {
+    grad_scores = grad_scores * mask.value().to(grad_scores.scalar_type());
+  }
+  return torch::nan_to_num(grad_scores);
+}
+
+torch::Tensor signed_abs_softmax_scores(
+    const torch::Tensor& scores,
+    const c10::optional<torch::Tensor>& mask = c10::nullopt) {
+  auto clean_scores = torch::nan_to_num(scores);
+  torch::Tensor probs;
+  if (mask.has_value()) {
+    auto stats = clean_scores.abs().masked_fill(mask.value().logical_not(), -std::numeric_limits<double>::infinity());
+    probs = torch::softmax(stats, -1).masked_fill(mask.value().logical_not(), 0.0);
+  } else {
+    probs = torch::softmax(clean_scores.abs(), -1);
+  }
+  auto signed_routes = torch::sign(clean_scores) * probs;
+  if (mask.has_value()) {
+    signed_routes = signed_routes * mask.value().to(signed_routes.scalar_type());
+  }
+  return torch::nan_to_num(signed_routes);
+}
+
+torch::Tensor signed_abs_softmax_backward_scores(
+    const torch::Tensor& scores,
+    const torch::Tensor& grad_routes,
+    const c10::optional<torch::Tensor>& mask = c10::nullopt) {
+  auto clean_scores = torch::nan_to_num(scores);
+  auto signed_routes = signed_abs_softmax_scores(scores, mask);
+  auto signs = torch::sign(clean_scores);
+  auto probs = signed_routes * signs;
+  auto dot = (grad_routes * signed_routes).sum(-1, true);
+  auto grad_scores = signs * probs * (signs * grad_routes - dot);
   if (mask.has_value()) {
     grad_scores = grad_scores * mask.value().to(grad_scores.scalar_type());
   }
@@ -4401,6 +4571,9 @@ std::vector<std::string> supported_ops() {
             "low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cuda",
             "low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_forward_cuda",
             "low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_backward_cuda",
+            "low_rank_multihead_projection_epilogue_backward_cuda",
+            "low_rank_multihead_projection_tiles_backward_cuda",
+            "low_rank_multihead_projection_tiles_weighted_backward_cuda",
             "low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_forward_bmm_cuda",
             "low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_backward_bmm_cuda",
             "diagonal_multihead_smoothmax_propagation_causal_dense_signed_abs_forward_bmm_cuda",
@@ -5842,11 +6015,27 @@ std::tuple<torch::Tensor, torch::Tensor> transition_query_topk(
 }  // namespace
 
 TORCH_LIBRARY(jakal_net, m) {
+  m.def("signed_abs_softmax(Tensor scores, Tensor mask) -> Tensor");
+  m.def("signed_abs_softmax_backward(Tensor scores, Tensor grad_routes, Tensor mask) -> Tensor");
   m.def("signed_entmax15(Tensor scores, Tensor mask) -> Tensor");
   m.def("signed_entmax15_backward(Tensor scores, Tensor routes, Tensor grad_routes, Tensor mask) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(jakal_net, CPU, m) {
+  m.impl(
+      "signed_abs_softmax",
+      [](const torch::Tensor& scores, const torch::Tensor& mask) {
+        auto packed_mask = packed_optional_tensor(mask);
+        return signed_abs_softmax_scores(scores, packed_mask);
+      });
+  m.impl(
+      "signed_abs_softmax_backward",
+      [](const torch::Tensor& scores,
+         const torch::Tensor& grad_routes,
+         const torch::Tensor& mask) {
+        auto packed_mask = packed_optional_tensor(mask);
+        return signed_abs_softmax_backward_scores(scores, grad_routes, packed_mask);
+      });
   m.impl(
       "signed_entmax15",
       [](const torch::Tensor& scores, const torch::Tensor& mask) {
@@ -5865,6 +6054,20 @@ TORCH_LIBRARY_IMPL(jakal_net, CPU, m) {
 }
 
 TORCH_LIBRARY_IMPL(jakal_net, CUDA, m) {
+  m.impl(
+      "signed_abs_softmax",
+      [](const torch::Tensor& scores, const torch::Tensor& mask) {
+        auto packed_mask = packed_optional_tensor(mask);
+        return signed_abs_softmax_scores(scores, packed_mask);
+      });
+  m.impl(
+      "signed_abs_softmax_backward",
+      [](const torch::Tensor& scores,
+         const torch::Tensor& grad_routes,
+         const torch::Tensor& mask) {
+        auto packed_mask = packed_optional_tensor(mask);
+        return signed_abs_softmax_backward_scores(scores, grad_routes, packed_mask);
+      });
   m.impl(
       "signed_entmax15",
       [](const torch::Tensor& scores, const torch::Tensor& mask) {
@@ -5951,6 +6154,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_backward_cuda",
       &low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_abs_backward_cuda_wrapper,
       "CUDA fused multi-head signed_smoothmax low-rank propagation causal dense backward with signed_abs_softmax");
+  m.def(
+      "low_rank_multihead_projection_epilogue_backward_cuda",
+      &low_rank_multihead_projection_epilogue_backward_cuda_wrapper,
+      "CUDA fused low-rank multi-head projection epilogue backward");
+  m.def(
+      "low_rank_multihead_projection_tiles_backward_cuda",
+      &low_rank_multihead_projection_tiles_backward_cuda_wrapper,
+      "CUDA fused low-rank multi-head projection tile backward");
+  m.def(
+      "low_rank_multihead_projection_tiles_weighted_backward_cuda",
+      &low_rank_multihead_projection_tiles_weighted_backward_cuda_wrapper,
+      "CUDA fused low-rank multi-head projection tile backward without materialized head-weighted scores");
   m.def(
       "low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_forward_bmm_cuda",
       &low_rank_multihead_smoothmax_propagation_causal_dense_signed_abs_forward_bmm_cuda_wrapper,

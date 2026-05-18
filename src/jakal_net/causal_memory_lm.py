@@ -95,7 +95,7 @@ class CausalMemoryLM(nn.Module):
         propagation_residual_gate_init: float = 0.1,
         state_residual: bool = True,
         state_update_kind: str = "signed_softmax",
-        state_weight_delta_state: bool = True,
+        state_weight_delta_state: bool = False,
         feed_forward_layers: bool = True,
         memory_feed_forward_layers: bool | None = None,
         disable_memory: bool = False,

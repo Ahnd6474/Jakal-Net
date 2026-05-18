@@ -8,6 +8,25 @@ from pathlib import Path
 from torch.utils.cpp_extension import CUDA_HOME, load
 
 
+def _cutlass_include_paths(repo_root: Path) -> list[str]:
+    candidates: list[Path] = []
+    env_path = os.environ.get("CUTLASS_PATH", "").strip()
+    if env_path:
+        candidates.append(Path(env_path))
+    candidates.append(repo_root / "third_party" / "cutlass")
+
+    include_paths: list[str] = []
+    seen: set[str] = set()
+    for root in candidates:
+        for include_dir in (root / "include", root / "tools" / "util" / "include"):
+            if include_dir.exists():
+                resolved = str(include_dir.resolve())
+                if resolved not in seen:
+                    include_paths.append(resolved)
+                    seen.add(resolved)
+    return include_paths
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--module-name", default="jakal_net_native")
@@ -47,6 +66,7 @@ def main() -> None:
             "-DWITH_CUDA"
         )
     extra_include_paths = [str(native_dir)]
+    extra_include_paths.extend(_cutlass_include_paths(repo_root))
     for candidate in (
         Path("/home/dannyahn/.local/opt/python3.12-dev-root/usr/include/python3.12"),
         Path("/home/dannyahn/.local/opt/python3.12-dev-root/usr/include"),

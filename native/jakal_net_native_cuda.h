@@ -140,7 +140,8 @@ jakal_net_low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_ab
     const torch::Tensor& projected_state,
     const torch::Tensor& projected_val,
     const torch::Tensor& biases,
-    bool has_bias);
+    bool has_bias,
+    bool state_weight_delta_state);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 jakal_net_low_rank_multihead_max_propagation_causal_dense_signed_abs_backward_cuda(
@@ -169,7 +170,8 @@ jakal_net_low_rank_multihead_signed_smoothmax_propagation_causal_dense_signed_ab
     const torch::Tensor& row_denom,
     const torch::Tensor& grad_delta_state,
     const torch::Tensor& grad_delta_val,
-    bool has_bias);
+    bool has_bias,
+    bool state_weight_delta_state);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 jakal_net_low_rank_multihead_signed_smoothmax_reduce_backward_cuda(
@@ -182,6 +184,33 @@ jakal_net_low_rank_multihead_signed_smoothmax_reduce_backward_cuda(
     const torch::Tensor& row_denom,
     const torch::Tensor& grad_delta_state,
     const torch::Tensor& grad_delta_val,
+    bool has_bias);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+jakal_net_low_rank_multihead_projection_epilogue_backward_cuda(
+    const torch::Tensor& grad_projected_source,
+    const torch::Tensor& grad_projected_target,
+    const torch::Tensor& flat_val,
+    const torch::Tensor& source_weights,
+    const torch::Tensor& target_weights);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+jakal_net_low_rank_multihead_projection_tiles_backward_cuda(
+    const torch::Tensor& grad_scores_heads,
+    const torch::Tensor& weighted_source_tile,
+    const torch::Tensor& source_tile,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& core_weights,
+    bool has_bias);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+jakal_net_low_rank_multihead_projection_tiles_weighted_backward_cuda(
+    const torch::Tensor& grad_scores,
+    const torch::Tensor& head_weights,
+    const torch::Tensor& weighted_source_tile,
+    const torch::Tensor& source_tile,
+    const torch::Tensor& projected_target,
+    const torch::Tensor& core_weights,
     bool has_bias);
 
 std::tuple<torch::Tensor, torch::Tensor>

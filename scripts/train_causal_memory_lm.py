@@ -5878,7 +5878,19 @@ def parse_args() -> argparse.Namespace:
         default="signed_softmax",
     )
     parser.add_argument("--disable-state-residual", action="store_true")
-    parser.add_argument("--disable-state-weighted-state-delta", action="store_true")
+    parser.set_defaults(disable_state_weighted_state_delta=True)
+    parser.add_argument(
+        "--disable-state-weighted-state-delta",
+        action="store_true",
+        dest="disable_state_weighted_state_delta",
+        help="Do not apply source-state weighting when accumulating propagation delta_state (default).",
+    )
+    parser.add_argument(
+        "--enable-state-weighted-state-delta",
+        action="store_false",
+        dest="disable_state_weighted_state_delta",
+        help="Apply source-state weighting when accumulating propagation delta_state.",
+    )
     parser.add_argument("--implementation", choices=("reference", "streaming", "kernel", "native"), default="streaming")
     parser.add_argument("--feed-forward-pre-norm", action="store_true")
     parser.add_argument("--knowledge-nodes", type=int, default=0)

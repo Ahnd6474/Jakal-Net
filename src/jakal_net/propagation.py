@@ -171,7 +171,7 @@ class Propagation(nn.Module):
         residual: bool = True,
         return_delta: bool = True,
         state_weight_edges: bool = False,
-        state_weight_delta_state: bool = True,
+        state_weight_delta_state: bool = False,
         implementation: ImplementationMode = "streaming",
         target_block_size: int | None = 128,
         source_block_size: int | None = 128,
@@ -492,7 +492,7 @@ class SparsePropagation(Propagation):
         residual: bool = True,
         return_delta: bool = True,
         state_weight_edges: bool = False,
-        state_weight_delta_state: bool = True,
+        state_weight_delta_state: bool = False,
         implementation: ImplementationMode = "streaming",
         target_block_size: int | None = 128,
         source_block_size: int | None = 128,
@@ -784,6 +784,7 @@ class SparsePropagation(Propagation):
                     layer_val=directional_layer_val,
                     projected_state=projected_state,
                     projected_val=projected_val,
+                    state_weight_delta_state=self.state_weight_delta_state,
                     window=self.window or 0,
                     target_block_size=self.target_block_size or layer.num_nodes,
                     source_block_size=self.source_block_size or layer.num_nodes,
@@ -872,7 +873,16 @@ class SparsePropagation(Propagation):
             self._record_stats(layer)
         else:
             self.last_stats = None
-        if self.state_weight_edges and not self.state_weight_delta_state:
+        native_unweighted_state_delta_supported = (
+            self.implementation == "native"
+            and self.state_weight_edges
+            and not self.state_weight_delta_state
+            and _disable_native_multihead_signed_smoothmax_path(self.pairwise_fn)
+            and self.sparse_type == "window"
+            and int(self.window or 0) + 1 >= int(layer.num_nodes)
+            and _native_edge_compress_name(self.edge_compress_fn) == "signed_abs_softmax"
+        )
+        if self.state_weight_edges and not self.state_weight_delta_state and not native_unweighted_state_delta_supported:
             return self._compute_delta_streaming(layer)
         signed_smoothmax_lowrank_dense_native = (
             self.implementation == "native"
@@ -912,6 +922,7 @@ class SparsePropagation(Propagation):
                         layer_val=directional_layer_val,
                         projected_state=projected_state,
                         projected_val=projected_val,
+                        state_weight_delta_state=self.state_weight_delta_state,
                         window=self.window or 0,
                         target_block_size=self.target_block_size or layer.num_nodes,
                         source_block_size=self.source_block_size or layer.num_nodes,
