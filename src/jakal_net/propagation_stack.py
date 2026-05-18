@@ -20,6 +20,7 @@ def make_propagation_ffn(
     hidden_mult: float,
     residual_scale: float,
     learnable_residual_scale: bool,
+    pre_norm: bool,
     zero_init_output: bool,
     activation: str,
 ) -> nn.Module:
@@ -39,6 +40,7 @@ def make_propagation_ffn(
         hidden_mult=hidden_mult,
         residual_scale=residual_scale,
         learnable_residual_scale=learnable_residual_scale,
+        pre_norm=pre_norm,
         activation=activation,
     )
 

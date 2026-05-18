@@ -50,11 +50,13 @@ class SModule(nn.Module):
         propagation_residual_gate_init: float = 0.1,
         state_residual: bool = True,
         state_update_kind: str = "signed_softmax",
+        state_weight_delta_state: bool = True,
         feed_forward_layers: bool = True,
         feed_forward_hidden_mult: float = 2.0,
         feed_forward_kind: str = "value",
         feed_forward_residual_scale: float = 1.0,
         feed_forward_learnable_residual_scale: bool = False,
+        feed_forward_pre_norm: bool = False,
         feed_forward_zero_init_output: bool = True,
         feed_forward_activation: str = "gelu",
     ) -> None:
@@ -88,11 +90,13 @@ class SModule(nn.Module):
         self.propagation_residual_gate_init = float(propagation_residual_gate_init)
         self.state_residual = bool(state_residual)
         self.state_update_kind = validate_state_update_kind(state_update_kind)
+        self.state_weight_delta_state = bool(state_weight_delta_state)
         self.feed_forward_layers = bool(feed_forward_layers)
         self.feed_forward_hidden_mult = float(feed_forward_hidden_mult)
         self.feed_forward_kind = feed_forward_kind
         self.feed_forward_residual_scale = float(feed_forward_residual_scale)
         self.feed_forward_learnable_residual_scale = bool(feed_forward_learnable_residual_scale)
+        self.feed_forward_pre_norm = bool(feed_forward_pre_norm)
         self.feed_forward_zero_init_output = bool(feed_forward_zero_init_output)
         self.feed_forward_activation = feed_forward_activation
         self.sequence_anchor = bool(sequence_anchor)
@@ -133,6 +137,7 @@ class SModule(nn.Module):
                 window=sequence_window,
                 edge_compress_fn=signed_abs_softmax_edges,
                 state_weight_edges=True,
+                state_weight_delta_state=self.state_weight_delta_state,
                 implementation=implementation,
                 residual=True,
                 target_block_size=full_window_block_size,
@@ -147,6 +152,7 @@ class SModule(nn.Module):
                 hidden_mult=self.feed_forward_hidden_mult,
                 residual_scale=self.feed_forward_residual_scale,
                 learnable_residual_scale=self.feed_forward_learnable_residual_scale,
+                pre_norm=self.feed_forward_pre_norm,
                 zero_init_output=self.feed_forward_zero_init_output,
                 activation=self.feed_forward_activation,
             ),
