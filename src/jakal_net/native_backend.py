@@ -6223,7 +6223,10 @@ def _low_rank_multihead_signed_smoothmax_causal_dense_exact_tensors(
         target_indices = torch.arange(nodes, device=flat_val.device)
         source_indices = torch.arange(source_start, source_end, device=flat_val.device)
         valid_mask = source_indices.view(1, 1, source_nodes) <= target_indices.view(1, nodes, 1)
-        combined_scores = (scores_by_head * torch.softmax(scores_by_head.abs(), dim=-1)).sum(dim=-1)
+        scores_by_head_f32 = scores_by_head.to(dtype=torch.float32)
+        combined_scores = (
+            scores_by_head_f32 * torch.softmax(scores_by_head_f32.abs(), dim=-1)
+        ).sum(dim=-1)
         combined_scores = combined_scores.masked_fill(~valid_mask, float("-inf"))
         return combined_scores, valid_mask
 

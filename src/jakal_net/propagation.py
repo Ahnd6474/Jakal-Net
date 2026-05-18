@@ -95,6 +95,28 @@ def _native_edge_compress_name(edge_compress_fn: Callable[[Tensor], Tensor]) -> 
     return None
 
 
+def _reduce_delta_state(
+    edges: Tensor,
+    projected_state: Tensor | None = None,
+) -> Tensor:
+    edges_f32 = edges.float()
+    if projected_state is None:
+        return edges_f32.sum(dim=-1).to(dtype=edges.dtype)
+    return torch.einsum(
+        "...ij,...j->...i",
+        edges_f32,
+        projected_state.float(),
+    ).to(dtype=projected_state.dtype)
+
+
+def _reduce_delta_val(edges: Tensor, projected_val: Tensor) -> Tensor:
+    return torch.einsum(
+        "...ij,...jd->...id",
+        edges.float(),
+        projected_val.float(),
+    ).to(dtype=projected_val.dtype)
+
+
 def _disable_native_multihead_signed_smoothmax_path(pairwise_fn: object) -> bool:
     if not isinstance(pairwise_fn, MultiHeadPairwise):
         return False
@@ -149,6 +171,7 @@ class Propagation(nn.Module):
         residual: bool = True,
         return_delta: bool = True,
         state_weight_edges: bool = False,
+        state_weight_delta_state: bool = True,
         implementation: ImplementationMode = "streaming",
         target_block_size: int | None = 128,
         source_block_size: int | None = 128,
@@ -165,6 +188,7 @@ class Propagation(nn.Module):
         self.residual = residual
         self.return_delta = return_delta
         self.state_weight_edges = state_weight_edges
+        self.state_weight_delta_state = state_weight_delta_state
         self.implementation = implementation
         self.target_block_size = target_block_size
         self.source_block_size = source_block_size
@@ -242,15 +266,16 @@ class Propagation(nn.Module):
         directional_val = self._directional_val(layer.state, layer.val)
         scores = self.pairwise_fn(directional_val, directional_val)
         validate_pairwise_scores(scores, layer)
-        edges = self.edge_compress_fn(scores)
-        edges = self._weight_edges(edges, layer.state)
+        raw_edges = self.edge_compress_fn(scores)
+        edges = self._weight_edges(raw_edges, layer.state)
         projected_state, projected_val = self._project_inputs(layer, directional_val=directional_val)
 
         if self.state_weight_edges:
-            delta_state = edges.sum(dim=-1)
+            delta_state_edges = edges if self.state_weight_delta_state else raw_edges
+            delta_state = _reduce_delta_state(delta_state_edges)
         else:
-            delta_state = torch.einsum("...ij,...j->...i", edges, projected_state)
-        delta_val = torch.einsum("...ij,...jd->...id", edges, projected_val)
+            delta_state = _reduce_delta_state(edges, projected_state)
+        delta_val = _reduce_delta_val(edges, projected_val)
         return LayerDelta(delta_state=delta_state, delta_val=delta_val)
 
     def _record_stats(self, layer: Layer) -> None:
@@ -284,11 +309,14 @@ class Propagation(nn.Module):
                     target_nodes=target_end - target_start,
                     source_nodes=source_end - source_start,
                 )
+                raw_edges = self.edge_compress_fn(scores)
                 edges = self._weight_edges(
-                    self.edge_compress_fn(scores),
+                    raw_edges,
                     layer.state[..., source_start:source_end],
                 )
-                state_edges = edges.to(dtype=state_acc_dtype)
+                state_edges = (
+                    edges if self.state_weight_delta_state else raw_edges
+                ).to(dtype=state_acc_dtype)
                 val_edges = edges.to(dtype=val_acc_dtype)
 
                 if self.state_weight_edges:
@@ -464,6 +492,7 @@ class SparsePropagation(Propagation):
         residual: bool = True,
         return_delta: bool = True,
         state_weight_edges: bool = False,
+        state_weight_delta_state: bool = True,
         implementation: ImplementationMode = "streaming",
         target_block_size: int | None = 128,
         source_block_size: int | None = 128,
@@ -479,6 +508,7 @@ class SparsePropagation(Propagation):
             residual=residual,
             return_delta=return_delta,
             state_weight_edges=state_weight_edges,
+            state_weight_delta_state=state_weight_delta_state,
             implementation=implementation,
             target_block_size=target_block_size,
             source_block_size=source_block_size,
@@ -515,13 +545,14 @@ class SparsePropagation(Propagation):
         else:
             mask = build_topk_mask(scores, self.topk or layer.num_nodes)
 
-        masked_edges = _compress_edges(scores, self.edge_compress_fn, mask=mask)
-        masked_edges = self._weight_edges(masked_edges, layer.state)
+        raw_masked_edges = _compress_edges(scores, self.edge_compress_fn, mask=mask)
+        masked_edges = self._weight_edges(raw_masked_edges, layer.state)
         if self.state_weight_edges:
-            delta_state = masked_edges.sum(dim=-1)
+            delta_state_edges = masked_edges if self.state_weight_delta_state else raw_masked_edges
+            delta_state = _reduce_delta_state(delta_state_edges)
         else:
-            delta_state = torch.einsum("...ij,...j->...i", masked_edges, projected_state)
-        delta_val = torch.einsum("...ij,...jd->...id", masked_edges, projected_val)
+            delta_state = _reduce_delta_state(masked_edges, projected_state)
+        delta_val = _reduce_delta_val(masked_edges, projected_val)
         return LayerDelta(delta_state=delta_state, delta_val=delta_val)
 
     def _record_stats(self, layer: Layer) -> None:
@@ -591,13 +622,15 @@ class SparsePropagation(Propagation):
                     device=scores.device,
                 )
                 mask = mask_2d.view((1,) * len(layer.batch_shape) + mask_2d.shape)
-                edges = _compress_edges(scores, self.edge_compress_fn, mask=mask)
+                raw_edges = _compress_edges(scores, self.edge_compress_fn, mask=mask)
                 edges = self._weight_edges(
-                    edges,
+                    raw_edges,
                     layer.state[..., global_source_start:global_source_end],
                 )
 
-                state_edges = edges.to(dtype=state_acc_dtype)
+                state_edges = (
+                    edges if self.state_weight_delta_state else raw_edges
+                ).to(dtype=state_acc_dtype)
                 if self.state_weight_edges:
                     delta_state[..., target_start:target_end] += state_edges.sum(dim=-1)
                 else:
@@ -685,14 +718,17 @@ class SparsePropagation(Propagation):
             if best_scores is None or best_indices is None:
                 continue
 
-            compressed_edges = _compress_edges(best_scores, self.edge_compress_fn)
+            raw_compressed_edges = _compress_edges(best_scores, self.edge_compress_fn)
+            compressed_edges = raw_compressed_edges
             if self.state_weight_edges:
                 selected_source_state = gather_state_by_indices(layer.state, best_indices)
                 compressed_edges = compressed_edges * self._edge_source_strength(selected_source_state)
             selected_state = gather_state_by_indices(projected_state, best_indices)
             selected_val = gather_val_by_indices(projected_val, best_indices)
 
-            state_edges = compressed_edges.to(dtype=state_acc_dtype)
+            state_edges = (
+                compressed_edges if self.state_weight_delta_state else raw_compressed_edges
+            ).to(dtype=state_acc_dtype)
             if self.state_weight_edges:
                 delta_state[..., target_start:target_end] = state_edges.sum(dim=-1)
             else:
@@ -836,6 +872,8 @@ class SparsePropagation(Propagation):
             self._record_stats(layer)
         else:
             self.last_stats = None
+        if self.state_weight_edges and not self.state_weight_delta_state:
+            return self._compute_delta_streaming(layer)
         signed_smoothmax_lowrank_dense_native = (
             self.implementation == "native"
             and _disable_native_multihead_signed_smoothmax_path(self.pairwise_fn)

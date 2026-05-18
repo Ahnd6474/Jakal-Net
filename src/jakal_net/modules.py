@@ -141,6 +141,7 @@ class ResidualFeedForward(nn.Module):
         dropout: float = 0.0,
         residual_scale: float = 1.0,
         learnable_residual_scale: bool = False,
+        pre_norm: bool = False,
         activation: str = "gelu",
     ) -> None:
         super().__init__()
@@ -155,6 +156,7 @@ class ResidualFeedForward(nn.Module):
         hidden_dim = max(dim, int(round(float(dim) * float(hidden_mult))))
         self.input_norm = nn.LayerNorm(dim)
         self.learnable_residual_scale = bool(learnable_residual_scale)
+        self.pre_norm = bool(pre_norm)
         if self.learnable_residual_scale:
             self.residual_scale_param = nn.Parameter(torch.tensor(_inverse_softplus(float(residual_scale))))
             self.register_buffer("fixed_residual_scale", None, persistent=False)
@@ -186,7 +188,11 @@ class ResidualFeedForward(nn.Module):
         else:
             assert self.fixed_residual_scale is not None
             scale = self.fixed_residual_scale.to(device=val.device, dtype=val.dtype)
-        return self.input_norm(val + scale * self.net(val))
+        if self.pre_norm:
+            residual = self.net(self.input_norm(val))
+            return val + scale * residual
+        residual = self.net(val)
+        return self.input_norm(val + scale * residual)
 
 
 class StateValueFeedForward(nn.Module):
@@ -242,7 +248,7 @@ class StateValueFeedForward(nn.Module):
         nn.init.zeros_(second.bias)
 
     def forward(self, state: Tensor, val: Tensor) -> tuple[Tensor, Tensor]:
-        mixed = F.softplus(state).unsqueeze(-1) * val
+        mixed = F.softplus(state.float()).unsqueeze(-1) * val.float()
         delta = self.net(self.input_norm(mixed))
         delta_state = delta[..., 0]
         delta_val = delta[..., 1:]
@@ -251,7 +257,7 @@ class StateValueFeedForward(nn.Module):
         else:
             assert self.fixed_residual_scale is not None
             scale = self.fixed_residual_scale.to(device=val.device, dtype=val.dtype)
-        return state + scale * delta_state, val + scale * delta_val
+        return state + scale * delta_state.to(dtype=state.dtype), val + scale * delta_val.to(dtype=val.dtype)
 
 
 class FixedProjectionRoute(nn.Module):
@@ -314,8 +320,9 @@ class MultiHeadPairwise(nn.Module):
             )
         if self.aggregate == "signed_smoothmax":
             stacked = self.head_scores(target_val, source_val)
-            weights = torch.softmax(stacked.abs(), dim=-1)
-            return (stacked * weights).sum(dim=-1)
+            stacked_f32 = stacked.float()
+            weights = torch.softmax(stacked_f32.abs(), dim=-1)
+            return (stacked_f32 * weights).sum(dim=-1).to(dtype=stacked.dtype)
         if self.aggregate == "max":
             running: Tensor | None = None
             for head in self.heads:

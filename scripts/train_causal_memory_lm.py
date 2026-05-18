@@ -1100,6 +1100,30 @@ def move_batch_to_device(
     )
 
 
+def slice_document_batch_for_rank(
+    batch: DocumentBatch,
+    *,
+    rank: int,
+    world_size: int,
+) -> DocumentBatch:
+    if world_size <= 1:
+        return batch
+    batch_size = int(batch.context.shape[0])
+    if batch_size % world_size != 0:
+        raise ValueError(
+            f"Batch size {batch_size} must be divisible by world_size={world_size} for distributed slicing."
+        )
+    local_batch_size = batch_size // world_size
+    start = rank * local_batch_size
+    end = start + local_batch_size
+    return DocumentBatch(
+        context=batch.context[start:end],
+        target=batch.target[start:end],
+        loss_mask=batch.loss_mask[start:end],
+        reset_mask=batch.reset_mask[start:end],
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _PrefetchFailure:
     error: BaseException
@@ -5854,7 +5878,9 @@ def parse_args() -> argparse.Namespace:
         default="signed_softmax",
     )
     parser.add_argument("--disable-state-residual", action="store_true")
+    parser.add_argument("--disable-state-weighted-state-delta", action="store_true")
     parser.add_argument("--implementation", choices=("reference", "streaming", "kernel", "native"), default="streaming")
+    parser.add_argument("--feed-forward-pre-norm", action="store_true")
     parser.add_argument("--knowledge-nodes", type=int, default=0)
     parser.add_argument("--knowledge-route-topk", type=int, default=0)
     parser.add_argument("--knowledge-propagation-topk", type=int, default=0)
@@ -5862,6 +5888,15 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--batch-size", type=int, default=384)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
+    parser.add_argument(
+        "--distributed-replicate-global-batches",
+        action="store_true",
+        help=(
+            "In distributed training, replicate the same global training batch on every rank "
+            "and slice it locally. This is slower but keeps batch composition aligned with the "
+            "single-process batcher for reproducibility checks."
+        ),
+    )
     parser.add_argument(
         "--data-seed",
         type=int,
@@ -6518,6 +6553,10 @@ def main() -> None:
     stage1_grad_accum_steps = args.stage1_grad_accum_steps or args.grad_accum_steps
     stage2_grad_accum_steps = args.stage2_grad_accum_steps or args.grad_accum_steps
     stage3_grad_accum_steps = args.stage3_grad_accum_steps or args.grad_accum_steps
+    replicate_global_batches = bool(args.distributed_replicate_global_batches and distributed)
+    data_stage1_batch_size = global_stage1_batch_size if replicate_global_batches else stage1_batch_size
+    data_stage2_batch_size = global_stage2_batch_size if replicate_global_batches else stage2_batch_size
+    data_stage3_batch_size = global_stage3_batch_size if replicate_global_batches else stage3_batch_size
 
     tokenizer_label: str
     tokenizer_model_path: str | None
@@ -6640,7 +6679,7 @@ def main() -> None:
             train_fraction=args.train_fraction,
             seed=args.data_seed,
         )
-        if distributed:
+        if distributed and not replicate_global_batches:
             train_documents_flat = shard_sequence_for_rank(
                 train_documents_flat,
                 rank=rank,
@@ -6660,9 +6699,9 @@ def main() -> None:
             documents=train_documents_flat,
             stage1_ratio=args.curriculum_stage1_ratio,
             stage2_ratio=args.curriculum_stage2_ratio,
-            stage1_batch_size=stage1_batch_size,
-            stage2_batch_size=stage2_batch_size,
-            stage3_batch_size=stage3_batch_size,
+            stage1_batch_size=data_stage1_batch_size,
+            stage2_batch_size=data_stage2_batch_size,
+            stage3_batch_size=data_stage3_batch_size,
         )
         print("startup | estimate_steps_flat_done", flush=True)
         fixed_eval_documents_flat = sample_flat_documents_uniform_by_bucket(
@@ -6684,7 +6723,7 @@ def main() -> None:
             train_fraction=args.train_fraction,
             seed=args.data_seed,
         )
-        if distributed:
+        if distributed and not replicate_global_batches:
             train_documents = shard_sequence_for_rank(
                 train_documents,
                 rank=rank,
@@ -6703,9 +6742,9 @@ def main() -> None:
             documents=train_documents,
             stage1_ratio=args.curriculum_stage1_ratio,
             stage2_ratio=args.curriculum_stage2_ratio,
-            stage1_batch_size=stage1_batch_size,
-            stage2_batch_size=stage2_batch_size,
-            stage3_batch_size=stage3_batch_size,
+            stage1_batch_size=data_stage1_batch_size,
+            stage2_batch_size=data_stage2_batch_size,
+            stage3_batch_size=data_stage3_batch_size,
         )
         print("startup | estimate_steps_done", flush=True)
         fixed_eval_documents = sample_documents_uniform_by_bucket(
@@ -6771,21 +6810,22 @@ def main() -> None:
     checkpoints_dir = ensure_directory(run_dir / "checkpoints")
 
     def create_training_batcher() -> DocumentChunkBatcher | FlatDocumentChunkBatcher:
+        batcher_seed = args.data_seed if replicate_global_batches else (args.data_seed + rank * 100_003)
         if flat_collection is not None:
             return FlatDocumentChunkBatcher(
                 flat_collection,
                 train_documents_flat,
-                batch_size=stage1_batch_size,
+                batch_size=data_stage1_batch_size,
                 device=device,
                 active_shards_per_bucket=args.pretokenized_active_shards_per_bucket,
                 shard_rotation_interval=args.pretokenized_shard_rotation_interval,
-                seed=args.data_seed + rank * 100_003,
+                seed=batcher_seed,
             )
         return DocumentChunkBatcher(
             train_documents,
-            batch_size=stage1_batch_size,
+            batch_size=data_stage1_batch_size,
             device=device,
-            seed=args.data_seed + rank * 100_003,
+            seed=batcher_seed,
         )
 
     def prebuild_from_batcher(
@@ -6806,9 +6846,9 @@ def main() -> None:
             stage1_span=args.curriculum_stage1_span,
             stage2_span=args.curriculum_stage2_span,
             stage3_span=args.curriculum_stage3_span,
-            stage1_batch_size=stage1_batch_size,
-            stage2_batch_size=stage2_batch_size,
-            stage3_batch_size=stage3_batch_size,
+            stage1_batch_size=data_stage1_batch_size,
+            stage2_batch_size=data_stage2_batch_size,
+            stage3_batch_size=data_stage3_batch_size,
             stage1_grad_accum_steps=stage1_grad_accum_steps,
             stage2_grad_accum_steps=stage2_grad_accum_steps,
             stage3_grad_accum_steps=stage3_grad_accum_steps,
@@ -6872,9 +6912,9 @@ def main() -> None:
                 stage1_span=args.curriculum_stage1_span,
                 stage2_span=args.curriculum_stage2_span,
                 stage3_span=args.curriculum_stage3_span,
-                stage1_batch_size=stage1_batch_size,
-                stage2_batch_size=stage2_batch_size,
-                stage3_batch_size=stage3_batch_size,
+                stage1_batch_size=data_stage1_batch_size,
+                stage2_batch_size=data_stage2_batch_size,
+                stage3_batch_size=data_stage3_batch_size,
                 stage1_grad_accum_steps=stage1_grad_accum_steps,
                 stage2_grad_accum_steps=stage2_grad_accum_steps,
                 stage3_grad_accum_steps=stage3_grad_accum_steps,
@@ -6895,9 +6935,9 @@ def main() -> None:
             stage1_span=args.curriculum_stage1_span,
             stage2_span=args.curriculum_stage2_span,
             stage3_span=args.curriculum_stage3_span,
-            stage1_batch_size=stage1_batch_size,
-            stage2_batch_size=stage2_batch_size,
-            stage3_batch_size=stage3_batch_size,
+            stage1_batch_size=data_stage1_batch_size,
+            stage2_batch_size=data_stage2_batch_size,
+            stage3_batch_size=data_stage3_batch_size,
             stage1_grad_accum_steps=stage1_grad_accum_steps,
             stage2_grad_accum_steps=stage2_grad_accum_steps,
             stage3_grad_accum_steps=stage3_grad_accum_steps,
@@ -6980,6 +7020,7 @@ def main() -> None:
             feed_forward_kind=args.feed_forward_kind,
             feed_forward_residual_scale=args.feed_forward_residual_scale,
             feed_forward_learnable_residual_scale=args.feed_forward_learnable_residual_scale,
+            feed_forward_pre_norm=args.feed_forward_pre_norm,
             feed_forward_zero_init_output=not args.feed_forward_random_output_init,
             feed_forward_activation=args.feed_forward_activation,
             memory_topk=args.memory_topk,
@@ -7007,6 +7048,7 @@ def main() -> None:
             propagation_residual_gate_init=args.propagation_residual_gate_init,
             state_residual=not args.disable_state_residual,
             state_update_kind=args.state_update_kind,
+            state_weight_delta_state=not args.disable_state_weighted_state_delta,
             knowledge_nodes=args.knowledge_nodes,
             knowledge_route_topk=None if args.knowledge_route_topk <= 0 else args.knowledge_route_topk,
             knowledge_propagation_topk=None if args.knowledge_propagation_topk <= 0 else args.knowledge_propagation_topk,
@@ -7052,6 +7094,7 @@ def main() -> None:
             f"pairwise_head_aggregate={args.pairwise_head_aggregate} | "
             f"propagation_residual_gate_init={args.propagation_residual_gate_init:g} | "
             f"state_update_kind={args.state_update_kind} | state_residual={not args.disable_state_residual} | "
+            f"state_weight_delta_state={not args.disable_state_weighted_state_delta} | "
             f"memory_feed_forward_layers={not (args.disable_feed_forward_layers or args.disable_memory_feed_forward_layers)} | "
             f"disable_memory={args.disable_memory} | disable_memory_read={args.disable_memory_read} | "
             f"disable_memory_propagation={args.disable_memory_propagation} | "
@@ -7059,6 +7102,7 @@ def main() -> None:
             f"feed_forward_kind={args.feed_forward_kind} | "
             f"feed_forward_residual_scale={args.feed_forward_residual_scale:g} | "
             f"feed_forward_learnable_residual_scale={args.feed_forward_learnable_residual_scale} | "
+            f"feed_forward_pre_norm={args.feed_forward_pre_norm} | "
             f"feed_forward_zero_init_output={not args.feed_forward_random_output_init} | "
             f"feed_forward_activation={args.feed_forward_activation} | "
             f"optimizer={args.optimizer} | checkpoint_sequence={args.checkpoint_sequence_layers} | "
@@ -7080,6 +7124,7 @@ def main() -> None:
         f"forced_document_span_policy={forced_document_span_policy} | "
         f"unit_norm_values={args.unit_norm_values} | "
         f"lowrank_lion_default_schedule_applied={lowrank_lion_default_schedule_applied} | "
+        f"replicate_global_batches={replicate_global_batches} | "
         f"nomemory_lowrank_grad_scale={args.nomemory_lowrank_grad_scale} | "
         f"lr_decay_start_step={args.lr_decay_start_step} | "
         f"lr_decay_steps={args.lr_decay_steps} | lr_min_ratio={args.lr_min_ratio}",
@@ -7099,7 +7144,8 @@ def main() -> None:
         f"stage2=batch{stage2_batch_size}/ga{stage2_grad_accum_steps} "
         f"(global={global_stage2_batch_size}) | "
         f"stage3=batch{stage3_batch_size}/ga{stage3_grad_accum_steps} "
-        f"(global={global_stage3_batch_size})",
+        f"(global={global_stage3_batch_size}) | "
+        f"data_batch_sizes=({data_stage1_batch_size},{data_stage2_batch_size},{data_stage3_batch_size})",
         flush=True,
     )
     print(
@@ -7131,10 +7177,16 @@ def main() -> None:
                     "stage2": global_stage2_batch_size,
                     "stage3": global_stage3_batch_size,
                 },
+                "data_batch_sizes": {
+                    "stage1": data_stage1_batch_size,
+                    "stage2": data_stage2_batch_size,
+                    "stage3": data_stage3_batch_size,
+                },
                 "training_policy": {
                     "forced_unit_norm_policy": forced_unit_norm_policy,
                     "forced_document_span_policy": forced_document_span_policy,
                     "lowrank_lion_default_schedule_applied": lowrank_lion_default_schedule_applied,
+                    "replicate_global_batches": replicate_global_batches,
                 },
                 "tokenizer_label": tokenizer_label,
                 "tokenizer_model_path": tokenizer_model_path,
@@ -7388,6 +7440,12 @@ def main() -> None:
         if not args.prebuild_train_batches:
             prefetcher = create_live_batch_provider(start_step_value=micro_step)
 
+    data_batch_size_by_stage = {
+        "stage1": data_stage1_batch_size,
+        "stage2": data_stage2_batch_size,
+        "stage3": data_stage3_batch_size,
+    }
+
     for step in range(start_step + 1, total_steps + 1):
         stage = resolve_curriculum_stage(
             step=step,
@@ -7405,7 +7463,7 @@ def main() -> None:
             stage3_grad_accum_steps=stage3_grad_accum_steps,
         )
         bucket_weights = stage.bucket_weights
-        batcher.set_batch_size(stage.batch_size)
+        batcher.set_batch_size(data_batch_size_by_stage.get(stage.name, stage.batch_size))
         batcher.set_bucket_weights(bucket_weights)
         if stage.name != active_stage_name:
             if not args.prebuild_train_batches and int(args.rolling_prefetch_workers) <= 0:
@@ -7463,6 +7521,12 @@ def main() -> None:
                     prefetcher.next_batch(),
                     reset_all=stage.freeze_memory,
                 )
+                if replicate_global_batches:
+                    batch = slice_document_batch_for_rank(
+                        batch,
+                        rank=rank,
+                        world_size=world_size,
+                    )
                 total_batch_wait_seconds += time.perf_counter() - batch_wait_started_at
                 consumed_batches += 1
                 use_stage1_cuda_graph = (
@@ -7527,7 +7591,23 @@ def main() -> None:
                     else:
                         print("diagnose_nonfinite_memory | all_finite", flush=True)
                     break
-                span_losses.append(main_loss_value)
+                local_token_weight = batch.loss_mask.sum().to(device=loss.device, dtype=torch.float32).clamp_min(1.0)
+                logged_main_loss_value = main_loss_value
+                if distributed and dist.is_initialized():
+                    global_token_weight = local_token_weight.clone()
+                    dist.all_reduce(global_token_weight, op=dist.ReduceOp.SUM)
+                    global_loss_numerator = (loss.detach().float() * local_token_weight).clone()
+                    dist.all_reduce(global_loss_numerator, op=dist.ReduceOp.SUM)
+                    logged_main_loss_value = float(
+                        (global_loss_numerator / global_token_weight.clamp_min(1.0)).item()
+                    )
+                    if not used_cuda_graph:
+                        loss = loss * (
+                            local_token_weight
+                            * float(world_size)
+                            / global_token_weight.clamp_min(1.0)
+                        ).to(dtype=loss.dtype)
+                span_losses.append(logged_main_loss_value)
                 last_span_loss_tensor = loss
                 current_memory_state = None if stage.freeze_memory else next_memory_state
 

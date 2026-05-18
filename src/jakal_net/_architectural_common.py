@@ -47,10 +47,10 @@ def _unit_normalize_values_impl(val: Tensor, *, eps: float = UNIT_NORM_EPS) -> T
 
 
 def _signed_softmax_state_impl(state: Tensor) -> Tensor:
-    clean_state = torch.nan_to_num(state)
+    clean_state = torch.nan_to_num(state.float())
     magnitude = torch.softmax(clean_state.abs(), dim=-1)
     state_mass = float(state.size(-1)) * STATE_MASS_PER_NODE
-    return torch.sign(clean_state) * magnitude * state_mass
+    return (torch.sign(clean_state) * magnitude * state_mass).to(dtype=state.dtype)
 
 
 _COMPILED_UNIT_NORMALIZE_VALUES = _maybe_compile(_unit_normalize_values_impl)
@@ -58,9 +58,9 @@ _COMPILED_SIGNED_SOFTMAX_STATE = _maybe_compile(_signed_softmax_state_impl)
 
 
 def _rms_state_impl(state: Tensor, *, eps: float = UNIT_NORM_EPS) -> Tensor:
-    clean_state = torch.nan_to_num(state)
+    clean_state = torch.nan_to_num(state.float())
     rms = clean_state.square().mean(dim=-1, keepdim=True).add(eps).sqrt()
-    return clean_state / rms
+    return (clean_state / rms).to(dtype=state.dtype)
 
 
 _COMPILED_RMS_STATE = _maybe_compile(_rms_state_impl)
@@ -278,18 +278,18 @@ def apply_state_update(
     unit_norm_values: bool = False,
     state_update_kind: str = "signed_softmax",
 ) -> Tensor:
-    raw_state = state + delta_state if residual else delta_state
+    raw_state = state.float() + delta_state.float() if residual else delta_state.float()
     if unit_norm_values:
-        return softsign_state(raw_state)
+        return softsign_state(raw_state).to(dtype=state.dtype)
     normalized_kind = validate_state_update_kind(state_update_kind)
     if normalized_kind == "signed_softmax":
-        return signed_softmax_state(raw_state)
+        return signed_softmax_state(raw_state).to(dtype=state.dtype)
     if normalized_kind == "softsign":
-        return softsign_state(raw_state)
+        return softsign_state(raw_state).to(dtype=state.dtype)
     if normalized_kind == "rms":
-        return rms_state(raw_state)
+        return rms_state(raw_state).to(dtype=state.dtype)
     if normalized_kind == "rms_softsign":
-        return rms_softsign_state(raw_state)
+        return rms_softsign_state(raw_state).to(dtype=state.dtype)
     raise AssertionError(f"Unhandled state_update_kind: {normalized_kind}")
 
 
