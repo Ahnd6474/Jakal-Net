@@ -15,7 +15,7 @@ from train_causal_memory_lm import (
     byte_bpe_tokenizer_cache_exists,
     load_serialized_documents,
 )
-from train_progressive_b_lm import build_tokenizer
+from tokenizer_utils import build_tokenizer
 
 
 BUILDER_SCRIPTS = {

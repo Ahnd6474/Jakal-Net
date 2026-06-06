@@ -33,12 +33,12 @@ from lm_experiment_utils import (
     write_csv_rows,
     write_json,
 )
-from train_progressive_b_lm import (
+from tokenizer_utils import (
     ASSISTANT_TOKEN,
-    HFTokenizerVocab,
     ByteBPEVocab,
     ByteLevelBPETokenizer,
     EOS_TOKEN,
+    HFTokenizerVocab,
     PAD_TOKEN,
     USER_TOKEN,
     _encode_byte_bpe_preserving_specials,
@@ -69,13 +69,6 @@ except ImportError:
 
 from jakal_net import describe_device, resolve_device
 from jakal_net.causal_memory_lm import CausalMemoryLM, MemoryScanOutput, ModelRecurrentState
-from jakal_net.native_backend import (
-    EXPERIMENTAL_CAUSAL_DENSE_PROP_FORWARD_CUDA_ENV,
-    EXPERIMENTAL_DIAGONAL_DENSE_PROP_CUDA_ENV,
-    EXPERIMENTAL_FUSED_TRAINING_CHECKPOINT_STRIDE_ENV,
-    EXPERIMENTAL_FUSED_TRAINING_ENV,
-    EXPERIMENTAL_SCAN_BACKWARD_CUDA_ENV,
-)
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -161,7 +154,7 @@ class TrainingCurriculumStage:
     name: str
     document_span: int
     freeze_memory: bool
-    freeze_propagation: bool
+    freeze_backbone: bool
     freeze_skip: bool
     batch_size: int = 1
     grad_accum_steps: int = 1
@@ -4259,7 +4252,7 @@ def resolve_curriculum_stage(
             name="stage1",
             document_span=max(1, stage1_span),
             freeze_memory=True,
-            freeze_propagation=True,
+            freeze_backbone=True,
             freeze_skip=True,
             batch_size=max(1, stage1_batch_size),
             grad_accum_steps=max(1, stage1_grad_accum_steps),
@@ -4270,7 +4263,7 @@ def resolve_curriculum_stage(
             name="stage2",
             document_span=max(1, stage2_span),
             freeze_memory=False,
-            freeze_propagation=True,
+            freeze_backbone=True,
             freeze_skip=True,
             batch_size=max(1, stage2_batch_size),
             grad_accum_steps=max(1, stage2_grad_accum_steps),
@@ -4280,7 +4273,7 @@ def resolve_curriculum_stage(
         name="stage3",
         document_span=max(1, stage3_span),
         freeze_memory=False,
-        freeze_propagation=False,
+        freeze_backbone=False,
         freeze_skip=False,
         batch_size=max(1, stage3_batch_size),
         grad_accum_steps=max(1, stage3_grad_accum_steps),
@@ -4326,36 +4319,8 @@ def count_optimizer_steps(
 
 
 def apply_training_curriculum(model: torch.nn.Module, stage: TrainingCurriculumStage) -> None:
-    base_model = unwrap_model(model)
-    if not hasattr(base_model, "b_module"):
-        return
-    b_module = base_model.b_module
-    _set_module_requires_grad(b_module.memory_levels, True)
-    _set_module_requires_grad(b_module.level_transitions, True)
-    _set_module_requires_grad(b_module.level_norms, True)
-    _set_module_requires_grad(b_module.level_ffns, True)
-    _set_module_requires_grad(b_module.read_projections, True)
-    _set_parameter_collection_requires_grad(b_module.read_gates, True)
-    b_module.read_template_val.requires_grad_(True)
-    for level in b_module.memory_levels:
-        _set_module_requires_grad(level.propagation, True)
-    _set_module_requires_grad(b_module.skip_transitions, True)
-    _set_parameter_collection_requires_grad(tuple(b_module.skip_gates.values()), True)
-
-    if stage.freeze_memory:
-        _set_module_requires_grad(b_module.memory_levels, False)
-        _set_module_requires_grad(b_module.level_transitions, False)
-        _set_module_requires_grad(b_module.level_norms, False)
-        _set_module_requires_grad(b_module.level_ffns, False)
-        _set_module_requires_grad(b_module.read_projections, False)
-        _set_parameter_collection_requires_grad(b_module.read_gates, False)
-        b_module.read_template_val.requires_grad_(False)
-    if stage.freeze_propagation:
-        for level in b_module.memory_levels:
-            _set_module_requires_grad(level.propagation, False)
-    if stage.freeze_skip or stage.freeze_memory:
-        _set_module_requires_grad(b_module.skip_transitions, False)
-        _set_parameter_collection_requires_grad(tuple(b_module.skip_gates.values()), False)
+    del model
+    del stage
 
 
 def override_batch_reset(batch: DocumentBatch, *, reset_all: bool) -> DocumentBatch:
@@ -4370,15 +4335,14 @@ def override_batch_reset(batch: DocumentBatch, *, reset_all: bool) -> DocumentBa
 
 
 def build_run_name(args: argparse.Namespace) -> str:
-    memory_slug = "-".join(str(slot) for slot in args.memory_slots)
-    propagation_layers = resolve_total_propagation_layers(args)
+    transformer_layers = resolve_transformer_layers(args)
     if args.model_kind == "transformer":
         return (
             f"transformer-doc-l{args.transformer_layers}-h{args.transformer_heads}"
             f"-ff{args.transformer_ff_mult:g}-dim{args.dim}-seq{args.seq_len}"
         )
     return (
-        f"causal-memory-doc-pl{propagation_layers}-b{memory_slug}"
+        f"causal-memory-doc-l{transformer_layers}-km{int(args.knowledge_memory_size)}"
         f"-dim{args.dim}-seq{args.seq_len}"
     )
 
@@ -4388,10 +4352,7 @@ def estimate_steps_per_epoch(*, documents: Sequence[TokenizedDocument], batch_si
     return max(1, math.ceil(total_chunks / max(1, batch_size)))
 
 
-def resolve_total_propagation_layers(args: argparse.Namespace) -> int:
-    explicit = int(getattr(args, "propagation_layers", 0))
-    if explicit > 0:
-        return explicit
+def resolve_transformer_layers(args: argparse.Namespace) -> int:
     return int(args.s_layers) + int(args.prediction_layers)
 
 
@@ -4513,70 +4474,122 @@ def compute_warmup_scalar(
     return float(initial_value + (final_value - initial_value) * progress)
 
 
+def _detach_memory_item(item: Any) -> Any:
+    if isinstance(item, torch.Tensor):
+        return item.detach()
+    if hasattr(item, "state") and hasattr(item, "val"):
+        return item.with_tensors(state=item.state.detach(), val=item.val.detach())
+    raise TypeError(f"Unsupported memory state item: {type(item)!r}")
+
+
+def _clone_memory_item(item: Any) -> Any:
+    if isinstance(item, torch.Tensor):
+        return item.clone()
+    if hasattr(item, "clone"):
+        return item.clone()
+    raise TypeError(f"Unsupported memory state item: {type(item)!r}")
+
+
+def _move_memory_item(item: Any, *, device: torch.device) -> Any:
+    if isinstance(item, torch.Tensor):
+        return item.to(device=device)
+    if hasattr(item, "state") and hasattr(item, "val"):
+        return item.with_tensors(
+            state=item.state.to(device=device),
+            val=item.val.to(device=device),
+        )
+    raise TypeError(f"Unsupported memory state item: {type(item)!r}")
+
+
+def _copy_memory_item(destination: Any, source: Any) -> None:
+    if isinstance(destination, torch.Tensor):
+        if not isinstance(source, torch.Tensor):
+            raise TypeError("source memory item type does not match destination.")
+        destination.copy_(source)
+        return
+    if hasattr(destination, "state") and hasattr(destination, "val"):
+        destination.state.copy_(source.state)
+        destination.val.copy_(source.val)
+        return
+    raise TypeError(f"Unsupported memory state item: {type(destination)!r}")
+
+
+def _memory_item_is_finite(item: Any) -> bool:
+    if isinstance(item, torch.Tensor):
+        return bool(torch.isfinite(item).all().item())
+    if hasattr(item, "state") and hasattr(item, "val"):
+        return bool(torch.isfinite(item.state).all().item()) and bool(torch.isfinite(item.val).all().item())
+    raise TypeError(f"Unsupported memory state item: {type(item)!r}")
+
+
+def _summarize_nonfinite_memory_item(name: str, item: Any) -> list[str]:
+    if isinstance(item, torch.Tensor):
+        finite_mask = torch.isfinite(item)
+        if bool(finite_mask.all().item()):
+            return []
+        nonfinite_count = int((~finite_mask).sum().item())
+        return [f"{name}:shape={tuple(item.shape)} nonfinite={nonfinite_count}"]
+    if hasattr(item, "state") and hasattr(item, "val"):
+        diagnostics: list[str] = []
+        for tensor_name, tensor in (("state", item.state), ("val", item.val)):
+            finite_mask = torch.isfinite(tensor)
+            if bool(finite_mask.all().item()):
+                continue
+            nonfinite_count = int((~finite_mask).sum().item())
+            diagnostics.append(
+                f"{name}.{tensor_name}:shape={tuple(tensor.shape)} nonfinite={nonfinite_count}"
+            )
+        return diagnostics
+    raise TypeError(f"Unsupported memory state item: {type(item)!r}")
+
+
 def detach_memory_state(memory_state: Any | None) -> Any | None:
     if memory_state is None:
         return None
+    if isinstance(memory_state, torch.Tensor):
+        return memory_state.detach()
     if isinstance(memory_state, ModelRecurrentState):
-        detached_knowledge = None
-        if memory_state.knowledge_state is not None:
-            detached_knowledge = memory_state.knowledge_state.with_tensors(
-                state=memory_state.knowledge_state.state.detach(),
-                val=memory_state.knowledge_state.val.detach(),
-            )
+        detached_knowledge = (
+            None
+            if memory_state.knowledge_state is None
+            else _detach_memory_item(memory_state.knowledge_state)
+        )
         return ModelRecurrentState(
-            memory_state=tuple(
-                layer.with_tensors(state=layer.state.detach(), val=layer.val.detach())
-                for layer in memory_state.memory_state
-            ),
+            memory_state=tuple(_detach_memory_item(item) for item in memory_state.memory_state),
             knowledge_state=detached_knowledge,
         )
-    return tuple(
-        layer.with_tensors(state=layer.state.detach(), val=layer.val.detach())
-        for layer in memory_state
-    )
+    return tuple(_detach_memory_item(item) for item in memory_state)
 
 
 def clone_memory_state(memory_state: Any | None) -> Any | None:
     if memory_state is None:
         return None
+    if isinstance(memory_state, torch.Tensor):
+        return memory_state.clone()
     if isinstance(memory_state, ModelRecurrentState):
-        cloned_knowledge = None
-        if memory_state.knowledge_state is not None:
-            cloned_knowledge = memory_state.knowledge_state.clone()
+        cloned_knowledge = None if memory_state.knowledge_state is None else _clone_memory_item(memory_state.knowledge_state)
         return ModelRecurrentState(
-            memory_state=tuple(layer.clone() for layer in memory_state.memory_state),
+            memory_state=tuple(_clone_memory_item(item) for item in memory_state.memory_state),
             knowledge_state=cloned_knowledge,
         )
-    return tuple(layer.clone() for layer in memory_state)
+    return tuple(_clone_memory_item(item) for item in memory_state)
 
 
 def move_memory_state(memory_state: Any | None, *, device: torch.device) -> Any | None:
     if memory_state is None:
         return None
+    if isinstance(memory_state, torch.Tensor):
+        return memory_state.to(device=device)
     if isinstance(memory_state, ModelRecurrentState):
-        moved_knowledge = None
-        if memory_state.knowledge_state is not None:
-            moved_knowledge = memory_state.knowledge_state.with_tensors(
-                state=memory_state.knowledge_state.state.to(device=device),
-                val=memory_state.knowledge_state.val.to(device=device),
-            )
+        moved_knowledge = None if memory_state.knowledge_state is None else _move_memory_item(
+            memory_state.knowledge_state,
+            device=device,
+        )
         return ModelRecurrentState(
-            memory_state=tuple(
-                layer.with_tensors(
-                    state=layer.state.to(device=device),
-                    val=layer.val.to(device=device),
-                )
-                for layer in memory_state.memory_state
-            ),
+            memory_state=tuple(_move_memory_item(item, device=device) for item in memory_state.memory_state),
             knowledge_state=moved_knowledge,
         )
-    return tuple(
-        layer.with_tensors(
-            state=layer.state.to(device=device),
-            val=layer.val.to(device=device),
-        )
-        for layer in memory_state
-    )
+    return tuple(_move_memory_item(item, device=device) for item in memory_state)
 
 
 def cpu_clone_memory_state(memory_state: Any | None) -> Any | None:
@@ -4588,21 +4601,23 @@ def cpu_clone_memory_state(memory_state: Any | None) -> Any | None:
 def copy_memory_state_(destination: Any | None, source: Any | None) -> Any | None:
     if destination is None or source is None:
         return destination
+    if isinstance(destination, torch.Tensor):
+        if not isinstance(source, torch.Tensor):
+            raise TypeError("source memory state type does not match destination.")
+        destination.copy_(source)
+        return destination
     if isinstance(destination, ModelRecurrentState):
         if not isinstance(source, ModelRecurrentState):
             raise TypeError("source memory state type does not match destination.")
-        for dst_layer, src_layer in zip(destination.memory_state, source.memory_state, strict=True):
-            dst_layer.state.copy_(src_layer.state)
-            dst_layer.val.copy_(src_layer.val)
+        for dst_item, src_item in zip(destination.memory_state, source.memory_state, strict=True):
+            _copy_memory_item(dst_item, src_item)
         if destination.knowledge_state is not None and source.knowledge_state is not None:
-            destination.knowledge_state.state.copy_(source.knowledge_state.state)
-            destination.knowledge_state.val.copy_(source.knowledge_state.val)
+            _copy_memory_item(destination.knowledge_state, source.knowledge_state)
         return destination
     if isinstance(source, ModelRecurrentState):
         raise TypeError("source memory state type does not match destination.")
-    for dst_layer, src_layer in zip(destination, source, strict=True):
-        dst_layer.state.copy_(src_layer.state)
-        dst_layer.val.copy_(src_layer.val)
+    for dst_item, src_item in zip(destination, source, strict=True):
+        _copy_memory_item(dst_item, src_item)
     return destination
 
 
@@ -4625,18 +4640,14 @@ def copy_document_batch_(destination: DocumentBatch, source: DocumentBatch) -> N
 def memory_state_is_finite(memory_state: Any | None) -> bool:
     if memory_state is None:
         return True
+    if isinstance(memory_state, torch.Tensor):
+        return bool(torch.isfinite(memory_state).all().item())
     if isinstance(memory_state, ModelRecurrentState):
         memory_layers: list[Any] = list(memory_state.memory_state)
         if memory_state.knowledge_state is not None:
             memory_layers.append(memory_state.knowledge_state)
-        return all(
-            bool(torch.isfinite(layer.state).all().item()) and bool(torch.isfinite(layer.val).all().item())
-            for layer in memory_layers
-        )
-    return all(
-        bool(torch.isfinite(layer.state).all().item()) and bool(torch.isfinite(layer.val).all().item())
-        for layer in memory_state
-    )
+        return all(_memory_item_is_finite(item) for item in memory_layers)
+    return all(_memory_item_is_finite(item) for item in memory_state)
 
 
 def summarize_nonfinite_memory_state(memory_state: Any | None) -> list[str]:
@@ -4650,15 +4661,8 @@ def summarize_nonfinite_memory_state(memory_state: Any | None) -> list[str]:
     else:
         layers.extend((f"memory[{index}]", layer) for index, layer in enumerate(memory_state))
     diagnostics: list[str] = []
-    for layer_name, layer in layers:
-        for tensor_name, tensor in (("state", layer.state), ("val", layer.val)):
-            finite_mask = torch.isfinite(tensor)
-            if bool(finite_mask.all().item()):
-                continue
-            nonfinite_count = int((~finite_mask).sum().item())
-            diagnostics.append(
-                f"{layer_name}.{tensor_name}:shape={tuple(tensor.shape)} nonfinite={nonfinite_count}"
-            )
+    for layer_name, item in layers:
+        diagnostics.extend(_summarize_nonfinite_memory_item(layer_name, item))
     return diagnostics
 
 
@@ -4733,42 +4737,18 @@ def summarize_gradient_extremes(
 
 def classify_grad_diagnose_group(parameter_name: str) -> str:
     lower = parameter_name.lower()
-    in_route = "route" in lower or "transition" in lower
-    in_propagation = "propagation" in lower
     if "lm_head" in lower:
         return "lm_head"
     if "token_embedding" in lower or "embed_tokens" in lower or "input_embedding" in lower:
         return "token_embedding"
-    if "source_proj" in lower:
-        if in_route:
-            return "route_lowrank_source"
-        if in_propagation:
-            return "propagation_lowrank_source"
-        return "lowrank_source"
-    if "target_proj" in lower:
-        if in_route:
-            return "route_lowrank_target"
-        if in_propagation:
-            return "propagation_lowrank_target"
-        return "lowrank_target"
-    if "core_weights" in lower or ("pairwise" in lower and lower.endswith(".weight")):
-        if in_route:
-            return "route_lowrank_core"
-        if in_propagation:
-            return "propagation_lowrank_core"
-        return "lowrank_core"
-    if in_propagation:
-        return "propagation"
-    if in_route:
-        return "route"
+    if "knowledge_encoder" in lower or "knowledge_decoder" in lower:
+        return "knowledge_projection"
+    if "knowledge_memory" in lower or "knowledge_relation" in lower:
+        return "knowledge_memory"
+    if "transformer" in lower or "layers" in lower:
+        return "backbone"
     if "skip" in lower:
         return "skip"
-    if "read" in lower or "reader" in lower:
-        return "memory_read"
-    if "prediction" in lower or "predict" in lower:
-        return "prediction"
-    if "memory_levels" in lower:
-        return "memory_levels"
     return "other"
 
 
@@ -4847,7 +4827,6 @@ def should_apply_nomemory_lowrank_grad_scale(args: argparse.Namespace) -> bool:
     return (
         args.model_kind == "causal_memory"
         and args.disable_memory
-        and args.pairwise_kind == "low_rank_bilinear"
         and float(args.nomemory_lowrank_grad_scale) > 1.0
     )
 
@@ -5672,7 +5651,7 @@ def load_checkpoint(path: Path, *, device: torch.device) -> dict[str, Any]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train the document-chunked causal hierarchical memory LM.")
+    parser = argparse.ArgumentParser(description="Train the document-chunked causal memory LM.")
     parser.add_argument("--text-file")
     parser.add_argument("--text-source", action="append", default=[])
     parser.add_argument("--jsonl-source", action="append", default=[])
@@ -5742,17 +5721,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--transformer-heads", type=int, default=6)
     parser.add_argument("--transformer-ff-mult", type=float, default=4.0)
     parser.add_argument("--transformer-dropout", type=float, default=0.0)
-    parser.add_argument("--propagation-layers", type=int, default=0)
     parser.add_argument("--s-layers", type=int, default=2)
     parser.add_argument("--memory-slots", type=int, nargs="+", default=[256, 64, 16])
     parser.add_argument("--memory-update-intervals", type=int, nargs="+")
-    parser.add_argument("--prediction-layers", type=int, default=2)
+    parser.add_argument("--knowledge-memory-size", type=int, default=2048)
+    parser.add_argument("--knowledge-beta-dim", type=int, default=64)
     parser.add_argument(
-        "--s-window",
+        "--knowledge-relation-rank",
         type=int,
-        default=0,
-        help="Sequence propagation window. Use 0 for full causal dense propagation across the whole sequence.",
+        default=64,
+        help="Legacy compatibility argument. The current knowledge path uses a full dense relation matrix E.",
     )
+    parser.add_argument(
+        "--knowledge-activation",
+        choices=("relu", "gelu", "softplus"),
+        default="relu",
+    )
+    parser.add_argument("--prediction-layers", type=int, default=2)
     parser.add_argument("--s-microbatch-size", type=int, default=0)
     parser.add_argument("--prediction-window", type=int, default=64)
     parser.add_argument("--checkpoint-sequence-layers", action="store_true")
@@ -5760,27 +5745,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--disable-feed-forward-layers",
         action="store_true",
-        help="Disable memory-model FFN blocks between propagation/transition layers.",
-    )
-    parser.add_argument(
-        "--disable-memory-feed-forward-layers",
-        action="store_true",
-        help="Disable only B-module recurrent memory FFN blocks while keeping sequence/prediction FFNs.",
+        help="Disable the backbone FFN blocks.",
     )
     parser.add_argument(
         "--disable-memory",
         action="store_true",
-        help="Bypass B-module scan/read entirely and train sequence/prediction path only.",
+        help="Disable the knowledge-trace path and train the transformer backbone only.",
     )
     parser.add_argument(
         "--disable-memory-read",
         action="store_true",
-        help="Run B-module scan but replace its query readout with the sequence projection.",
-    )
-    parser.add_argument(
-        "--disable-memory-propagation",
-        action="store_true",
-        help="Disable recurrent same-level B memory propagation while keeping writes/transitions/readout.",
+        help="Compatibility flag for older ablation configs.",
     )
     parser.add_argument(
         "--feed-forward-hidden-mult",
@@ -5827,76 +5802,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--scan-checkpoint-chunk-size", type=int, default=0)
     parser.add_argument("--scan-backend", choices=("auto", "python", "native"), default="auto")
-    parser.add_argument("--enable-fused-training", action="store_true")
-    parser.add_argument("--fused-training-checkpoint-stride", type=int, default=0)
-    parser.add_argument("--enable-scan-backward-cuda", action="store_true")
-    parser.add_argument(
-        "--enable-causal-dense-prop-cuda",
-        action="store_true",
-        help="Enable the generic causal dense propagation CUDA fastpath for supported pairwise kernels such as low_rank_bilinear.",
-    )
-    parser.add_argument("--enable-diagonal-dense-prop-cuda", action="store_true")
     parser.add_argument("--compile-model", action="store_true")
     parser.add_argument(
         "--compile-mode",
         choices=("default", "reduce-overhead", "max-autotune"),
         default="reduce-overhead",
     )
-    parser.add_argument(
-        "--dense-profile",
-        action="store_true",
-        help="Print CUDA event timings for dense propagation phases when Python dense kernels run.",
-    )
-    parser.add_argument(
-        "--pairwise-kind",
-        choices=("low_rank_bilinear", "diagonal_bilinear", "bilinear", "additive_low_rank", "scaled_cosine"),
-        default="low_rank_bilinear",
-    )
-    parser.add_argument(
-        "--route-kind",
-        choices=("low_rank_bilinear", "diagonal_bilinear", "bilinear", "additive_low_rank", "query_norm_dot"),
-        default="low_rank_bilinear",
-    )
-    parser.add_argument("--pairwise-rank", type=int, default=256)
-    parser.add_argument("--route-rank", type=int, default=256)
-    parser.add_argument("--pairwise-heads", type=int, default=4)
-    parser.add_argument("--pairwise-frozen-heads", type=int, default=0)
-    parser.add_argument("--pairwise-anchor-heads", type=int, default=0)
-    parser.add_argument("--pairwise-anchor-kind", choices=("scaled_cosine", "diagonal_bilinear", "constant_one"), default="scaled_cosine")
-    parser.add_argument("--pairwise-head-aggregate", choices=("max", "mean", "sum", "head_mean", "smoothmax", "signed_smoothmax"), default="signed_smoothmax")
-    parser.add_argument("--disable-sequence-anchor", action="store_true")
-    parser.add_argument("--route-heads", type=int, default=4)
-    parser.add_argument("--route-frozen-heads", type=int, default=0)
-    parser.add_argument("--route-anchor-heads", type=int, default=0)
-    parser.add_argument("--route-anchor-kind", choices=("fixed_projection", "query_norm_dot", "diagonal_bilinear", "constant_one"), default="fixed_projection")
     parser.add_argument("--unit-norm-values", action="store_true")
     parser.add_argument("--disable-forced-unit-norm-values", action="store_true")
-    parser.add_argument("--propagation-residual-gate-init", type=float, default=0.1)
-    parser.add_argument(
-        "--state-update-kind",
-        choices=("signed_softmax", "softsign", "rms", "rms_softsign"),
-        default="signed_softmax",
-    )
     parser.add_argument("--disable-state-residual", action="store_true")
-    parser.set_defaults(disable_state_weighted_state_delta=True)
-    parser.add_argument(
-        "--disable-state-weighted-state-delta",
-        action="store_true",
-        dest="disable_state_weighted_state_delta",
-        help="Do not apply source-state weighting when accumulating propagation delta_state (default).",
-    )
-    parser.add_argument(
-        "--enable-state-weighted-state-delta",
-        action="store_false",
-        dest="disable_state_weighted_state_delta",
-        help="Apply source-state weighting when accumulating propagation delta_state.",
-    )
-    parser.add_argument("--implementation", choices=("reference", "streaming", "kernel", "native"), default="streaming")
+    parser.add_argument("--disable-state-weighted-state-delta", action="store_true")
     parser.add_argument("--feed-forward-pre-norm", action="store_true")
     parser.add_argument("--knowledge-nodes", type=int, default=0)
-    parser.add_argument("--knowledge-route-topk", type=int, default=0)
-    parser.add_argument("--knowledge-propagation-topk", type=int, default=0)
-    parser.add_argument("--knowledge-propagation-layers", type=int, default=1)
 
     parser.add_argument("--batch-size", type=int, default=384)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
@@ -6059,32 +5976,7 @@ def serialize_tokenized_document_refs(documents: Sequence[TokenizedDocument]) ->
 
 
 def configure_native_runtime_flags(args: argparse.Namespace) -> None:
-    if args.enable_fused_training:
-        os.environ[EXPERIMENTAL_FUSED_TRAINING_ENV] = "1"
-    else:
-        os.environ.pop(EXPERIMENTAL_FUSED_TRAINING_ENV, None)
-    if args.fused_training_checkpoint_stride > 0:
-        os.environ[EXPERIMENTAL_FUSED_TRAINING_CHECKPOINT_STRIDE_ENV] = str(
-            int(args.fused_training_checkpoint_stride)
-        )
-    else:
-        os.environ.pop(EXPERIMENTAL_FUSED_TRAINING_CHECKPOINT_STRIDE_ENV, None)
-    if args.enable_scan_backward_cuda:
-        os.environ[EXPERIMENTAL_SCAN_BACKWARD_CUDA_ENV] = "1"
-    else:
-        os.environ.pop(EXPERIMENTAL_SCAN_BACKWARD_CUDA_ENV, None)
-    if args.enable_causal_dense_prop_cuda:
-        os.environ[EXPERIMENTAL_CAUSAL_DENSE_PROP_FORWARD_CUDA_ENV] = "1"
-    else:
-        os.environ.pop(EXPERIMENTAL_CAUSAL_DENSE_PROP_FORWARD_CUDA_ENV, None)
-    if args.enable_diagonal_dense_prop_cuda:
-        os.environ[EXPERIMENTAL_DIAGONAL_DENSE_PROP_CUDA_ENV] = "1"
-    else:
-        os.environ.pop(EXPERIMENTAL_DIAGONAL_DENSE_PROP_CUDA_ENV, None)
-    if args.dense_profile:
-        os.environ["JAKAL_NET_DENSE_PROFILE"] = "1"
-    else:
-        os.environ.pop("JAKAL_NET_DENSE_PROFILE", None)
+    del args
 
 
 def build_parameter_groups(
@@ -6433,7 +6325,7 @@ def build_rnn_aux_optimizer(
 
 def main() -> None:
     args = parse_args()
-    forced_unit_norm_policy = "none"
+    forced_unit_norm_policy = "respect_cli"
     requested_legacy_layer_split = (int(args.s_layers), int(args.prediction_layers))
     requested_stage_spans = (
         int(args.curriculum_stage1_span),
@@ -6444,12 +6336,6 @@ def main() -> None:
     args.curriculum_stage2_span = 1
     args.curriculum_stage3_span = 1
     forced_document_span_policy = "all_stage_spans_fixed_to_1"
-    if not args.disable_forced_unit_norm_values:
-        if args.model_kind == "causal_memory" and args.pairwise_kind == "diagonal_bilinear":
-            args.unit_norm_values = True
-            forced_unit_norm_policy = "diagonal_default_on"
-        else:
-            forced_unit_norm_policy = "respect_cli"
     if args.pretokenize_workers < 0:
         raise ValueError("pretokenize-workers must be non-negative.")
     if args.pretokenized_load_workers <= 0:
@@ -6536,14 +6422,6 @@ def main() -> None:
             f"requested={requested_stage_spans}",
             flush=True,
         )
-    if args.model_kind == "causal_memory" and int(args.propagation_layers) > 0:
-        print(
-            "warning | using propagation_layers as the single causal stack depth; "
-            f"ignoring legacy layer split s_layers={requested_legacy_layer_split[0]} "
-            f"prediction_layers={requested_legacy_layer_split[1]}",
-            flush=True,
-        )
-
     global_stage1_batch_size = args.stage1_batch_size or args.batch_size
     global_stage2_batch_size = args.stage2_batch_size or args.batch_size
     global_stage3_batch_size = args.stage3_batch_size or args.batch_size
@@ -6801,7 +6679,6 @@ def main() -> None:
     if (
         args.model_kind == "causal_memory"
         and args.optimizer.lower() == "lion"
-        and args.pairwise_kind == "low_rank_bilinear"
         and args.lr_decay_start_step == -1
         and args.lr_decay_steps == 0
         and abs(float(args.lr_min_ratio)) <= 1.0e-12
@@ -7006,65 +6883,23 @@ def main() -> None:
             dropout=args.transformer_dropout,
         ).to(device)
     else:
-        total_propagation_layers = resolve_total_propagation_layers(args)
+        total_transformer_layers = resolve_transformer_layers(args)
         model = CausalMemoryLM(
             vocab_size=vocab_size,
             dim=args.dim,
             max_seq_len=args.seq_len,
-            propagation_layers=total_propagation_layers,
-            s_layers=total_propagation_layers,
-            memory_slots=tuple(args.memory_slots),
-            memory_update_intervals=None if args.memory_update_intervals is None else tuple(args.memory_update_intervals),
-            prediction_layers=0,
-            s_window=args.s_window,
-            s_microbatch_size=None if args.s_microbatch_size <= 0 else args.s_microbatch_size,
-            prediction_window=args.prediction_window,
-            checkpoint_sequence_layers=args.checkpoint_sequence_layers,
-            checkpoint_prediction_layers=args.checkpoint_prediction_layers,
+            transformer_layers=total_transformer_layers,
             feed_forward_layers=not args.disable_feed_forward_layers,
-            memory_feed_forward_layers=not (
-                args.disable_feed_forward_layers or args.disable_memory_feed_forward_layers
-            ),
-            disable_memory=args.disable_memory,
-            disable_memory_read=args.disable_memory_read,
-            disable_memory_propagation=args.disable_memory_propagation,
             feed_forward_hidden_mult=args.feed_forward_hidden_mult,
-            feed_forward_kind=args.feed_forward_kind,
-            feed_forward_residual_scale=args.feed_forward_residual_scale,
-            feed_forward_learnable_residual_scale=args.feed_forward_learnable_residual_scale,
-            feed_forward_pre_norm=args.feed_forward_pre_norm,
-            feed_forward_zero_init_output=not args.feed_forward_random_output_init,
             feed_forward_activation=args.feed_forward_activation,
-            memory_topk=args.memory_topk,
-            memory_train_mode=args.memory_train_mode,
-            memory_eval_mode=args.memory_eval_mode,
-            eval_topk=None if args.eval_topk <= 0 else args.eval_topk,
             scan_checkpoint_chunk_size=None if args.scan_checkpoint_chunk_size <= 0 else args.scan_checkpoint_chunk_size,
             scan_backend=args.scan_backend,
-            pairwise_kind=args.pairwise_kind,
-            route_kind=args.route_kind,
-            pairwise_rank=args.pairwise_rank,
-            route_rank=args.route_rank,
-            pairwise_heads=args.pairwise_heads,
-            pairwise_frozen_heads=args.pairwise_frozen_heads,
-            pairwise_anchor_heads=args.pairwise_anchor_heads,
-            pairwise_anchor_kind=args.pairwise_anchor_kind,
-            pairwise_head_aggregate=args.pairwise_head_aggregate,
-            sequence_anchor=not args.disable_sequence_anchor,
-            route_heads=args.route_heads,
-            route_frozen_heads=args.route_frozen_heads,
-            route_anchor_heads=args.route_anchor_heads,
-            route_anchor_kind=args.route_anchor_kind,
-            implementation=args.implementation,
-            unit_norm_values=args.unit_norm_values,
-            propagation_residual_gate_init=args.propagation_residual_gate_init,
-            state_residual=not args.disable_state_residual,
-            state_update_kind=args.state_update_kind,
-            state_weight_delta_state=not args.disable_state_weighted_state_delta,
-            knowledge_nodes=args.knowledge_nodes,
-            knowledge_route_topk=None if args.knowledge_route_topk <= 0 else args.knowledge_route_topk,
-            knowledge_propagation_topk=None if args.knowledge_propagation_topk <= 0 else args.knowledge_propagation_topk,
-            knowledge_propagation_layers=args.knowledge_propagation_layers,
+            transformer_heads=args.transformer_heads,
+            transformer_dropout=args.transformer_dropout,
+            knowledge_memory_size=args.knowledge_memory_size,
+            knowledge_beta_dim=args.knowledge_beta_dim,
+            knowledge_relation_rank=args.knowledge_relation_rank,
+            knowledge_activation=args.knowledge_activation,
         ).to(device)
     if args.hf_embedding_model:
         if not isinstance(decode_vocab, HFTokenizerVocab):
@@ -7094,41 +6929,20 @@ def main() -> None:
     else:
         print(
             f"model=causal_memory_doc | params={parameter_count:,} | dim={args.dim} | seq_len={args.seq_len} | "
-            f"propagation_layers={total_propagation_layers} | "
-            f"legacy_s_layers={requested_legacy_layer_split[0]} | "
-            f"legacy_prediction_layers={requested_legacy_layer_split[1]} | "
-            f"full_dense_causal={args.s_window <= 0} | s_window={args.s_window} | "
-            f"s_microbatch_size={args.s_microbatch_size} | "
+            f"layers={total_transformer_layers} | heads={args.transformer_heads} | "
+            f"ff_mult={args.feed_forward_hidden_mult:g} | dropout={args.transformer_dropout:g} | "
             f"scan_backend={args.scan_backend} | scan_checkpoint_chunk_size={args.scan_checkpoint_chunk_size} | "
-            f"memory_slots={args.memory_slots} | memory_update_intervals={args.memory_update_intervals} | knowledge_nodes={args.knowledge_nodes} | "
-            f"memory_train_mode={args.memory_train_mode} | memory_eval_mode={args.memory_eval_mode} | eval_topk={args.eval_topk or args.memory_topk} | "
-            f"unit_norm_values={args.unit_norm_values} | feed_forward_layers={not args.disable_feed_forward_layers} | "
-            f"pairwise_head_aggregate={args.pairwise_head_aggregate} | "
-            f"propagation_residual_gate_init={args.propagation_residual_gate_init:g} | "
-            f"state_update_kind={args.state_update_kind} | state_residual={not args.disable_state_residual} | "
-            f"state_weight_delta_state={not args.disable_state_weighted_state_delta} | "
-            f"memory_feed_forward_layers={not (args.disable_feed_forward_layers or args.disable_memory_feed_forward_layers)} | "
-            f"disable_memory={args.disable_memory} | disable_memory_read={args.disable_memory_read} | "
-            f"disable_memory_propagation={args.disable_memory_propagation} | "
-            f"feed_forward_hidden_mult={args.feed_forward_hidden_mult:g} | "
-            f"feed_forward_kind={args.feed_forward_kind} | "
-            f"feed_forward_residual_scale={args.feed_forward_residual_scale:g} | "
-            f"feed_forward_learnable_residual_scale={args.feed_forward_learnable_residual_scale} | "
-            f"feed_forward_pre_norm={args.feed_forward_pre_norm} | "
-            f"feed_forward_zero_init_output={not args.feed_forward_random_output_init} | "
+            f"knowledge_memory_size={args.knowledge_memory_size} | "
+            f"knowledge_beta_dim={args.knowledge_beta_dim} | "
+            f"knowledge_relation=full_dense | "
+            f"knowledge_activation={args.knowledge_activation} | "
+            f"feed_forward_layers={not args.disable_feed_forward_layers} | "
             f"feed_forward_activation={args.feed_forward_activation} | "
-            f"optimizer={args.optimizer} | checkpoint_sequence={args.checkpoint_sequence_layers} | "
-            f"checkpoint_prediction={args.checkpoint_prediction_layers}",
+            f"optimizer={args.optimizer}",
             flush=True,
         )
     print(
-        f"native_runtime | fused_training={args.enable_fused_training} | "
-        f"fused_training_checkpoint_stride={args.fused_training_checkpoint_stride} | "
-        f"scan_backward_cuda={args.enable_scan_backward_cuda} | "
-        f"causal_dense_prop_cuda={args.enable_causal_dense_prop_cuda} | "
-        f"diagonal_dense_prop_cuda={args.enable_diagonal_dense_prop_cuda} | "
-        f"compile_model={args.compile_model} | compile_mode={args.compile_mode} | "
-        f"dense_profile={args.dense_profile}",
+        f"runtime | compile_model={args.compile_model} | compile_mode={args.compile_mode}",
         flush=True,
     )
     print(
@@ -7142,12 +6956,9 @@ def main() -> None:
         f"lr_decay_steps={args.lr_decay_steps} | lr_min_ratio={args.lr_min_ratio}",
         flush=True,
     )
-    if args.model_kind == "causal_memory" and (
-        args.disable_memory or args.disable_memory_read or args.disable_memory_propagation
-    ):
+    if args.model_kind == "causal_memory" and (args.disable_memory or args.disable_memory_read):
         print(
-            "warning | legacy memory ablation flags are set, but the current CausalMemoryLM path is propagation-only; "
-            "those flags no longer change the forward graph",
+            "warning | compatibility memory ablation flags are set on the clean-slate CausalMemoryLM path",
             flush=True,
         )
     print(
@@ -7449,7 +7260,7 @@ def main() -> None:
             torch_rng_state=torch.get_rng_state(),
             cuda_rng_state=(torch.cuda.get_rng_state_all() if device.type == "cuda" else None),
         )
-        if not args.prebuild_train_batches:
+        if not args.prebuild_train_batches and micro_step < total_steps:
             prefetcher = create_live_batch_provider(start_step_value=micro_step)
 
     data_batch_size_by_stage = {
@@ -7488,7 +7299,7 @@ def main() -> None:
             print(
                 f"curriculum | step={step} | stage={stage.name} | span={stage.document_span} | "
                 f"batch_size={stage.batch_size} | grad_accum_steps={stage.grad_accum_steps} | "
-                f"freeze_memory={stage.freeze_memory} | freeze_propagation={stage.freeze_propagation} | freeze_skip={stage.freeze_skip} | "
+                f"freeze_memory={stage.freeze_memory} | freeze_backbone={stage.freeze_backbone} | freeze_skip={stage.freeze_skip} | "
                 f"bucket_weights={{{', '.join(f'{key}:{value:.3f}' for key, value in bucket_weights.items() if value > 0.0)}}}",
                 flush=True,
             )

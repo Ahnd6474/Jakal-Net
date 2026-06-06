@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from lm_experiment_utils import _extract_text_from_json_record, write_json
-from train_progressive_b_lm import DialoguePairText, _pairs_from_record, make_next_sentence_pairs
+from tokenizer_utils import DialoguePairText, _pairs_from_record, make_next_sentence_pairs
 
 
 DEFAULT_HF_SOURCES = (
