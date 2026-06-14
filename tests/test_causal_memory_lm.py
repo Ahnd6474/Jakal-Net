@@ -1,7 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -38,8 +38,9 @@ class CausalMemoryLMTests(unittest.TestCase):
         self.assertIsInstance(output, MemoryScanOutput)
         self.assertEqual(output.logits.shape, (2, 5, 32))
         self.assertEqual(len(output.memory_state), 1)
-        self.assertEqual(output.memory_state[0].shape, (2, 4, 24))
+        self.assertEqual(output.memory_state[0].shape, (2, 2, 4, 24))
         self.assertEqual(model.knowledge_block.relation.shape, (24, 24))
+        self.assertEqual(model.knowledge_block.value.shape, (2, 24, 16))
         self.assertIsNotNone(output.knowledge_state)
         assert output.sequence_layer is not None
         assert output.query_layer is not None
@@ -47,7 +48,7 @@ class CausalMemoryLMTests(unittest.TestCase):
         self.assertEqual(output.query_layer.val.shape, (2, 5, 16))
         recurrent_state = output.recurrent_state
         self.assertIsInstance(recurrent_state, ModelRecurrentState)
-        self.assertEqual(recurrent_state.memory_state[0].shape, (2, 4, 24))
+        self.assertEqual(recurrent_state.memory_state[0].shape, (2, 2, 4, 24))
 
     def test_initialize_memory_state_returns_zero_trace(self) -> None:
         model = CausalMemoryLM(
@@ -63,7 +64,7 @@ class CausalMemoryLMTests(unittest.TestCase):
         state = model.initialize_memory_state(3, device=torch.device("cpu"), dtype=torch.float32)
 
         self.assertEqual(len(state), 1)
-        self.assertEqual(state[0].shape, (3, 1, 10))
+        self.assertEqual(state[0].shape, (3, 6, 1, 10))
         self.assertTrue(torch.equal(state[0], torch.zeros_like(state[0])))
 
     def test_carried_trace_changes_output_and_reset_mask_restores_fresh_path(self) -> None:
@@ -113,6 +114,62 @@ class CausalMemoryLMTests(unittest.TestCase):
         self.assertIn("knowledge/beta_entropy", stats)
         self.assertIn("knowledge/trace_rms", stats)
         self.assertIn("knowledge/relation_rms", stats)
+
+    def test_residual_two_hop_memory_path_runs_and_exposes_hop_gate(self) -> None:
+        torch.manual_seed(15)
+        model = CausalMemoryLM(
+            vocab_size=16,
+            dim=8,
+            max_seq_len=8,
+            transformer_layers=2,
+            transformer_heads=2,
+            knowledge_memory_size=12,
+            knowledge_beta_dim=4,
+            knowledge_hops=2,
+            knowledge_relation_rank=4,
+        )
+        token_ids = torch.randint(0, 16, (2, 4))
+
+        model.set_track_stats(True)
+        output = model(token_ids, return_memory_state=True)
+        stats = model.collect_internal_stats()
+
+        self.assertIsInstance(output, MemoryScanOutput)
+        self.assertEqual(model.knowledge_block.hop_residual_logit.shape, (2, 1))
+        self.assertIn("knowledge/hop_gate_mean", stats)
+
+    def test_memory_lookup_uses_attention_query_projection(self) -> None:
+        torch.manual_seed(17)
+        model = CausalMemoryLM(
+            vocab_size=16,
+            dim=8,
+            max_seq_len=8,
+            transformer_layers=1,
+            transformer_heads=2,
+            knowledge_memory_size=12,
+            knowledge_beta_dim=4,
+            knowledge_relation_rank=4,
+        )
+        token_ids = torch.randint(0, 16, (2, 4))
+        batch_size, seq_len = token_ids.shape
+        hidden_after_attention = torch.randn(batch_size, seq_len, model.dim)
+        attention_input = torch.randn(batch_size, seq_len, model.dim)
+        query_states = torch.randn(batch_size, seq_len, model.dim)
+        attention_probs = torch.softmax(
+            torch.randn(batch_size, model.transformer_heads, seq_len, seq_len),
+            dim=-1,
+        )
+
+        model.encoder_layers[0].attend = MagicMock(  # type: ignore[method-assign]
+            return_value=(hidden_after_attention, attention_input, attention_probs, query_states)
+        )
+        original_lookup = model.knowledge_block.lookup
+        model.knowledge_block.lookup = MagicMock(side_effect=original_lookup)  # type: ignore[method-assign]
+
+        _ = model(token_ids)
+
+        lookup_arg = model.knowledge_block.lookup.call_args[0][0]
+        self.assertTrue(torch.equal(lookup_arg, query_states))
 
     def test_value_norm_state_projection_uses_vector_norm(self) -> None:
         projection = ValueNormStateProjection()

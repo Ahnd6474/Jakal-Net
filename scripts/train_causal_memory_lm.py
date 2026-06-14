@@ -67,7 +67,7 @@ except ImportError:
     AutoModelForCausalLM = None
     AutoTokenizer = None
 
-from jakal_net import describe_device, resolve_device
+from jakal_net import Layer, describe_device, resolve_device
 from jakal_net.causal_memory_lm import CausalMemoryLM, MemoryScanOutput, ModelRecurrentState
 
 try:
@@ -283,8 +283,9 @@ class TransformerBaselineLM(torch.nn.Module):
         reset_mask: torch.Tensor | None = None,
         return_memory_state: bool = False,
         return_layers: bool = False,
+        return_logits: bool = True,
     ) -> torch.Tensor | MemoryScanOutput:
-        del memory_state, knowledge_state, reset_mask, return_layers
+        del memory_state, knowledge_state, reset_mask
         seq_len = int(input_ids.shape[1])
         if seq_len > self.max_seq_len:
             raise ValueError(f"input sequence length {seq_len} exceeds max_seq_len={self.max_seq_len}.")
@@ -292,10 +293,23 @@ class TransformerBaselineLM(torch.nn.Module):
         hidden = self.token_embedding(input_ids) + self.position_embedding(positions)
         causal_mask = torch.ones(seq_len, seq_len, device=input_ids.device, dtype=torch.bool).triu(1)
         hidden = self.encoder(hidden, mask=causal_mask, is_causal=True)
-        logits = self.lm_head(self.output_norm(hidden))
-        if not return_memory_state:
+        output_val = self.output_norm(hidden)
+        logits = self.lm_head(output_val) if return_logits else output_val.new_empty((0,))
+        if not (return_memory_state or return_layers):
             return logits
-        return MemoryScanOutput(logits=logits, memory_state=())
+        sequence_layer = None
+        query_layer = None
+        if return_layers:
+            sequence_state = torch.linalg.vector_norm(hidden, ord=2, dim=-1)
+            output_state = torch.linalg.vector_norm(output_val, ord=2, dim=-1)
+            sequence_layer = Layer(dim=self.dim, num_nodes=seq_len, state=sequence_state, val=hidden)
+            query_layer = Layer(dim=self.dim, num_nodes=seq_len, state=output_state, val=output_val)
+        return MemoryScanOutput(
+            logits=logits,
+            memory_state=(),
+            sequence_layer=sequence_layer,
+            query_layer=query_layer,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -5726,6 +5740,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--memory-update-intervals", type=int, nargs="+")
     parser.add_argument("--knowledge-memory-size", type=int, default=2048)
     parser.add_argument("--knowledge-beta-dim", type=int, default=64)
+    parser.add_argument("--knowledge-hops", type=int, default=1)
     parser.add_argument(
         "--knowledge-relation-rank",
         type=int,
@@ -6898,6 +6913,7 @@ def main() -> None:
             transformer_dropout=args.transformer_dropout,
             knowledge_memory_size=args.knowledge_memory_size,
             knowledge_beta_dim=args.knowledge_beta_dim,
+            knowledge_hops=args.knowledge_hops,
             knowledge_relation_rank=args.knowledge_relation_rank,
             knowledge_activation=args.knowledge_activation,
         ).to(device)

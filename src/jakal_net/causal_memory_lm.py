@@ -64,6 +64,8 @@ class _KnowledgeTraceBlock(nn.Module):
         memory_size: int,
         beta_dim: int,
         num_heads: int,
+        num_layers: int,
+        hops: int,
         relation_rank: int,
         activation: str,
     ) -> None:
@@ -74,6 +76,10 @@ class _KnowledgeTraceBlock(nn.Module):
             raise ValueError("beta_dim must be positive.")
         if num_heads <= 0:
             raise ValueError("num_heads must be positive.")
+        if num_layers <= 0:
+            raise ValueError("num_layers must be positive.")
+        if hops <= 0:
+            raise ValueError("hops must be positive.")
         if activation not in {"relu", "gelu", "softplus"}:
             raise ValueError(f"Unsupported knowledge activation: {activation!r}.")
 
@@ -81,16 +87,21 @@ class _KnowledgeTraceBlock(nn.Module):
         self.memory_size = int(memory_size)
         self.beta_dim = int(beta_dim)
         self.num_heads = int(num_heads)
+        self.num_layers = int(num_layers)
+        self.hops = int(hops)
         self.relation_rank = int(relation_rank)
         self.activation_name = activation
 
         self.memory = nn.Parameter(torch.empty(self.memory_size, self.dim))
-        self.beta_query = nn.Parameter(torch.empty(self.num_heads, self.beta_dim, self.memory_size))
-        self.beta_key = nn.Parameter(torch.empty(self.num_heads, self.beta_dim, self.memory_size))
         self.relation = nn.Parameter(torch.empty(self.memory_size, self.memory_size))
-        self.distance_decay = nn.Parameter(torch.tensor(0.1))
-        self.prior_logit = nn.Parameter(torch.tensor(0.0))
-        self.residual_gate = nn.Linear(self.dim, self.dim)
+        self.value = nn.Parameter(torch.empty(self.num_layers, self.memory_size, self.dim))
+        self.share_logit = nn.Parameter(torch.full((self.num_layers, self.num_heads), -2.0))
+        self.prior_logit = nn.Parameter(torch.full((self.num_layers, self.num_heads), -4.0))
+        if self.hops > 1:
+            self.hop_residual_logit = nn.Parameter(torch.full((self.num_layers, self.hops - 1), -2.0))
+        else:
+            self.register_parameter("hop_residual_logit", None)
+        self.residual_gate = nn.ModuleList(nn.Linear(self.dim, self.dim) for _ in range(self.num_layers))
 
         self.track_stats = False
         self.last_stats: dict[str, float] = {}
@@ -98,11 +109,14 @@ class _KnowledgeTraceBlock(nn.Module):
 
     def _reset_parameters(self) -> None:
         nn.init.normal_(self.memory, mean=0.0, std=PARAM_INIT_STD)
-        nn.init.xavier_uniform_(self.beta_query)
-        nn.init.xavier_uniform_(self.beta_key)
         nn.init.normal_(self.relation, mean=0.0, std=PARAM_INIT_STD)
-        nn.init.zeros_(self.residual_gate.weight)
-        nn.init.zeros_(self.residual_gate.bias)
+        nn.init.normal_(self.value, mean=0.0, std=PARAM_INIT_STD)
+        for gate in self.residual_gate:
+            nn.init.zeros_(gate.weight)
+            nn.init.zeros_(gate.bias)
+
+    def lookup(self, hidden: Tensor) -> Tensor:
+        return torch.matmul(hidden, self.memory.transpose(0, 1))
 
     def _activation(self, tensor: Tensor) -> Tensor:
         if self.activation_name == "relu":
@@ -113,59 +127,143 @@ class _KnowledgeTraceBlock(nn.Module):
 
     def forward(
         self,
-        hidden: Tensor,
+        activations: Tensor,
         *,
+        attention_probs: Tensor,
         prior_trace: Tensor | None,
-    ) -> tuple[Tensor, Tensor]:
-        activations = torch.matmul(hidden, self.memory.transpose(0, 1))
+        layer_index: int,
+    ) -> tuple[Tensor, Tensor, dict[str, float] | None]:
+        if not 0 <= layer_index < self.num_layers:
+            raise ValueError(f"layer_index must be in [0, {self.num_layers}), got {layer_index}.")
         batch_size, seq_len, _ = activations.shape
         if prior_trace is None:
             prior_trace = activations.new_zeros((batch_size, self.num_heads, self.memory_size))
-        history = torch.cat(
-            (
-                prior_trace.unsqueeze(2),
-                activations.unsqueeze(1).expand(-1, self.num_heads, -1, -1),
-            ),
-            dim=2,
+        if attention_probs.shape != (batch_size, self.num_heads, seq_len, seq_len):
+            raise ValueError(
+                "attention_probs must have shape "
+                f"({batch_size}, {self.num_heads}, {seq_len}, {seq_len}), got {tuple(attention_probs.shape)}."
+            )
+
+        shared = torch.einsum("bhts,bsk->bhtk", attention_probs, activations)
+        share_mix = torch.sigmoid(self.share_logit[layer_index]).view(1, self.num_heads, 1, 1)
+        traced_by_head = (
+            (1.0 - share_mix) * activations.unsqueeze(1)
+            + share_mix * shared
         )
-
-        query = torch.einsum("btk,hdk->bthd", activations, self.beta_query)
-        key = torch.einsum("bhsk,hdk->bhsd", history, self.beta_key)
-        scores = torch.einsum("bthd,bhsd->bhts", query, key) / math.sqrt(float(self.beta_dim))
-
-        device = hidden.device
-        query_index = torch.arange(seq_len, device=device).view(1, seq_len, 1)
-        key_index = torch.arange(seq_len + 1, device=device).view(1, 1, seq_len + 1)
-        causal_mask = key_index > (query_index + 1)
-        scores = scores.masked_fill(causal_mask.unsqueeze(1), torch.finfo(scores.dtype).min)
-
-        positive_decay = F.softplus(self.distance_decay)
-        distance = (query_index + 1 - key_index).clamp_min(0).to(dtype=scores.dtype)
-        distance_bias = -positive_decay * distance
-        distance_bias[..., 0] = self.prior_logit.to(dtype=scores.dtype)
-        beta = torch.softmax(scores + distance_bias, dim=-1)
-
-        traced_by_head = torch.einsum("bhts,bhsk->bhtk", beta, history)
+        prior_mix = torch.sigmoid(self.prior_logit[layer_index]).view(1, self.num_heads, 1, 1)
+        traced_by_head = traced_by_head + prior_mix * prior_trace.unsqueeze(2)
         traced = traced_by_head.mean(dim=1)
-        relation_scores = torch.matmul(traced, self.relation)
-        relation_scores = self._activation(relation_scores)
-        delta = torch.matmul(relation_scores, self.memory)
-        gate = torch.sigmoid(self.residual_gate(hidden))
-        updated = hidden + gate * delta
+        relation_scores = self._activation(torch.matmul(traced, self.relation))
+        if self.hops > 1:
+            assert self.hop_residual_logit is not None
+            propagated = relation_scores
+            for hop_index in range(self.hops - 1):
+                hop_update = self._activation(torch.matmul(propagated, self.relation))
+                hop_gate = torch.sigmoid(self.hop_residual_logit[layer_index, hop_index]).to(dtype=hop_update.dtype)
+                propagated = propagated + hop_gate * hop_update
+            relation_scores = propagated
         next_trace = traced_by_head[:, :, -1, :]
 
+        stats = None
         if self.track_stats:
-            beta_probs = beta.clamp_min(1.0e-12)
+            beta_probs = attention_probs.clamp_min(1.0e-12)
             beta_entropy = -(beta_probs * beta_probs.log()).sum(dim=-1).mean()
-            self.last_stats = {
-                "knowledge/gate_mean": float(gate.detach().float().mean().item()),
+            stats = {
+                "knowledge/share_mean": float(share_mix.detach().float().mean().item()),
+                "knowledge/prior_mean": float(prior_mix.detach().float().mean().item()),
                 "knowledge/beta_entropy": float(beta_entropy.detach().float().item()),
                 "knowledge/trace_rms": float(next_trace.detach().float().square().mean().sqrt().item()),
                 "knowledge/activation_mean": float(relation_scores.detach().float().mean().item()),
                 "knowledge/relation_rms": float(self.relation.detach().float().square().mean().sqrt().item()),
             }
+            if self.hop_residual_logit is not None:
+                stats["knowledge/hop_gate_mean"] = float(
+                    torch.sigmoid(self.hop_residual_logit[layer_index]).detach().float().mean().item()
+                )
 
-        return updated, next_trace
+        return relation_scores, next_trace, stats
+
+
+class _CausalTransformerBlock(nn.Module):
+    def __init__(
+        self,
+        *,
+        dim: int,
+        heads: int,
+        ff_dim: int,
+        dropout: float,
+        activation: str,
+        enable_feed_forward: bool,
+    ) -> None:
+        super().__init__()
+        self.attention_norm = nn.LayerNorm(dim)
+        self.self_attention = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.attention_dropout = nn.Dropout(dropout)
+        self.enable_feed_forward = bool(enable_feed_forward)
+        if self.enable_feed_forward:
+            self.feed_forward_norm = nn.LayerNorm(dim)
+            self.feed_forward_in = nn.Linear(dim, ff_dim)
+            self.feed_forward_out = nn.Linear(ff_dim, dim)
+            self.feed_forward_dropout = nn.Dropout(dropout)
+            self.feed_forward_activation_name = activation
+        else:
+            self.feed_forward_norm = None
+            self.feed_forward_in = None
+            self.feed_forward_out = None
+            self.feed_forward_dropout = None
+            self.feed_forward_activation_name = activation
+
+    def _activation(self, tensor: Tensor) -> Tensor:
+        if self.feed_forward_activation_name == "gelu":
+            return F.gelu(tensor)
+        if self.feed_forward_activation_name == "relu":
+            return F.relu(tensor)
+        if self.feed_forward_activation_name == "silu":
+            return F.silu(tensor)
+        raise ValueError(f"Unsupported feed_forward_activation: {self.feed_forward_activation_name!r}.")
+
+    def attend(
+        self,
+        hidden: Tensor,
+        *,
+        attention_mask: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        attention_input = self.attention_norm(hidden)
+        query_weight = self.self_attention.in_proj_weight[: self.self_attention.embed_dim]
+        query_bias = None
+        if self.self_attention.in_proj_bias is not None:
+            query_bias = self.self_attention.in_proj_bias[: self.self_attention.embed_dim]
+        query_states = F.linear(attention_input, query_weight, query_bias)
+        attention_output, _ = self.self_attention(
+            attention_input,
+            attention_input,
+            attention_input,
+            attn_mask=attention_mask,
+            need_weights=True,
+            average_attn_weights=False,
+        )
+        hidden = hidden + self.attention_dropout(attention_output)
+        return hidden, attention_input, _, query_states
+
+    def feed_forward(self, hidden: Tensor) -> Tensor:
+        if not self.enable_feed_forward:
+            return hidden
+
+        assert self.feed_forward_norm is not None
+        assert self.feed_forward_in is not None
+        assert self.feed_forward_out is not None
+        assert self.feed_forward_dropout is not None
+        feed_forward_hidden = self.feed_forward_norm(hidden)
+        feed_forward_hidden = self.feed_forward_in(feed_forward_hidden)
+        feed_forward_hidden = self._activation(feed_forward_hidden)
+        feed_forward_hidden = self.feed_forward_dropout(feed_forward_hidden)
+        feed_forward_hidden = self.feed_forward_out(feed_forward_hidden)
+        return hidden + self.feed_forward_dropout(feed_forward_hidden)
 
 
 class CausalMemoryLM(nn.Module):
@@ -186,6 +284,7 @@ class CausalMemoryLM(nn.Module):
         transformer_dropout: float = 0.0,
         knowledge_memory_size: int = 2048,
         knowledge_beta_dim: int = 64,
+        knowledge_hops: int = 1,
         knowledge_relation_rank: int = 64,
         knowledge_activation: str = "relu",
         **legacy_kwargs: Any,
@@ -228,6 +327,7 @@ class CausalMemoryLM(nn.Module):
         self.transformer_dropout = float(transformer_dropout)
         self.knowledge_memory_size = int(knowledge_memory_size)
         self.knowledge_beta_dim = int(knowledge_beta_dim)
+        self.knowledge_hops = int(knowledge_hops)
         self.knowledge_relation_rank = int(knowledge_relation_rank)
         self.knowledge_activation = str(knowledge_activation)
         self.value_to_state = ValueNormStateProjection()
@@ -250,20 +350,23 @@ class CausalMemoryLM(nn.Module):
             memory_size=self.knowledge_memory_size,
             beta_dim=self.knowledge_beta_dim,
             num_heads=self.transformer_heads,
+            num_layers=self.transformer_layer_count,
+            hops=self.knowledge_hops,
             relation_rank=self.knowledge_relation_rank,
             activation=self.knowledge_activation,
         )
         ff_dim = max(self.dim, int(round(self.dim * self.feed_forward_hidden_mult)))
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.dim,
-            nhead=self.transformer_heads,
-            dim_feedforward=ff_dim,
-            dropout=self.transformer_dropout,
-            activation=encoder_activation,
-            batch_first=True,
-            norm_first=True,
+        self.encoder_layers = nn.ModuleList(
+            _CausalTransformerBlock(
+                dim=self.dim,
+                heads=self.transformer_heads,
+                ff_dim=ff_dim,
+                dropout=self.transformer_dropout,
+                activation=self.feed_forward_activation,
+                enable_feed_forward=self.feed_forward_layers,
+            )
+            for _ in range(self.transformer_layer_count)
         )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=self.transformer_layer_count)
         self.output_norm = nn.LayerNorm(self.dim)
         self.lm_head = nn.Linear(self.dim, self.vocab_size, bias=False)
         if tie_embedding_head:
@@ -302,6 +405,7 @@ class CausalMemoryLM(nn.Module):
         return (
             torch.zeros(
                 int(batch_size),
+                self.transformer_layer_count,
                 self.transformer_heads,
                 self.knowledge_memory_size,
                 device=device,
@@ -324,10 +428,10 @@ class CausalMemoryLM(nn.Module):
             trace = self.initialize_memory_state(batch_size, device=device, dtype=dtype)[0]
         else:
             trace = tuple(memory_state)[0]
-            if trace.shape != (batch_size, self.transformer_heads, self.knowledge_memory_size):
+            if trace.shape != (batch_size, self.transformer_layer_count, self.transformer_heads, self.knowledge_memory_size):
                 raise ValueError(
                     "memory_state[0] must have shape "
-                    f"({batch_size}, {self.transformer_heads}, {self.knowledge_memory_size}), got {tuple(trace.shape)}."
+                    f"({batch_size}, {self.transformer_layer_count}, {self.transformer_heads}, {self.knowledge_memory_size}), got {tuple(trace.shape)}."
                 )
             trace = trace.to(device=device, dtype=dtype)
         if reset_mask is not None:
@@ -336,7 +440,7 @@ class CausalMemoryLM(nn.Module):
                     f"reset_mask must have shape ({batch_size},), got {tuple(reset_mask.shape)}."
                 )
             trace = torch.where(
-                reset_mask.to(device=device, dtype=torch.bool).view(batch_size, 1, 1),
+                reset_mask.to(device=device, dtype=torch.bool).view(batch_size, 1, 1, 1),
                 torch.zeros_like(trace),
                 trace,
             )
@@ -366,10 +470,40 @@ class CausalMemoryLM(nn.Module):
             dtype=embedded.dtype,
             reset_mask=reset_mask,
         )
-        injected, next_trace = self.knowledge_block(embedded, prior_trace=prior_trace)
-
         causal_mask = torch.ones(seq_len, seq_len, device=input_ids.device, dtype=torch.bool).triu(1)
-        encoded = self.encoder(injected, mask=causal_mask, is_causal=True)
+        hidden = embedded
+        next_trace_layers: list[Tensor] = []
+        injected = embedded
+        layer_stats: list[dict[str, float]] = []
+        for layer_index, block in enumerate(self.encoder_layers):
+            hidden_after_attention, attention_input, attention_probs, query_states = block.attend(
+                hidden,
+                attention_mask=causal_mask,
+            )
+            activations = self.knowledge_block.lookup(query_states)
+            relation_scores, layer_trace, stats = self.knowledge_block(
+                activations,
+                attention_probs=attention_probs,
+                prior_trace=prior_trace[:, layer_index],
+                layer_index=layer_index,
+            )
+            delta = torch.matmul(relation_scores, self.knowledge_block.value[layer_index])
+            gate = torch.sigmoid(self.knowledge_block.residual_gate[layer_index](hidden_after_attention))
+            hidden = hidden_after_attention + gate * delta
+            hidden = block.feed_forward(hidden)
+            injected = hidden
+            next_trace_layers.append(layer_trace)
+            if stats is not None:
+                stats["knowledge/gate_mean"] = float(gate.detach().float().mean().item())
+                layer_stats.append(stats)
+        if self.knowledge_block.track_stats and layer_stats:
+            stat_names = layer_stats[0].keys()
+            self.knowledge_block.last_stats = {
+                name: float(sum(stat[name] for stat in layer_stats) / len(layer_stats))
+                for name in stat_names
+            }
+
+        encoded = hidden
         output_val = self.output_norm(encoded)
         output_state = self.value_to_state(output_val).squeeze(-1)
         logits = self.lm_head(output_val) if return_logits else output_val.new_empty((0,))
@@ -383,6 +517,7 @@ class CausalMemoryLM(nn.Module):
             sequence_layer = Layer(dim=self.dim, num_nodes=seq_len, state=sequence_state, val=injected)
             query_layer = Layer(dim=self.dim, num_nodes=seq_len, state=output_state, val=output_val)
 
+        next_trace = torch.stack(next_trace_layers, dim=1)
         next_memory_state = (next_trace,)
         return MemoryScanOutput(
             logits=logits,
