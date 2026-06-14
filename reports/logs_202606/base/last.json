@@ -1,0 +1,6 @@
+{
+  "step": 144500,
+  "micro_step": 1156000,
+  "train_loss": 1.940406084060669,
+  "val_loss": null
+}

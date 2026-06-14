@@ -1,0 +1,28 @@
+using device: cuda | distributed=False | rank=0 | local_rank=0 | world_size=1
+flat_metadata_index | path=/home/dannyahn/Jakal-Net/artifacts/wiki6m_hf16k/pretokenized_seq512 | shards=12 | workers=8
+flat_metadata_ok | path=/home/dannyahn/Jakal-Net/artifacts/wiki6m_hf16k/pretokenized_seq512 | shards=12
+loaded_pretokenized_dir | path=/home/dannyahn/Jakal-Net/artifacts/wiki6m_hf16k/pretokenized_seq512 | documents=5,782,048 | tokenizer=hf_auto
+startup | split_train_val_flat_done
+startup | summarize_flat_buckets_done
+startup | estimate_steps_flat_done
+startup | fixed_eval_documents_flat_done
+startup | fixed_eval_sample_documents_flat_done
+startup | model_init_done
+model=causal_memory_doc | params=195,694,762 | dim=1024 | seq_len=512 | layers=10 | heads=8 | ff_mult=3 | dropout=0 | scan_backend=auto | scan_checkpoint_chunk_size=0 | knowledge_memory_size=4096 | knowledge_beta_dim=64 | knowledge_relation=full_dense | knowledge_activation=relu | feed_forward_layers=True | feed_forward_activation=gelu | optimizer=adamw_fused
+runtime | compile_model=False | compile_mode=reduce-overhead
+training_policy | forced_unit_norm_policy=respect_cli | forced_document_span_policy=all_stage_spans_fixed_to_1 | unit_norm_values=False | lowrank_lion_default_schedule_applied=False | replicate_global_batches=False | nomemory_lowrank_grad_scale=1.0 | lr_decay_start_step=20000 | lr_decay_steps=120000 | lr_min_ratio=0.1
+curriculum_batches | stage1=batch8/ga8 (global=8) | stage2=batch8/ga8 (global=8) | stage3=batch8/ga8 (global=8) | data_batch_sizes=(8,8,8)
+curriculum_spans | stage1=1 | stage2=1 | stage3=1
+bucket_summary | train={'wiki': 5203843} | val={'wiki': 578205}
+optimizer_groups | model:count=195,694,762,lr_scale=1.0000
+startup | main_optimizer_done
+startup | batcher_done
+startup | prefetcher_done | mode=async | workers=0 | prefetch_workers=1 | block_size=16 | queued_blocks=4 | cache_dir=None | pin_memory=False
+/home/dannyahn/Jakal-Net/scripts/train_causal_memory_lm.py:488: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  bundle = torch.load(self.path, map_location="cpu")
+curriculum | step=1 | stage=stage1 | span=1 | batch_size=8 | grad_accum_steps=8 | freeze_memory=True | freeze_backbone=True | freeze_skip=True | bucket_weights={mixed_dialogue:1.000, arxiv:1.000, pubmed:1.000, dialogue:1.000, wiki:1.000, code:1.000, math:1.000, docs:1.000}
+progress | opt_step=    1/172211 | micro_step=    8/1377681 | stage=stage1 | span=1 | train_loss=9.9707 | lr=0.0001 | cpu_batch_ms=193.6 | provider_batch_ms=36.1 | prefetch_q=98 | elapsed=6.8s
+progress | opt_step=   25/172211 | micro_step=  200/1377681 | stage=stage1 | span=1 | train_loss=7.5847 | lr=0.00010481 | cpu_batch_ms=8.4 | provider_batch_ms=271.8 | prefetch_q=99 | elapsed=103.5s
+progress | opt_step=   50/172211 | micro_step=  400/1377681 | stage=stage1 | span=1 | train_loss=7.2693 | lr=0.00010982 | cpu_batch_ms=4.5 | provider_batch_ms=308.6 | prefetch_q=100 | elapsed=204.9s
+progress | opt_step=   75/172211 | micro_step=  600/1377681 | stage=stage1 | span=1 | train_loss=6.9744 | lr=0.00011483 | cpu_batch_ms=3.2 | provider_batch_ms=342.0 | prefetch_q=98 | elapsed=307.2s
+progress | opt_step=  100/172211 | micro_step=  800/1377681 | stage=stage1 | span=1 | train_loss=6.7738 | lr=0.00011984 | cpu_batch_ms=2.6 | provider_batch_ms=349.8 | prefetch_q=100 | elapsed=409.0s

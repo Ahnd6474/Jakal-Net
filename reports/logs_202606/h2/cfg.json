@@ -1,0 +1,608 @@
+{
+  "args": {
+    "text_file": null,
+    "text_source": [],
+    "jsonl_source": [],
+    "hf_dataset": null,
+    "hf_config": null,
+    "hf_split": "train",
+    "hf_text_key": "text",
+    "hf_streaming": false,
+    "max_samples": null,
+    "tokenizer": "byte_bpe",
+    "subword_vocab_size": 16384,
+    "subword_model_type": "bpe",
+    "tokenizer_prefix": null,
+    "hf_tokenizer_model": null,
+    "hf_embedding_model": null,
+    "hf_trust_remote_code": false,
+    "match_dim_to_hf_embedding": false,
+    "subword_character_coverage": 1.0,
+    "subword_input_sentence_size": 0,
+    "subword_num_threads": 0,
+    "pretokenize_workers": 8,
+    "pretokenized_path": null,
+    "pretokenized_dir": "/home/dannyahn/Jakal-Net/artifacts/wiki6m_hf16k/pretokenized_seq512",
+    "pretokenized_load_workers": 8,
+    "flat_integrity_mode": "meta",
+    "flat_integrity_workers": 8,
+    "pretokenized_max_loaded_shards": 8,
+    "preload_flat_shards": false,
+    "pretokenized_active_shards_per_bucket": 2,
+    "pretokenized_shard_rotation_interval": 256,
+    "prefetch_batches": 100,
+    "prefetch_workers": 1,
+    "prefetch_pin_memory": false,
+    "rolling_prefetch_workers": 0,
+    "rolling_prefetch_worker_threads": 1,
+    "rolling_prefetch_block_size": 16,
+    "rolling_prefetch_blocks": 4,
+    "rolling_prefetch_cache_dir": null,
+    "prebuild_train_batches": false,
+    "prebuild_pin_memory": false,
+    "prebuild_workers": 1,
+    "prebuild_worker_threads": 1,
+    "prebuild_cache_dir": null,
+    "save_pretokenized": false,
+    "device": "cuda",
+    "precision": "bf16",
+    "seed": 1337,
+    "seq_len": 512,
+    "dim": 1024,
+    "model_kind": "causal_memory",
+    "transformer_layers": 5,
+    "transformer_heads": 8,
+    "transformer_ff_mult": 4.0,
+    "transformer_dropout": 0.0,
+    "s_layers": 10,
+    "memory_slots": [
+      256,
+      64,
+      16
+    ],
+    "memory_update_intervals": null,
+    "knowledge_memory_size": 4096,
+    "knowledge_beta_dim": 64,
+    "knowledge_hops": 2,
+    "knowledge_relation_rank": 64,
+    "knowledge_activation": "relu",
+    "prediction_layers": 0,
+    "s_microbatch_size": 0,
+    "prediction_window": 64,
+    "checkpoint_sequence_layers": false,
+    "checkpoint_prediction_layers": false,
+    "disable_feed_forward_layers": false,
+    "disable_memory": false,
+    "disable_memory_read": false,
+    "feed_forward_hidden_mult": 3.0,
+    "feed_forward_kind": "value",
+    "feed_forward_residual_scale": 1.0,
+    "feed_forward_learnable_residual_scale": false,
+    "feed_forward_random_output_init": false,
+    "feed_forward_activation": "gelu",
+    "memory_topk": 16,
+    "memory_train_mode": "dense",
+    "memory_eval_mode": "dense",
+    "eval_topk": 0,
+    "scan_checkpoint_chunk_size": 0,
+    "scan_backend": "auto",
+    "compile_model": false,
+    "compile_mode": "reduce-overhead",
+    "unit_norm_values": false,
+    "disable_forced_unit_norm_values": false,
+    "disable_state_residual": false,
+    "disable_state_weighted_state_delta": false,
+    "feed_forward_pre_norm": false,
+    "knowledge_nodes": 0,
+    "batch_size": 8,
+    "grad_accum_steps": 8,
+    "distributed_replicate_global_batches": false,
+    "data_seed": 1337,
+    "stage1_batch_size": 0,
+    "stage2_batch_size": 0,
+    "stage3_batch_size": 0,
+    "stage1_grad_accum_steps": 0,
+    "stage2_grad_accum_steps": 0,
+    "stage3_grad_accum_steps": 0,
+    "learning_rate": 0.0002,
+    "weight_decay": 0.01,
+    "optimizer": "adamw_fused",
+    "adam_beta1": 0.9,
+    "adam_beta2": 0.999,
+    "vi_lion_ema_beta": 0.99,
+    "vi_lion_var_low": 0.02,
+    "vi_lion_var_high": 0.1,
+    "vi_lion_min_scale": 0.1,
+    "vi_lion_max_scale": 1.0,
+    "warmup_start_lr": 0.0001,
+    "warmup_steps": 500,
+    "lr_min_ratio": 0.1,
+    "lr_decay_start_step": 20000,
+    "lr_decay_steps": 120000,
+    "epochs": 1.0,
+    "train_fraction": 0.9,
+    "grad_clip": 1.0,
+    "fast_grad_clip": false,
+    "nomemory_lowrank_grad_scale": 1.0,
+    "grad_diagnose_groups": false,
+    "grad_diagnose_interval": 25,
+    "grad_diagnose_first_steps": 10,
+    "diagnose_nonfinite_grad": false,
+    "diagnose_nonfinite_limit": 12,
+    "stop_on_nonfinite_grad": false,
+    "eval_interval": 200,
+    "checkpoint_interval": 100,
+    "eval_start_step": 200,
+    "eval_sample_interval": 1000,
+    "eval_documents": 8,
+    "curriculum_stage1_ratio": 0.1,
+    "curriculum_stage2_ratio": 0.4,
+    "curriculum_stage1_span": 1,
+    "curriculum_stage2_span": 1,
+    "curriculum_stage3_span": 1,
+    "output_root": "artifacts/training_runs",
+    "run_name": "20260614-knowledge-postlookup-hop2res-k4096-d1024-l10-ff3-decay-tb",
+    "resume_checkpoint": null,
+    "init_model_checkpoint": null,
+    "tensorboard": true,
+    "cuda_graph_stage1": false
+  },
+  "distributed": {
+    "enabled": false,
+    "world_size": 1
+  },
+  "local_batch_sizes": {
+    "stage1": 8,
+    "stage2": 8,
+    "stage3": 8
+  },
+  "global_batch_sizes": {
+    "stage1": 8,
+    "stage2": 8,
+    "stage3": 8
+  },
+  "data_batch_sizes": {
+    "stage1": 8,
+    "stage2": 8,
+    "stage3": 8
+  },
+  "training_policy": {
+    "forced_unit_norm_policy": "respect_cli",
+    "forced_document_span_policy": "all_stage_spans_fixed_to_1",
+    "lowrank_lion_default_schedule_applied": false,
+    "replicate_global_batches": false
+  },
+  "tokenizer_label": "hf_auto",
+  "tokenizer_model_path": "/tmp/jakal_net_tokenizers/progressive_b_hf_auto_hf_16384_144a5902bebb",
+  "parameter_count": 195694762,
+  "rnn_aux_parameter_count": 0,
+  "corpus_metadata": {
+    "shards": [
+      {
+        "path": "/home/dannyahn/Jakal-Net/artifacts/wiki6m_hf16k/pretokenized_seq512/raw_shard_0000.pt",
+        "documents": 500000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 500000
+          },
+          "tokenized_summary": {
+            "documents": 500000,
+            "chunks": 1229370,
+            "tokens": 491558826
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "raw_shard_path": "artifacts/wiki6m_hf16k/raw_shards/raw_shard_0000.jsonl",
+          "virtual_shard_index": 0,
+          "virtual_num_shards": 12
+        }
+      },
+      {
+        "path": "/home/dannyahn/Jakal-Net/artifacts/wiki6m_hf16k/pretokenized_seq512/raw_shard_0001.pt",
+        "documents": 500000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 500000
+          },
+          "tokenized_summary": {
+            "documents": 500000,
+            "chunks": 1013055,
+            "tokens": 373545788
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "raw_shard_path": "artifacts/wiki6m_hf16k/raw_shards/raw_shard_0001.jsonl",
+          "virtual_shard_index": 1,
+          "virtual_num_shards": 12
+        }
+      },
+      {
+        "path": "/home/dannyahn/Jakal-Net/artifacts/wiki6m_hf16k/pretokenized_seq512/raw_shard_0002.pt",
+        "documents": 500000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 500000
+          },
+          "tokenized_summary": {
+            "documents": 500000,
+            "chunks": 925529,
+            "tokens": 320412759
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "raw_shard_path": "artifacts/wiki6m_hf16k/raw_shards/raw_shard_0002.jsonl",
+          "virtual_shard_index": 2,
+          "virtual_num_shards": 12
+        }
+      },
+      {
+        "path": "/home/dannyahn/Jakal-Net/artifacts/wiki6m_hf16k/pretokenized_seq512/raw_shard_0003.pt",
+        "documents": 500000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 500000
+          },
+          "tokenized_summary": {
+            "documents": 500000,
+            "chunks": 918298,
+            "tokens": 318141299
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "raw_shard_path": "artifacts/wiki6m_hf16k/raw_shards/raw_shard_0003.jsonl",
+          "virtual_shard_index": 3,
+          "virtual_num_shards": 12
+        }
+      },
+      {
+        "path": "/home/dannyahn/Jakal-Net/artifacts/wiki6m_hf16k/pretokenized_seq512/raw_shard_0004.pt",
+        "documents": 500000,
+        "corpus_info": {
+          "document_summary": {
+            "text": 500000
+          },
+          "tokenized_summary": {
+            "documents": 500000,
+            "chunks": 1148456,
+            "tokens": 437358647
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "raw_shard_path": "artifacts/wiki6m_hf16k/raw_shards/raw_shard_0004.jsonl",
+          "virtual_shard_index": 4,
+          "virtual_num_shards": 12
+        }
+      },
+      {
+        "path": "/home/dannyahn/Jakal-Net/artifacts/wiki6m_hf16k/pretokenized_seq512/raw_shard_0005.pt",
+        "documents": 468864,
+        "corpus_info": {
+          "document_summary": {
+            "text": 468864
+          },
+          "tokenized_summary": {
+            "documents": 468864,
+            "chunks": 836098,
+            "tokens": 280552725
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "raw_shard_path": "artifacts/wiki6m_hf16k/raw_shards/raw_shard_0005.jsonl",
+          "virtual_shard_index": 5,
+          "virtual_num_shards": 12
+        }
+      },
+      {
+        "path": "/home/dannyahn/Jakal-Net/artifacts/wiki6m_hf16k/pretokenized_seq512/raw_shard_0006.pt",
+        "documents": 468864,
+        "corpus_info": {
+          "document_summary": {
+            "text": 468864
+          },
+          "tokenized_summary": {
+            "documents": 468864,
+            "chunks": 826351,
+            "tokens": 280731525
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "raw_shard_path": "artifacts/wiki6m_hf16k/raw_shards/raw_shard_0006.jsonl",
+          "virtual_shard_index": 6,
+          "virtual_num_shards": 12
+        }
+      },
+      {
+        "path": "/home/dannyahn/Jakal-Net/artifacts/wiki6m_hf16k/pretokenized_seq512/raw_shard_0007.pt",
+        "documents": 468864,
+        "corpus_info": {
+          "document_summary": {
+            "text": 468864
+          },
+          "tokenized_summary": {
+            "documents": 468864,
+            "chunks": 797484,
+            "tokens": 262859396
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "raw_shard_path": "artifacts/wiki6m_hf16k/raw_shards/raw_shard_0007.jsonl",
+          "virtual_shard_index": 7,
+          "virtual_num_shards": 12
+        }
+      },
+      {
+        "path": "/home/dannyahn/Jakal-Net/artifacts/wiki6m_hf16k/pretokenized_seq512/raw_shard_0008.pt",
+        "documents": 468864,
+        "corpus_info": {
+          "document_summary": {
+            "text": 468864
+          },
+          "tokenized_summary": {
+            "documents": 468864,
+            "chunks": 813309,
+            "tokens": 272171202
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "raw_shard_path": "artifacts/wiki6m_hf16k/raw_shards/raw_shard_0008.jsonl",
+          "virtual_shard_index": 8,
+          "virtual_num_shards": 12
+        }
+      },
+      {
+        "path": "/home/dannyahn/Jakal-Net/artifacts/wiki6m_hf16k/pretokenized_seq512/raw_shard_0009.pt",
+        "documents": 468864,
+        "corpus_info": {
+          "document_summary": {
+            "text": 468864
+          },
+          "tokenized_summary": {
+            "documents": 468864,
+            "chunks": 814798,
+            "tokens": 274296661
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "raw_shard_path": "artifacts/wiki6m_hf16k/raw_shards/raw_shard_0009.jsonl",
+          "virtual_shard_index": 9,
+          "virtual_num_shards": 12
+        }
+      },
+      {
+        "path": "/home/dannyahn/Jakal-Net/artifacts/wiki6m_hf16k/pretokenized_seq512/raw_shard_0010.pt",
+        "documents": 468864,
+        "corpus_info": {
+          "document_summary": {
+            "text": 468864
+          },
+          "tokenized_summary": {
+            "documents": 468864,
+            "chunks": 1503141,
+            "tokens": 636222297
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "raw_shard_path": "artifacts/wiki6m_hf16k/raw_shards/raw_shard_0010.jsonl",
+          "virtual_shard_index": 10,
+          "virtual_num_shards": 12
+        }
+      },
+      {
+        "path": "/home/dannyahn/Jakal-Net/artifacts/wiki6m_hf16k/pretokenized_seq512/raw_shard_0011.pt",
+        "documents": 468864,
+        "corpus_info": {
+          "document_summary": {
+            "text": 468864
+          },
+          "tokenized_summary": {
+            "documents": 468864,
+            "chunks": 1421423,
+            "tokens": 600066073
+          },
+          "special_tokens": {
+            "bos": 1,
+            "eos": 2,
+            "pad": 0,
+            "text": -1,
+            "code": -1,
+            "math": -1,
+            "cont": 2,
+            "dialogue": -1,
+            "instruction": -1,
+            "response": -1,
+            "user": 4,
+            "assistant": 4,
+            "eot": 5
+          },
+          "raw_shard_path": "artifacts/wiki6m_hf16k/raw_shards/raw_shard_0011.jsonl",
+          "virtual_shard_index": 11,
+          "virtual_num_shards": 12
+        }
+      }
+    ],
+    "directory": "/home/dannyahn/Jakal-Net/artifacts/wiki6m_hf16k/pretokenized_seq512"
+  },
+  "fixed_eval_documents": [
+    {
+      "shard_index": 1,
+      "document_index": 191342
+    },
+    {
+      "shard_index": 6,
+      "document_index": 258648
+    },
+    {
+      "shard_index": 3,
+      "document_index": 381517
+    },
+    {
+      "shard_index": 1,
+      "document_index": 269243
+    },
+    {
+      "shard_index": 6,
+      "document_index": 120701
+    },
+    {
+      "shard_index": 7,
+      "document_index": 378130
+    },
+    {
+      "shard_index": 10,
+      "document_index": 306563
+    },
+    {
+      "shard_index": 8,
+      "document_index": 53036
+    }
+  ],
+  "fixed_eval_sample_documents": [
+    {
+      "shard_index": 5,
+      "document_index": 271733
+    }
+  ]
+}
