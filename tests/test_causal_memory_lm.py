@@ -41,6 +41,13 @@ class CausalMemoryLMTests(unittest.TestCase):
         self.assertEqual(output.memory_state[0].shape, (2, 2, 4, 24))
         self.assertEqual(model.knowledge_block.relation.shape, (24, 24))
         self.assertEqual(model.knowledge_block.value.shape, (2, 24, 16))
+        self.assertEqual(model.knowledge_block.residual_gate_logit.shape, (2,))
+        self.assertTrue(
+            torch.equal(
+                torch.sigmoid(model.knowledge_block.residual_gate_logit),
+                torch.full((2,), 0.5),
+            )
+        )
         self.assertIsNotNone(output.knowledge_state)
         assert output.sequence_layer is not None
         assert output.query_layer is not None
@@ -114,6 +121,29 @@ class CausalMemoryLMTests(unittest.TestCase):
         self.assertIn("knowledge/beta_entropy", stats)
         self.assertIn("knowledge/trace_rms", stats)
         self.assertIn("knowledge/relation_rms", stats)
+
+    def test_scalar_residual_gate_receives_gradient(self) -> None:
+        torch.manual_seed(14)
+        model = CausalMemoryLM(
+            vocab_size=16,
+            dim=8,
+            max_seq_len=8,
+            transformer_layers=2,
+            transformer_heads=2,
+            knowledge_memory_size=12,
+            knowledge_beta_dim=4,
+            knowledge_relation_rank=4,
+        )
+        token_ids = torch.randint(0, 16, (2, 4))
+
+        logits = model(token_ids)
+        logits.square().mean().backward()
+
+        gradient = model.knowledge_block.residual_gate_logit.grad
+        self.assertIsNotNone(gradient)
+        assert gradient is not None
+        self.assertEqual(gradient.shape, (2,))
+        self.assertTrue(torch.isfinite(gradient).all())
 
     def test_residual_two_hop_memory_path_runs_and_exposes_hop_gate(self) -> None:
         torch.manual_seed(15)

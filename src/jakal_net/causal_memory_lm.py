@@ -101,7 +101,7 @@ class _KnowledgeTraceBlock(nn.Module):
             self.hop_residual_logit = nn.Parameter(torch.full((self.num_layers, self.hops - 1), -2.0))
         else:
             self.register_parameter("hop_residual_logit", None)
-        self.residual_gate = nn.ModuleList(nn.Linear(self.dim, self.dim) for _ in range(self.num_layers))
+        self.residual_gate_logit = nn.Parameter(torch.zeros(self.num_layers))
 
         self.track_stats = False
         self.last_stats: dict[str, float] = {}
@@ -111,9 +111,6 @@ class _KnowledgeTraceBlock(nn.Module):
         nn.init.normal_(self.memory, mean=0.0, std=PARAM_INIT_STD)
         nn.init.normal_(self.relation, mean=0.0, std=PARAM_INIT_STD)
         nn.init.normal_(self.value, mean=0.0, std=PARAM_INIT_STD)
-        for gate in self.residual_gate:
-            nn.init.zeros_(gate.weight)
-            nn.init.zeros_(gate.bias)
 
     def lookup(self, hidden: Tensor) -> Tensor:
         return torch.matmul(hidden, self.memory.transpose(0, 1))
@@ -488,7 +485,7 @@ class CausalMemoryLM(nn.Module):
                 layer_index=layer_index,
             )
             delta = torch.matmul(relation_scores, self.knowledge_block.value[layer_index])
-            gate = torch.sigmoid(self.knowledge_block.residual_gate[layer_index](hidden_after_attention))
+            gate = torch.sigmoid(self.knowledge_block.residual_gate_logit[layer_index]).to(dtype=delta.dtype)
             hidden = hidden_after_attention + gate * delta
             hidden = block.feed_forward(hidden)
             injected = hidden
