@@ -10,6 +10,10 @@ from typing import Any, Iterator
 
 os.environ.setdefault("PJRT_DEVICE", "TPU")
 os.environ.setdefault("XLA_USE_BF16", "1")
+# Kaggle TPU VMs expose legacy topology variables that conflict with PJRT's
+# local v3-8 discovery. PJRT must discover the eight local devices itself.
+os.environ.pop("TPU_PROCESS_ADDRESSES", None)
+os.environ.pop("CLOUD_TPU_TASK_ID", None)
 
 import numpy as np
 import torch
@@ -267,12 +271,14 @@ def _save_checkpoint(
 
 def _train_process(index: int, args: argparse.Namespace, metadata: dict[str, Any]) -> None:
     del index
+    import torch_xla.runtime as xr
     import torch_xla.core.xla_model as xm
     import torch_xla.distributed.parallel_loader as pl
 
     device = xm.xla_device()
-    rank = xm.get_ordinal()
-    world_size = xm.xrt_world_size()
+    rank = xr.global_ordinal()
+    world_size = xr.world_size()
+    is_master = rank == 0
     torch.manual_seed(args.seed + rank)
 
     train_dataset = TokenBlockDataset(args.data_dir / "train.bin", seq_len=args.seq_len)
@@ -318,7 +324,7 @@ def _train_process(index: int, args: argparse.Namespace, metadata: dict[str, Any
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     history_path = args.output_dir / "history.jsonl"
-    if xm.is_master_ordinal():
+    if is_master:
         config = {
             "args": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
             "data": metadata,
@@ -374,7 +380,7 @@ def _train_process(index: int, args: argparse.Namespace, metadata: dict[str, Any
                     "elapsed_seconds": elapsed,
                     "steps_per_second": step / max(elapsed, 1.0e-9),
                 }
-                if xm.is_master_ordinal():
+                if is_master:
                     with history_path.open("a", encoding="utf-8") as history_file:
                         history_file.write(json.dumps(record) + "\n")
                     print(
@@ -396,7 +402,7 @@ def _train_process(index: int, args: argparse.Namespace, metadata: dict[str, Any
                     max_batches=args.eval_batches,
                 )
                 last_validation_loss = validation_loss
-                if xm.is_master_ordinal():
+                if is_master:
                     with history_path.open("a", encoding="utf-8") as history_file:
                         history_file.write(
                             json.dumps(
@@ -439,7 +445,7 @@ def _train_process(index: int, args: argparse.Namespace, metadata: dict[str, Any
     )
     train_dataset.close()
     validation_dataset.close()
-    if xm.is_master_ordinal():
+    if is_master:
         summary = {
             "step": step,
             "validation_loss": last_validation_loss,

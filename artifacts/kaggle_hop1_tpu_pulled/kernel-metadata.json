@@ -1,0 +1,21 @@
+{
+  "id": "dannyahn/jakal-net-hop1-scalar-gate-tpu",
+  "id_no": 125834183,
+  "title": "Jakal Net Hop1 Scalar Gate TPU",
+  "code_file": "jakal-net-hop1-scalar-gate-tpu.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_tpu": true,
+  "enable_internet": true,
+  "keywords": [],
+  "dataset_sources": [
+    "dannyahn/jakal-net-tpu-source"
+  ],
+  "kernel_sources": [],
+  "competition_sources": [],
+  "model_sources": [],
+  "docker_image": "gcr.io/kaggle-private-byod/python-tpuvm@sha256:a2111cb9be558ea4bc187754bb95d7b65e90d8259434f1eb0e0ab1193ff498c0",
+  "machine_shape": "Tpu1VmV38"
+}

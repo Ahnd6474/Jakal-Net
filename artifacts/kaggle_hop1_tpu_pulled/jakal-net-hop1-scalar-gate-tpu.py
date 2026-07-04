@@ -7,32 +7,19 @@ import zipfile
 from pathlib import Path
 
 
-def find_source_root() -> Path:
-    unpacked_sources = list(Path("/kaggle/input").glob("**/src/jakal_net/causal_memory_lm.py"))
-    if len(unpacked_sources) == 1:
-        return unpacked_sources[0].parents[2]
-
-    source_archives = list(Path("/kaggle/input").glob("**/jakal-net-tpu-source.zip"))
-    if len(source_archives) != 1:
-        raise RuntimeError(
-            "Expected one unpacked Jakal-Net source tree or source archive, "
-            f"found unpacked={unpacked_sources!r}, archives={source_archives!r}."
-        )
-    source_root = Path("/kaggle/working/Jakal-Net")
-    source_root.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(source_archives[0]) as archive:
-        archive.extractall(source_root)
-    return source_root
-
-
 def main() -> None:
     os.environ.setdefault("PJRT_DEVICE", "TPU")
     os.environ.setdefault("XLA_USE_BF16", "1")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-    os.environ.pop("TPU_PROCESS_ADDRESSES", None)
-    os.environ.pop("CLOUD_TPU_TASK_ID", None)
 
-    source_root = find_source_root()
+    source_archives = list(Path("/kaggle/input").glob("**/jakal-net-tpu-source.zip"))
+    if len(source_archives) != 1:
+        raise RuntimeError(f"Expected one Jakal-Net source archive, found {source_archives!r}.")
+
+    source_root = Path("/kaggle/working/Jakal-Net")
+    source_root.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(source_archives[0]) as archive:
+        archive.extractall(source_root)
 
     subprocess.run(
         [
